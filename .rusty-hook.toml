@@ -1,0 +1,2 @@
+[hooks]
+pre-commit = "cargo test && cargo check && cargo fmt --check"
