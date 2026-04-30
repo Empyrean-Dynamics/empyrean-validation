@@ -2,12 +2,45 @@
 name = "empyrean-validation"
 version = "0.1.0"
 edition = "2024"
-authors = ["Joachim Moeyens <joachim@empyrean-dynamics.com>"]
+rust-version = "1.90.0"
+authors = ["Joachim Moeyens <joachim@empyrean-dynamics.com>", "Empyrean Dynamics"]
+description = "Cross-channel validation framework for the empyrean astrodynamics stack — schema, test catalog, plan generator, report renderer, and external-reference runners (ASSIST, find_orb, kete) shared by every empyrean repo's CI."
+repository = "https://github.com/Empyrean-Dynamics/empyrean-validation"
+include = ["src/**/*", "catalog.json", "Cargo.toml", "docs/katex-header.html"]
 
 [lib]
 name = "empyrean_validation"
 
+[[bin]]
+name = "empyrean-validation"
+path = "src/bin/cli.rs"
+
+[package.metadata.docs.rs]
+rustdoc-args = ["--html-in-header", "docs/katex-header.html"]
+
 [dependencies]
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
+clap = { version = "4", features = ["derive"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# villeneuve provides the SBDB / Horizons disk-cached query clients used
+# by the plan generator. Pinned to a tagged version here; sibling-checkout
+# local development resolves to ../villeneuve via the [patch] block below.
+villeneuve = { git = "ssh://git@github.com/Empyrean-Dynamics/villeneuve.git", tag = "v1.9.0", features = ["jpl"] }
 
 [dev-dependencies]
-rusty-hook = "^0.11.2"
+tempfile = "3"
+
+# Sibling-checkout development: when this repo is laid out next to a
+# villeneuve clone (either at ../villeneuve in the same parent directory,
+# or at the canonical empyrean monorepo layout), cargo resolves the
+# [dependencies] declaration above to that local path instead of fetching
+# the tagged release. CI without a sibling checkout pulls the tagged
+# version. Same pattern as scott / empyrean-core / empyrean.
+[patch."ssh://git@github.com/Empyrean-Dynamics/villeneuve.git"]
+villeneuve = { path = "../villeneuve" }
+
+# nolan is a transitive dep of villeneuve. Override to the sibling
+# checkout for the same dev-vs-CI reason.
+[patch."ssh://git@github.com/Empyrean-Dynamics/nolan.git"]
+nolan = { path = "../nolan" }
