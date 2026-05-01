@@ -16,7 +16,30 @@ jobs:
     name: Build & Lint
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      # `Cargo.toml` patches villeneuve + nolan to `../villeneuve` and
+      # `../nolan` for sibling-checkout development. CI replicates that
+      # layout: this repo lands at `<workspace>/empyrean-validation/`,
+      # the patched siblings live alongside it. Without these checkouts
+      # cargo aborts with `failed to load source for dependency
+      # 'villeneuve' / No such file or directory`.
+      - name: Checkout empyrean-validation (default)
+        uses: actions/checkout@v4
+        with:
+          path: empyrean-validation
+
+      - name: Checkout villeneuve (sibling for [patch])
+        uses: actions/checkout@v4
+        with:
+          repository: Empyrean-Dynamics/villeneuve
+          path: villeneuve
+          token: ${{ secrets.GH_PAT }}
+
+      - name: Checkout nolan (sibling for [patch])
+        uses: actions/checkout@v4
+        with:
+          repository: Empyrean-Dynamics/nolan
+          path: nolan
+          token: ${{ secrets.GH_PAT }}
 
       - name: Configure git for private dependencies
         run: git config --global url."https://x-access-token:${{ secrets.GH_PAT }}@github.com/".insteadOf "ssh://git@github.com/"
@@ -28,9 +51,11 @@ jobs:
           rustflags: ""
 
       - name: Build
+        working-directory: empyrean-validation
         run: cargo build --verbose
 
       - name: Lint
+        working-directory: empyrean-validation
         run: |
           cargo fmt -- --check
           cargo clippy --all-targets --all-features
@@ -41,7 +66,24 @@ jobs:
     needs: build-lint
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout empyrean-validation (default)
+        uses: actions/checkout@v4
+        with:
+          path: empyrean-validation
+
+      - name: Checkout villeneuve (sibling for [patch])
+        uses: actions/checkout@v4
+        with:
+          repository: Empyrean-Dynamics/villeneuve
+          path: villeneuve
+          token: ${{ secrets.GH_PAT }}
+
+      - name: Checkout nolan (sibling for [patch])
+        uses: actions/checkout@v4
+        with:
+          repository: Empyrean-Dynamics/nolan
+          path: nolan
+          token: ${{ secrets.GH_PAT }}
 
       - name: Configure git for private dependencies
         run: git config --global url."https://x-access-token:${{ secrets.GH_PAT }}@github.com/".insteadOf "ssh://git@github.com/"
@@ -52,4 +94,5 @@ jobs:
           rustflags: ""
 
       - name: Unit tests
+        working-directory: empyrean-validation
         run: cargo test --verbose

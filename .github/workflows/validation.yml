@@ -1,0 +1,313 @@
+name: Validation Suite
+
+# Centralized in empyrean-validation because the framework owns the
+# pipeline (schema, catalog, plan, report, ci-check, external-reference
+# runners). Per-channel runners (rust / python / c / cli / core) still
+# live in the repos whose surface they exercise — empyrean and
+# empyrean-core — and are checked out here as siblings.
+#
+# Triggers:
+#   - cron     — Monday 06:00 UTC weekly refresh
+#   - dispatch — manual run with optional OBJECTS / TIER inputs
+#   - push     — any change to this repo's main (framework / schema /
+#                external-runner code, the orchestrator Makefile, or
+#                this workflow itself)
+#
+# Not yet plumbed: repository_dispatch from sibling-repo CIs (empyrean,
+# empyrean-core, scott, villeneuve, nolan) so a wrapper change in
+# empyrean fires validation here within minutes rather than waiting
+# for the weekly cron. Add when the cross-repo PAT is sized for it.
+
+on:
+  schedule:
+    - cron: "0 6 * * 1"
+  workflow_dispatch:
+    inputs:
+      objects:
+        description: "Subset of objects to validate (comma-separated; empty = all)"
+        type: string
+        default: ""
+      tier:
+        description: "Force model tier (approximate / basic / standard)"
+        type: string
+        default: "standard"
+  push:
+    branches: [main]
+    paths-ignore:
+      - "README.md"
+      - "docs/**"
+      - "**.md"
+
+permissions:
+  contents: read
+  id-token: write  # Workload Identity Federation for GCS upload
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_NET_GIT_FETCH_WITH_CLI: true
+  GCS_BUCKET: gs://empyrean-validation
+  EMPYREAN_DATA_DIR: ${{ github.workspace }}/data
+  PYTHON_VERSION: "3.12"
+  OBJECTS: ${{ inputs.objects || 'Apophis,Bennu,Eros,Vesta,2018 LA' }}
+  TIER: ${{ inputs.tier || 'standard' }}
+
+jobs:
+  validate:
+    name: Build + run + report
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      # ── Sibling-checkout layout ────────────────────────────────
+      # The Makefile expects:
+      #   <workspace>/empyrean/                 (rust / python / c / cli runners)
+      #   <workspace>/empyrean-core/            (validate-core binary)
+      #   <workspace>/empyrean-validation/      (this repo: framework + Makefile + externals)
+      #   <workspace>/{scott,villeneuve,nolan}/ (transitive sibling deps for [patch])
+      # All paths in the Makefile resolve from `..` of the empyrean-validation
+      # checkout, which means each repo MUST sit alongside it. We do that by
+      # checking the default repo out under `path: empyrean-validation/`
+      # rather than the workspace root.
+      - name: Checkout empyrean-validation (default)
+        uses: actions/checkout@v4
+        with:
+          path: empyrean-validation
+
+      - name: Checkout empyrean (sibling)
+        uses: actions/checkout@v4
+        with:
+          repository: Empyrean-Dynamics/empyrean
+          path: empyrean
+          token: ${{ secrets.GH_PAT }}
+
+      - name: Checkout empyrean-core (sibling)
+        uses: actions/checkout@v4
+        with:
+          repository: Empyrean-Dynamics/empyrean-core
+          path: empyrean-core
+          token: ${{ secrets.GH_PAT }}
+
+      # Transitive deps — needed by the [patch] sections in
+      # empyrean / empyrean-core / empyrean-validation Cargo.toml so
+      # cargo resolves villeneuve / scott / nolan to local sibling
+      # checkouts instead of the tagged git URLs (which would
+      # otherwise duplicate the dep tree and produce incompatible
+      # `Orbits<AU>` types across the workspace).
+      - name: Checkout scott (transitive)
+        uses: actions/checkout@v4
+        with:
+          repository: Empyrean-Dynamics/scott
+          path: scott
+          token: ${{ secrets.GH_PAT }}
+
+      - name: Checkout villeneuve (transitive)
+        uses: actions/checkout@v4
+        with:
+          repository: Empyrean-Dynamics/villeneuve
+          path: villeneuve
+          token: ${{ secrets.GH_PAT }}
+
+      - name: Checkout nolan (transitive)
+        uses: actions/checkout@v4
+        with:
+          repository: Empyrean-Dynamics/nolan
+          path: nolan
+          token: ${{ secrets.GH_PAT }}
+
+      - name: Configure git for any non-patched private deps
+        run: git config --global url."https://x-access-token:${{ secrets.GH_PAT }}@github.com/".insteadOf "ssh://git@github.com/"
+
+      # ── Toolchains ─────────────────────────────────────────────
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          rustflags: ""
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Install uv (used by empyrean-py wheel build)
+        run: pip install uv
+
+      # ── Caches ─────────────────────────────────────────────────
+      # SPICE kernels + DE440 + bias.dat — large (~2 GB), rebuilt only
+      # when the cache key changes. Bump the suffix when adding a kernel.
+      - name: Cache empyrean data kernels
+        id: cache-data
+        uses: actions/cache@v4
+        with:
+          path: data
+          key: empyrean-data-v2
+
+      - name: Download empyrean data kernels
+        if: steps.cache-data.outputs.cache-hit != 'true'
+        run: |
+          mkdir -p data
+          cd data
+          curl -sSfL -o de440.bsp https://naif.jpl.nasa.gov/pub/naif/generic_kernels/spk/planets/de440.bsp
+          curl -sSfL -o gm_de440.tpc https://naif.jpl.nasa.gov/pub/naif/generic_kernels/pck/gm_de440.tpc
+          curl -sSfL -o earth_latest_high_prec.bpc https://naif.jpl.nasa.gov/pub/naif/generic_kernels/pck/earth_latest_high_prec.bpc
+          curl -sSfL -o earth_620120_250826.bpc https://naif.jpl.nasa.gov/pub/naif/generic_kernels/pck/earth_620120_250826.bpc
+          curl -sSfL -o earth_2025_250826_2125_predict.bpc https://naif.jpl.nasa.gov/pub/naif/generic_kernels/pck/earth_2025_250826_2125_predict.bpc
+          curl -sSfL -o moon_pa_de440_200625.bpc https://naif.jpl.nasa.gov/pub/naif/generic_kernels/pck/moon_pa_de440_200625.bpc
+          curl -sSfL -o sb441-n16.bsp https://ssd.jpl.nasa.gov/ftp/eph/small_bodies/asteroids_de441/sb441-n16.bsp
+          curl -sSfL https://minorplanetcenter.net/Extended_Files/obscodes_extended.json.gz | gunzip > obscodes_extended.json
+          curl -sSfL -o linux_p1550p2650.440 https://ssd.jpl.nasa.gov/ftp/eph/planets/Linux/de440/linux_p1550p2650.440
+
+      # JPL Horizons + SBDB API responses — the rust runner caches every
+      # IC and reference vector the first time it fetches them, so warm
+      # CI runs avoid hammering JPL's servers.
+      - name: Cache JPL API responses
+        uses: actions/cache@v4
+        with:
+          path: ~/.empyrean/cache
+          key: empyrean-api-cache-v1
+
+      # Cargo registry + workspace targets across all sibling repos. Key
+      # on every Cargo.toml / Cargo.lock so any dep bump invalidates.
+      - name: Cache cargo state
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            empyrean/target
+            empyrean-core/target
+            empyrean-validation/target
+          key: cargo-${{ hashFiles('**/Cargo.lock', '**/Cargo.toml') }}
+          restore-keys: cargo-
+
+      # ASSIST venv — assist + rebound take ~30 seconds to install
+      # cleanly from PyPI; cache the resolved venv across runs.
+      - name: Cache ASSIST venv
+        uses: actions/cache@v4
+        with:
+          path: empyrean-validation/runners/assist/.venv
+          key: assist-venv-${{ hashFiles('empyrean-validation/runners/assist/setup.sh') }}
+
+      # find_orb is a from-source build of four C/C++ libraries (lunar,
+      # jpl_eph, sat_code, find_orb). Cache the build tree + install
+      # prefix, otherwise it's ~5 minutes of compile every run.
+      - name: Cache find_orb build
+        id: cache-findorb
+        uses: actions/cache@v4
+        with:
+          path: |
+            empyrean-validation/runners/findorb/build
+            empyrean-validation/runners/findorb/install
+            ~/include
+            ~/lib
+          key: findorb-build-v5
+
+      # ── Pipeline ───────────────────────────────────────────────
+      # `make setup` only runs the per-runner setup scripts that produce
+      # things the cache might not have (or that are cheap to re-check).
+      - name: One-time external setup (ASSIST venv + find_orb build)
+        working-directory: empyrean-validation
+        env:
+          DATA_DIR: ${{ env.EMPYREAN_DATA_DIR }}
+        run: make setup
+
+      # `make all` = build + run + report. The Makefile owns every detail
+      # of the pipeline — channel order, perturber exclusion, plan
+      # derivation, merge-external, report renderer invocation. CI just
+      # passes through OBJECTS / TIERS as overrides.
+      - name: make all
+        working-directory: empyrean-validation
+        env:
+          DATA_DIR: ${{ env.EMPYREAN_DATA_DIR }}
+        run: make all OBJECTS="${OBJECTS}" TIERS="${TIER}"
+
+      # ── Hard gate ──────────────────────────────────────────────
+      # python and core are both expected to be bit-exact to the rust
+      # reference at 1e-10 fidelity. python tests that the PyO3 bridge
+      # round-trips without precision loss; core tests that the FFI
+      # surface (rust) and direct-scott surface (core) don't drift apart
+      # on the v0.7.0 ODConfig defaults. A failure here usually means a
+      # config-default regression in either the wrapper or scott.
+      - name: ci-check (gate on python + core parity)
+        working-directory: empyrean-validation
+        run: |
+          ./target/release/empyrean-validation ci-check \
+            --summary results/validation_summary.json \
+            --strict-channels python,core
+
+      # ── GCS upload ─────────────────────────────────────────────
+      - name: Authenticate to Google Cloud
+        if: github.event_name == 'schedule' || github.event_name == 'push' || github.event_name == 'workflow_dispatch'
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: "projects/786706985139/locations/global/workloadIdentityPools/github-pool/providers/github-provider"
+          service_account: "empyrean-ci@empyrean-dynamics.iam.gserviceaccount.com"
+
+      - name: Upload to GCS
+        if: github.event_name == 'schedule' || github.event_name == 'push' || github.event_name == 'workflow_dispatch'
+        working-directory: empyrean-validation
+        run: |
+          TIMESTAMP=$(date -u +%Y%m%d_%H%M%S)
+
+          # GCS layout consumed by spielberg's ValidationPage
+          # (https://validation.empyrean-dynamics.com/latest/...):
+          #
+          #   latest/validation.json         ← merged rust prop+eph (canonical, backwards-compat)
+          #   latest/od_validation.json      ← rust OD (canonical, backwards-compat)
+          #   latest/channels/{rust,python,core,assist,findorb}.json
+          #   latest/validation_report.html
+          #   latest/validation_summary.json
+          #
+          # archive/{TIMESTAMP}/ mirrors the same structure for history.
+
+          alias_canonical() { cp "$1" "$2"; }
+          alias_canonical results/validation_rust_merged.json results/validation.json
+          alias_canonical results/validation_rust_od.json      results/od_validation.json
+
+          # latest/ — overwrite each upload
+          gcloud storage rm -r ${{ env.GCS_BUCKET }}/latest/ 2>/dev/null || true
+          gcloud storage cp results/validation.json            ${{ env.GCS_BUCKET }}/latest/validation.json
+          gcloud storage cp results/od_validation.json         ${{ env.GCS_BUCKET }}/latest/od_validation.json
+          gcloud storage cp results/validation_report.html     ${{ env.GCS_BUCKET }}/latest/validation_report.html
+          gcloud storage cp results/validation_summary.json    ${{ env.GCS_BUCKET }}/latest/validation_summary.json
+          for ch in rust python core assist findorb; do
+            f="results/validation_${ch}.json"
+            [ -f "$f" ] && gcloud storage cp "$f" "${{ env.GCS_BUCKET }}/latest/channels/${ch}.json"
+          done
+
+          # archive/ — historical
+          gcloud storage cp results/validation.json            ${{ env.GCS_BUCKET }}/archive/${TIMESTAMP}/validation.json
+          gcloud storage cp results/od_validation.json         ${{ env.GCS_BUCKET }}/archive/${TIMESTAMP}/od_validation.json
+          gcloud storage cp results/validation_report.html     ${{ env.GCS_BUCKET }}/archive/${TIMESTAMP}/validation_report.html
+          gcloud storage cp results/validation_summary.json    ${{ env.GCS_BUCKET }}/archive/${TIMESTAMP}/validation_summary.json
+          for ch in rust python core assist findorb; do
+            f="results/validation_${ch}.json"
+            [ -f "$f" ] && gcloud storage cp "$f" "${{ env.GCS_BUCKET }}/archive/${TIMESTAMP}/channels/${ch}.json"
+          done
+
+      - name: Upload report artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: validation-report
+          path: |
+            empyrean-validation/results/validation_report.html
+            empyrean-validation/results/validation_summary.json
+            empyrean-validation/results/*.json
+          retention-days: 30
+
+      - name: Step summary
+        working-directory: empyrean-validation
+        run: |
+          echo "## Validation Suite — ${TIER} tier" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          python3 -c "
+          import json
+          s = json.load(open('results/validation_summary.json'))
+          print('| channel | rows | pass @ 1e-10 | max Δpos km | p50 t (ms) | speed |')
+          print('|---------|-----:|:-------------|------------:|-----------:|------:|')
+          for ch in s['channels']:
+              passing = ch['n_passing']; total = ch['n_total_compared']
+              pass_str = '—' if total == 0 else f\"{passing}/{total}\"
+              dpos = ch.get('max_pos_diff_km', 0.0)
+              p50 = ch.get('p50_time_ms') or 0
+              ratio = ch.get('p50_speed_ratio') or 1.0
+              print(f\"| {ch['channel']} | {ch['n_rows']} | {pass_str} | {dpos:.2e} | {p50:.1f} | {ratio:.2f}x |\")
+          " >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "Report uploaded to \`${{ env.GCS_BUCKET }}/latest/validation_report.html\`" >> $GITHUB_STEP_SUMMARY
