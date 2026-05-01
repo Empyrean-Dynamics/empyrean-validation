@@ -1,2 +1,21 @@
 /target
 Cargo.lock
+
+# External-runner build artifacts (find_orb and OpenOrb both build from source via setup.sh)
+runners/findorb/build/
+runners/findorb/install/
+runners/oorb/build/
+runners/oorb/install/
+
+# Per-runner Python venvs (each .venv has its own auto-generated
+# .gitignore but be explicit so a stray `git add .` doesn't pull
+# in CACHEDIR.TAG / pyvenv.cfg).
+runners/*/.venv/
+
+# Python bytecode caches that pop up when the runners are imported
+# directly (e.g. for smoke-testing helpers without going through the
+# venv entry point).
+runners/*/__pycache__/
+
+# Validation artifacts produced by runners (output JSONs / reports).
+runners/*/results/
