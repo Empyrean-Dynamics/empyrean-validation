@@ -535,18 +535,25 @@ def main():
         obj_data[name]["population"] = r["population"]
         obj_data[name]["notes"] = r.get("notes", "")
         obj_data[name]["dt_days"].append(r["dt_days"])
-        # Pick up non-grav params from empyrean results
-        if r.get("non_grav_a1") is not None:
-            obj_data[name]["a1"] = r["non_grav_a1"]
-            obj_data[name]["a2"] = r.get("non_grav_a2", 0.0)
-            obj_data[name]["a3"] = r.get("non_grav_a3", 0.0)
-        # g(r) function parameters
-        if r.get("non_grav_alpha") is not None:
-            obj_data[name]["gr_alpha"] = r["non_grav_alpha"]
-            obj_data[name]["gr_r0"] = r.get("non_grav_r0")
-            obj_data[name]["gr_m"] = r.get("non_grav_m")
-            obj_data[name]["gr_n"] = r.get("non_grav_n")
-            obj_data[name]["gr_k"] = r.get("non_grav_k")
+        # Pick up non-grav params from empyrean results. The schema uses
+        # `ic_*` keys (set by the rust runner from SBDB) — older versions
+        # of this runner read `non_grav_*` which never matched anything,
+        # silently dropping all Yarkovsky / cometary outgassing terms and
+        # producing a quietly-wrong "no non-grav" comparison.
+        if r.get("ic_a1") is not None:
+            obj_data[name]["a1"] = r["ic_a1"] or 0.0
+            obj_data[name]["a2"] = r.get("ic_a2") or 0.0
+            obj_data[name]["a3"] = r.get("ic_a3") or 0.0
+        # g(r) function parameters (Marsden water-ice form for comets;
+        # asteroids carry the inverse-square defaults that ASSIST uses
+        # natively, so we only override when the row supplies an explicit
+        # alpha).
+        if r.get("ic_g_alpha"):
+            obj_data[name]["gr_alpha"] = r["ic_g_alpha"]
+            obj_data[name]["gr_r0"] = r.get("ic_g_r0")
+            obj_data[name]["gr_m"] = r.get("ic_g_m")
+            obj_data[name]["gr_n"] = r.get("ic_g_n")
+            obj_data[name]["gr_k"] = r.get("ic_g_k")
 
     # Build Horizons command mapping from ALL_OBJECTS
     cmd_map = {o.name: o for o in ALL_OBJECTS}
