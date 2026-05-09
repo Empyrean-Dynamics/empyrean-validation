@@ -7,16 +7,36 @@ name: Validation Suite
 # empyrean-core — and are checked out here as siblings.
 #
 # Triggers:
-#   - cron     — Monday 06:00 UTC weekly refresh
-#   - dispatch — manual run with optional OBJECTS / TIER inputs
-#   - push     — any change to this repo's main (framework / schema /
-#                external-runner code, the orchestrator Makefile, or
-#                this workflow itself)
+#   - cron                — Monday 06:00 UTC weekly refresh
+#   - dispatch            — manual run with optional OBJECTS / TIER inputs
+#   - push                — any change to this repo's main (framework
+#                           / schema / external-runner code, the
+#                           orchestrator Makefile, or this workflow
+#                           itself)
+#   - repository_dispatch — fired by sibling repos when their main /
+#                           release lands (see "Cross-repo dispatch"
+#                           below).
 #
-# Not yet plumbed: repository_dispatch from sibling-repo CIs (empyrean,
-# empyrean-core, scott, villeneuve, nolan) so a wrapper change in
-# empyrean fires validation here within minutes rather than waiting
-# for the weekly cron. Add when the cross-repo PAT is sized for it.
+# Cross-repo dispatch
+# ──────────────────────────────────────────────────────────────────
+# Two event types are accepted:
+#   - sibling-main-push : empyrean / empyrean-core push to main.
+#                         Fires immediately because every push to
+#                         either of those is the next release
+#                         candidate users will feel.
+#   - sibling-tag-push  : villeneuve / scott / nolan tag a release.
+#                         Pre-tag main pushes are not dispatched —
+#                         the tag is the moment the upstream commits
+#                         to "this is the version the rest of the
+#                         stack will adopt." Validation gates that
+#                         transition.
+#
+# `client_payload.source` carries the dispatching repo's full name
+# (`Empyrean-Dynamics/<repo>`) and `client_payload.sha` (or `tag` for
+# tag pushes) carries the commit / tag that triggered the run.
+# Senders need a PAT with `actions: write` permission scoped to this
+# repo only, stored on the sender side as
+# `VALIDATION_DISPATCH_TOKEN`.
 
 on:
   schedule:
@@ -37,6 +57,8 @@ on:
       - "README.md"
       - "docs/**"
       - "**.md"
+  repository_dispatch:
+    types: [sibling-main-push, sibling-tag-push]
 
 permissions:
   contents: read
@@ -57,6 +79,20 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 90
     steps:
+      # ── Trace what fired this run ──────────────────────────────
+      # Surfaces the sender repo + sha/tag in the GitHub UI's Annotations
+      # tab so triaging "who broke validation" is one click instead of
+      # a hunt through the run summary JSON.
+      - name: Log trigger source
+        run: |
+          echo "Event: ${{ github.event_name }}"
+          if [ "${{ github.event_name }}" = "repository_dispatch" ]; then
+            echo "Dispatch type:    ${{ github.event.action }}"
+            echo "Source repo:      ${{ github.event.client_payload.source }}"
+            echo "Source sha:       ${{ github.event.client_payload.sha }}"
+            echo "Source tag:       ${{ github.event.client_payload.tag }}"
+          fi
+
       # ── Sibling-checkout layout ────────────────────────────────
       # The Makefile expects:
       #   <workspace>/empyrean/                 (rust / python / c / cli runners)
