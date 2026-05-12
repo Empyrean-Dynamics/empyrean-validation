@@ -198,6 +198,10 @@ pub struct ValidationResult {
     pub od_rms_ra_arcsec: Option<f64>,
     /// Post-fit RMS of Dec residuals (arcsec).
     pub od_rms_dec_arcsec: Option<f64>,
+    /// Combined RA·cosδ + Dec residual RMS (arcsec). Matches the
+    /// find_orb / OrbFit `rms` reporting convention — directly
+    /// comparable to `findorb_rms_residual`.
+    pub od_rms_combined_arcsec: Option<f64>,
     /// Post-fit chi-squared.
     pub od_chi2: Option<f64>,
     /// Reduced chi-squared (`chi2 / (N - k)`).
@@ -290,6 +294,7 @@ impl ValidationResult {
             od_converged: None,
             od_rms_ra_arcsec: None,
             od_rms_dec_arcsec: None,
+            od_rms_combined_arcsec: None,
             od_chi2: None,
             od_reduced_chi2: None,
             excluded_perturbers_naif: Vec::new(),
