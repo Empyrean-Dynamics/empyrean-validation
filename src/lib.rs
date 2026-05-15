@@ -31,6 +31,7 @@
 
 pub mod catalog;
 pub mod compare;
+pub mod orbit_compare;
 pub mod plan;
 pub mod report;
 pub mod schema;

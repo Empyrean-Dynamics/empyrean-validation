@@ -41,6 +41,57 @@
 
 use serde::{Deserialize, Serialize};
 
+/// Serde adapter for `f64` fields that may be NaN. `serde_json` writes
+/// non-finite floats as JSON `null` (NaN/Infinity aren't valid JSON
+/// numbers) but the default deserializer rejects `null` → `f64`. This
+/// adapter round-trips: NaN ↔ null, finite ↔ number.
+pub mod f64_nan_null {
+    use serde::{Deserialize, Deserializer, Serializer};
+
+    pub fn serialize<S: Serializer>(v: &f64, s: S) -> Result<S::Ok, S::Error> {
+        if v.is_finite() {
+            s.serialize_f64(*v)
+        } else {
+            s.serialize_none()
+        }
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<f64, D::Error> {
+        let opt: Option<f64> = Deserialize::deserialize(d)?;
+        Ok(opt.unwrap_or(f64::NAN))
+    }
+}
+
+/// Same as [`f64_nan_null`] but for `[f64; 6]` arrays — each element
+/// round-trips NaN ↔ null.
+pub mod f64_array6_nan_null {
+    use serde::{Deserialize, Deserializer, Serializer, ser::SerializeSeq};
+
+    pub fn serialize<S: Serializer>(v: &[f64; 6], s: S) -> Result<S::Ok, S::Error> {
+        let mut seq = s.serialize_seq(Some(6))?;
+        for x in v.iter() {
+            if x.is_finite() {
+                seq.serialize_element(x)?;
+            } else {
+                seq.serialize_element(&Option::<f64>::None)?;
+            }
+        }
+        seq.end()
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<[f64; 6], D::Error> {
+        let v: Vec<Option<f64>> = Deserialize::deserialize(d)?;
+        if v.len() != 6 {
+            return Err(serde::de::Error::invalid_length(v.len(), &"expected 6"));
+        }
+        let mut out = [0.0_f64; 6];
+        for (i, o) in v.into_iter().enumerate() {
+            out[i] = o.unwrap_or(f64::NAN);
+        }
+        Ok(out)
+    }
+}
+
 /// Canonical channel names used in [`ValidationResult::channel`].
 pub mod channels {
     /// Test plan — the canonical fixture every replay channel consumes.
@@ -321,6 +372,184 @@ impl ValidationResult {
 /// alias gives the consumer a way to spell "I want the plan" without
 /// committing to a wrapper.
 pub type ValidationPlan = Vec<ValidationResult>;
+
+/// Canonical [`CapturedOrbit::source`] values.
+pub mod orbit_sources {
+    /// Orbit fitted by scott (this crate's OD runner).
+    pub const SCOTT_OD: &str = "scott_od";
+    /// Orbit fitted by find_orb (Bill Gray / Project Pluto).
+    pub const FINDORB: &str = "findorb";
+    /// Orbit published by JPL Small-Body Database.
+    pub const SBDB: &str = "sbdb";
+}
+
+/// Per-object orbit + 6×6 covariance snapshot, emitted as a sidecar
+/// to [`ValidationResult`] for the orbit-comparison panel.
+///
+/// Each tool that produces a fitted (or published) orbit + covariance
+/// — scott OD, find_orb, JPL SBDB — emits one [`CapturedOrbit`] record
+/// per object. The orbit-comparison kernel consumes these to compare
+/// scott's fit to find_orb and to SBDB in Keplerian element space at a
+/// common epoch.
+///
+/// Each record carries the orbit in three coordinate views:
+/// 1. **Native** — the representation the tool produced (Cartesian for
+///    scott + find_orb; Cometary for SBDB).
+/// 2. **Sun-centered ICRF Cartesian** — the common interchange basis,
+///    used by the propagation step when transporting an orbit from one
+///    tool's native epoch to another.
+/// 3. **Sun-centered ecliptic-J2000 Keplerian** — the comparison basis;
+///    Mahalanobis distance and σ-ratios are computed here.
+///
+/// All three views share the same epoch (`epoch_mjd_tdb`); the
+/// covariance is transformed through the Jacobian via
+/// `empyrean::Context::transform`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct CapturedOrbit {
+    /// Object name (matches [`crate::catalog::ValidationObject::name`]).
+    pub object: String,
+    /// Source tool. One of [`orbit_sources::SCOTT_OD`],
+    /// [`orbit_sources::FINDORB`], [`orbit_sources::SBDB`].
+    pub source: String,
+    /// Optional source-tool version tag (e.g., scott crate version,
+    /// find_orb build date, SBDB orbit solution name like "JPL#256").
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_version: Option<String>,
+    /// Epoch shared by all three coordinate views (MJD TDB).
+    pub epoch_mjd_tdb: f64,
+    /// Native representation: `"cartesian"`, `"cometary"`, or `"keplerian"`.
+    pub native_repr: String,
+    /// Native frame: `"icrf"` or `"ecliptic_j2000"`.
+    pub native_frame: String,
+    /// Native origin NAIF ID (10 = Sun, 0 = SSB).
+    pub native_origin_naif: i32,
+    /// Native state vector (6 elements). Element order matches the
+    /// representation: Cartesian = `[x, y, z, vx, vy, vz]` (AU, AU/day);
+    /// Cometary = `[q, e, i, Ω, ω, T_p]` (AU, —, deg, deg, deg, MJD TDB);
+    /// Keplerian = `[a, e, i, Ω, ω, M]` (AU, —, deg, deg, deg, deg).
+    pub native_state: [f64; 6],
+    /// Native 6×6 covariance (units paired with `native_state`).
+    /// `None` if the source did not provide one.
+    pub native_cov_6x6: Option<[[f64; 6]; 6]>,
+    /// State in Sun-centered ICRF Cartesian (AU, AU/day).
+    pub state_cart_icrf_sun: [f64; 6],
+    /// 6×6 covariance in Sun-centered ICRF Cartesian. `None` if the
+    /// native covariance was absent.
+    pub cov_cart_icrf_sun_6x6: Option<[[f64; 6]; 6]>,
+    /// State in Sun-centered ecliptic-J2000 Keplerian
+    /// (a [AU], e, i [deg], Ω [deg], ω [deg], M [deg]).
+    pub state_kep_ecliptic_sun: [f64; 6],
+    /// 6×6 covariance in Sun-centered ecliptic-J2000 Keplerian
+    /// (units paired with `state_kep_ecliptic_sun`).
+    pub cov_kep_ecliptic_sun_6x6: Option<[[f64; 6]; 6]>,
+}
+
+impl CapturedOrbit {
+    /// Construct with default-zero fields. Tests / partial fixtures
+    /// should fill specific fields after construction.
+    pub fn empty(object: impl Into<String>, source: impl Into<String>) -> Self {
+        Self {
+            object: object.into(),
+            source: source.into(),
+            source_version: None,
+            epoch_mjd_tdb: 0.0,
+            native_repr: String::new(),
+            native_frame: String::new(),
+            native_origin_naif: 0,
+            native_state: [0.0; 6],
+            native_cov_6x6: None,
+            state_cart_icrf_sun: [0.0; 6],
+            cov_cart_icrf_sun_6x6: None,
+            state_kep_ecliptic_sun: [0.0; 6],
+            cov_kep_ecliptic_sun_6x6: None,
+        }
+    }
+}
+
+/// Per-object, per-reference orbit comparison. Emitted by the
+/// orbit-comparison kernel; consumed by the report panel.
+///
+/// Each row compares scott's fitted orbit + covariance to one
+/// reference (SBDB or find_orb) in Keplerian element space at one
+/// common epoch. The same (object, reference) pair may produce
+/// multiple rows: one per common-epoch choice (scott's fit epoch,
+/// reference's native epoch).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct OrbitComparison {
+    /// Object name.
+    pub object: String,
+    /// Reference tool. One of [`orbit_sources::SBDB`],
+    /// [`orbit_sources::FINDORB`].
+    pub reference: String,
+    /// Common epoch all states are propagated to (MJD TDB).
+    pub common_epoch_mjd_tdb: f64,
+    /// Whose native epoch is the common epoch: `"scott"`, `"sbdb"`,
+    /// or `"findorb"`.
+    pub common_epoch_source: String,
+    /// Comparison representation (currently always `"keplerian"`).
+    pub repr: String,
+    /// Scott's state at common epoch (Keplerian).
+    pub state_scott: [f64; 6],
+    /// Reference's state at common epoch (Keplerian).
+    pub state_ref: [f64; 6],
+    /// `state_scott - state_ref` (element-wise; angle elements
+    /// wrapped to `(-180°, 180°]`).
+    pub delta: [f64; 6],
+    /// Per-element 1σ from scott's covariance diagonal. Per-element
+    /// NaNs (when the source has no covariance) round-trip as JSON
+    /// `null`.
+    #[serde(with = "f64_array6_nan_null")]
+    pub sigma_scott: [f64; 6],
+    /// Per-element 1σ from reference's covariance diagonal.
+    #[serde(with = "f64_array6_nan_null")]
+    pub sigma_ref: [f64; 6],
+    /// `Δᵀ Σ_scott⁻¹ Δ` — is the reference inside scott's ellipsoid?
+    /// NaN (round-trip as `null`) when Σ_scott is not SPD or missing.
+    #[serde(with = "f64_nan_null")]
+    pub mahalanobis_d2_scott_metric: f64,
+    /// `Δᵀ Σ_ref⁻¹ Δ` — is scott inside the reference's ellipsoid?
+    #[serde(with = "f64_nan_null")]
+    pub mahalanobis_d2_ref_metric: f64,
+    /// `Δᵀ (Σ_scott + Σ_ref)⁻¹ Δ` — symmetric consistency metric.
+    #[serde(with = "f64_nan_null")]
+    pub mahalanobis_d2_combined_metric: f64,
+    /// `Σ_k (Δ_k / σ_combined,k)²` — sum of squared marginal z-scores.
+    /// Compare to [`Self::mahalanobis_d2_combined_metric`]: when the
+    /// joint d² ≫ marginal d², off-diagonal correlation in the joint
+    /// covariance (not any single marginal) is driving the
+    /// discrepancy — the "correlation" pathology signature. When
+    /// joint d² ≈ marginal d², the discrepancy is element-by-element.
+    #[serde(with = "f64_nan_null")]
+    pub mahalanobis_d2_marginal: f64,
+    /// `√(d²_combined / 6)` — 6-DOF χ-equivalent sigma.
+    #[serde(with = "f64_nan_null")]
+    pub sigma_equiv_combined: f64,
+    /// Sorted-descending eigenvalues of `Σ_scott` (Keplerian
+    /// element-space). Same units as `sigma_scott²`.
+    #[serde(with = "f64_array6_nan_null")]
+    pub eigenvalues_scott: [f64; 6],
+    /// Sorted-descending eigenvalues of `Σ_ref`.
+    #[serde(with = "f64_array6_nan_null")]
+    pub eigenvalues_ref: [f64; 6],
+    /// Principal-axis rotation between `Σ_scott` and `Σ_ref` in
+    /// degrees: `arccos(|v₁_scott · v₁_ref|)` where v₁ is the
+    /// eigenvector of the largest eigenvalue. Small angle means
+    /// ellipsoids are aligned; a large angle with similar eigenvalue
+    /// spectra is the "rotation" pathology signature.
+    #[serde(with = "f64_nan_null")]
+    pub principal_axis_rotation_deg: f64,
+    /// `det(Σ_scott) / det(Σ_ref)` — overall ellipsoid volume ratio.
+    /// Retained for backward compatibility; the eigenvalue spectra
+    /// above are more interpretable.
+    #[serde(with = "f64_nan_null")]
+    pub cov_volume_ratio: f64,
+    /// Free-form notes (e.g., propagation method, epoch handling).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub notes: Vec<String>,
+}
+
 
 #[cfg(test)]
 mod tests {
