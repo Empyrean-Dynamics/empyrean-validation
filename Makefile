@@ -32,10 +32,11 @@
 
 # ── Configuration ──────────────────────────────────────────
 ROOT := $(abspath $(dir $(MAKEFILE_LIST)))
-# Sibling repos. `empyrean` ships the in-monorepo per-channel runners
-# (rust / python / c / cli) plus the wrapper crate / dylib / wheel they
-# consume. `empyrean-core` ships the validate-core binary that bypasses
-# FFI for the "core" reference channel.
+# Sibling repos. `empyrean` ships the distribution channels — the
+# wrapper crate, libempyrean.dylib, empyrean-cli binary, and the
+# empyrean Python wheel — that the per-channel runners consume.
+# `empyrean-core` ships the validate-core binary that bypasses FFI
+# for the "core" reference channel.
 EMPYREAN_ROOT := $(abspath $(ROOT)/../empyrean)
 EMPYREAN_CORE_ROOT := $(abspath $(ROOT)/../empyrean-core)
 EMPYREAN_VALIDATION_ROOT := $(ROOT)
@@ -45,15 +46,16 @@ TIERS ?= standard
 DATA_DIR ?= $(HOME)/.empyrean/data
 CACHE_DIR ?= $(HOME)/.empyrean/cache
 RESULTS_DIR := $(ROOT)/results
-FIXTURES_PSV := $(EMPYREAN_ROOT)/validation/fixtures/psv
+FIXTURES_PSV := $(ROOT)/fixtures/psv
 
-# In-monorepo per-channel runners (consume empyrean's distribution
-# artifacts: empyrean wrapper crate, libempyrean.dylib, empyrean-cli
-# binary, empyrean Python wheel). They live in the empyrean repo
-# because each one directly links or imports the empyrean surface
-# it's exercising — moving them here would force a publish-tag-bump
-# loop on every wrapper change.
-EMPYREAN_RUNNERS := $(EMPYREAN_ROOT)/validation/runners
+# Per-channel runners (rust / python / c / cli) live in this repo's
+# runners/ directory alongside the external-reference runners. They
+# consume empyrean's distribution artifacts — wrapper crate,
+# libempyrean.dylib, empyrean-cli binary, empyrean Python wheel —
+# from the sibling empyrean checkout, but link / import those
+# artifacts by path, so they carry no build-graph coupling that
+# would force an empyrean publish-tag-bump on every wrapper change.
+EMPYREAN_RUNNERS := $(ROOT)/runners
 WHEEL_VENV := $(EMPYREAN_ROOT)/empyrean-py/.venv
 WHEEL_PY := $(WHEEL_VENV)/bin/python
 RUST_BIN := $(EMPYREAN_RUNNERS)/rust/target/release/validate

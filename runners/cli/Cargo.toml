@@ -1,0 +1,24 @@
+[workspace]
+
+[package]
+name = "empyrean-validation-cli"
+version = "0.1.0"
+edition = "2024"
+authors = ["Joachim Moeyens <joachim@empyrean-dynamics.com>", "Empyrean Dynamics"]
+publish = false
+
+[[bin]]
+name = "empyrean-cli-runner"
+path = "src/main.rs"
+
+[dependencies]
+# CLI distribution channel — exercises the empyrean wrapper just like a
+# user invoking `empyrean propagate` from a shell would.
+empyrean = { path = "../../../empyrean/empyrean" }
+clap = { version = "4", features = ["derive"] }
+
+[patch."ssh://git@github.com/Empyrean-Dynamics/villeneuve.git"]
+villeneuve = { path = "../../../villeneuve" }
+
+# No nolan patch: villeneuve 1.12 depends on the renamed crate `hyperjet`
+# from crates.io, not the private git `nolan`.
