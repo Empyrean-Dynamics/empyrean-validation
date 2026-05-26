@@ -102,10 +102,19 @@ CLI_OUT := $(RESULTS_DIR)/validation_cli.json
 CORE_OUT := $(RESULTS_DIR)/validation_core.json
 ASSIST_OUT := $(RESULTS_DIR)/validation_assist.json
 FINDORB_OUT := $(RESULTS_DIR)/validation_findorb.json
+OORB_OUT := $(RESULTS_DIR)/validation_oorb.json
+ORBFIT_OUT := $(RESULTS_DIR)/validation_orbfit.json
 KETE_OUT := $(RESULTS_DIR)/validation_kete.json
+JORBIT_OUT := $(RESULTS_DIR)/validation_jorbit.json
 # Merged-with-external version of the rust unified file. ASSIST and find_orb
 # references attach onto the rust prop+eph and OD rows in a single pass.
 RUST_MERGED := $(RESULTS_DIR)/validation_rust_merged.json
+# `core` is the canonical reference channel: empyrean-core direct (no
+# FFI). The merged-with-externals JSON is keyed off core rows so the
+# report's external-references panel pairs ASSIST / find_orb / OpenOrb /
+# OrbFit comparisons to the same physical computation that the cross-
+# channel parity panel uses as its reference.
+CORE_MERGED := $(RESULTS_DIR)/validation_core_merged.json
 REPORT := $(RESULTS_DIR)/validation_report.html
 SUMMARY := $(RESULTS_DIR)/validation_summary.json
 
@@ -113,13 +122,19 @@ SUMMARY := $(RESULTS_DIR)/validation_summary.json
 # only appended when its sibling tree is present (WITH_CORE). Each channel
 # contributes exactly one file.
 comma := ,
-REPORT_INPUTS := $(RUST_MERGED),$(PYTHON),$(C_OUT),$(CLI_OUT)$(if $(WITH_CORE),$(comma)$(CORE_OUT),)
+# Report inputs: rust is now included WITHOUT externals folded in (just
+# the bare $(RUST) file); externals are folded onto the `core` reference
+# channel via $(CORE_MERGED). When `core` isn't present, fall back to
+# $(RUST_MERGED) so the report still has external comparison data
+# (degraded — externals will only pair against rust rows in that mode).
+REPORT_INPUTS := $(if $(WITH_CORE),$(RUST)$(comma)$(PYTHON)$(comma)$(C_OUT)$(comma)$(CLI_OUT)$(comma)$(CORE_MERGED),$(RUST_MERGED)$(comma)$(PYTHON)$(comma)$(C_OUT)$(comma)$(CLI_OUT))
 
 # ── Targets ────────────────────────────────────────────────
 .PHONY: all setup build run report clean help \
-        setup-assist setup-findorb setup-kete \
+        setup-assist setup-findorb setup-oorb setup-orbfit setup-kete setup-jorbit \
         build-empyrean-c build-rust build-c build-cli build-wheel build-core build-empyrean-validation \
-        run-rust run-python run-c run-cli run-assist run-findorb run-core run-kete \
+        run-rust run-python run-c run-cli run-assist run-findorb run-oorb run-orbfit \
+        run-core run-kete run-jorbit \
         merge-external plan
 
 help:
@@ -141,7 +156,7 @@ help:
 all: build run report
 
 # ── Setup (one-time) ───────────────────────────────────────
-setup: setup-assist setup-findorb
+setup: setup-assist setup-findorb setup-oorb setup-orbfit
 	@echo
 	@echo "External dependencies installed."
 
@@ -213,7 +228,19 @@ build-empyrean-validation:
 # channel consumes), then the four replay channels (python / c / cli / core),
 # then the externals. Each non-rust channel reads exactly one file and writes
 # exactly one file.
-run: run-rust run-python run-c run-cli run-assist run-findorb $(if $(WITH_CORE),run-core,)
+# Public-report channel set: ASSIST + OrbFit + OpenOrb + find_orb are
+# the four canonical externals surfaced in the headline report. kete +
+# jorbit stay as opt-in runners — invoke `make run-kete` / `make run-jorbit`
+# explicitly to produce their JSONs, and pass `INCLUDE_OPTIONAL=1` to
+# the `report` target to surface them in the rendered HTML.
+#
+# OrbFit ships its runner via Docker but is not yet end-to-end
+# (Cartesian seed orbit + equinoctial→Cartesian conversion pending).
+# Set `WITH_ORBFIT=1` to opt in once those are in place.
+WITH_ORBFIT ?=
+run: run-rust run-python run-c run-cli run-assist run-findorb run-oorb \
+     $(if $(WITH_ORBFIT),run-orbfit,) \
+     $(if $(WITH_CORE),run-core,)
 
 # Rust channel: two binary subcommands (`validate run` for prop+eph,
 # `validate od` for orbit determination) feed into one unified output.
@@ -297,6 +324,39 @@ run-findorb: $(FO_BIN) $(ASSIST_PY)
 	    --output $(FINDORB_OUT) --fo-binary $(FO_BIN) \
 	    --data-dir $(DATA_DIR)
 
+# ── OpenOrb (oorb) external comparison — propagation + ephemeris ─
+# Independent Fortran implementation (Granvik et al., University of
+# Helsinki). Covers the same propagation + ephemeris axes ASSIST does,
+# from a different code base. Setup builds oorb from source via the
+# bundled setup.sh; subsequent runs reuse the installed binary.
+OORB_BIN := $(EMP_VAL_RUNNERS)/oorb/install/bin/oorb
+
+setup-oorb: $(OORB_BIN)
+$(OORB_BIN):
+	@echo "──── Building OpenOrb from source ──────────────────────"
+	@cd $(EMP_VAL_RUNNERS)/oorb && ./setup.sh
+
+run-oorb: $(OORB_OUT)
+$(OORB_OUT): $(PLAN) $(OORB_BIN) $(ASSIST_PY)
+	@echo "──── OpenOrb: external prop + ephemeris reference ──────"
+	@$(ASSIST_PY) $(EMP_VAL_RUNNERS)/oorb/run_oorb.py \
+	    --input $(PLAN) --output $(OORB_OUT) \
+	    --prefix $(EMP_VAL_RUNNERS)/oorb/install
+
+# ── OrbFit external comparison — orbit determination ─────────────
+# OrbFit Consortium (University of Pisa) / IAU Minor Planet Center.
+# Canonical implementation of CMC2003 χ²-with-hysteresis rejection.
+# Setup pulls the MPC's Docker container; runner shells out via docker.
+setup-orbfit:
+	@echo "──── Pulling OrbFit container ──────────────────────────"
+	@cd $(EMP_VAL_RUNNERS)/orbfit && ./setup.sh
+
+run-orbfit: $(ORBFIT_OUT)
+$(ORBFIT_OUT): $(PLAN)
+	@echo "──── OrbFit: external OD reference (via docker) ────────"
+	@$(EMP_VAL_RUNNERS)/orbfit/run_orbfit.py \
+	    --plan $(PLAN) --output $(ORBFIT_OUT)
+
 # Optional: empyrean-core direct (no FFI). Replays the plan in-process so
 # the report's Section 09 can show binding-translation drift (rust wrapper
 # vs the core baseline) alongside the C / CLI / Python channels.
@@ -332,17 +392,58 @@ $(KETE_OUT): $(PLAN) $(KETE_PY)
 	    --input $(PLAN) --output $(KETE_OUT) \
 	    --fixtures-dir $(FIXTURES_PSV)
 
+# ── jorbit (opt-in, parallel to kete) ────────────────────────
+# JAX-based propagator + OD (independent — affiliation pending
+# verification). Out of the public-report headline set; invoke
+# explicitly via `make run-jorbit` and `make report INCLUDE_OPTIONAL=1`.
+JORBIT_VENV := $(EMP_VAL_RUNNERS)/jorbit/.venv
+JORBIT_PY := $(JORBIT_VENV)/bin/python
+
+setup-jorbit: $(JORBIT_PY)
+$(JORBIT_PY):
+	@echo "──── Setting up jorbit venv ────────────────────────────"
+	@cd $(EMP_VAL_RUNNERS)/jorbit && ./setup.sh
+
+run-jorbit: $(JORBIT_OUT)
+$(JORBIT_OUT): $(PLAN) $(JORBIT_PY)
+	@echo "──── jorbit: external (opt-in) reference ───────────────"
+	@$(JORBIT_PY) $(EMP_VAL_RUNNERS)/jorbit/run_jorbit.py \
+	    --input $(PLAN) --output $(JORBIT_OUT)
+
 # ── Merge external + report ────────────────────────────────
 # Channel-agnostic meta operations live in this repo's CLI binary. It
 # owns the schema, so its merge / report / ci-check stays in lockstep
 # with the row format every channel runner emits.
-merge-external: $(RUST_MERGED)
-$(RUST_MERGED): $(RUST) $(ASSIST_OUT) $(FINDORB_OUT) $(EMP_VAL_BIN)
-	@echo "──── Merge ASSIST + find_orb references into rust ──────"
+#
+# Headline externals folded onto rust rows by default: ASSIST + find_orb
+# + OpenOrb + OrbFit. kete + jorbit are opt-in — their per-row data is
+# present in their own JSONs but not folded onto the rust rows unless
+# the user explicitly opts in via the recipe below (see
+# INCLUDE_OPTIONAL).
+INCLUDE_OPTIONAL ?=
+# Fold external references (ASSIST / find_orb / OpenOrb / [OrbFit]) onto
+# the canonical `core` reference channel's rows. The report consumes
+# $(CORE_MERGED) and the report's external-references panel reads the
+# `*_*` fields off core rows, matching the parity-comparison reference
+# choice. If `core` isn't present (WITH_CORE not set), fall back to
+# folding onto rust rows for backward compat.
+merge-external: $(if $(WITH_CORE),$(CORE_MERGED),$(RUST_MERGED))
+$(CORE_MERGED): $(CORE_OUT) $(ASSIST_OUT) $(FINDORB_OUT) $(OORB_OUT) \
+                $(if $(WITH_ORBFIT),$(ORBFIT_OUT),) $(EMP_VAL_BIN)
+	@echo "──── Merge ASSIST + find_orb + OpenOrb$(if $(WITH_ORBFIT), + OrbFit,) into core ──"
+	@$(EMP_VAL_BIN) merge-external -i $(CORE_OUT) -o $(CORE_MERGED) \
+	    --assist $(ASSIST_OUT) --findorb $(FINDORB_OUT) \
+	    --oorb $(OORB_OUT) \
+	    $(if $(WITH_ORBFIT),--orbfit $(ORBFIT_OUT),)
+$(RUST_MERGED): $(RUST) $(ASSIST_OUT) $(FINDORB_OUT) $(OORB_OUT) \
+                $(if $(WITH_ORBFIT),$(ORBFIT_OUT),) $(EMP_VAL_BIN)
+	@echo "──── Merge ASSIST + find_orb + OpenOrb$(if $(WITH_ORBFIT), + OrbFit,) into rust (fallback) ──"
 	@$(EMP_VAL_BIN) merge-external -i $(RUST) -o $(RUST_MERGED) \
-	    --assist $(ASSIST_OUT) --findorb $(FINDORB_OUT)
+	    --assist $(ASSIST_OUT) --findorb $(FINDORB_OUT) \
+	    --oorb $(OORB_OUT) \
+	    $(if $(WITH_ORBFIT),--orbfit $(ORBFIT_OUT),)
 
-report: $(RUST_MERGED) $(if $(WITH_CORE),$(CORE_OUT),) $(EMP_VAL_BIN)
+report: $(RUST) $(PYTHON) $(C_OUT) $(CLI_OUT) $(if $(WITH_CORE),$(CORE_MERGED),$(RUST_MERGED)) $(EMP_VAL_BIN)
 	@echo "──── Generating combined HTML report ───────────────────"
 	@$(EMP_VAL_BIN) report \
 	    --results $(REPORT_INPUTS) \

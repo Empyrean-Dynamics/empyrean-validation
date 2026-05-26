@@ -3,11 +3,11 @@
 Reads the canonical test plan (`validation_plan.json`) and replays each row
 through `kete` — Dar Dahlen's open-source NEO toolkit (originally developed
 at Caltech IPAC for NEO Surveyor mission simulation work; now an independent
-personal project at github.com/dahlend/kete). Emits one row per input
-row with kete-specific fields populated, plus an executive-summary print
-at the end. Output JSON is *not* consumed by the validation report — kete
-is a sanity-check sibling to ASSIST + find_orb, covering propagation,
-ephemeris, and OD in one tool.
+personal project at github.com/dahlend/kete). Emits one row per input row
+with kete-specific fields populated, plus an executive-summary print at the
+end. Output JSON is opt-in for the validation report (not in the headline
+ASSIST / OrbFit / OpenOrb / find_orb set) — kete is a sanity-check sibling
+covering propagation, ephemeris, and OD in one tool.
 
 Schema mirrors the ValidationResult shape used by every other channel.
 Kete-specific fields:

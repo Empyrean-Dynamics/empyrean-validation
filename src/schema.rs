@@ -292,6 +292,51 @@ pub struct ValidationResult {
     /// find_orb observation count rejected.
     pub findorb_n_obs_rejected: Option<u32>,
 
+    // ── OpenOrb (oorb) external reference ───────────────────────────
+    // Propagation + ephemeris reference. Independent Fortran
+    // implementation (Granvik et al. — University of Helsinki).
+    // Populated by `merge-external` from the OpenOrb runner's output.
+    /// |OpenOrb − Horizons| in km (propagation rows).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub oorb_vs_horizons_km: Option<f64>,
+    /// |empyrean − OpenOrb| in km (propagation rows).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub emp_vs_oorb_km: Option<f64>,
+    /// OpenOrb wall-clock per row (ms).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub oorb_time_ms: Option<f64>,
+    /// OpenOrb angular separation vs Horizons (ephemeris rows, arcsec).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub oorb_separation_arcsec: Option<f64>,
+    /// OpenOrb dRA·cos(Dec) vs Horizons (ephemeris rows, arcsec).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub oorb_d_ra_arcsec: Option<f64>,
+    /// OpenOrb dDec vs Horizons (ephemeris rows, arcsec).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub oorb_d_dec_arcsec: Option<f64>,
+    /// OpenOrb d|range| vs Horizons (ephemeris rows, km).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub oorb_d_rho_km: Option<f64>,
+
+    // ── OrbFit external reference ───────────────────────────────────
+    // OD reference. Canonical implementation of CMC2003 χ²-with-
+    // hysteresis rejection (OrbFit Consortium, University of Pisa /
+    // IAU Minor Planet Center; Federica Spoto et al.). Populated by
+    // `merge-external` from the OrbFit runner's output.
+    /// OrbFit post-fit weighted RMS (arcsec). Read from the `.rwo`
+    /// header's `RMSast` field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub orbfit_rms_arcsec: Option<f64>,
+    /// OrbFit observation count after rejection (SEL=1 in `.rwo`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub orbfit_n_obs_used: Option<u32>,
+    /// OrbFit observation count rejected (SEL=0 in `.rwo`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub orbfit_n_obs_rejected: Option<u32>,
+    /// OrbFit wall-clock per row (ms).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub orbfit_time_ms: Option<f64>,
+
     // ── Metadata ────────────────────────────────────────────────────
     /// ISO 8601 timestamp at row creation.
     pub timestamp: String,
@@ -357,6 +402,17 @@ impl ValidationResult {
             findorb_rms_residual: None,
             findorb_n_obs_used: None,
             findorb_n_obs_rejected: None,
+            oorb_vs_horizons_km: None,
+            emp_vs_oorb_km: None,
+            oorb_time_ms: None,
+            oorb_separation_arcsec: None,
+            oorb_d_ra_arcsec: None,
+            oorb_d_dec_arcsec: None,
+            oorb_d_rho_km: None,
+            orbfit_rms_arcsec: None,
+            orbfit_n_obs_used: None,
+            orbfit_n_obs_rejected: None,
+            orbfit_time_ms: None,
             timestamp: String::new(),
             notes: String::new(),
         }
@@ -550,7 +606,6 @@ pub struct OrbitComparison {
     pub notes: Vec<String>,
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -609,6 +664,7 @@ mod tests {
             "ref_rho_au": null, "ref_light_time_d": null,
             "n_obs_used": null, "od_iterations": null, "od_converged": null,
             "od_rms_ra_arcsec": null, "od_rms_dec_arcsec": null,
+            "od_rms_combined_arcsec": null,
             "od_chi2": null, "od_reduced_chi2": null,
             "assist_vs_horizons_km": null, "emp_vs_assist_km": null,
             "assist_time_ms": null, "speed_ratio": null,

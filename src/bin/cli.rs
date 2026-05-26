@@ -30,7 +30,7 @@ use empyrean_validation::{
     catalog::{ValidationObject, all_objects, filter_by_name, filter_by_population},
     plan::{PlanConfig, build_plan},
     report::generate_report,
-    schema::ValidationResult,
+    schema::{OrbitComparison, ValidationResult},
 };
 use villeneuve::io::cache::DiskCache;
 
@@ -97,6 +97,15 @@ struct MergeExternalArgs {
     /// find_orb per-channel JSON (from `runners/findorb/run_findorb.py`).
     #[arg(long)]
     findorb: Option<PathBuf>,
+    /// OpenOrb (oorb) per-channel JSON (from `runners/oorb/run_oorb.py`).
+    /// Folds propagation + ephemeris fields onto matching rust rows.
+    #[arg(long)]
+    oorb: Option<PathBuf>,
+    /// OrbFit per-channel JSON (from `runners/orbfit/run_orbfit.py`).
+    /// Folds OD-row fields (RMS + observation counts) onto matching
+    /// rust rows.
+    #[arg(long)]
+    orbfit: Option<PathBuf>,
 }
 
 #[derive(Parser, Debug)]
@@ -201,6 +210,14 @@ fn merge_external(args: MergeExternalArgs) -> Result<(), Box<dyn std::error::Err
         let n = merge_findorb(&mut rows, path)?;
         eprintln!("Merged {n} find_orb rows");
     }
+    if let Some(path) = &args.oorb {
+        let n = merge_oorb(&mut rows, path)?;
+        eprintln!("Merged {n} OpenOrb rows");
+    }
+    if let Some(path) = &args.orbfit {
+        let n = merge_orbfit(&mut rows, path)?;
+        eprintln!("Merged {n} OrbFit rows");
+    }
 
     let out_path = args.output.unwrap_or(args.input);
     std::fs::write(&out_path, serde_json::to_string_pretty(&rows)?)?;
@@ -281,8 +298,121 @@ fn merge_findorb(
     Ok(n)
 }
 
+/// Fold OpenOrb (oorb) per-channel JSON into the rust rows.
+///
+/// OpenOrb covers propagation + ephemeris (Granvik et al.; not OD —
+/// oorb's Ranging / LSL is a multi-stage pipeline that doesn't fit the
+/// per-row replay model). Keyed by (object, dt_days) on propagation
+/// rows and (object, dt_days, observer) on ephemeris rows.
+fn merge_oorb(
+    rows: &mut [ValidationResult],
+    path: &std::path::Path,
+) -> Result<usize, Box<dyn std::error::Error>> {
+    let txt = std::fs::read_to_string(path).map_err(|e| format!("read {}: {e}", path.display()))?;
+    let oo: Vec<serde_json::Value> = serde_json::from_str(&txt)?;
+    let mut prop_idx: std::collections::HashMap<(String, i64), &serde_json::Value> =
+        Default::default();
+    let mut eph_idx: std::collections::HashMap<(String, i64, String), &serde_json::Value> =
+        Default::default();
+    for o in &oo {
+        let (Some(name), Some(dt)) = (o["object"].as_str(), o["dt_days"].as_f64()) else {
+            continue;
+        };
+        match o["test_type"].as_str() {
+            Some("propagation") => {
+                prop_idx.insert((name.to_string(), dt as i64), o);
+            }
+            Some("ephemeris") => {
+                if let Some(obs) = o["observer"].as_str() {
+                    eph_idx.insert((name.to_string(), dt as i64, obs.to_string()), o);
+                }
+            }
+            _ => {}
+        }
+    }
+    let mut n = 0;
+    for r in rows.iter_mut() {
+        match r.test_type.as_str() {
+            "propagation" => {
+                let Some(o) = prop_idx.get(&(r.object.clone(), r.dt_days as i64)) else {
+                    continue;
+                };
+                r.oorb_vs_horizons_km = o["oorb_vs_horizons_km"].as_f64();
+                r.oorb_time_ms = o["oorb_time_ms"].as_f64();
+                if let (Some(emp), Some(arr)) = (&r.emp_pos_au, o["oorb_pos_au"].as_array())
+                    && arr.len() == 3
+                {
+                    let oo_pos = [
+                        arr[0].as_f64().unwrap_or(0.0),
+                        arr[1].as_f64().unwrap_or(0.0),
+                        arr[2].as_f64().unwrap_or(0.0),
+                    ];
+                    let dx = emp[0] - oo_pos[0];
+                    let dy = emp[1] - oo_pos[1];
+                    let dz = emp[2] - oo_pos[2];
+                    r.emp_vs_oorb_km = Some(
+                        (dx * dx + dy * dy + dz * dz).sqrt() * empyrean_validation::compare::AU_KM,
+                    );
+                }
+                n += 1;
+            }
+            "ephemeris" => {
+                let Some(obs) = r.observer.as_deref() else {
+                    continue;
+                };
+                let key = (r.object.clone(), r.dt_days as i64, obs.to_string());
+                let Some(o) = eph_idx.get(&key) else { continue };
+                r.oorb_separation_arcsec = o["oorb_separation_arcsec"].as_f64();
+                r.oorb_d_ra_arcsec = o["oorb_d_ra_arcsec"].as_f64();
+                r.oorb_d_dec_arcsec = o["oorb_d_dec_arcsec"].as_f64();
+                r.oorb_d_rho_km = o["oorb_d_rho_km"].as_f64();
+                r.oorb_time_ms = o["oorb_time_ms"].as_f64();
+                n += 1;
+            }
+            _ => {}
+        }
+    }
+    Ok(n)
+}
+
+/// Fold OrbFit per-channel JSON into the rust rows.
+///
+/// OrbFit covers orbit determination only (the canonical CMC2003
+/// rejection implementation; OrbFit Consortium / IAU MPC). Keyed by
+/// object — same as `merge_findorb` — since OD rows have one fit per
+/// object per arc.
+fn merge_orbfit(
+    rows: &mut [ValidationResult],
+    path: &std::path::Path,
+) -> Result<usize, Box<dyn std::error::Error>> {
+    let txt = std::fs::read_to_string(path).map_err(|e| format!("read {}: {e}", path.display()))?;
+    let of: Vec<serde_json::Value> = serde_json::from_str(&txt)?;
+    let mut idx: std::collections::HashMap<String, &serde_json::Value> = Default::default();
+    for f in &of {
+        if let Some(o) = f["object"].as_str() {
+            idx.insert(o.to_string(), f);
+        }
+    }
+    let mut n = 0;
+    for r in rows.iter_mut() {
+        if r.test_type != "orbit_determination" {
+            continue;
+        }
+        let Some(f) = idx.get(&r.object) else {
+            continue;
+        };
+        r.orbfit_rms_arcsec = f["orbfit_rms_arcsec"].as_f64();
+        r.orbfit_n_obs_used = f["orbfit_n_obs_used"].as_u64().map(|v| v as u32);
+        r.orbfit_n_obs_rejected = f["orbfit_n_obs_rejected"].as_u64().map(|v| v as u32);
+        r.orbfit_time_ms = f["orbfit_time_ms"].as_f64();
+        n += 1;
+    }
+    Ok(n)
+}
+
 fn report(args: ReportArgs) -> Result<(), Box<dyn std::error::Error>> {
     let mut all: Vec<ValidationResult> = Vec::new();
+    let mut orbit_comparisons: Vec<OrbitComparison> = Vec::new();
     for path in &args.results {
         let raw =
             std::fs::read_to_string(path).map_err(|e| format!("read {}: {e}", path.display()))?;
@@ -295,6 +425,34 @@ fn report(args: ReportArgs) -> Result<(), Box<dyn std::error::Error>> {
             distinct_channels(&rows).join(", ")
         );
         all.extend(rows);
+
+        // Pick up the orbit-comparison sidecar if it exists. Try
+        // the canonical `{stem}_compare.jsonl` first, then fall back
+        // to the OD-specific sibling `*_rust_od_compare.jsonl` for the
+        // Makefile's merged / unified rust outputs (which inherit the
+        // sidecar from the upstream `validate od` step but don't carry
+        // it forward in the file name).
+        for cmp_path in compare_sidecar_candidates(path) {
+            if !cmp_path.exists() {
+                continue;
+            }
+            let raw = std::fs::read_to_string(&cmp_path)
+                .map_err(|e| format!("read {}: {e}", cmp_path.display()))?;
+            let mut n = 0;
+            for line in raw.lines() {
+                let line = line.trim();
+                if line.is_empty() {
+                    continue;
+                }
+                let c: OrbitComparison = serde_json::from_str(line)
+                    .map_err(|e| format!("parse {}: {e}", cmp_path.display()))?;
+                orbit_comparisons.push(c);
+                n += 1;
+            }
+            eprintln!("Loaded {n} orbit comparisons from {}", cmp_path.display(),);
+            // First sidecar wins — don't double-load if both candidates exist.
+            break;
+        }
     }
     if !all.iter().any(|r| r.channel == "rust") {
         return Err(
@@ -302,13 +460,61 @@ fn report(args: ReportArgs) -> Result<(), Box<dyn std::error::Error>> {
                 .into(),
         );
     }
-    generate_report(&all, &args.output, args.summary.as_deref())
-        .map_err(|e| format!("report: {e}"))?;
+    generate_report(
+        &all,
+        &orbit_comparisons,
+        &args.output,
+        args.summary.as_deref(),
+    )
+    .map_err(|e| format!("report: {e}"))?;
     eprintln!("Wrote report to {}", args.output.display());
     if let Some(p) = &args.summary {
         eprintln!("Wrote CI summary to {}", p.display());
     }
     Ok(())
+}
+
+/// Candidate sidecar paths for the orbit-comparison data associated
+/// with a results JSON. The Makefile path is:
+///
+/// ```text
+/// validate od --output validation_rust_od.json       # writes
+///   ↳ validation_rust_od_compare.jsonl               # sidecar
+/// jq merge → validation_rust.json                    # no sidecar emitted
+/// validate merge-external → validation_rust_merged.json  # no sidecar emitted
+/// ```
+///
+/// When the report is invoked on `validation_rust_merged.json` (or the
+/// pre-merge `validation_rust.json`), the canonical
+/// `{stem}_compare.jsonl` lookup misses the only sidecar that actually
+/// exists, leaving §12 of the HTML report empty (empyrean-urfu). Return
+/// the canonical candidate first, then the `*_rust_od_compare.jsonl`
+/// fallback so report() can pick up the upstream sidecar.
+fn compare_sidecar_candidates(main_path: &std::path::Path) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    let Some(stem) = main_path.file_stem().and_then(|s| s.to_str()) else {
+        return out;
+    };
+    let Some(parent) = main_path.parent() else {
+        return out;
+    };
+    // 1. Canonical: same stem with `_compare.jsonl` suffix.
+    out.push(parent.join(format!("{stem}_compare.jsonl")));
+    // 2. If the stem looks like a merged/unified rust output, also try
+    //    the OD-specific sidecar (`_od_compare.jsonl`). Covers the
+    //    `validation_rust_merged.json` and `validation_rust.json`
+    //    cases produced by the Makefile.
+    let od_stem = if let Some(base) = stem.strip_suffix("_rust_merged") {
+        Some(format!("{base}_rust_od"))
+    } else if let Some(base) = stem.strip_suffix("_rust") {
+        Some(format!("{base}_rust_od"))
+    } else {
+        None
+    };
+    if let Some(od_stem) = od_stem {
+        out.push(parent.join(format!("{od_stem}_compare.jsonl")));
+    }
+    out
 }
 
 fn ci_check(args: CiCheckArgs) -> Result<(), Box<dyn std::error::Error>> {

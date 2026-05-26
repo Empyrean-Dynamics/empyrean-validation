@@ -255,7 +255,7 @@ def _ephemeris(row: dict, oorb_bin: Path, env: dict[str, str]) -> dict | None:
 
     with tempfile.TemporaryDirectory(prefix="oorb_eph_") as td:
         in_path = Path(td) / "in.orb"
-        _write_orb_file(in_path, row["object"], row["epoch_mjd_tdb"], ic_pos, ic_vel)
+        _write_des_file(in_path, row["object"], row["epoch_mjd_tdb"], ic_pos, ic_vel)
         t0 = time.perf_counter()
         out, err, rc = _run_oorb(
             oorb_bin,
