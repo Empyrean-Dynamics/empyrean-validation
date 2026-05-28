@@ -231,10 +231,19 @@ fn merge_assist(
 ) -> Result<usize, Box<dyn std::error::Error>> {
     let txt = std::fs::read_to_string(path).map_err(|e| format!("read {}: {e}", path.display()))?;
     let assist: Vec<serde_json::Value> = serde_json::from_str(&txt)?;
-    let mut idx: std::collections::HashMap<(String, i64), &serde_json::Value> = Default::default();
+    // Key by (object, dt, propagation_uncertainty) so the f64 ASSIST row
+    // attaches only to the empyrean f64_no_cov rust row, and (if the
+    // runner emitted it) the STM ASSIST row attaches only to the
+    // first_order_with_cov rust row. Without the uncertainty axis in
+    // the key, the same ASSIST timing landed on both empyrean modes —
+    // making the timing chart compare empyrean's STM-bearing Jet1 path
+    // against ASSIST's f64 path on the same axis.
+    let mut idx: std::collections::HashMap<(String, i64, Option<String>), &serde_json::Value> =
+        Default::default();
     for a in &assist {
         if let (Some(o), Some(d)) = (a["object"].as_str(), a["dt_days"].as_f64()) {
-            idx.insert((o.to_string(), d as i64), a);
+            let unc = a["propagation_uncertainty"].as_str().map(str::to_string);
+            idx.insert((o.to_string(), d as i64, unc), a);
         }
     }
     let mut n = 0;
@@ -242,7 +251,17 @@ fn merge_assist(
         if r.test_type != "propagation" {
             continue;
         }
-        let key = (r.object.clone(), r.dt_days as i64);
+        // For empyrean's "auto" rows (UncertaintyMethod::Auto), pair
+        // against ASSIST's STM row — the closest analogue REBOUND
+        // offers. Auto in well-behaved regimes resolves to FirstOrder
+        // (matches STM), and in high-κ regimes escalates to
+        // SecondOrder or AGM mixture (no REBOUND analogue at all). STM
+        // is the strongest available comparison baseline.
+        let assist_uncertainty = match r.propagation_uncertainty.as_deref() {
+            Some("auto") => Some("first_order_with_cov".to_string()),
+            other => other.map(str::to_string),
+        };
+        let key = (r.object.clone(), r.dt_days as i64, assist_uncertainty);
         let Some(a) = idx.get(&key) else { continue };
         r.assist_vs_horizons_km = a["assist_vs_horizons_km"].as_f64();
         r.assist_time_ms = a["assist_time_ms"].as_f64();

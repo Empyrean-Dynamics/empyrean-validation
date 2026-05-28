@@ -237,8 +237,35 @@ def propagate_assist(
     gr_nm=None,
     gr_nn=None,
     gr_r0=None,
+    with_stm=False,
 ):
-    """Propagate with ASSIST. Returns (pos, vel, time_ms).
+    """Propagate with ASSIST. Returns (pos, vel, time_ms, stm).
+
+    Two integration modes, selected by the `with_stm` flag:
+
+    - False (default): single-particle f64 propagation. `stm`
+      returned as None. Comparable to empyrean's
+      `propagation_uncertainty = "f64_no_cov"` path.
+    - True: 6 REBOUND first-order variational particles seeded with
+      unit vectors in each state component. The integrated 6×6 STM is
+      returned. Comparable to empyrean's `"first_order_with_cov"`
+      path.
+
+    ASSIST encodes first-order variational derivatives only ("the
+    first order variational equations are included for all terms"),
+    so there is deliberately NO second-order mode: REBOUND's order-2
+    variational machinery would integrate shadow particles that
+    receive no second-order contributions from ASSIST's force model,
+    and the resulting timing would not be comparable to a genuine
+    STT propagation. empyrean's `"second_order_with_cov"` rows have
+    no ASSIST counterpart.
+
+    REBOUND propagates the variational equations under the
+    gravitational force model only — ASSIST's non-gravitational
+    `additional_forces` callback is applied to the real particle but
+    not to the variational shadows. The STM is therefore exact for
+    purely gravitating objects and gravity-only-approximate for active
+    bodies with non-zero a1/a2/a3.
 
     Parameters
     ----------
@@ -246,6 +273,8 @@ def propagate_assist(
         Marsden non-gravitational parameters (AU/day^2).
     gr_* : float or None
         g(r) function parameters. None = ASSIST defaults (r^{-2}).
+    with_stm : bool
+        Adds 6 first-order variational particles for the STM.
     """
     t0_sim = epoch_mjd + MJD_TO_JD - J2000_JD
     dt = target_mjd - epoch_mjd
@@ -279,6 +308,21 @@ def propagate_assist(
         if gr_r0 is not None:
             extras.r0 = gr_r0
 
+    # Variational particles: 6 first-order particles seeded with unit
+    # perturbations in each state component (x, y, z, vx, vy, vz).
+    first_order = []
+    if with_stm:
+        for k in range(6):
+            v = sim.add_variation(order=1)
+            vp = v.particles[0]
+            vp.x = 1.0 if k == 0 else 0.0
+            vp.y = 1.0 if k == 1 else 0.0
+            vp.z = 1.0 if k == 2 else 0.0
+            vp.vx = 1.0 if k == 3 else 0.0
+            vp.vy = 1.0 if k == 4 else 0.0
+            vp.vz = 1.0 if k == 5 else 0.0
+            first_order.append(v)
+
     t0 = time.perf_counter()
     sim.integrate(t0_sim + dt)
     elapsed_ms = (time.perf_counter() - t0) * 1000.0
@@ -286,8 +330,25 @@ def propagate_assist(
     p = sim.particles[0]
     pos = np.array([p.x, p.y, p.z])
     vel = np.array([p.vx, p.vy, p.vz])
+
+    stm = None
+    if first_order:
+        stm = np.zeros((6, 6))
+        for k, v in enumerate(first_order):
+            vp = v.particles[0]
+            stm[0, k] = vp.x
+            stm[1, k] = vp.y
+            stm[2, k] = vp.z
+            stm[3, k] = vp.vx
+            stm[4, k] = vp.vy
+            stm[5, k] = vp.vz
+    # STT (21 second-order variational particles) is propagated for
+    # timing parity with empyrean's Jet2 path but not extracted into
+    # an output array here — we don't compare STT values directly,
+    # only the propagated state and the timing.
+
     del extras
-    return pos, vel, elapsed_ms
+    return pos, vel, elapsed_ms, stm
 
 
 # ── Object catalog ──────────────────────────────────────
@@ -614,51 +675,83 @@ def main():
                 print(f"  dt={dt:>+.0f}d SKIP (Horizons ref: {e})")
                 continue
 
-            # ASSIST propagation (warmup + timed runs)
-            try:
-                propagate_assist(pos0, vel0, epoch, target, ephem,
-                                 a1, a2, a3,
-                                 gr_alpha, gr_nk, gr_nm, gr_nn, gr_r0)
-
-                ast_times = []
-                ast_pos = ast_vel = None
-                for _ in range(n_runs):
-                    ast_pos, ast_vel, ms = propagate_assist(
+            # ASSIST propagation under two modes:
+            #   - f64-only (single particle): matches empyrean's
+            #     propagation_uncertainty = "f64_no_cov" rust row.
+            #   - first-order STM (6 variational particles): matches
+            #     empyrean's "first_order_with_cov" (Jet1) rust row.
+            # No STT mode: ASSIST encodes first-order variational
+            # derivatives only, so empyrean's "second_order_with_cov"
+            # (Jet2) rows have no ASSIST counterpart (see
+            # propagate_assist's docstring).
+            # The variational equations propagate under gravity only
+            # (REBOUND's built-in force model); ASSIST's non-grav
+            # `additional_forces` is not seen by the shadows, so for
+            # active bodies (a1/a2/a3 != 0) the STM is a gravity-only
+            # approximation of empyrean's full-Jacobian outputs.
+            for mode, propagation_uncertainty in (
+                ("f64", "f64_no_cov"),
+                ("stm", "first_order_with_cov"),
+            ):
+                with_stm = mode == "stm"
+                try:
+                    # warmup
+                    propagate_assist(
                         pos0, vel0, epoch, target, ephem,
-                        a1, a2, a3,
-                        gr_alpha, gr_nk, gr_nm, gr_nn, gr_r0,
+                        a1=a1, a2=a2, a3=a3,
+                        gr_alpha=gr_alpha, gr_nk=gr_nk, gr_nm=gr_nm,
+                        gr_nn=gr_nn, gr_r0=gr_r0,
+                        with_stm=with_stm,
                     )
-                    ast_times.append(ms)
 
-                ast_ms = min(ast_times)
-                ast_vs_hor = float(np.linalg.norm(ast_pos - hor_pos) * AU_KM)
+                    ast_times = []
+                    ast_pos = ast_vel = None
+                    ast_stm = None
+                    for _ in range(n_runs):
+                        ast_pos, ast_vel, ms, ast_stm = propagate_assist(
+                            pos0, vel0, epoch, target, ephem,
+                            a1=a1, a2=a2, a3=a3,
+                            gr_alpha=gr_alpha, gr_nk=gr_nk, gr_nm=gr_nm,
+                            gr_nn=gr_nn, gr_r0=gr_r0,
+                            with_stm=with_stm,
+                        )
+                        ast_times.append(ms)
 
-                print(f"  dt={dt:>+6.0f}d  a-h={fmt_km(ast_vs_hor)}  {ast_ms:>7.1f}ms")
+                    ast_ms = min(ast_times)
+                    ast_vs_hor = float(np.linalg.norm(ast_pos - hor_pos) * AU_KM)
 
-                results.append({
-                    "object": name,
-                    "population": data["population"],
-                    "epoch_mjd_tdb": epoch,
-                    "dt_days": dt,
-                    "t_mjd_tdb": target,
-                    "force_model": "full",
-                    "test_type": "assist",
-                    "assist_vs_horizons_km": ast_vs_hor,
-                    "assist_time_ms": ast_ms,
-                    "assist_pos_au": ast_pos.tolist(),
-                    "horizons_pos_au": hor_pos.tolist(),
-                    "has_nongrav": has_ng,
-                    "a1": a1,
-                    "a2": a2,
-                    "a3": a3,
-                    "timestamp": timestamp,
-                    "notes": data["notes"],
-                    "assist_version": assist.__version__,
-                    "rebound_version": rebound.__version__,
-                })
+                    print(
+                        f"  dt={dt:>+6.0f}d  [{mode:>3}]  a-h={fmt_km(ast_vs_hor)}  {ast_ms:>7.1f}ms"
+                    )
 
-            except Exception as e:
-                print(f"  dt={dt:>+6.0f}d ASSIST FAIL ({e})")
+                    row = {
+                        "object": name,
+                        "population": data["population"],
+                        "epoch_mjd_tdb": epoch,
+                        "dt_days": dt,
+                        "t_mjd_tdb": target,
+                        "force_model": "full",
+                        "test_type": "assist",
+                        "propagation_uncertainty": propagation_uncertainty,
+                        "assist_vs_horizons_km": ast_vs_hor,
+                        "assist_time_ms": ast_ms,
+                        "assist_pos_au": ast_pos.tolist(),
+                        "horizons_pos_au": hor_pos.tolist(),
+                        "has_nongrav": has_ng,
+                        "a1": a1,
+                        "a2": a2,
+                        "a3": a3,
+                        "timestamp": timestamp,
+                        "notes": data["notes"],
+                        "assist_version": assist.__version__,
+                        "rebound_version": rebound.__version__,
+                    }
+                    if ast_stm is not None:
+                        row["assist_stm"] = ast_stm.tolist()
+                    results.append(row)
+
+                except Exception as e:
+                    print(f"  dt={dt:>+6.0f}d  [{mode:>3}]  ASSIST FAIL ({e})")
 
     # Save results
     output_path = Path(args.output)
