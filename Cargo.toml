@@ -26,7 +26,7 @@ serde_json = "1"
 # villeneuve provides the SBDB / Horizons disk-cached query clients used
 # by the plan generator. Pinned to a tagged version here; sibling-checkout
 # local development resolves to ../villeneuve via the [patch] block below.
-villeneuve = { git = "ssh://git@github.com/Empyrean-Dynamics/villeneuve.git", tag = "v1.9.0", features = ["jpl"] }
+villeneuve = { git = "ssh://git@github.com/Empyrean-Dynamics/villeneuve.git", tag = "v1.13.1", features = ["jpl"] }
 
 [dev-dependencies]
 tempfile = "3"
@@ -40,7 +40,6 @@ tempfile = "3"
 [patch."ssh://git@github.com/Empyrean-Dynamics/villeneuve.git"]
 villeneuve = { path = "../villeneuve" }
 
-# nolan is a transitive dep of villeneuve. Override to the sibling
-# checkout for the same dev-vs-CI reason.
-[patch."ssh://git@github.com/Empyrean-Dynamics/nolan.git"]
-nolan = { path = "../nolan" }
+# No nolan patch: villeneuve 1.12 depends on the renamed crate `hyperjet`
+# from crates.io, not the private git `nolan`, so there is nothing for an
+# `ssh://.../nolan.git` patch to override.
