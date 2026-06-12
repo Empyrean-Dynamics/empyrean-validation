@@ -1208,10 +1208,7 @@ pub fn generate_report(
                 ch = r.channel,
             ));
         }
-        let n_od_rust = od_results
-            .iter()
-            .filter(|r| r.channel == "core")
-            .count();
+        let n_od_rust = od_results.iter().filter(|r| r.channel == "core").count();
         let n_od_conv = od_results
             .iter()
             .filter(|r| r.channel == "core" && r.od_converged.unwrap_or(false))

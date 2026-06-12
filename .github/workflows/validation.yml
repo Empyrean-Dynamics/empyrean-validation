@@ -34,8 +34,10 @@ name: Validation Suite
 # `client_payload.source` carries the dispatching repo's full name
 # (`Empyrean-Dynamics/<repo>`) and `client_payload.sha` (or `tag` for
 # tag pushes) carries the commit / tag that triggered the run.
-# Senders need a PAT with `actions: write` permission scoped to this
-# repo only, stored on the sender side as
+# Senders need a fine-grained PAT scoped to this repo only with
+# `Contents: read and write` (the repository_dispatch endpoint's
+# fine-grained requirement — NOT `actions: write`, which is for the
+# workflow_dispatch endpoint), stored on the sender side as
 # `VALIDATION_DISPATCH_TOKEN`.
 
 on:
@@ -74,8 +76,35 @@ env:
   TIER: ${{ inputs.tier || 'standard' }}
 
 jobs:
+  # The full suite needs the empyrean wrapper repo for the rust /
+  # python / c / cli channel runners, and that repo has no public push
+  # yet (its first publish rides the wrapper release). Until it
+  # exists, skip the suite cleanly instead of failing on the sibling
+  # checkout — a red run here must mean broken validation, not an
+  # unpublished sibling. The probe makes the suite resume
+  # automatically on the wrapper repo's first push.
+  precheck:
+    name: Sibling availability
+    runs-on: ubuntu-latest
+    outputs:
+      empyrean-available: ${{ steps.probe.outputs.available }}
+    steps:
+      - name: Probe for the empyrean wrapper repo
+        id: probe
+        env:
+          GH_TOKEN: ${{ secrets.GH_PAT }}
+        run: |
+          if gh api repos/Empyrean-Dynamics/empyrean --silent 2>/dev/null; then
+            echo "available=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "available=false" >> "$GITHUB_OUTPUT"
+            echo "::notice title=Validation suite skipped::Empyrean-Dynamics/empyrean is not published yet; the full-channel suite resumes automatically once the wrapper repo exists."
+          fi
+
   validate:
     name: Build + run + report
+    needs: precheck
+    if: needs.precheck.outputs.empyrean-available == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 90
     steps:
