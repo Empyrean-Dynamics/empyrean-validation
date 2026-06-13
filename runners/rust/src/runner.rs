@@ -792,14 +792,17 @@ pub fn run_od_validation(
             ms
         );
 
-        let orbit = &determine_result.orbit;
+        // `DetermineResult.orbit` is now a re-feedable `Orbit`; take the
+        // bare state snapshot (epoch/position/velocity/covariance/frame/
+        // origin) the validation channel records.
+        let orbit = determine_result.state();
 
         // Capture scott's fitted state + cov in three coordinate views
         // (native Cartesian, Sun-centered ICRF Cartesian, Sun-centered
         // ecliptic-J2000 Keplerian) for the orbit-comparison panel.
         // Transformation via `ctx.transform` propagates covariance
         // through the Jacobian.
-        let scott_native = propagated_state_to_coord(orbit);
+        let scott_native = propagated_state_to_coord(&orbit);
         let empy_version = empyrean::version_string().ok();
         let scott_captured = match capture_orbit(
             ctx,

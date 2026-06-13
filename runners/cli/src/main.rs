@@ -374,14 +374,17 @@ fn daemon_od(ctx: &Context, rest: &str) -> Result<String, String> {
     let t0 = Instant::now();
     let result = ctx.determine(&observations, None, &cfg).map_err(|e| e.to_string())?;
     let ms = t0.elapsed().as_secs_f64() * 1000.0;
+    // `DetermineResult.orbit` is now a re-feedable `Orbit`; take the flat
+    // state snapshot for the position/velocity output.
+    let s = result.state();
     Ok(format!(
         "ok {:.18e} {:.18e} {:.18e} {:.18e} {:.18e} {:.18e} {} {:.6}",
-        result.orbit.position[0],
-        result.orbit.position[1],
-        result.orbit.position[2],
-        result.orbit.velocity[0],
-        result.orbit.velocity[1],
-        result.orbit.velocity[2],
+        s.position[0],
+        s.position[1],
+        s.position[2],
+        s.velocity[0],
+        s.velocity[1],
+        s.velocity[2],
         result.iterations,
         ms,
     ))
@@ -527,15 +530,18 @@ fn run_od(
     let result = ctx.determine(&observations, None, &cfg)?;
     let ms = t0.elapsed().as_secs_f64() * 1000.0;
 
+    // `DetermineResult.orbit` is now a re-feedable `Orbit`; take the flat
+    // state snapshot for the position/velocity output.
+    let s = result.state();
     // Output: x y z vx vy vz iterations time_ms
     println!(
         "{:.18e} {:.18e} {:.18e} {:.18e} {:.18e} {:.18e} {} {:.6}",
-        result.orbit.position[0],
-        result.orbit.position[1],
-        result.orbit.position[2],
-        result.orbit.velocity[0],
-        result.orbit.velocity[1],
-        result.orbit.velocity[2],
+        s.position[0],
+        s.position[1],
+        s.position[2],
+        s.velocity[0],
+        s.velocity[1],
+        s.velocity[2],
         result.iterations,
         ms,
     );
