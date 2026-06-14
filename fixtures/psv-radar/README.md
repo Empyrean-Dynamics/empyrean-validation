@@ -10,6 +10,14 @@ single file carries an object's combined optical + radar arc for an OD fit.
 | Bennu (101955)    |     603 |          29 (22 / 7)    | Goldstone DSS-14, Arecibo |
 | Didymos (65803)   |    6034 |           9 (9 / 0)     | Goldstone, Arecibo        |
 | Eros (433)        |   13150 |           6 (4 / 2)     | Goldstone, Arecibo        |
+| Toutatis (4179) † |       0 |          62 (35 / 27)   | DSS-14, DSS-13, Arecibo   |
+
+† **Toutatis is radar-only** — it has no optical fixture in the suite and is not
+in the catalog. It is seeded purely to exercise the **bistatic** geometry the
+others lack: 11 of its 62 records are a Goldstone DSS-14 → DSS-13 transmit/receive
+pair (`trx=253`, `rcv=252`; `trx != rcv`), independently verified 1:1 against the
+live JPL API. To make it a fittable OD object, add it to `src/catalog.rs` and
+pair it with optical astrometry.
 
 The optical table is byte-identical to `../psv/<name>.psv`; the radar table is a
 second ADES `<radar>` block (`trx`/`rcv`/`obsTime`/`delay`|`doppler`/`rms*`/`frq`/
@@ -55,5 +63,6 @@ villeneuve::io::jpl::query_radar(["<des>"])   // live JPL sb_radar astrometry
 ```
 
 Add a candidate by running that pipeline for its designation against its optical
-fixture. Candidates with substantial radar not yet seeded: Toutatis (4179, incl.
-a bistatic DSS-14→DSS-13 pair), 1950 DA (29075), Geographos (1620).
+fixture (or with the optical path `-` for a radar-only file, as Toutatis was).
+Candidates with substantial radar not yet seeded: 1950 DA (29075),
+Geographos (1620).
