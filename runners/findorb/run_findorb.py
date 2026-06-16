@@ -331,6 +331,12 @@ def main():
         "--fo-binary", type=str, default=None,
         help="Path to fo binary. Default: scripts/findorb/install/bin/fo",
     )
+    parser.add_argument(
+        "--test-type", type=str, default="orbit_determination",
+        help="Stamp each record's test_type so the merge can route it. Use "
+             "'orbit_determination_radar' when fitting the optical+radar "
+             "fixtures/psv-radar/ files (find_orb ingests the ADES <radar> table).",
+    )
     args = parser.parse_args()
 
     data_dir = pathlib.Path(args.data_dir) if args.data_dir else pathlib.Path.home() / ".empyrean" / "data"
@@ -376,6 +382,7 @@ def main():
 
         result = {
             "object": name.replace("_", "/"),  # undo safe_name encoding
+            "test_type": args.test_type,
             "timestamp": timestamp,
 
             # find_orb results

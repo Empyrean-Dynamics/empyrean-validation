@@ -1799,7 +1799,7 @@ const ALL_CHANNELS = uniq(results.map(r => r.channel));
 const rustResults = results.filter(r => r.channel === 'rust');
 const propResults = rustResults.filter(r => r.test_type === 'propagation');
 const ephResults = rustResults.filter(r => r.test_type === 'ephemeris');
-const odResultsAll = results.filter(r => r.test_type === 'orbit_determination');
+const odResultsAll = results.filter(r => r.test_type === 'orbit_determination' || r.test_type === 'orbit_determination_radar');
 const odRust = odResultsAll.filter(r => r.channel === 'rust');
 const objectNames = uniq(propResults.map(r => r.object));
 const popNames = uniq(propResults.map(r => r.population));
@@ -2261,8 +2261,12 @@ if (odRust.length === 0) {{
     // Group rows by (object) across channels.
     const byObj = {{}};
     for (const r of odResultsAll) {{
-        if (!byObj[r.object]) byObj[r.object] = {{}};
-        byObj[r.object][r.channel] = r;
+        // Render the optical+radar OD as a distinct "<obj> +radar" entry so it
+        // sits beside the optical-only row with its own find_orb comparison,
+        // reusing every downstream table/chart unchanged.
+        const key = r.test_type === 'orbit_determination_radar' ? r.object + ' +radar' : r.object;
+        if (!byObj[key]) byObj[key] = {{}};
+        byObj[key][r.channel] = r;
     }}
     // Pre-sort the overview table by |Δ RMS vs find_orb| descending,
     // with rows that have no find_orb match falling to the bottom. The

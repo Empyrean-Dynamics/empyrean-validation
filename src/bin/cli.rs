@@ -97,6 +97,11 @@ struct MergeExternalArgs {
     /// find_orb per-channel JSON (from `runners/findorb/run_findorb.py`).
     #[arg(long)]
     findorb: Option<PathBuf>,
+    /// find_orb radar-augmented JSON (the second pass over `fixtures/psv-radar/`,
+    /// run with `--test-type orbit_determination_radar`). Its rows attach to the
+    /// `orbit_determination_radar` OD rows.
+    #[arg(long)]
+    findorb_radar: Option<PathBuf>,
     /// OpenOrb (oorb) per-channel JSON (from `runners/oorb/run_oorb.py`).
     /// Folds propagation + ephemeris fields onto matching rust rows.
     #[arg(long)]
@@ -210,6 +215,10 @@ fn merge_external(args: MergeExternalArgs) -> Result<(), Box<dyn std::error::Err
         let n = merge_findorb(&mut rows, path)?;
         eprintln!("Merged {n} find_orb rows");
     }
+    if let Some(path) = &args.findorb_radar {
+        let n = merge_findorb(&mut rows, path)?;
+        eprintln!("Merged {n} find_orb radar rows");
+    }
     if let Some(path) = &args.oorb {
         let n = merge_oorb(&mut rows, path)?;
         eprintln!("Merged {n} OpenOrb rows");
@@ -295,18 +304,29 @@ fn merge_findorb(
 ) -> Result<usize, Box<dyn std::error::Error>> {
     let txt = std::fs::read_to_string(path).map_err(|e| format!("read {}: {e}", path.display()))?;
     let fo: Vec<serde_json::Value> = serde_json::from_str(&txt)?;
-    let mut idx: std::collections::HashMap<String, &serde_json::Value> = Default::default();
+    // Key on (object, test_type) so the optical find_orb fit attaches to the
+    // `orbit_determination` row and the radar-augmented fit (find_orb run over
+    // the fixtures/psv-radar/ files, which carry the ADES <radar> table)
+    // attaches to the `orbit_determination_radar` row — same object, distinct
+    // fit. Older single-pass find_orb files omit `test_type`; default those to
+    // the optical OD for backward compatibility.
+    let mut idx: std::collections::HashMap<(String, String), &serde_json::Value> =
+        Default::default();
     for f in &fo {
         if let Some(o) = f["object"].as_str() {
-            idx.insert(o.to_string(), f);
+            let tt = f["test_type"]
+                .as_str()
+                .unwrap_or("orbit_determination")
+                .to_string();
+            idx.insert((o.to_string(), tt), f);
         }
     }
     let mut n = 0;
     for r in rows.iter_mut() {
-        if r.test_type != "orbit_determination" {
+        if r.test_type != "orbit_determination" && r.test_type != "orbit_determination_radar" {
             continue;
         }
-        let Some(f) = idx.get(&r.object) else {
+        let Some(f) = idx.get(&(r.object.clone(), r.test_type.clone())) else {
             continue;
         };
         r.findorb_rms_residual = f["fo_rms_residual"].as_f64();

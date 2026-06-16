@@ -47,6 +47,9 @@ DATA_DIR ?= $(HOME)/.empyrean/data
 CACHE_DIR ?= $(HOME)/.empyrean/cache
 RESULTS_DIR := $(ROOT)/results
 FIXTURES_PSV := $(ROOT)/fixtures/psv
+# Radar-augmented fixtures (optical + ADES <radar> table) for the objects with
+# radar astrometry; drives the find_orb radar-OD reference pass.
+FIXTURES_PSV_RADAR := $(ROOT)/fixtures/psv-radar
 
 # Per-channel runners (rust / python / c / cli) live in this repo's
 # runners/ directory alongside the external-reference runners. They
@@ -102,6 +105,9 @@ CLI_OUT := $(RESULTS_DIR)/validation_cli.json
 CORE_OUT := $(RESULTS_DIR)/validation_core.json
 ASSIST_OUT := $(RESULTS_DIR)/validation_assist.json
 FINDORB_OUT := $(RESULTS_DIR)/validation_findorb.json
+# find_orb radar-augmented OD reference (second pass over the psv-radar fixtures);
+# its rows attach to the `orbit_determination_radar` OD rows in the merge.
+FINDORB_RADAR_OUT := $(RESULTS_DIR)/validation_findorb_radar.json
 OORB_OUT := $(RESULTS_DIR)/validation_oorb.json
 ORBFIT_OUT := $(RESULTS_DIR)/validation_orbfit.json
 KETE_OUT := $(RESULTS_DIR)/validation_kete.json
@@ -324,6 +330,10 @@ run-findorb: $(FO_BIN) $(ASSIST_PY)
 	@$(ASSIST_PY) $(EMP_VAL_RUNNERS)/findorb/run_findorb.py $(FIXTURES_PSV) \
 	    --output $(FINDORB_OUT) --fo-binary $(FO_BIN) \
 	    --data-dir $(DATA_DIR)
+	@echo "──── find_orb: radar-augmented OD reference (psv-radar) ─"
+	@$(ASSIST_PY) $(EMP_VAL_RUNNERS)/findorb/run_findorb.py $(FIXTURES_PSV_RADAR) \
+	    --output $(FINDORB_RADAR_OUT) --fo-binary $(FO_BIN) \
+	    --data-dir $(DATA_DIR) --test-type orbit_determination_radar
 
 # ── OpenOrb (oorb) external comparison — propagation + ephemeris ─
 # Independent Fortran implementation (Granvik et al., University of
@@ -429,18 +439,20 @@ INCLUDE_OPTIONAL ?=
 # choice. If `core` isn't present (WITH_CORE not set), fall back to
 # folding onto rust rows for backward compat.
 merge-external: $(if $(WITH_CORE),$(CORE_MERGED),$(RUST_MERGED))
-$(CORE_MERGED): $(CORE_OUT) $(ASSIST_OUT) $(FINDORB_OUT) $(OORB_OUT) \
+$(CORE_MERGED): $(CORE_OUT) $(ASSIST_OUT) $(FINDORB_OUT) $(FINDORB_RADAR_OUT) $(OORB_OUT) \
                 $(if $(WITH_ORBFIT),$(ORBFIT_OUT),) $(EMP_VAL_BIN)
 	@echo "──── Merge ASSIST + find_orb + OpenOrb$(if $(WITH_ORBFIT), + OrbFit,) into core ──"
 	@$(EMP_VAL_BIN) merge-external -i $(CORE_OUT) -o $(CORE_MERGED) \
 	    --assist $(ASSIST_OUT) --findorb $(FINDORB_OUT) \
+	    --findorb-radar $(FINDORB_RADAR_OUT) \
 	    --oorb $(OORB_OUT) \
 	    $(if $(WITH_ORBFIT),--orbfit $(ORBFIT_OUT),)
-$(RUST_MERGED): $(RUST) $(ASSIST_OUT) $(FINDORB_OUT) $(OORB_OUT) \
+$(RUST_MERGED): $(RUST) $(ASSIST_OUT) $(FINDORB_OUT) $(FINDORB_RADAR_OUT) $(OORB_OUT) \
                 $(if $(WITH_ORBFIT),$(ORBFIT_OUT),) $(EMP_VAL_BIN)
 	@echo "──── Merge ASSIST + find_orb + OpenOrb$(if $(WITH_ORBFIT), + OrbFit,) into rust (fallback) ──"
 	@$(EMP_VAL_BIN) merge-external -i $(RUST) -o $(RUST_MERGED) \
 	    --assist $(ASSIST_OUT) --findorb $(FINDORB_OUT) \
+	    --findorb-radar $(FINDORB_RADAR_OUT) \
 	    --oorb $(OORB_OUT) \
 	    $(if $(WITH_ORBFIT),--orbfit $(ORBFIT_OUT),)
 
