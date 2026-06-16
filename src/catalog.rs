@@ -8,7 +8,7 @@
 //!
 //! # Populations
 //!
-//! - **NEO** — Apophis, Bennu, Didymos, Duende, Eros, Farnocchia, 2020 AV2
+//! - **NEO** — Apophis, Bennu, Didymos, Duende, Eros, Toutatis, Farnocchia, 2020 AV2
 //! - **MBA** — Lutetia, Nysa, Holman, Parijskij
 //! - **Self-Perturber** — Iris, Vesta, Pallas, Hygiea (SB441-N16 bodies that
 //!   appear in the perturber set; their OD must exclude themselves)
@@ -23,7 +23,7 @@
 //! - **Impactor** — 2008 TC3, 2023 CX1, 2024 BX1, 2014 AA, 2018 LA
 //! - **Short-arc NEO** — 2026 FQ12, 2026 FO12, 2026 DA
 //!
-//! Total: 43 objects across 13 populations.
+//! Total: 44 objects across 13 populations.
 
 use serde::Serialize;
 
@@ -231,6 +231,18 @@ const NEOS: &[ValidationObject] = &[
         population: "NEO",
         dt_days: None,
         notes: "NEAR target, Mars-crosser",
+        horizons_only: false,
+        epoch_mjd: None,
+        skip_od: false,
+    },
+    ValidationObject {
+        name: "Toutatis",
+        sbdb_query: "Toutatis",
+        horizons_command: "4179;",
+        mpc_designation: "4179",
+        population: "NEO",
+        dt_days: None,
+        notes: "Goldstone/Arecibo radar target, Chang'e 2 flyby; optical+radar OD",
         horizons_only: false,
         epoch_mjd: None,
         skip_od: false,
@@ -732,7 +744,7 @@ const SHORT_ARC_NEOS: &[ValidationObject] = &[
     },
 ];
 
-/// Returns the full validation object catalog (43 objects across 13
+/// Returns the full validation object catalog (44 objects across 13
 /// populations). Order matches the populations enumerated in the module
 /// docstring.
 pub fn all_objects() -> Vec<&'static ValidationObject> {
@@ -781,7 +793,7 @@ mod tests {
 
     #[test]
     fn catalog_has_43_objects() {
-        assert_eq!(all_objects().len(), 43);
+        assert_eq!(all_objects().len(), 44);
     }
 
     #[test]
