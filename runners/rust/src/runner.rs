@@ -1001,6 +1001,131 @@ pub fn run_od_validation(
             timestamp: timestamp.clone(),
             notes: obj.notes.to_string(),
         });
+
+        // ── Second OD: optical + radar (objects with a psv-radar fixture) ──
+        // For objects that have radar astrometry, read the radar-augmented
+        // fixture (the same optical arc plus the ADES `<radar>` delay/Doppler
+        // table, in the sibling `psv-radar/` dir) and run a second determine,
+        // reusing the same `od_config`. The radar-tightened orbit is emitted as
+        // a separate `orbit_determination_radar` row so the report / find_orb
+        // merge cross-checks it the same way as the optical-only fit. Objects
+        // without a psv-radar fixture (the bulk of the catalog) are untouched.
+        let radar_psv = fixtures_dir
+            .parent()
+            .map(|p| p.join("psv-radar"))
+            .into_iter()
+            .flat_map(|d| {
+                [
+                    d.join(format!("{}.psv", obj.name)),
+                    d.join(format!("{}.psv", obj.mpc_designation)),
+                ]
+            })
+            .find(|p| p.exists());
+        if let Some(radar_psv) = radar_psv {
+            match std::fs::read_to_string(&radar_psv)
+                .ok()
+                .and_then(|s| ctx.read_ades(&s).ok())
+            {
+                Some(obs_r) if obs_r.radar_len() > 0 => {
+                    eprintln!(
+                        "  {}: + radar OD ({} obs incl {} radar)...",
+                        obj.name,
+                        obs_r.len(),
+                        obs_r.radar_len()
+                    );
+                    let t0r = std::time::Instant::now();
+                    match ctx.determine(&obs_r, None, &od_config) {
+                        Ok(dr) => {
+                            let ms_r = t0r.elapsed().as_secs_f64() * 1000.0;
+                            let orbit_r = dr.state();
+                            eprintln!(
+                                "    radar: converged={} rms_combined={:.4} ({:.0}ms)",
+                                dr.converged, dr.summary.rms_combined_arcsec, ms_r
+                            );
+                            let excluded_naif_r: Vec<i32> = od_config
+                                .excluded_perturbers
+                                .iter()
+                                .copied()
+                                .map(Origin::naif_id)
+                                .collect();
+                            results.push(ValidationResult {
+                                object: obj.name.to_string(),
+                                population: obj.population.to_string(),
+                                epoch_mjd_tdb: orbit_r.epoch.mjd_tdb().unwrap_or(f64::NAN),
+                                dt_days: 0.0,
+                                t_mjd_tdb: orbit_r.epoch.mjd_tdb().unwrap_or(f64::NAN),
+                                force_model: tier_str.clone(),
+                                test_type:
+                                    empyrean_validation::schema::test_types::ORBIT_DETERMINATION_RADAR
+                                        .to_string(),
+                                channel: channel.clone(),
+                                observer: None,
+                                emp_vs_horizons_km: None,
+                                emp_pos_au: Some(orbit_r.position),
+                                emp_time_ms: Some(ms_r),
+                                separation_arcsec: None,
+                                d_ra_arcsec: None,
+                                d_dec_arcsec: None,
+                                d_rho_km: None,
+                                d_light_time_s: None,
+                                ic_pos_au: None,
+                                ic_vel_au_d: None,
+                                ic_a1: None,
+                                ic_a2: None,
+                                ic_a3: None,
+                                ic_g_alpha: None,
+                                ic_g_r0: None,
+                                ic_g_m: None,
+                                ic_g_n: None,
+                                ic_g_k: None,
+                                ic_non_grav_dt: None,
+                                ref_pos_au: None,
+                                ref_vel_au_d: None,
+                                ref_ra_rad: None,
+                                ref_dec_rad: None,
+                                ref_rho_au: None,
+                                ref_light_time_d: None,
+                                n_obs_used: Some(dr.summary.num_selected as u32),
+                                od_iterations: Some(dr.iterations),
+                                od_converged: Some(dr.converged),
+                                od_rms_ra_arcsec: Some(dr.summary.rms_ra_arcsec),
+                                od_rms_dec_arcsec: Some(dr.summary.rms_dec_arcsec),
+                                od_rms_combined_arcsec: Some(dr.summary.rms_combined_arcsec),
+                                od_chi2: Some(dr.summary.chi2),
+                                od_reduced_chi2: Some(dr.summary.reduced_chi2),
+                                excluded_perturbers_naif: excluded_naif_r,
+                                propagation_uncertainty: None,
+                                assist_vs_horizons_km: None,
+                                emp_vs_assist_km: None,
+                                assist_time_ms: None,
+                                speed_ratio: None,
+                                findorb_rms_residual: None,
+                                findorb_n_obs_used: None,
+                                findorb_n_obs_rejected: None,
+                                oorb_vs_horizons_km: None,
+                                emp_vs_oorb_km: None,
+                                oorb_time_ms: None,
+                                oorb_separation_arcsec: None,
+                                oorb_d_ra_arcsec: None,
+                                oorb_d_dec_arcsec: None,
+                                oorb_d_rho_km: None,
+                                orbfit_rms_arcsec: None,
+                                orbfit_n_obs_used: None,
+                                orbfit_n_obs_rejected: None,
+                                orbfit_time_ms: None,
+                                timestamp: timestamp.clone(),
+                                notes: format!("optical+radar ({} radar obs)", obs_r.radar_len()),
+                            });
+                        }
+                        Err(e) => {
+                            eprintln!("  {}: radar OD FAIL ({e})", obj.name);
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+
         (results, captured_orbits, orbit_comparisons)
     }).collect();
 

@@ -124,6 +124,12 @@ pub mod test_types {
     /// Run differential correction on a PSV fixture; compare fitted state
     /// + chi² + post-fit RMS across channels.
     pub const ORBIT_DETERMINATION: &str = "orbit_determination";
+    /// Run differential correction on an optical+radar PSV fixture (the ADES
+    /// `<radar>` delay/Doppler table folded into the fit) for objects that
+    /// have radar astrometry. Emitted as a second OD row alongside the
+    /// optical-only [`ORBIT_DETERMINATION`] row so the radar-tightened orbit
+    /// is cross-checked against find_orb the same way.
+    pub const ORBIT_DETERMINATION_RADAR: &str = "orbit_determination_radar";
 }
 
 /// Canonical [`ValidationResult::propagation_uncertainty`] values.
