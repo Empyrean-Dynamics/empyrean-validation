@@ -1253,7 +1253,7 @@ pub fn generate_report(
   · <b>ON</b> for Jet1 covariance propagation by default — correct Earth-encounter dynamics, mode-consistent with f64.
   · <b>OFF</b> for short observation arcs (&lt; 7 days) via scott's auto-gate — short arcs are ill-conditioned and DC chatter destabilises convergence; the gate restores heliocentric stability at the cost of accuracy on atmospheric-impactor fits (4 fixtures in §9).
   · <b>Bodies in <code>excluded_perturbers</code></b> (the test-particle's own mass for SB441-N16 self-perturbers) are filtered out of the OriginSwitchZone install — Pallas / Vesta / Iris / Hygiea now fit to sub-arcsec RMS where prior runs blew up to 10<sup>5</sup>″.
-  · OD residuals worse than find_orb on the three atmospheric impactors (2008 TC3, 2024 BX1, 2023 CX1) are due to the short-arc gate's heliocentric integration; <code>bd:empyrean-wu49</code> is the follow-up to recover impactor-OD precision via systematic-ranging-as-final-answer.
+  · OD residuals worse than find_orb on the three atmospheric impactors (2008 TC3, 2024 BX1, 2023 CX1) are due to the short-arc gate's heliocentric integration; a follow-up task will recover impactor-OD precision via systematic-ranging-as-final-answer.
   · See §13 for full provenance and citation list.
 </div>
 "##.to_string();
@@ -1396,12 +1396,13 @@ pub fn generate_report(
     <a href="#s01b" style="color:#5b9bd5; text-decoration:none;">01b External Reference Tools — Transparency</a><br/>
     <a href="#s02" style="color:#5b9bd5; text-decoration:none;">02 Propagation &mdash; Accuracy Heatmap</a><br/>
     <a href="#s03" style="color:#5b9bd5; text-decoration:none;">03 Propagation &mdash; Error Growth (per population)</a><br/>
-    <a href="#s04" style="color:#5b9bd5; text-decoration:none;">04 Propagation &mdash; ASSIST Comparison</a><br/>
-    <a href="#s05" style="color:#5b9bd5; text-decoration:none;">05 Propagation &mdash; Timing</a><br/>
+    <span id="toc-s04" style="display:none"><a href="#s04" style="color:#5b9bd5; text-decoration:none;">04 Propagation &mdash; ASSIST Comparison</a><br/></span>
+    <span id="toc-s05" style="display:none"><a href="#s05" style="color:#5b9bd5; text-decoration:none;">05 Propagation &mdash; Timing</a><br/></span>
     <a href="#s06" style="color:#5b9bd5; text-decoration:none;">06 Ephemeris &mdash; Angular Separation</a><br/>
     <a href="#s07" style="color:#5b9bd5; text-decoration:none;">07 Ephemeris &mdash; RA/Dec Residuals</a><br/>
     <a href="#s08" style="color:#5b9bd5; text-decoration:none;">08 Ephemeris &mdash; Residual Growth</a><br/>
     <a href="#s09" style="color:#5b9bd5; text-decoration:none;">09 Orbit Determination &mdash; Diagnostics</a><br/>
+    <a href="#s09b" style="color:#5b9bd5; text-decoration:none;">09b Non-gravitational Recovery &mdash; Fitted A1/A2/A3 vs JPL</a><br/>
     <a href="#s10" style="color:#5b9bd5; text-decoration:none;">10 Distribution Channel Fidelity</a><br/>
     <a href="#s11" style="color:#5b9bd5; text-decoration:none;">11 Propagation &mdash; Uncertainty Cost (Jet1 vs f64)</a><br/>
     <a href="#s12" style="color:#5b9bd5; text-decoration:none;">12 Fitted Orbit and Covariance &mdash; vs References</a><br/>
@@ -1452,22 +1453,7 @@ pub fn generate_report(
         <td><a href="https://github.com/Empyrean-Dynamics/empyrean-validation/blob/main/runners/findorb/run_findorb.py" target="_blank" rel="noopener"><code>runners/findorb/run_findorb.py</code></a></td>
       </tr>
       <tr style="opacity:0.55">
-        <td><b>OpenOrb (OORB)</b> <small style="color:#e8a040">(planned — not in this run)</small></td>
-        <td>Granvik et al. 2009 · Helsinki / NEODyS-style OD</td>
-        <td>Statistical ranging / least-squares OD on the same astrometry</td>
-        <td><a href="https://github.com/Empyrean-Dynamics/empyrean-validation/blob/main/runners/oorb/run_oorb.py" target="_blank" rel="noopener"><code>runners/oorb/run_oorb.py</code></a></td>
-      </tr>
-      <tr style="opacity:0.55">
-        <td><b>kete</b> <small style="color:#e8a040">(opt-in — not in this run)</small></td>
-        <td>Dar Dahlen · independent Rust + Python NEO toolkit (originally Caltech IPAC, NEO Surveyor)</td>
-        <td>Sanity-check comparison parallel to ASSIST / find_orb across all three test types</td>
-        <td><a href="https://github.com/Empyrean-Dynamics/empyrean-validation/blob/main/runners/kete/run_kete.py" target="_blank" rel="noopener"><code>runners/kete/run_kete.py</code></a></td>
-      </tr>
-      <tr style="opacity:0.55">
-        <td><b>jorbit</b> <small style="color:#e8a040">(opt-in — not in this run)</small></td>
-        <td>JAX-based propagator / OD (independent — affiliation pending verification)</td>
-        <td>Independent autodiff propagator comparison</td>
-        <td><a href="https://github.com/Empyrean-Dynamics/empyrean-validation/blob/main/runners/jorbit/run_jorbit.py" target="_blank" rel="noopener"><code>runners/jorbit/run_jorbit.py</code></a></td>
+        <td colspan="4"><small style="color:#8b9198"><b>Planned / opt-in (not in this run):</b> <b>OpenOrb</b> (Granvik et al. 2009 — statistical-ranging / least-squares OD), <b>kete</b> (Dar Dahlen — independent Rust/Python NEO toolkit, originally Caltech IPAC / NEO Surveyor), <b>jorbit</b> (JAX autodiff propagator / OD). Runner scripts live under <a href="https://github.com/Empyrean-Dynamics/empyrean-validation/tree/main/runners" target="_blank" rel="noopener"><code>runners/</code></a>; their JSON merges into the report when run.</small></td>
       </tr>
     </tbody>
   </table>
@@ -1476,7 +1462,7 @@ pub fn generate_report(
 <div class="section" id="s02">
   <div class="section-num">02</div>
   <div class="section-title">Propagation &mdash; Accuracy Heatmap</div>
-  <div class="section-desc">Position error vs JPL Horizons (km) at each propagation offset. Color scale tagged to planetary-defense thresholds (sub-keyhole / lunar / Earth–Moon / Hill sphere). Rust channel; sorted within each population by max error.</div>
+  <div class="section-desc">Position error vs JPL Horizons (km) at each propagation offset. Color scale tagged to encounter-distance thresholds (sub-keyhole / lunar / Earth–Moon / Hill sphere). Rust channel; sorted within each population by max error.</div>
 {heatmap_html}</div>
 
 <div class="section" id="s03">
@@ -1742,18 +1728,7 @@ pub fn generate_report(
         <tbody id="orbit-compare-tbody"></tbody>
       </table>
     </div>
-    <div class="panel-title">Notes</div>
-    <div class="heatmap-container">
-      <table class="od-table">
-        <thead><tr>
-          <th class="obj" style="text-align:left">Object</th>
-          <th>Reference</th>
-          <th>Common epoch source</th>
-          <th style="text-align:left">Notes</th>
-        </tr></thead>
-        <tbody id="orbit-compare-notes-tbody"></tbody>
-      </table>
-    </div>
+    <div class="section-desc" style="font-size:0.85em; margin-top:0.8em">Every pair references the JPL SBDB solution, propagated to the common epoch via the fitted-covariance STM (the per-row epoch source is shown in the table above). Where an object's reference covariance is non-SPD at the common epoch, that row's Mahalanobis metric uses the regularised form.</div>
   </div>
 </div>
 
@@ -1892,6 +1867,8 @@ const assistResults = propResults.filter(r => r.assist_vs_horizons_km != null);
 if (assistResults.length > 0) {{
     document.getElementById('s04').style.display = '';
     document.getElementById('s05').style.display = '';
+    document.getElementById('toc-s04').style.display = '';
+    document.getElementById('toc-s05').style.display = '';
     const traces = [];
     const empMarker = {{ symbol: 'circle', size: 6 }};
     const assistMarker = {{ symbol: 'diamond-open', size: 6 }};
@@ -2932,19 +2909,12 @@ const orbitComparisons = ORBIT_COMPARISONS_JSON;
 // User-facing relabel — the sidecar embeds "scott" / "sbdb" as the
 // `common_epoch_source` enum because scott is the internal Rust crate
 // name for the OD library; surface as "Empyrean fit" / "SBDB" for the
-// reader. Same for "to scott epoch" string substitution in notes.
+// reader.
 function relabelEpochSource(s) {{
     if (s === 'scott') return 'Empyrean fit';
     if (s === 'sbdb') return 'SBDB';
     if (s === 'findorb') return 'find_orb';
     return s;
-}}
-function relabelNote(s) {{
-    return (s || '')
-        .replace(/scott epoch/g, 'Empyrean-fit epoch')
-        .replace(/scott propagated/g, 'Empyrean fit propagated')
-        .replace(/scott's/g, "Empyrean's")
-        .replace(/\bscott\b/g, 'Empyrean fit');
 }}
 if (!orbitComparisons.length) {{
     document.getElementById('oc-empty').style.display = '';
@@ -3067,7 +3037,6 @@ if (!orbitComparisons.length) {{
         return a.object.localeCompare(b.object);
     }});
     const tbody = document.getElementById('orbit-compare-tbody');
-    const notesBody = document.getElementById('orbit-compare-notes-tbody');
     rows.forEach((c, idx) => {{
         const tr = document.createElement('tr');
         tr.style.cursor = 'pointer';
@@ -3138,16 +3107,6 @@ if (!orbitComparisons.length) {{
         tr.onclick = () => {{
             expandRow.style.display = expandRow.style.display === 'none' ? '' : 'none';
         }};
-
-        if (c.notes && c.notes.length) {{
-            const nr = document.createElement('tr');
-            nr.innerHTML = `
-                <td class="obj-name">${{c.object}}</td>
-                <td>${{c.reference}}</td>
-                <td>${{relabelEpochSource(c.common_epoch_source)}}</td>
-                <td style="text-align:left">${{c.notes.map(relabelNote).join('; ')}}</td>`;
-            notesBody.appendChild(nr);
-        }}
     }});
 }}
 </script>
