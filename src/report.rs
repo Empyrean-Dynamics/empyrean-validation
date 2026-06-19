@@ -1234,30 +1234,6 @@ pub fn generate_report(
         parts.join(" · ")
     };
 
-    // ── Run-mode disclaimer banner. This run was captured with
-    // Per-call origin-switching policy disclaimer. Switching is ON
-    // by default for Jet1 covariance propagation, OFF for short
-    // observation arcs (< 7 days) via scott's automatic gate, and
-    // bodies in the test-particle's `excluded_perturbers` list are
-    // filtered out of the OriginSwitchZone install (so SB441-N16
-    // self-perturbers like Pallas / Vesta / Iris / Hygiea fit
-    // correctly). The four atmospheric impactors (2008 TC3, 2024 BX1,
-    // 2023 CX1, 2018 LA) get an unswitched fit via the gate; their
-    // RMS in §9 reflects the heliocentric-DC ranging seed quality.
-    // The empyrean-wu49 follow-up will recover them to find_orb /
-    // Scout territory by skipping DC entirely for short-arc Ranging
-    // IOD and using the MOV best sample.
-    let run_mode_banner_html = r##"
-<div class="run-mode-banner" style="background:#1a2a3a; border-left:4px solid #5b9bd5; padding:14px 60px; max-width:1400px; margin:0 auto; font-family:'JetBrains Mono',monospace; font-size:11px; color:#a8c9e8; line-height:1.6;">
-  <b style="color:#5b9bd5">PER-CALL ORIGIN-SWITCHING POLICY</b>
-  · <b>ON</b> for Jet1 covariance propagation by default — correct Earth-encounter dynamics, mode-consistent with f64.
-  · <b>OFF</b> for short observation arcs (&lt; 7 days) via scott's auto-gate — short arcs are ill-conditioned and DC chatter destabilises convergence; the gate restores heliocentric stability at the cost of accuracy on atmospheric-impactor fits (4 fixtures in §9).
-  · <b>Bodies in <code>excluded_perturbers</code></b> (the test-particle's own mass for SB441-N16 self-perturbers) are filtered out of the OriginSwitchZone install — Pallas / Vesta / Iris / Hygiea now fit to sub-arcsec RMS where prior runs blew up to 10<sup>5</sup>″.
-  · OD residuals worse than find_orb on the three atmospheric impactors (2008 TC3, 2024 BX1, 2023 CX1) are due to the short-arc gate's heliocentric integration; a follow-up task will recover impactor-OD precision via systematic-ranging-as-final-answer.
-  · See §13 for full provenance and citation list.
-</div>
-"##.to_string();
-
     // ── §13 Reproducibility footer — every detail a referee needs to
     // reproduce a number from this report. Static content for now;
     // version + git-hash fields hard-coded against the current pins
@@ -1387,8 +1363,6 @@ pub fn generate_report(
   <div class="provenance">Test epoch: {test_epoch_label}<br/>Frame: ICRF (J2000) · Ephemeris: DE441 · Force model: empyrean::standard (1PN GR · 16-asteroid SB441-N16 perturbers · Marsden A1/A2/A3 + g(r) non-grav)<br/>Coverage: {coverage_line}<br/>Report run: {report_run_date} &nbsp;·&nbsp; <a href="#s13" style="color:#5b9bd5; text-decoration:none">▸ provenance &amp; references</a> &nbsp;·&nbsp; <a href="javascript:void(0)" onclick="downloadJSON()" style="color:#5b9bd5; text-decoration:none">↓ download embedded JSON</a></div>
 </div>
 
-{run_mode_banner_html}
-
 <div class="section" style="padding-bottom:20px;">
   <div class="section-title" style="font-size:16px; margin-bottom:12px;">Contents</div>
   <div style="font-family:'JetBrains Mono',monospace; font-size:11px; line-height:2.4; color:#5b9bd5;">
@@ -1443,7 +1417,7 @@ pub fn generate_report(
       <tr>
         <td><b>ASSIST</b></td>
         <td>Holman et al. 2023 · REBOUND IAS15 · DE441</td>
-        <td>N-body propagation; first-order STM (6 variational particles); second-order STT (6 + 21 variational particles)</td>
+        <td>N-body propagation; first-order STM (6 variational particles). ASSIST does not support second-order STT — its force model supplies no second-order force derivatives, so there is no ASSIST second-order counterpart.</td>
         <td><a href="https://github.com/Empyrean-Dynamics/empyrean-validation/blob/main/runners/assist/run_assist.py" target="_blank" rel="noopener"><code>runners/assist/run_assist.py</code></a></td>
       </tr>
       <tr>
@@ -1501,7 +1475,7 @@ pub fn generate_report(
     <div id="timing-chart" style="height:480px;"></div>
   </div>
   <div class="panel-title">STM/STT-bearing propagation (first-order, second-order, Auto cascade)</div>
-  <div class="section-desc">Three uncertainty modes plotted on the same axis so empyrean's per-call cost across the STM-bearing surface is visible in one frame. <b>First-order</b> pairs empyrean's Jet1 (6 partials) against ASSIST's 6 first-order variational particles. <b>Second-order</b> pairs empyrean's Jet2 (6 + 21 partials) against ASSIST's 6 first-order + 21 second-order variational particles — the symmetric 6×6 Hessian. <b>Auto</b> is empyrean's Phase A/B/C cascade (FirstOrder / SecondOrder / AGM mixture, driven by per-CA κ); REBOUND has no auto-cascade analogue, so Auto rows baseline against the first-order ASSIST row via the merge step. ASSIST propagates variational equations under gravity only — the non-gravitational <code>additional_forces</code> callback is not applied to the shadows, so STM/STT are gravity-only-approximate for active bodies with non-zero a1/a2/a3.</div>
+  <div class="section-desc">Three uncertainty modes plotted on the same axis so empyrean's per-call cost across the STM-bearing surface is visible in one frame. <b>First-order</b> pairs empyrean's Jet1 (6 partials) against ASSIST's 6 first-order variational particles. <b>Second-order</b> shows empyrean's Jet2 (6 + 21 partials) per-call cost only — <b>ASSIST does not support second order</b>: REBOUND can carry order-2 variational particles geometrically, but ASSIST's force model supplies no second-order force derivatives, so there is no valid ASSIST second-order counterpart to pair against. <b>Auto</b> is empyrean's Phase A/B/C cascade (FirstOrder / SecondOrder / AGM mixture, driven by per-CA κ); REBOUND has no auto-cascade analogue, so Auto rows baseline against the first-order ASSIST row via the merge step. ASSIST propagates variational equations under gravity only — the non-gravitational <code>additional_forces</code> callback is not applied to the shadows, so STM/STT are gravity-only-approximate for active bodies with non-zero a1/a2/a3.</div>
   <div class="chart-container">
     <div id="timing-cov-chart" style="height:540px;"></div>
   </div>
@@ -3132,7 +3106,6 @@ if (!orbitComparisons.length) {{
         channel_table_html = channel_table_html,
         offenders_html = offenders_html,
         quality_summary_html = quality_summary_html,
-        run_mode_banner_html = run_mode_banner_html,
         provenance_footer_html = provenance_footer_html,
     );
 
