@@ -1,6 +1,6 @@
 //! Branded HTML validation report.
 //!
-//! Renders sections 01-08 over the rust reference channel, then a new
+//! Renders sections 01-08 over the core reference channel, then a new
 //! section 09 (OD diagnostics across channels) and a rebuilt section 10
 //! (cross-channel fidelity matrix + ECDF + beeswarm + timing-vs-accuracy).
 //! All non-rust channel data are embedded so the report can render any
@@ -226,7 +226,7 @@ fn percentile(values: &mut [f64], p: f64) -> f64 {
     values[idx]
 }
 
-/// Vector position difference (km) between channel row and rust row.
+/// Vector position difference (km) between channel row and core row.
 fn vec_dr_km(a: &Option<[f64; 3]>, b: &Option<[f64; 3]>) -> Option<f64> {
     match (a, b) {
         (Some(a), Some(b)) => {
@@ -651,8 +651,8 @@ fn build_channel_table_html(rollups: &[ChannelRollup]) -> String {
     html.push_str("<th>Max Δρ (km)</th>");
     html.push_str("<th>Max Δlt (s)</th>");
     html.push_str("<th>p50 t</th>");
-    html.push_str("<th>p50 t (rust paired)</th>");
-    html.push_str("<th>speed (ch/rust)</th>");
+    html.push_str("<th>p50 t (core paired)</th>");
+    html.push_str("<th>speed (ch/core)</th>");
     html.push_str("</tr></thead><tbody>");
 
     for r in rollups {
@@ -1142,8 +1142,8 @@ pub fn generate_report(
         heatmap_html.push_str(r##"  <div class="legend" style="margin-top:8px;">
     <div class="legend-item"><span class="pop-dot" style="background:#0d1e3c"></span>&lt; 1 km · sub-keyhole</div>
     <div class="legend-item"><span class="pop-dot" style="background:#5b9bd5"></span>1 km</div>
-    <div class="legend-item"><span class="pop-dot" style="background:#c8af46"></span>100 km</div>
-    <div class="legend-item"><span class="pop-dot" style="background:#dc6e37"></span>10⁴ km · Earth–Moon</div>
+    <div class="legend-item"><span class="pop-dot" style="background:#c8af46"></span>100 km · lunar orbit</div>
+    <div class="legend-item"><span class="pop-dot" style="background:#dc6e37"></span>10⁴ km · GEO / high-Earth-orbit</div>
     <div class="legend-item"><span class="pop-dot" style="background:#c83c3c"></span>10⁶ km · Hill sphere</div>
     <div class="legend-item"><span class="pop-dot" style="background:#b41e6e"></span>≥ 10⁸ km · &gt;1 AU</div>
     <div class="legend-item"><span class="pop-dot" style="background:#161c25; border:1px dashed #4a5060"></span>not tested (atmospheric impactors aren't propagated past the entry time, so positive dt cells are dashed)</div>
@@ -1178,7 +1178,7 @@ pub fn generate_report(
         for r in &rollups {
             if r.channel == "core" {
                 parts.push(format!(
-                    r#"<span style="color:#5b9bd5">{n}/{n} rust (ref)</span>"#,
+                    r#"<span style="color:#5b9bd5">{n}/{n} core (ref)</span>"#,
                     n = r.n_rows
                 ));
                 continue;
@@ -1237,7 +1237,7 @@ pub fn generate_report(
     // ── §13 Reproducibility footer — every detail a referee needs to
     // reproduce a number from this report. Static content for now;
     // version + git-hash fields hard-coded against the current pins
-    // (empyrean-core v0.7, villeneuve 1.12, hyperjet 1.7). Per-row
+    // (empyrean-core v0.7.0, villeneuve 1.14.0, hyperjet 1.9). Per-row
     // run-time provenance (commit hash, kernel hash) is a follow-up.
     let provenance_footer_html = format!(
         r##"
@@ -1257,28 +1257,29 @@ pub fn generate_report(
     <tbody>
       <tr><td>Frame</td><td>ICRF (J2000), barycentric</td></tr>
       <tr><td>Time scale</td><td>TDB (Barycentric Dynamical Time)</td></tr>
-      <tr><td>Planetary ephemeris</td><td>JPL DE441 (long-term, no extended terms)</td></tr>
-      <tr><td>Asteroid perturber set</td><td>SB441-N16: <code>1, 3, 4, 7, 10, 15, 16, 31, 52, 65, 70, 87, 88, 107, 511, 704</code></td></tr>
-      <tr><td>Force model (standard)</td><td>Point-mass Sun + 8 planets + Moon + Pluto + 16 SB441-N16 asteroids; 1PN GR Einstein-Infeld-Hoffmann for Sun; non-gravitational A1 (radial) / A2 (transverse) / A3 (normal) accelerations with Marsden's <code>g(r) = α (r/r₀)<sup>−m</sup> [1 + (r/r₀)<sup>n</sup>]<sup>−k</sup></code>. For asteroids (Apophis, Bennu, et al.) A2 ≠ 0 is the standard parameterisation of the <b>Yarkovsky effect</b> (Marsden 1968 / Vokrouhlický et al. 2015); A1 = A3 = 0 and g(r) = 1/r² for asteroid fits. For comets all three may be non-zero with the Marsden / Yeomans–Chodas g(r).</td></tr>
-      <tr><td>Integrator</td><td>villeneuve 1.12 GR15 (15-stage Gauss-Radau, adaptive step, default ε=1e-9; dt_min = 10⁻⁹ days ≈ 86 µs, derived solely from Everhart 1985)</td></tr>
-      <tr><td>Autodiff (Jet1 STM)</td><td>hyperjet 1.7 (forward-mode, N=6 or N=9 with non-grav)</td></tr>
-      <tr><td>Origin switching</td><td><b>DISABLED on Jet1 path</b> (see run-mode banner); enabled on f64 path with default 0.2 hysteresis band; Laplace SOI test per Amato/Baù/Bombardelli 2017</td></tr>
+      <tr><td>Planetary ephemeris</td><td>JPL DE440</td></tr>
+      <tr><td>Asteroid perturber set</td><td>SB441-N16: <code>1, 2, 3, 4, 7, 10, 15, 16, 31, 52, 65, 87, 88, 107, 511, 704</code></td></tr>
+      <tr><td>Force model (standard)</td><td>Point-mass Sun + 8 planets + Moon + Pluto + 16 SB441-N16 asteroids; 1PN GR Einstein-Infeld-Hoffmann for Sun; non-gravitational A1 (radial) / A2 (transverse) / A3 (normal) accelerations with Marsden's <code>g(r) = α (r/r₀)<sup>−m</sup> [1 + (r/r₀)<sup>n</sup>]<sup>−k</sup></code>. For asteroids (Apophis, Bennu, et al.) A2 ≠ 0 is the standard parameterisation of the <b>Yarkovsky effect</b> (Marsden, Sekanina &amp; Yeomans 1973 / Vokrouhlický et al. 2015); A1 = A3 = 0 and g(r) = 1/r² for asteroid fits. For comets all three may be non-zero with the Marsden / Yeomans–Chodas g(r).</td></tr>
+      <tr><td>Integrator</td><td>villeneuve 1.14.0 GR15 (15-stage Gauss-Radau, adaptive step, default ε=1e-9; dt_min = 10⁻⁶ days ≈ 86 ms, derived solely from Everhart 1985)</td></tr>
+      <tr><td>Autodiff (Jet1 STM)</td><td>hyperjet 1.9 (forward-mode, N=6 or N=9 with non-grav)</td></tr>
+      <tr><td>Origin switching</td><td>villeneuve propagation: <b>ENABLED</b> (library default, 0.2 hysteresis band, Laplace SOI test per Amato/Baù/Bombardelli 2017). scott OD pipeline: <b>DISABLED</b> (pipeline default).</td></tr>
       <tr><td>External OD reference</td><td>find_orb (Project Pluto, B. Gray) · environ.dat: <code>SETTINGS2=1 22.00 0 -2 0</code>, <code>OUTLIER_REJECTION_LIMIT=3</code>, <code>ENCKE=1</code>, <code>PERTURBERS=1007fe</code>, SB441-N16 perturbers</td></tr>
-      <tr><td>External propagation reference</td><td>ASSIST (Holman et al. 2023, arXiv:2308.15572) on REBOUND IAS15; DE441 + SB441-N16</td></tr>
+      <tr><td>External propagation reference</td><td>ASSIST (Holman et al. 2023, arXiv:2308.15572) on REBOUND IAS15; DE440 + SB441-N16</td></tr>
       <tr><td>Observation source</td><td>Minor Planet Center API (<a href="https://data.minorplanetcenter.net/api/get-obs" target="_blank" rel="noopener" style="color:#5b9bd5">data.minorplanetcenter.net/api/get-obs</a>); fetched at runtime</td></tr>
-      <tr><td>Observation weights</td><td>MPC-reported <code>rmsRA</code>/<code>rmsDec</code> when present; Vereš et al. 2017 (Icarus 296) fallback for missing</td></tr>
-      <tr><td>Outlier rejection</td><td>Empyrean OD: 4σ Huber; find_orb: 3σ</td></tr>
-      <tr><td>OD convergence criterion</td><td>‖ΔIC‖₂ &lt; 10⁻¹² · ‖IC‖ <i>or</i> |Δχ²| &lt; 10⁻⁶</td></tr>
+      <tr><td>Observation weights</td><td>Vereš–Farnocchia–Chesley 2017 (VFC17) per-station RMS floors, σ = max(reported, floor); NightlyDeweighting 1/√N over same-station 0.5-day batches; Eggl–Farnocchia–Chamberlin–Chesley 2020 (EFCC2020) star-catalog debiasing</td></tr>
+      <tr><td>Outlier rejection</td><td>Empyrean OD: adaptive information-aware χ² rejection (the default <code>RejectionStrategy::Adaptive</code> — χ² outlier evidence balanced against the Fisher-information cost of removing the observation; residual statistics per Carpino, Milani &amp; Chesley 2003). The explicit Carpino–Milani–Chesley χ²-with-hysteresis scheme (OrbFit/NEODyS) is available as <code>RejectionStrategy::CMC2003</code> but is not the default. find_orb: 3σ</td></tr>
+      <tr><td>OD convergence criterion</td><td>Gauss-Newton step quadratic form Δxᵀ𝒩Δx &lt; 10⁻⁵ on the undamped step; MINPACK gtol = 10⁻⁸ and ftol = 1.49×10⁻⁸ as secondary criteria; Nielsen relative-step (xtol) test disabled</td></tr>
       <tr><td>OD max iterations</td><td>100 (rows iter=100 in §9 did not converge within cap)</td></tr>
       <tr><td>Reference orbits (§12)</td><td>JPL SBDB web service; per-object epoch as returned</td></tr>
-      <tr><td>Fidelity threshold</td><td>‖Δr<sub>chan</sub> − Δr<sub>rust</sub>‖ ≤ 10⁻¹⁰ km ≈ 0.1 nm (float64 ULP at 1 AU)</td></tr>
+      <tr><td>Fidelity threshold</td><td>‖Δr<sub>chan</sub> − Δr<sub>core</sub>‖ ≤ 10⁻¹⁰ km = 100 nm (a sub-ULP absolute floor; float64 ULP at 1 AU is ≈ 3×10⁻⁸ km ≈ 30 µm, so this threshold is ~300× tighter)</td></tr>
       <tr><td>Report generated</td><td>{report_run_date}</td></tr>
     </tbody>
   </table>
   <div class="section-desc" style="margin-top:24px; font-size:11px;">
     <b>References</b><br/>
-    · Holman, M. et al. 2023, "ASSIST: An ephemeris-quality test-particle integrator", AJ 166, 99 (arXiv:2308.15572).<br/>
+    · Holman, M. et al. 2023, "ASSIST: An ephemeris-quality test-particle integrator", PSJ 4(4), 69 (DOI 10.3847/PSJ/acc9a9, arXiv:2308.15572).<br/>
     · Vereš, P. et al. 2017, "Statistical analysis of astrometric errors for the most productive asteroid surveys", Icarus 296, 139.<br/>
+    · Eggl, S., Farnocchia, D., Chamberlin, A. B., Chesley, S. R. 2020, "Star catalog position and proper motion corrections in asteroid astrometry II: the Gaia era", Icarus 339, 113596 (DOI 10.1016/j.icarus.2019.113596).<br/>
     · Amato, D., Baù, G., Bombardelli, C. 2017, "Accurate orbit propagation in the presence of planetary close encounters", MNRAS 470, 2079.<br/>
     · Park, R. S., Folkner, W. M., Williams, J. G., Boggs, D. H. 2021, "The JPL Planetary and Lunar Ephemerides DE440 and DE441", AJ 161, 105.<br/>
     · Marsden, B. G., Sekanina, Z., Yeomans, D. K. 1973, "Comets and Nongravitational Forces. V", AJ 78, 211.<br/>
@@ -1360,7 +1361,7 @@ pub fn generate_report(
   <h2>DYNAMICS</h2>
   <div class="meta" style="font-size:12px; line-height:1.8;">{quality_summary_html}</div>
   <div class="meta" style="margin-top:6px; color:#5b9098;">{n_prop} propagation · {n_eph} ephemeris · {n_od} OD · {n_objects} objects · {n_channels} channel{channels_label}</div>
-  <div class="provenance">Test epoch: {test_epoch_label}<br/>Frame: ICRF (J2000) · Ephemeris: DE441 · Force model: empyrean::standard (1PN GR · 16-asteroid SB441-N16 perturbers · Marsden A1/A2/A3 + g(r) non-grav)<br/>Coverage: {coverage_line}<br/>Report run: {report_run_date} &nbsp;·&nbsp; <a href="#s13" style="color:#5b9bd5; text-decoration:none">▸ provenance &amp; references</a> &nbsp;·&nbsp; <a href="javascript:void(0)" onclick="downloadJSON()" style="color:#5b9bd5; text-decoration:none">↓ download embedded JSON</a></div>
+  <div class="provenance">Test epoch: {test_epoch_label}<br/>Frame: ICRF (J2000) · Ephemeris: DE440 · Force model: empyrean::standard (1PN GR · 16-asteroid SB441-N16 perturbers · Marsden A1/A2/A3 + g(r) non-grav)<br/>Coverage: {coverage_line}<br/>Report run: {report_run_date} &nbsp;·&nbsp; <a href="#s13" style="color:#5b9bd5; text-decoration:none">▸ provenance &amp; references</a> &nbsp;·&nbsp; <a href="javascript:void(0)" onclick="downloadJSON()" style="color:#5b9bd5; text-decoration:none">↓ download embedded JSON</a></div>
 </div>
 
 <div class="section" style="padding-bottom:20px;">
@@ -1416,7 +1417,7 @@ pub fn generate_report(
     <tbody>
       <tr>
         <td><b>ASSIST</b></td>
-        <td>Holman et al. 2023 · REBOUND IAS15 · DE441</td>
+        <td>Holman et al. 2023 · REBOUND IAS15 · DE440</td>
         <td>N-body propagation; first-order STM (6 variational particles). ASSIST does not support second-order STT — its force model supplies no second-order force derivatives, so there is no ASSIST second-order counterpart.</td>
         <td><a href="https://github.com/Empyrean-Dynamics/empyrean-validation/blob/main/runners/assist/run_assist.py" target="_blank" rel="noopener"><code>runners/assist/run_assist.py</code></a></td>
       </tr>
@@ -1436,13 +1437,13 @@ pub fn generate_report(
 <div class="section" id="s02">
   <div class="section-num">02</div>
   <div class="section-title">Propagation &mdash; Accuracy Heatmap</div>
-  <div class="section-desc">Position error vs JPL Horizons (km) at each propagation offset. Color scale tagged to encounter-distance thresholds (sub-keyhole / lunar / Earth–Moon / Hill sphere). Rust channel; sorted within each population by max error.</div>
+  <div class="section-desc">Position error vs JPL Horizons (km) at each propagation offset. Color scale tagged to encounter-distance thresholds (sub-keyhole / lunar orbit / GEO / Hill sphere). empyrean-core channel; sorted within each population by max error.</div>
 {heatmap_html}</div>
 
 <div class="section" id="s03">
   <div class="section-num">03</div>
   <div class="section-title">Propagation &mdash; Error Growth</div>
-  <div class="section-desc">Position error vs JPL Horizons over time, log-y. Median curve plus IQR band per population reduces the 43 individual lines to 13 population curves + named outliers. Toggle between rust-only (default) and 5-channel overlay; in <b>All channels</b> mode, c/cli/python lie exactly on rust (bit-exact, the lines overlap at chart resolution) and core diverges only on the deep-time chaotic-divergence rows surfaced in §10 — so a lone deviating line is the only visible signal, never four parallel lines.</div>
+  <div class="section-desc">Position error vs JPL Horizons over time, log-y. Median curve plus IQR band per population reduces the 44 individual lines to 13 population curves + named outliers. Toggle between rust-only (default) and 5-channel overlay; in <b>All channels</b> mode, c/cli/python lie exactly on rust (bit-exact, the lines overlap at chart resolution) and core is bit-identical to rust on the chaotic-divergence rows and on all but two objects, differing from rust by at most ~0.3 m on Didymos and 2026 FQ12 across all dt — a benign round-off-order difference in the core binary, not chaotic divergence. On this median-of-all-rows log-y plot all five channels overlap.</div>
   <div class="channel-toggle" id="s03-toggle">
     <button class="active" data-mode="rust">Rust only</button>
     <button data-mode="all">All channels overlay</button>
@@ -1455,7 +1456,7 @@ pub fn generate_report(
 <div class="section" id="s04" style="display:none">
   <div class="section-num">04</div>
   <div class="section-title">Propagation &mdash; ASSIST Comparison</div>
-  <div class="section-desc">Log-y |empyrean − ASSIST| vs |ASSIST − Horizons| over time. ASSIST (Holman et al. 2023, REBOUND/IAS15/DE441) is the independent N-body reference. Triangular markers = comets (g(r) implementation differs from ASSIST). Squares = self-perturbers (ASSIST treats as test particles). Threshold lines at 1 km / 100 km / 1 AU.</div>
+  <div class="section-desc">Log-y |empyrean − ASSIST| vs |ASSIST − Horizons| over time. ASSIST (Holman et al. 2023, REBOUND/IAS15/DE440) is the independent N-body reference. Triangular markers = comets and ISOs (g(r) implementation differs from ASSIST). Circles = self-perturbers (ASSIST treats as test particles). Threshold lines at 1 km / 100 km / 1 AU.</div>
   <div class="chart-container">
     <div id="assist-chart" style="height:520px;"></div>
   </div>
@@ -1469,7 +1470,7 @@ pub fn generate_report(
 <div class="section" id="s05" style="display:none">
   <div class="section-num">05</div>
   <div class="section-title">Propagation &mdash; Timing</div>
-  <div class="section-desc">Per-row timing (log-y) for empyrean vs ASSIST, broken out by <code>propagation_uncertainty</code> mode so the comparison is apples-to-apples: empyrean's f64 path against single-particle ASSIST (f64), and empyrean's Jet1 + 6&times;6 covariance path against ASSIST with 6 first-order variational particles. The merge keys on <code>(object, dt, propagation_uncertainty)</code> so each empyrean row pairs with the matching ASSIST mode. <b>Caveat:</b> ASSIST f64 timings represent per-output-epoch retrieval from a single batch integration (the standard REBOUND/ASSIST workflow), while empyrean f64 timings represent a fresh per-call propagation from the initial epoch to the target. Treat the ASSIST f64 sub-microsecond column as a sanity floor, not a head-to-head benchmark — empyrean's f64 timing would converge to it under the same dense-output discipline.</div>
+  <div class="section-desc">Per-row timing (log-y) for empyrean vs ASSIST, broken out by <code>propagation_uncertainty</code> mode so the comparison is apples-to-apples: empyrean's f64 path against single-particle ASSIST (f64), and empyrean's Jet1 + 6&times;6 covariance path against ASSIST with 6 first-order variational particles. The merge keys on <code>(object, dt, propagation_uncertainty)</code> so each empyrean row pairs with the matching ASSIST mode. <b>Caveat:</b> both ASSIST and empyrean f64 rows are fresh per-call integrations from the initial epoch to the target (the ASSIST runner constructs a new <code>rebound.Simulation()</code> and re-integrates from t₀ per dt), so the f64 panel <i>is</i> a head-to-head comparison. Where ASSIST's f64 column reads sub-microsecond, the cause is REBOUND/ASSIST's cached ephemeris-interpolation state and IAS15 step reuse across the closely spaced output epochs, not a different timing methodology.</div>
   <div class="panel-title">f64 propagation (state only)</div>
   <div class="chart-container">
     <div id="timing-chart" style="height:480px;"></div>
@@ -1524,7 +1525,7 @@ pub fn generate_report(
 <div class="section" id="s09">
   <div class="section-num">09</div>
   <div class="section-title">Orbit Determination &mdash; Diagnostics</div>
-  <div class="section-desc">For every OD test case, four diagnostics drive the "did the differential corrector land in the same minimum?" question across channels. Post-fit RMS, reduced χ² = χ²/ν, iteration count, and fitted-state drift to rust are all signals that an OD pipeline is not solving the same problem on the same data. <b>Cross-channel OD agreement in this run is bit-exact at 1 nm in fitted state for c / cli / python</b> (see the per-object scatter below — every point sits on the 10⁻¹² km floor). The remaining story is Empyrean vs find_orb on the same observations, where this run shows agreement within ~30% for typical-arc NEOs / MBAs / TNOs and three large regressions on atmospheric impactors flagged in red below (2008 TC3, 2024 BX1, 2023 CX1) — see the run-mode banner for the suspected root cause.</div>
+  <div class="section-desc">For every OD test case, four diagnostics drive the "did the differential corrector land in the same minimum?" question across channels. Post-fit RMS, reduced χ² = χ²/ν, iteration count, and fitted-state drift to the core channel are all signals that an OD pipeline is not solving the same problem on the same data. <b>Cross-channel OD agreement in this run is bit-identical in fitted state for rust / c / cli / python</b> (see the per-object scatter below — every point sits on the 10⁻⁹ km chart floor). The remaining story is Empyrean vs find_orb on the same observations: find_orb fit 31 of the objects this run (the other 8 hit its 10&nbsp;min/fixture cap and read &ldquo;not run&rdquo; below). Of the 27 that also have a converged Empyrean fit to pair against, the 23 with full-coverage find_orb solutions agree to within a factor of ~1.6 in post-fit RMS (median 1.09&times;, all within 2&times;) &mdash; no large regressions this run. The four exceptions (2008 TC3, 2023 CX1, 2024 BX1, 67P) are <i>not</i> clean comparisons: find_orb falls back to a degenerate low-coverage placeholder on these short / sparse arcs (&le;&nbsp;2% of observations used, fitting only its 2 anchor points), so their &Delta; is flagged &ldquo;rejection-mismatch&rdquo; in grey rather than counted as a fit-quality difference. Empyrean fits the full arc on those same objects (e.g. 2008 TC3: 809 obs at 0.84″ RMS).</div>
   <div id="od-empty" class="section-desc" style="display:none; color:#8b9198">No orbit-determination rows in this report. Run the OD subset to populate this section.</div>
   <div id="od-content">
     <div class="panel-title">Per-object overview</div>
@@ -1550,6 +1551,7 @@ pub fn generate_report(
     <div class="chart-container">
       <div id="od-chi2-chart" style="height:480px;"></div>
     </div>
+    <div class="section-desc" style="font-size:0.85em; margin-top:-12px;">Note: the <code>c</code> and <code>cli</code> channels do not yet marshal <code>od_reduced_chi2</code> through the C ABI / CLI, so they have no χ² series and are omitted from this chart.</div>
 
     <div class="panel-title">Iterations to convergence</div>
     <div class="chart-container">
@@ -1561,13 +1563,15 @@ pub fn generate_report(
       <div id="od-rms-chart" style="height:380px;"></div>
     </div>
 
+    <div id="od-rms-vs-findorb-panel">
     <div class="panel-title">Empyrean OD combined RMS vs find_orb (y = x line)</div>
     <div class="section-desc">Per-object scatter of Empyrean OD's combined RA·cosδ + Dec RMS against find_orb's <code>rms</code>. Points on the y = x diagonal mean the two pipelines agree; deviations above the line mean Empyrean reports a larger RMS than find_orb on that object (typically because find_orb's rejection policy trimmed more observations). Log scale on both axes.</div>
     <div class="chart-container">
       <div id="od-rms-vs-findorb-chart" style="height:480px;"></div>
     </div>
+    </div>
 
-    <div class="panel-title">Fitted-state drift to rust (km, log-y)</div>
+    <div class="panel-title">Fitted-state drift to core (km, log-y)</div>
     <div class="chart-container">
       <div id="od-fitdr-chart" style="height:420px;"></div>
     </div>
@@ -1577,14 +1581,14 @@ pub fn generate_report(
 <div class="section" id="s10">
   <div class="section-num">10</div>
   <div class="section-title">Distribution Channel Fidelity</div>
-  <div class="section-desc">Cross-channel agreement broken out by test type. The five channels run end-to-end through libempyrean (or empyrean-core directly for the <code>core</code> channel). Bit-identical results are the expected outcome for propagation and ephemeris; OD is bit-exact at &lt; 1 nm fitted-state agreement (see §9 fitted-state-drift chart).
-  <br/><br/><small style="color:#8b9198"><b>On the denominators:</b> rust's <code>2588 / 2760 / 35</code> totals cover the full uncertainty grid (Auto + first_order_with_cov + second_order_with_cov + f64_no_cov). Non-rust channels run only the modes their public API exposes (first_order_with_cov + f64_no_cov for c / cli / python; the same two for core, replayed twice through different entry points), so their compared denominators are <code>≈ rust ÷ 2</code> by design — not a coverage gap. The fidelity claim is per-row bit-exactness against the matching rust row; the denominator difference is a sampling artefact of which modes are end-to-end production-shipped.</small></div>
+  <div class="section-desc">Cross-channel agreement broken out by test type. The five channels run end-to-end through libempyrean (or empyrean-core directly for the <code>core</code> channel). Bit-identical results are the expected outcome for propagation and ephemeris; OD is bit-identical in fitted state (see §9 fitted-state-drift chart).
+  <br/><br/><small style="color:#8b9198"><b>On the denominators:</b> rust's <code>2588 / 2760 / 35</code> totals cover the full uncertainty grid (Auto + first_order_with_cov + second_order_with_cov + f64_no_cov). Non-rust channels run only the modes their public API exposes (first_order_with_cov + f64_no_cov for c / cli / python; the same two for core, replayed twice through different entry points), so their compared denominators are <code>≈ rust ÷ 2</code> by design — not a coverage gap. The fidelity claim is per-row bit-exactness against the matching core row; the denominator difference is a sampling artefact of which modes are end-to-end production-shipped.</small></div>
   <div class="section-desc">{fidelity_summary}</div>
 
   <div class="panel-title">Per-test-type matrix</div>
   {per_tt_matrix_html}
 
-  <div class="panel-title">ECDF of |emp_pos − rust.emp_pos| per channel × test type</div>
+  <div class="panel-title">ECDF of |emp_pos − core.emp_pos| per channel × test type</div>
   <div class="chart-container">
     <div id="ecdf-chart" style="height:440px;"></div>
   </div>
@@ -1602,7 +1606,7 @@ pub fn generate_report(
   <div class="panel-title">Top metric details</div>
   {channel_table_html}
 
-  <div class="panel-title">Offending rows (channel-vs-rust threshold {fidelity_threshold:.0e})</div>
+  <div class="panel-title">Offending rows (channel-vs-core threshold {fidelity_threshold:.0e})</div>
   {offenders_html}
 </div>
 
@@ -1669,7 +1673,7 @@ pub fn generate_report(
       <li><b>CONSISTENT</b> (σ<sub>equiv</sub> &lt; 1, green): the two ellipsoids agree within their joint uncertainty.</li>
       <li><b>CORRELATION</b> (joint d² &gt;&gt; marginal d²): off-diagonal correlation in the joint covariance is driving the discrepancy, not any single element. Canonical example: short-arc fit with a/e degeneracy.</li>
       <li><b>ROTATION</b> (principal-axis rotation angle &gt; 30° with similar eigenvalue spectra): the two ellipsoids have different orientations. Often artifact of propagation across a non-linear region.</li>
-      <li><b>(unlabeled high σ<sub>equiv</sub>)</b>: large σ<sub>equiv</sub> that triggers neither CORRELATION nor ROTATION typically means a scale-only disagreement (missing perturber, weight scheme mismatch) or a true difference in the fit. Asymmetric bidirectional pairs (e.g., 2020 CD3 σ_equiv = 0.04 one way / 17 the other) reflect non-linear regions like chaotic-capture geometries — the STM Mahalanobis is only direction-invariant in the linear limit.</li>
+      <li><b>(unlabeled high σ<sub>equiv</sub>)</b>: large σ<sub>equiv</sub> that triggers neither CORRELATION nor ROTATION typically means a scale-only disagreement (missing perturber, weight scheme mismatch) or a true difference in the fit. Canonical example: 67P (σ<sub>equiv</sub> ≈ 67.7 in both directions, near-zero rotation and joint ≈ marginal). Asymmetric bidirectional pairs (e.g., 2020 CD3 σ_equiv = 106.82 one way / 89.71 the other, both with principal-axis rotation flagging it ROTATION) reflect non-linear regions like chaotic-capture geometries — the STM Mahalanobis is only direction-invariant in the linear limit.</li>
     </ul>
     The Mahalanobis decomposition column (d²<sub>combined</sub> / d²<sub>marginal</sub>) flags whether the joint metric is or is not marginally explained.
   </div>
@@ -1702,7 +1706,7 @@ pub fn generate_report(
         <tbody id="orbit-compare-tbody"></tbody>
       </table>
     </div>
-    <div class="section-desc" style="font-size:0.85em; margin-top:0.8em">Every pair references the JPL SBDB solution, propagated to the common epoch via the fitted-covariance STM (the per-row epoch source is shown in the table above). Where an object's reference covariance is non-SPD at the common epoch, that row's Mahalanobis metric uses the regularised form.</div>
+    <div class="section-desc" style="font-size:0.85em; margin-top:0.8em">Every pair references the JPL SBDB solution, propagated to the common epoch via the fitted-covariance STM (the per-row epoch source is shown in the table above). Where an object's reference covariance is non-SPD at the common epoch, the Mahalanobis metric is undefined (the Cholesky factor does not exist), so that row is blanked (—); no regularisation is applied.</div>
   </div>
 </div>
 
@@ -1837,7 +1841,11 @@ document.querySelectorAll('#s03-toggle button').forEach(btn => {{
 }});
 
 // ─────────── Section 04: ASSIST comparison ───────────
-const assistResults = propResults.filter(r => r.assist_vs_horizons_km != null);
+// The external-tool comparison fields (assist_vs_horizons_km, emp_vs_assist_km,
+// assist_time_ms) are merged onto whichever channel is the merge target —
+// `core` under WITH_CORE, else `rust` — NOT necessarily the rust rows the prop
+// plots key off. So select ASSIST rows by field presence across all channels.
+const assistResults = results.filter(r => r.test_type === 'propagation' && r.assist_vs_horizons_km != null);
 if (assistResults.length > 0) {{
     document.getElementById('s04').style.display = '';
     document.getElementById('s05').style.display = '';
@@ -1889,14 +1897,21 @@ if (assistResults.length > 0) {{
     }}, {{ responsive: true, displayModeBar: 'hover', modeBarButtonsToRemove: ['select2d', 'lasso2d', 'autoScale2d', 'toggleSpikelines'] }});
 
     // Summary cards
-    const empVals = assistResults.map(r => r.emp_vs_assist_km).filter(v => v != null);
+    // Condition the |emp − ASSIST| stat on rows where ASSIST itself
+    // agrees with Horizons (|ASSIST − Horizons| ≤ 1 km). The p99 / max
+    // were otherwise dominated by shared long-baseline chaotic-divergence
+    // rows where ASSIST has itself diverged from Horizons by hundreds of
+    // AU — those |emp − ASSIST| values measure two integrators drifting
+    // apart in a chaotic region, not an empyrean error. This matches the
+    // row-conditioning already used by the median-ratio card.
+    const ASSIST_HORIZONS_KM_TOL = 1.0;
+    const empVals = assistResults
+        .filter(r => r.emp_vs_assist_km != null && r.assist_vs_horizons_km != null && r.assist_vs_horizons_km <= ASSIST_HORIZONS_KM_TOL)
+        .map(r => r.emp_vs_assist_km);
     const refVals = assistResults.map(r => r.assist_vs_horizons_km).filter(v => v != null);
     const ratios = assistResults.filter(r => r.emp_vs_assist_km != null && r.assist_vs_horizons_km != null && r.assist_vs_horizons_km > 0)
         .map(r => r.emp_vs_assist_km / r.assist_vs_horizons_km);
-    // Report median + p99 + max (broken out by population for
-    // self-perturbers and comets, which have known mismatch reasons).
-    // The bare "0.000 km" median was hiding a 10^12 km self-perturber
-    // tail — surface that explicitly.
+    // Report median + p99 + max over the conditioned set above.
     const empVals_sorted = empVals.slice().sort((a, b) => a - b);
     const empP50 = empVals_sorted.length ? empVals_sorted[Math.floor(empVals_sorted.length * 0.5)] : 0;
     const empP99 = empVals_sorted.length ? empVals_sorted[Math.floor(empVals_sorted.length * 0.99)] : 0;
@@ -1909,7 +1924,8 @@ if (assistResults.length > 0) {{
     }};
     document.getElementById('assist-median').innerHTML =
         `<span style="font-size:24px">${{fmtKm(empP50)}}</span>` +
-        `<br/><small style="font-size:9px; color:#8b9198">p99 ${{fmtKm(empP99)}} · max ${{fmtKm(empMax)}}</small>`;
+        `<br/><small style="font-size:9px; color:#8b9198">p99 ${{fmtKm(empP99)}} · max ${{fmtKm(empMax)}}</small>` +
+        `<br/><small style="font-size:8px; color:#8b9198">over rows with |ASSIST−Horizons| ≤ 1 km (${{empVals.length}}/${{assistResults.length}}); excludes shared chaotic-divergence rows</small>`;
     document.getElementById('assist-ratio').textContent = ratios.length ? median(ratios).toFixed(3) : '—';
     document.getElementById('assist-rows').textContent = `${{assistResults.length}}`;
 
@@ -2225,7 +2241,10 @@ if (odRust.length === 0) {{
     // like 2023 CX1 (2200× find_orb) shouldn't be buried in the
     // alphabetical middle of the table.
     const odObjects = Object.keys(byObj).sort((a, b) => {{
-        const ra = byObj[a].rust, rb = byObj[b].rust;
+        // find_orb (and every external reference) merges onto the core
+        // channel — see the Makefile CORE_MERGED input — so the Δ-vs-find_orb
+        // sort key must read core, not rust (rust carries no findorb_* fields).
+        const ra = byObj[a].core || byObj[a].rust, rb = byObj[b].core || byObj[b].rust;
         const sortKey = (r) => {{
             if (!r || r.findorb_rms_residual == null || r.od_rms_combined_arcsec == null) return -1;
             return Math.abs(r.od_rms_combined_arcsec - r.findorb_rms_residual);
@@ -2243,6 +2262,9 @@ if (odRust.length === 0) {{
         const row = byObj[obj];
         const rust = row['rust'];
         if (!rust) continue;
+        // find_orb comparison fields (findorb_rms_residual / *_n_obs_*) are
+        // merged onto the core channel, not rust — read them from `fo`.
+        const fo = row['core'] || rust;
         let worstChi2Ratio = 0, worstChi2Channel = '—';
         let worstFitDr = 0, worstFitDrChannel = '—';
         for (const ch of ALL_CHANNELS) {{
@@ -2303,8 +2325,8 @@ if (odRust.length === 0) {{
         // hide why we don't have a comparison number. The run-time
         // cap in run_findorb.py is 10 min/fixture; large-N_obs cases
         // (Hygiea, Apophis, Eros, etc.) routinely hit it.
-        const foRms = (rust.findorb_rms_residual != null)
-            ? rust.findorb_rms_residual.toFixed(3) + '″'
+        const foRms = (fo.findorb_rms_residual != null)
+            ? fo.findorb_rms_residual.toFixed(3) + '″'
             : '— <small style="color:#8b9198">(timeout)</small>';
         // find_orb obs coverage = used / (used + rejected). Sub-50%
         // coverage on a short-arc fit is effectively a convergence
@@ -2314,8 +2336,8 @@ if (odRust.length === 0) {{
         // fit-quality metric. We flag those rows here so the
         // "find_orb RMS" column above can't be read at face value
         // without seeing the coverage qualifier.
-        const foUsed = rust.findorb_n_obs_used;
-        const foRej = rust.findorb_n_obs_rejected;
+        const foUsed = fo.findorb_n_obs_used;
+        const foRej = fo.findorb_n_obs_rejected;
         let foCovCell = '—';
         if (foUsed != null && foRej != null) {{
             const total = foUsed + foRej;
@@ -2333,8 +2355,8 @@ if (odRust.length === 0) {{
             }}
         }}
         let foDeltaCell = '—';
-        if (rust.od_rms_combined_arcsec != null && rust.findorb_rms_residual != null) {{
-            const delta = rust.od_rms_combined_arcsec - rust.findorb_rms_residual;
+        if (fo.od_rms_combined_arcsec != null && fo.findorb_rms_residual != null) {{
+            const delta = fo.od_rms_combined_arcsec - fo.findorb_rms_residual;
             const sign = delta >= 0 ? '+' : '−';
             // Down-rank the Δ visual when find_orb's coverage is
             // very low — the residual on its rejection-mismatched
@@ -2344,8 +2366,8 @@ if (odRust.length === 0) {{
             // explicitly so a reviewer can't miss them: this is
             // the right place for the impactor anomaly story
             // (2008 TC3, 2024 BX1, 2023 CX1) to scream.
-            const ratio = rust.findorb_rms_residual > 0
-                ? rust.od_rms_combined_arcsec / rust.findorb_rms_residual
+            const ratio = fo.findorb_rms_residual > 0
+                ? fo.od_rms_combined_arcsec / fo.findorb_rms_residual
                 : 1;
             let color, suffix;
             if (lowCoverage) {{
@@ -2383,7 +2405,7 @@ if (odRust.length === 0) {{
         }}
         // For timeout/missing rows, collapse the three find_orb columns
         // into one span (P1-7 from pass2 review — em-dash trail noise).
-        const foBlock = (rust.findorb_rms_residual == null)
+        const foBlock = (fo.findorb_rms_residual == null)
             ? `<td colspan="3" style="color:#8b9198; text-align:center"><i>find_orb: not run (timeout)</i></td>`
             : `<td>${{foRms}}</td><td>${{foCovCell}}</td><td>${{foDeltaCell}}</td>`;
         tr.innerHTML = `<td class="obj">${{obj}}</td><td>${{rust.n_obs_used || '—'}}</td><td>${{chi2Cell}}</td><td>${{rmsCell}}</td><td>${{rmsCombinedCell}}</td><td>${{rust.od_iterations || '—'}}</td>${{foBlock}}<td>${{xCh}}</td>`;
@@ -2409,6 +2431,11 @@ if (odRust.length === 0) {{
                 xs.push(obj); ys.push(Math.max(r.od_chi2 / (r.n_obs_used - 6), 1e-6));
             }}
         }}
+        // Skip channels with no χ² data at all (e.g. c / cli, whose
+        // od_reduced_chi2 is null on every row — not yet marshaled
+        // through the C ABI / CLI). Emitting an empty named trace just
+        // adds a phantom legend entry with nothing plotted.
+        if (!xs.length) continue;
         chi2Traces.push({{
             x: xs, y: ys, type: 'bar', name: ch,
             marker: {{ color: channelColors[ch] || '#888' }},
@@ -2510,13 +2537,16 @@ if (odRust.length === 0) {{
             hovertemplate: 'rust combined<br>%{{x}}: %{{y:.3f}}″%{{customdata}}<extra></extra>',
         }});
     }}
-    const foVals = odObjects.map(o => (byObj[o].rust && byObj[o].rust.findorb_rms_residual) || null);
+    // find_orb fields live on the core channel (external-reference merge),
+    // so read the find_orb comparison row from core, not rust.
+    const foRow = (o) => byObj[o].core || byObj[o].rust;
+    const foVals = odObjects.map(o => (foRow(o) && foRow(o).findorb_rms_residual) || null);
     if (foVals.some(v => v != null)) {{
         // Color-code find_orb diamonds by coverage so degenerate
         // placeholder fits (the 2008 TC3 / 2024 BX1 / 2023 CX1 class)
         // visually disqualify themselves from the RMS comparison.
         const foColors = odObjects.map(o => {{
-            const cov = foCoverage(byObj[o].rust);
+            const cov = foCoverage(foRow(o));
             if (cov == null) return '#e8a040';
             if (cov.pct < 5) return '#c0504d';          // placeholder
             if (cov.pct < 50) return '#dba23c';         // low-coverage
@@ -2527,7 +2557,7 @@ if (odRust.length === 0) {{
             mode: 'markers', name: 'find_orb RMS',
             marker: {{ color: foColors, size: 10, symbol: 'diamond-open', line: {{ width: 2 }} }},
             type: 'scatter',
-            customdata: odObjects.map(o => foCovLabel(foCoverage(byObj[o].rust))),
+            customdata: odObjects.map(o => foCovLabel(foCoverage(foRow(o)))),
             hovertemplate: 'find_orb<br>%{{x}}: %{{y:.3f}}″%{{customdata}}<extra></extra>',
         }});
     }}
@@ -2546,12 +2576,15 @@ if (odRust.length === 0) {{
     // sides for the same reason.
     const rmsPairs = odObjects
         .map(o => {{
-            const r = byObj[o].rust;
+            // find_orb residuals merge onto the core channel; pull the
+            // comparison row from core (Empyrean's own RMS is bit-identical
+            // across channels, so reading it from core is equivalent).
+            const r = byObj[o].core || byObj[o].rust;
             if (!r) return null;
             const s = r.od_rms_combined_arcsec;
             const f = r.findorb_rms_residual;
             if (s == null || f == null || s <= 0 || f <= 0) return null;
-            return {{ obj: o, rust: r, scott: s, findorb: f }};
+            return {{ obj: o, row: r, scott: s, findorb: f }};
         }})
         .filter(p => p != null);
     if (rmsPairs.length > 0) {{
@@ -2563,21 +2596,21 @@ if (odRust.length === 0) {{
         // red for placeholder. Buckets match the bar chart so the
         // two visualizations share a vocabulary.
         const colors = rmsPairs.map(p => {{
-            const c = foCoverage(p.rust);
+            const c = foCoverage(p.row);
             if (c == null) return '#5b9bd5';
             if (c.pct < 5) return '#c0504d';
             if (c.pct < 50) return '#dba23c';
             return '#5b9bd5';
         }});
         const hoverData = rmsPairs.map(p => {{
-            const c = foCoverage(p.rust);
-            const sChi = p.rust.od_reduced_chi2;
+            const c = foCoverage(p.row);
+            const sChi = p.row.od_reduced_chi2;
             const lines = [
                 `find_orb: ${{p.findorb.toFixed(3)}}″`,
                 `Empyrean combined: ${{p.scott.toFixed(3)}}″`,
             ];
             if (sChi != null) lines.push(`Empyrean χ²ᵣ: ${{sChi.toExponential(2)}}`);
-            if (p.rust.n_obs_used != null) lines.push(`Empyrean obs used: ${{p.rust.n_obs_used}}`);
+            if (p.row.n_obs_used != null) lines.push(`Empyrean obs used: ${{p.row.n_obs_used}}`);
             if (c != null) {{
                 const tag = c.pct < 5 ? ' — placeholder' : c.pct < 50 ? ' — low' : '';
                 lines.push(`find_orb obs: ${{c.used}}/${{c.total}} (${{c.pct.toFixed(1)}}%)${{tag}}`);
@@ -2610,17 +2643,30 @@ if (odRust.length === 0) {{
             yaxis: ax('Empyrean OD combined RMS (arcsec)', 'log'),
             showlegend: false,
         }}, {{ responsive: true, displayModeBar: 'hover', modeBarButtonsToRemove: ['select2d', 'lasso2d', 'autoScale2d', 'toggleSpikelines'] }});
+    }} else {{
+        // No (empyrean_rms, findorb_rms) pairs — find_orb did not
+        // converge on enough shared objects this run (typically a
+        // find_orb timeout). Replace the would-be-empty 480px Plotly
+        // void with an inline placeholder.
+        const panel = document.getElementById('od-rms-vs-findorb-panel');
+        if (panel) {{
+            const chartDiv = document.getElementById('od-rms-vs-findorb-chart');
+            if (chartDiv) {{
+                chartDiv.style.height = 'auto';
+                chartDiv.innerHTML = '<div style="color:#8b9198; font-style:italic; padding:24px 8px;">find_orb did not converge on enough shared objects this run (no paired RMS points).</div>';
+            }}
+        }}
     }}
 
     // Chart 4: fitted-state Δr per channel
     const drTraces = [];
     for (const ch of ALL_CHANNELS) {{
-        if (ch === 'rust') continue;
+        if (ch === 'core') continue;
         const xs = [], ys = [], hovers = [];
         for (const obj of odObjects) {{
-            const r = byObj[obj][ch], rust = byObj[obj].rust;
-            if (!r || !rust) continue;
-            const dr = vecDrKm(r.emp_pos_au, rust.emp_pos_au);
+            const r = byObj[obj][ch], base = byObj[obj].core;
+            if (!r || !base) continue;
+            const dr = vecDrKm(r.emp_pos_au, base.emp_pos_au);
             if (dr == null) continue;
             xs.push(obj); ys.push(Math.max(dr, 1e-9));
             hovers.push(`${{ch}}<br>${{obj}}<br>‖Δr_fit‖ = ${{dr < 1 ? dr.toFixed(4) : dr.toFixed(1)}} km`);
@@ -2643,14 +2689,14 @@ if (odRust.length === 0) {{
 // ECDF of Δr by channel × test_type
 const ecdfTraces = [];
 for (const ch of ALL_CHANNELS) {{
-    if (ch === 'rust') continue;
+    if (ch === 'core') continue;
     for (const tt of ['propagation', 'ephemeris', 'orbit_determination']) {{
         const chRows = results.filter(r => r.channel === ch && r.test_type === tt && r.emp_pos_au);
         const drs = [];
         for (const r of chRows) {{
-            const rustRow = results.find(rr => rr.channel === 'rust' && rr.object === r.object && rr.test_type === tt && rr.dt_days === r.dt_days && rr.observer === r.observer);
-            if (!rustRow) continue;
-            const dr = vecDrKm(r.emp_pos_au, rustRow.emp_pos_au);
+            const coreRow = results.find(rr => rr.channel === 'core' && rr.object === r.object && rr.test_type === tt && rr.dt_days === r.dt_days && rr.observer === r.observer);
+            if (!coreRow) continue;
+            const dr = vecDrKm(r.emp_pos_au, coreRow.emp_pos_au);
             if (dr != null) drs.push(Math.max(dr, 1e-12));
         }}
         if (!drs.length) continue;
@@ -2668,7 +2714,7 @@ for (const ch of ALL_CHANNELS) {{
 }}
 Plotly.newPlot('ecdf-chart', ecdfTraces, {{
     ...baseLayout,
-    xaxis: ax('‖Δr_channel − Δr_rust‖ (km, log)', 'log'),
+    xaxis: ax('‖Δr_channel − Δr_core‖ (km, log)', 'log'),
     yaxis: ax('CDF'),
     shapes: [
         {{ type: 'line', x0: 1e-10, x1: 1e-10, y0: 0, y1: 1, line: {{ color: '#5b9bd540', width: 1, dash: 'dot' }} }},
@@ -2682,14 +2728,14 @@ Plotly.newPlot('ecdf-chart', ecdfTraces, {{
 // Per-row beeswarm — Δr by channel, faceted by test type via dash/symbol
 const beeTraces = [];
 for (const ch of ALL_CHANNELS) {{
-    if (ch === 'rust') continue;
+    if (ch === 'core') continue;
     for (const tt of ['propagation', 'ephemeris', 'orbit_determination']) {{
         const chRows = results.filter(r => r.channel === ch && r.test_type === tt);
         const xs = [], ys = [], hovers = [];
         for (const r of chRows) {{
-            const rustRow = results.find(rr => rr.channel === 'rust' && rr.object === r.object && rr.test_type === tt && rr.dt_days === r.dt_days && rr.observer === r.observer);
-            if (!rustRow) continue;
-            const dr = vecDrKm(r.emp_pos_au, rustRow.emp_pos_au);
+            const coreRow = results.find(rr => rr.channel === 'core' && rr.object === r.object && rr.test_type === tt && rr.dt_days === r.dt_days && rr.observer === r.observer);
+            if (!coreRow) continue;
+            const dr = vecDrKm(r.emp_pos_au, coreRow.emp_pos_au);
             if (dr == null) continue;
             xs.push(`${{ch}}·${{tt.slice(0, 4)}}`);
             ys.push(Math.max(dr, 1e-12));
@@ -2708,7 +2754,7 @@ for (const ch of ALL_CHANNELS) {{
 Plotly.newPlot('dev-beeswarm-chart', beeTraces, {{
     ...baseLayout,
     xaxis: ax('Channel · test type'),
-    yaxis: ax('‖Δr_chan − Δr_rust‖ (km, log)', 'log'),
+    yaxis: ax('‖Δr_chan − Δr_core‖ (km, log)', 'log'),
     showlegend: false,
     shapes: [{{ type: 'line', xref: 'paper', x0: 0, x1: 1, y0: 1e-10, y1: 1e-10, line: {{ color: '#5b9bd540', width: 1, dash: 'dot' }} }}],
 }}, {{ responsive: true, displayModeBar: 'hover', modeBarButtonsToRemove: ['select2d', 'lasso2d', 'autoScale2d', 'toggleSpikelines'] }});
@@ -2716,16 +2762,16 @@ Plotly.newPlot('dev-beeswarm-chart', beeTraces, {{
 // Timing vs accuracy
 const taTraces = [];
 for (const ch of ALL_CHANNELS) {{
-    if (ch === 'rust') continue;
+    if (ch === 'core') continue;
     const xs = [], ys = [], hovers = [];
     for (const r of results.filter(rr => rr.channel === ch && rr.emp_time_ms != null && rr.emp_pos_au)) {{
-        const rustRow = results.find(rr => rr.channel === 'rust' && rr.object === r.object && rr.test_type === r.test_type && rr.dt_days === r.dt_days && rr.observer === r.observer);
-        if (!rustRow || !rustRow.emp_time_ms || rustRow.emp_time_ms <= 0) continue;
-        const dr = vecDrKm(r.emp_pos_au, rustRow.emp_pos_au);
+        const coreRow = results.find(rr => rr.channel === 'core' && rr.object === r.object && rr.test_type === r.test_type && rr.dt_days === r.dt_days && rr.observer === r.observer);
+        if (!coreRow || !coreRow.emp_time_ms || coreRow.emp_time_ms <= 0) continue;
+        const dr = vecDrKm(r.emp_pos_au, coreRow.emp_pos_au);
         if (dr == null) continue;
-        xs.push(r.emp_time_ms / rustRow.emp_time_ms);
+        xs.push(r.emp_time_ms / coreRow.emp_time_ms);
         ys.push(Math.max(dr, 1e-12));
-        hovers.push(`${{ch}}<br>${{r.object}} (${{r.test_type}}) dt=${{r.dt_days}}<br>time ratio: ${{(r.emp_time_ms / rustRow.emp_time_ms).toFixed(2)}}×<br>‖Δr‖ = ${{dr.toExponential(2)}} km`);
+        hovers.push(`${{ch}}<br>${{r.object}} (${{r.test_type}}) dt=${{r.dt_days}}<br>time ratio: ${{(r.emp_time_ms / coreRow.emp_time_ms).toFixed(2)}}×<br>‖Δr‖ = ${{dr.toExponential(2)}} km`);
     }}
     taTraces.push({{
         x: xs, y: ys, mode: 'markers', name: ch,
@@ -2735,7 +2781,7 @@ for (const ch of ALL_CHANNELS) {{
 }}
 Plotly.newPlot('timing-acc-chart', taTraces, {{
     ...baseLayout,
-    xaxis: ax('time(channel) / time(rust)'),
+    xaxis: ax('time(channel) / time(core)'),
     yaxis: ax('‖Δr‖ (km, log)', 'log'),
     showlegend: true, legend: {{ ...baseLayout.legend, orientation: 'h', y: 1.14 }},
 }}, {{ responsive: true, displayModeBar: 'hover', modeBarButtonsToRemove: ['select2d', 'lasso2d', 'autoScale2d', 'toggleSpikelines'] }});
