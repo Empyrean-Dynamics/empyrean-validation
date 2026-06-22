@@ -545,10 +545,9 @@ fn compare_sidecar_candidates(main_path: &std::path::Path) -> Vec<PathBuf> {
     //    cases produced by the Makefile.
     let od_stem = if let Some(base) = stem.strip_suffix("_rust_merged") {
         Some(format!("{base}_rust_od"))
-    } else if let Some(base) = stem.strip_suffix("_rust") {
-        Some(format!("{base}_rust_od"))
     } else {
-        None
+        stem.strip_suffix("_rust")
+            .map(|base| format!("{base}_rust_od"))
     };
     if let Some(od_stem) = od_stem {
         out.push(parent.join(format!("{od_stem}_compare.jsonl")));

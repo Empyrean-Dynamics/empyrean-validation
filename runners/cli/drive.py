@@ -108,11 +108,27 @@ def main() -> int:
         print("input JSON(s) empty", file=sys.stderr)
         return 1
 
+    # Per-object SBDB reference non-grav signal (A1/A2/A3). OD rows carry
+    # ic_a* = null, so the reference for an OD object is looked up from its
+    # propagation/ephemeris rows (which carry the SBDB-published A1/A2/A3).
+    # Mirrors the rust runner's per-object check `a1 != 0 || a2 != 0 || a3 != 0`
+    # — an object qualifies for the non_grav_recovery second pass when any of
+    # its reference coefficients is non-zero.
+    ref_nongrav = {}
+    for r in rust_rows:
+        a = (r.get("ic_a1"), r.get("ic_a2"), r.get("ic_a3"))
+        if any(v for v in a) and r["object"] not in ref_nongrav:
+            ref_nongrav[r["object"]] = a
+
     cmd = [str(args.runner), "--daemon"]
     if args.data_dir:
         cmd.extend(["--data-dir", args.data_dir])
     proc = subprocess.Popen(
-        cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+        cmd,
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
     )
 
     # Wait for "ready" on stderr (context loaded).
@@ -125,7 +141,10 @@ def main() -> int:
             break
         sys.stderr.write(line)
 
-    print(f"Loaded {len(rust_rows)} rust rows; replaying through CLI channel...", file=sys.stderr)
+    print(
+        f"Loaded {len(rust_rows)} rust rows; replaying through CLI channel...",
+        file=sys.stderr,
+    )
 
     timestamp = datetime.now(timezone.utc).isoformat()
     out_rows = []
@@ -148,7 +167,10 @@ def main() -> int:
             proc.stdin.flush()
             out_line = _read_line(proc)
             if not out_line or out_line.startswith("fail"):
-                print(f"  {r['object']} dt={r['dt_days']:+.0f}d prop FAIL: {out_line}", file=sys.stderr)
+                print(
+                    f"  {r['object']} dt={r['dt_days']:+.0f}d prop FAIL: {out_line}",
+                    file=sys.stderr,
+                )
                 n_skipped += 1
                 continue
             parts = out_line.split()
@@ -178,7 +200,10 @@ def main() -> int:
             proc.stdin.flush()
             out_line = _read_line(proc)
             if not out_line or out_line.startswith("fail"):
-                print(f"  {r['object']} dt={r['dt_days']:+.0f}d eph FAIL: {out_line}", file=sys.stderr)
+                print(
+                    f"  {r['object']} dt={r['dt_days']:+.0f}d eph FAIL: {out_line}",
+                    file=sys.stderr,
+                )
                 n_skipped += 1
                 continue
             parts = out_line.split()
@@ -207,7 +232,9 @@ def main() -> int:
                 den = sin_d1 * sin_d2 + cos_d1 * cos_d2 * math.cos(dra)
                 sep_rad = math.atan2(num, den)
                 new["separation_arcsec"] = math.degrees(sep_rad) * 3600.0
-                new["d_ra_arcsec"] = math.degrees((emp_ra_rad - ref_ra) * cos_d1) * 3600.0
+                new["d_ra_arcsec"] = (
+                    math.degrees((emp_ra_rad - ref_ra) * cos_d1) * 3600.0
+                )
                 new["d_dec_arcsec"] = math.degrees(emp_dec_rad - ref_dec) * 3600.0
             ref_rho = r.get("ref_rho_au")
             if ref_rho is not None:
@@ -218,7 +245,9 @@ def main() -> int:
             out_rows.append(new)
 
         elif tt == "orbit_determination":
-            psv = args.fixtures_dir / f"{r['object']}.psv"
+            # "/"-bearing object names (comets / interstellars) store the
+            # fixture with the slash rewritten to "_".
+            psv = args.fixtures_dir / f"{r['object'].replace('/', '_')}.psv"
             if not psv.exists():
                 n_skipped += 1
                 continue
@@ -236,20 +265,65 @@ def main() -> int:
                 n_skipped += 1
                 continue
             parts = out_line.split()
-            if len(parts) != 9 or parts[0] != "ok":
+            # 9 base fields (ok + state[6] + iters + ms) + 6 non-grav fields
+            # (a1 a2 a3 σ1 σ2 σ3) + optical rms + non-grav rms + non-grav
+            # position[3] = 20 fields.
+            if len(parts) != 20 or parts[0] != "ok":
                 print(f"  unexpected od output: {out_line!r}", file=sys.stderr)
                 n_skipped += 1
                 continue
             x, y, z = map(float, parts[1:4])
-            ms = float(parts[8])
             iters = int(parts[7])
+            ms = float(parts[8])
+            od_rms = float(parts[15])
             new = dict(r)
             new["channel"] = "cli"
             new["timestamp"] = timestamp
             new["emp_pos_au"] = [x, y, z]
             new["emp_time_ms"] = ms
             new["od_iterations"] = iters
+            new["od_rms_combined_arcsec"] = od_rms
             out_rows.append(new)
+
+            # Second OD pass: state + non-grav (9-param) on the same optical
+            # arc. Only objects whose SBDB reference carries a non-grav signal
+            # get a `non_grav_recovery` row (mirrors the rust runner's per-
+            # object `a1 != 0 || a2 != 0 || a3 != 0` gate). The runner emitted
+            # the fitted A1/A2/A3 ± σ in the trailing six fields; a value of
+            # NaN means "non-grav not recovered" (9×9 covariance absent or the
+            # fitted coefficient non-finite) and is recorded as JSON null —
+            # never 0 — so a missing value reads as a non-recovery, not zero.
+            if r["object"] in ref_nongrav:
+                ng_a1, ng_a2, ng_a3, ng_s1, ng_s2, ng_s3 = map(float, parts[9:15])
+                ng_rms = float(parts[16])
+                ng_px, ng_py, ng_pz = map(float, parts[17:20])
+
+                def _or_none(v):
+                    return None if math.isnan(v) else v
+
+                ref_a1, ref_a2, ref_a3 = ref_nongrav[r["object"]]
+                ng = dict(r)
+                ng["channel"] = "cli"
+                ng["timestamp"] = timestamp
+                ng["test_type"] = "non_grav_recovery"
+                # Position + rms of the NON-GRAV fit, not the optical-only one.
+                ng["emp_pos_au"] = [ng_px, ng_py, ng_pz]
+                ng["emp_time_ms"] = ms
+                ng["od_iterations"] = iters
+                ng["od_rms_combined_arcsec"] = ng_rms
+                # JPL SBDB reference A1/A2/A3 for the fitted-vs-reference
+                # comparison (OD rows carry ic_a* = null; backfill from the
+                # per-object reference looked up off the prop/eph rows).
+                ng["ic_a1"] = ref_a1
+                ng["ic_a2"] = ref_a2
+                ng["ic_a3"] = ref_a3
+                ng["od_a1"] = _or_none(ng_a1)
+                ng["od_a2"] = _or_none(ng_a2)
+                ng["od_a3"] = _or_none(ng_a3)
+                ng["od_a1_sigma"] = _or_none(ng_s1)
+                ng["od_a2_sigma"] = _or_none(ng_s2)
+                ng["od_a3_sigma"] = _or_none(ng_s3)
+                out_rows.append(ng)
 
         else:
             n_skipped += 1

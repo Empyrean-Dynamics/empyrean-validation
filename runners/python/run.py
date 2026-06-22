@@ -74,7 +74,16 @@ def _propagate_one(
     times = np.array([target_t_mjd_tdb], dtype=np.float64)
     epochs = np.array([epoch_mjd_tdb], dtype=np.float64)
     elements = np.array(
-        [[ic_pos_au[0], ic_pos_au[1], ic_pos_au[2], ic_vel_au_d[0], ic_vel_au_d[1], ic_vel_au_d[2]]],
+        [
+            [
+                ic_pos_au[0],
+                ic_pos_au[1],
+                ic_pos_au[2],
+                ic_vel_au_d[0],
+                ic_vel_au_d[1],
+                ic_vel_au_d[2],
+            ]
+        ],
         dtype=np.float64,
     )
     covariances = np.zeros((1, 6, 6), dtype=np.float64)
@@ -137,7 +146,10 @@ def _propagate_one(
                 non_grav_dts=non_grav_dts,
             )
         except Exception as e:  # noqa: BLE001
-            print(f"  {object_id} {force_model} dt→{target_t_mjd_tdb}: FAIL {e}", file=sys.stderr)
+            print(
+                f"  {object_id} {force_model} dt→{target_t_mjd_tdb}: FAIL {e}",
+                file=sys.stderr,
+            )
             return None
         timings_ms.append((time.perf_counter() - t0) * 1000.0)
         last_result = result
@@ -175,7 +187,9 @@ def _ephemeris_one(
     if tier is None:
         return None
 
-    obs_states = _get_observers([obs_code], np.array([target_t_mjd_tdb], dtype=np.float64))
+    obs_states = _get_observers(
+        [obs_code], np.array([target_t_mjd_tdb], dtype=np.float64)
+    )
     if len(obs_states.get("x", [])) == 0:
         return None
 
@@ -189,7 +203,16 @@ def _ephemeris_one(
 
     epochs = np.array([epoch_mjd_tdb], dtype=np.float64)
     elements = np.array(
-        [[ic_pos_au[0], ic_pos_au[1], ic_pos_au[2], ic_vel_au_d[0], ic_vel_au_d[1], ic_vel_au_d[2]]],
+        [
+            [
+                ic_pos_au[0],
+                ic_pos_au[1],
+                ic_pos_au[2],
+                ic_vel_au_d[0],
+                ic_vel_au_d[1],
+                ic_vel_au_d[2],
+            ]
+        ],
         dtype=np.float64,
     )
     covariances = np.zeros((1, 6, 6), dtype=np.float64)
@@ -249,7 +272,9 @@ def _ephemeris_one(
             non_grav_dts=non_grav_dts,
         )
     except Exception as e:  # noqa: BLE001
-        print(f"  {object_id} ephemeris t={target_t_mjd_tdb}: FAIL {e}", file=sys.stderr)
+        print(
+            f"  {object_id} ephemeris t={target_t_mjd_tdb}: FAIL {e}", file=sys.stderr
+        )
         return None
 
     if len(result.get("ra", [])) == 0:
@@ -305,6 +330,81 @@ def _determine_one(
     return pos, result, ms
 
 
+def _determine_nongrav_one(
+    object_id: str,
+    psv_text: str,
+    force_model: str,
+    max_iterations: int,
+    excluded_perturbers_naif: list[int] | None = None,
+) -> tuple[list[float], dict, float] | None:
+    """Run a non-grav-recovery OD on the PSV text via the wheel.
+
+    Forces ``solve_for=state_and_nongrav`` so the fit recovers A1/A2/A3 plus
+    their 9×9 (state + non-grav) covariance, mirroring the rust / c / cli /
+    core non_grav_recovery channels. Returns (fitted_orbit_pos_au,
+    raw_result_dict, time_ms) or None.
+    """
+    if force_model not in _TIER_TO_INT:
+        return None
+
+    obs_dict = {"ades": psv_text}
+    config_dict = {
+        "force_model": force_model,
+        "max_iterations": max_iterations,
+        "solve_for": "state_and_nongrav",
+    }
+    if excluded_perturbers_naif:
+        config_dict["excluded_perturbers_naif"] = list(excluded_perturbers_naif)
+    t0 = time.perf_counter()
+    try:
+        result = _determine(
+            obs_dict=obs_dict,
+            config_dict=config_dict,
+            initial_orbits_dict=None,
+        )
+    except Exception as e:  # noqa: BLE001
+        print(f"  {object_id} non-grav OD: FAIL {e}", file=sys.stderr)
+        return None
+    ms = (time.perf_counter() - t0) * 1000.0
+
+    pos = [float(result["orbit_x"]), float(result["orbit_y"]), float(result["orbit_z"])]
+    return pos, result, ms
+
+
+def _read_fitted_non_grav(raw: dict) -> tuple[list[float | None], list[float | None]]:
+    """Extract fitted (a1, a2, a3) and their 1σ from a non-grav OD result.
+
+    Loud-failure contract: a value reads as "non-grav not recovered" (None,
+    never 0 / NaN) when the fit silently fell back to a state-only solve — i.e.
+    the 9×9 (state + A1/A2/A3) covariance is absent (`covariance_9x9` missing /
+    None) — or when the fitted coefficient itself is non-finite. σ_aᵢ is the
+    sqrt of diagonal entry 6/7/8 of the 9×9 covariance.
+    """
+    # covariance_9x9 is set only when non-grav was actually solved; the wheel
+    # emits it as a flat 81-element row-major list (None / absent otherwise).
+    cov9 = raw.get("covariance_9x9")
+    if cov9 is None or len(cov9) != 81:
+        return [None, None, None], [None, None, None]
+    cov = np.asarray(cov9, dtype=np.float64).reshape(9, 9)
+
+    # orbit_a1/a2/a3 are present only when the fit carried a non-grav signal.
+    a_vals = [raw.get("orbit_a1"), raw.get("orbit_a2"), raw.get("orbit_a3")]
+    a_out: list[float | None] = [None, None, None]
+    s_out: list[float | None] = [None, None, None]
+    for i, a in enumerate(a_vals):
+        if a is None:
+            continue
+        af = float(a)
+        if not math.isfinite(af):
+            continue
+        var = float(cov[6 + i][6 + i])
+        if not math.isfinite(var) or var < 0.0:
+            continue
+        a_out[i] = af
+        s_out[i] = math.sqrt(var)
+    return a_out, s_out
+
+
 def main() -> int:
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--input", required=True, type=Path, help="rust-channel JSON")
@@ -330,16 +430,37 @@ def main() -> int:
         return 1
 
     _ensure_initialized(args.data_dir)
-    print(f"Loaded {len(rust_rows)} rust rows; replaying through Python channel...", file=sys.stderr)
+    print(
+        f"Loaded {len(rust_rows)} rust rows; replaying through Python channel...",
+        file=sys.stderr,
+    )
 
     timestamp = datetime.now(timezone.utc).isoformat()
+
+    # Per-object JPL SBDB reference non-grav, keyed by object name. The
+    # optical-only orbit_determination rows carry ic_a1/a2/a3 = None, but the
+    # propagation / ephemeris rows for the same object carry the SBDB
+    # reference (ic_a1/ic_a2/ic_a3). Harvest it here so the OD branch can run
+    # the non_grav_recovery second pass for objects with a known non-grav
+    # signal — mirroring the rust runner's `data.a1 != 0.0 || ...` check.
+    ref_non_grav: dict[str, tuple[float, float, float]] = {}
+    for r in rust_rows:
+        a1, a2, a3 = r.get("ic_a1"), r.get("ic_a2"), r.get("ic_a3")
+        if a1 is None and a2 is None and a3 is None:
+            continue
+        a1, a2, a3 = a1 or 0.0, a2 or 0.0, a3 or 0.0
+        if a1 != 0.0 or a2 != 0.0 or a3 != 0.0:
+            ref_non_grav[r["object"]] = (a1, a2, a3)
+
     out_rows = []
     n_skipped = 0
     for r in rust_rows:
         ic_pos = r.get("ic_pos_au")
         ic_vel = r.get("ic_vel_au_d")
         # OD rows discover the orbit from observations — no IC required.
-        if r["test_type"] != "orbit_determination" and (ic_pos is None or ic_vel is None):
+        if r["test_type"] != "orbit_determination" and (
+            ic_pos is None or ic_vel is None
+        ):
             n_skipped += 1
             continue
         # Uncertainty axis: skip Jet1 rows for now. The PyO3 _propagate
@@ -397,7 +518,9 @@ def main() -> int:
                 new["emp_vs_horizons_km"] = d * _AU_KM
 
         elif r["test_type"] == "orbit_determination":
-            psv_path = args.fixtures_dir / f"{r['object']}.psv"
+            # "/"-bearing object names (comets / interstellars) store the
+            # fixture with the slash rewritten to "_".
+            psv_path = args.fixtures_dir / f"{r['object'].replace('/', '_')}.psv"
             if not psv_path.exists():
                 n_skipped += 1
                 continue
@@ -424,7 +547,66 @@ def main() -> int:
                 raw.get("summary_rms_combined", float("nan"))
             )
             new["od_chi2"] = float(raw.get("summary_chi2", float("nan")))
-            new["od_reduced_chi2"] = float(raw.get("summary_reduced_chi2", float("nan")))
+            new["od_reduced_chi2"] = float(
+                raw.get("summary_reduced_chi2", float("nan"))
+            )
+
+            # ── Second OD: state + non-grav recovery ──────────────────────
+            # For objects whose JPL SBDB reference carries a non-grav signal
+            # (the Yarkovsky NEOs and the comets — looked up by object name
+            # since the optical-only OD row itself carries ic_a1/a2/a3 = None),
+            # run a second determine with solve_for=state_and_nongrav on the
+            # SAME optical fixture and emit a separate non_grav_recovery row
+            # carrying the FITTED A1/A2/A3 ± their 1σ so the report can compare
+            # fitted-vs-JPL in σ. Mirrors the rust runner's reference-non-grav
+            # check and the radar second-pass precedent. Objects with no
+            # reference non-grav (the bulk of the catalog) are untouched.
+            if r["object"] in ref_non_grav:
+                ret_ng = _determine_nongrav_one(
+                    object_id=r["object"],
+                    psv_text=psv_text,
+                    force_model=r["force_model"],
+                    max_iterations=100,
+                    excluded_perturbers_naif=r.get("excluded_perturbers_naif"),
+                )
+                if ret_ng is not None:
+                    pos_ng, raw_ng, ms_ng = ret_ng
+                    a_out, s_out = _read_fitted_non_grav(raw_ng)
+                    # Start from the schema-valid OD row to inherit every
+                    # required field, then override for the non_grav row.
+                    ng_row = dict(new)
+                    # Matches empyrean_validation::schema::test_types::
+                    # NON_GRAV_RECOVERY so the rust merge / report deserializes
+                    # this row.
+                    ng_row["test_type"] = "non_grav_recovery"
+                    ng_row["emp_pos_au"] = pos_ng
+                    ng_row["emp_time_ms"] = ms_ng
+                    ng_row["emp_vs_horizons_km"] = None
+                    ng_row["n_obs_used"] = int(raw_ng.get("summary_num_selected", 0))
+                    ng_row["od_iterations"] = int(raw_ng.get("iterations", 0))
+                    ng_row["od_converged"] = bool(raw_ng.get("converged", False))
+                    ng_row["od_rms_ra_arcsec"] = float(
+                        raw_ng.get("summary_rms_ra", float("nan"))
+                    )
+                    ng_row["od_rms_dec_arcsec"] = float(
+                        raw_ng.get("summary_rms_dec", float("nan"))
+                    )
+                    ng_row["od_rms_combined_arcsec"] = float(
+                        raw_ng.get("summary_rms_combined", float("nan"))
+                    )
+                    ng_row["od_chi2"] = float(raw_ng.get("summary_chi2", float("nan")))
+                    ng_row["od_reduced_chi2"] = float(
+                        raw_ng.get("summary_reduced_chi2", float("nan"))
+                    )
+                    # Fitted Marsden coefficients ± 1σ. None (never 0 / NaN)
+                    # when the fit did not actually recover non-grav.
+                    ng_row["od_a1"], ng_row["od_a2"], ng_row["od_a3"] = a_out
+                    (
+                        ng_row["od_a1_sigma"],
+                        ng_row["od_a2_sigma"],
+                        ng_row["od_a3_sigma"],
+                    ) = s_out
+                    out_rows.append(ng_row)
 
         elif r["test_type"] == "ephemeris":
             obs_code = r.get("observer")

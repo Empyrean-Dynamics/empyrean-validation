@@ -288,7 +288,7 @@ $(PLAN): $(RUST)
 	@echo "──── Plan: strip channel-specific fields from rust unified ─"
 	@$(WHEEL_PY) -c "import json; \
 rows=json.load(open('$(RUST)')); \
-clear_fields=['emp_pos_au','emp_time_ms','emp_vs_horizons_km','separation_arcsec','d_ra_arcsec','d_dec_arcsec','d_rho_km','d_light_time_s','od_iterations','od_converged','od_rms_ra_arcsec','od_rms_dec_arcsec','od_chi2','od_reduced_chi2','assist_vs_horizons_km','emp_vs_assist_km','assist_time_ms','speed_ratio','findorb_rms_residual','findorb_n_obs_used','findorb_n_obs_rejected']; \
+clear_fields=['emp_pos_au','emp_time_ms','emp_vs_horizons_km','separation_arcsec','d_ra_arcsec','d_dec_arcsec','d_rho_km','d_light_time_s','od_iterations','od_converged','od_rms_ra_arcsec','od_rms_dec_arcsec','od_rms_combined_arcsec','od_chi2','od_reduced_chi2','od_a1','od_a2','od_a3','od_a1_sigma','od_a2_sigma','od_a3_sigma','assist_vs_horizons_km','emp_vs_assist_km','assist_time_ms','speed_ratio','findorb_rms_residual','findorb_n_obs_used','findorb_n_obs_rejected']; \
 rows=[r for r in rows if r.get('propagation_uncertainty') not in ('auto', 'second_order_with_cov')]; \
 [r.update({f: None for f in clear_fields}) for r in rows]; \
 [r.update(channel='plan') for r in rows]; \

@@ -20,8 +20,8 @@ use clap::{Parser, ValueEnum};
 use std::time::Instant;
 
 use empyrean::{
-    Context, CoordinateState, Epoch, EphemerisConfig, ForceModelTier, Frame, ODConfig, Orbit,
-    Origin, PropagationConfig, Representation, UncertaintyMethod,
+    Context, CoordinateState, EphemerisConfig, Epoch, ForceModelTier, Frame, ODConfig, Orbit,
+    Origin, PropagationConfig, Representation, SolveForParams, UncertaintyMethod,
 };
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq, ValueEnum)]
@@ -103,7 +103,10 @@ struct Cli {
 fn parse_triple(s: &str) -> Result<[f64; 3], String> {
     let parts: Vec<&str> = s.split(',').collect();
     if parts.len() != 3 {
-        return Err(format!("expected 3 comma-separated floats, got {}", parts.len()));
+        return Err(format!(
+            "expected 3 comma-separated floats, got {}",
+            parts.len()
+        ));
     }
     let v: Result<Vec<f64>, _> = parts.iter().map(|p| p.parse::<f64>()).collect();
     let v = v.map_err(|e| e.to_string())?;
@@ -113,7 +116,10 @@ fn parse_triple(s: &str) -> Result<[f64; 3], String> {
 fn parse_quintuple(s: &str) -> Result<[f64; 5], String> {
     let parts: Vec<&str> = s.split(',').collect();
     if parts.len() != 5 {
-        return Err(format!("expected 5 comma-separated floats, got {}", parts.len()));
+        return Err(format!(
+            "expected 5 comma-separated floats, got {}",
+            parts.len()
+        ));
     }
     let v: Result<Vec<f64>, _> = parts.iter().map(|p| p.parse::<f64>()).collect();
     let v = v.map_err(|e| e.to_string())?;
@@ -247,7 +253,7 @@ fn daemon_prop(ctx: &Context, rest: &str, warmed_up: &mut bool) -> Result<String
 
     if !*warmed_up {
         for _ in 0..5 {
-            let _ = ctx.propagate(&[orbit.clone()], &[target], &cfg);
+            let _ = ctx.propagate(std::slice::from_ref(&orbit), &[target], &cfg);
         }
         *warmed_up = true;
         eprintln!("warmup done");
@@ -258,7 +264,9 @@ fn daemon_prop(ctx: &Context, rest: &str, warmed_up: &mut bool) -> Result<String
     let mut last_vel = [0.0f64; 3];
     for _ in 0..3 {
         let t0 = Instant::now();
-        let result = ctx.propagate(&[orbit.clone()], &[target], &cfg).map_err(|e| e.to_string())?;
+        let result = ctx
+            .propagate(std::slice::from_ref(&orbit), &[target], &cfg)
+            .map_err(|e| e.to_string())?;
         let ms = t0.elapsed().as_secs_f64() * 1000.0;
         if let Some(s) = result.states.first() {
             last_pos = s.position;
@@ -308,10 +316,12 @@ fn daemon_eph(ctx: &Context, rest: &str) -> Result<String, String> {
     if non_grav_dt.is_finite() {
         orbit = orbit.with_non_grav_dt(Some(non_grav_dt));
     }
-    let observers = ctx.get_observers(&[obs_code], &[target]).map_err(|e| e.to_string())?;
+    let observers = ctx
+        .get_observers(&[obs_code], &[target])
+        .map_err(|e| e.to_string())?;
     let mut cfg = EphemerisConfig::with_force_model(force);
     cfg.propagation.num_threads = std::num::NonZeroUsize::new(1);
-    let _ = ctx.generate_ephemeris(&[orbit.clone()], &observers, &cfg);
+    let _ = ctx.generate_ephemeris(std::slice::from_ref(&orbit), &observers, &cfg);
     let mut best_ms = f64::INFINITY;
     let mut last_ra = f64::NAN;
     let mut last_dec = f64::NAN;
@@ -319,9 +329,11 @@ fn daemon_eph(ctx: &Context, rest: &str) -> Result<String, String> {
     let mut last_lt = f64::NAN;
     for _ in 0..3 {
         let t0 = Instant::now();
-        let entries = ctx.generate_ephemeris(&[orbit.clone()], &observers, &cfg).map_err(|e| e.to_string())?;
+        let entries = ctx
+            .generate_ephemeris(std::slice::from_ref(&orbit), &observers, &cfg)
+            .map_err(|e| e.to_string())?;
         let ms = t0.elapsed().as_secs_f64() * 1000.0;
-        if let Some(e) = entries.first() {
+        if let Some(e) = entries.entries.first() {
             last_ra = e.ra_deg;
             last_dec = e.dec_deg;
             last_rho = e.rho_au;
@@ -347,13 +359,17 @@ fn daemon_od(ctx: &Context, rest: &str) -> Result<String, String> {
     let (force_str, after_force) = rest
         .split_once(char::is_whitespace)
         .ok_or_else(|| "od_parse_force".to_string())?;
-    let force_model: i32 = force_str.parse().map_err(|_| "od_parse_force".to_string())?;
+    let force_model: i32 = force_str
+        .parse()
+        .map_err(|_| "od_parse_force".to_string())?;
     let force = tier_from_int(force_model);
     let (exclude_str, path) = after_force
         .trim_start()
         .split_once(char::is_whitespace)
         .ok_or_else(|| "od_parse_exclude".to_string())?;
-    let exclude_naif: i32 = exclude_str.parse().map_err(|_| "od_parse_exclude".to_string())?;
+    let exclude_naif: i32 = exclude_str
+        .parse()
+        .map_err(|_| "od_parse_exclude".to_string())?;
     let path = path.trim();
     let content = std::fs::read_to_string(path).map_err(|e| format!("od_open_{path}: {e}"))?;
     let observations = ctx.read_ades(&content).map_err(|e| e.to_string())?;
@@ -368,17 +384,111 @@ fn daemon_od(ctx: &Context, rest: &str) -> Result<String, String> {
     let cfg = ODConfig {
         force_model: force,
         num_threads: 1,
-        excluded_perturbers,
+        excluded_perturbers: excluded_perturbers.clone(),
         ..ODConfig::default()
     };
     let t0 = Instant::now();
-    let result = ctx.determine(&observations, None, &cfg).map_err(|e| e.to_string())?;
+    let result = ctx
+        .determine(&observations, None, &cfg)
+        .map_err(|e| e.to_string())?;
     let ms = t0.elapsed().as_secs_f64() * 1000.0;
     // `DetermineResult.orbit` is now a re-feedable `Orbit`; take the flat
     // state snapshot for the position/velocity output.
     let s = result.state();
+
+    // Second OD: state + non-grav (9-param) fit on the SAME optical arc.
+    // Mirrors the rust channel's non_grav_recovery second pass. The driver
+    // pairs this with the per-object SBDB reference (ic_a1/ic_a2/ic_a3) and
+    // emits a `non_grav_recovery` row that compares fitted-vs-JPL in σ.
+    //
+    // σ_a1 = sqrt(C9x9[6][6]), σ_a2 = sqrt(C9x9[7][7]), σ_a3 = sqrt(C9x9[8][8]).
+    // The 9×9 covariance is populated ONLY when non-grav was actually solved
+    // (`covariance_9x9 == Some`). "Loud failure" rule: if the fit did NOT
+    // recover non-grav — 9×9 absent, OR a fitted a-value non-finite — emit
+    // the wire sentinel `nan` for that field so the row reads as
+    // "non-grav not recovered" (the driver maps `nan` → JSON `null`, never 0).
+    let ng_cfg = ODConfig {
+        force_model: force,
+        num_threads: 1,
+        excluded_perturbers,
+        solve_for: SolveForParams::StateAndNonGrav,
+        ..ODConfig::default()
+    };
+    // Optical-only fit's combined RMS — the driver writes it to the
+    // orbit_determination row so that column is the cli channel's own fit,
+    // not the (now-stripped) plan value.
+    let od_rms = result.summary.rms_combined_arcsec;
+
+    let (ng_a1, ng_a2, ng_a3, ng_s1, ng_s2, ng_s3, ng_rms, ng_px, ng_py, ng_pz) =
+        match ctx.determine(&observations, None, &ng_cfg) {
+            Ok(ng) => {
+                let cov = ng.covariance_9x9;
+                // rms + fitted position come from the 9-param fit and are
+                // valid even when it fell back to state-only (only the
+                // coefficients are then "not recovered"). Capture before the
+                // closures borrow `cov`.
+                let ng_rms = ng.summary.rms_combined_arcsec;
+                let p = ng.state().position;
+                let (a1, a2, a3) = (ng.orbit.a1, ng.orbit.a2, ng.orbit.a3);
+                // Fitted Marsden coefficients live on the re-feedable orbit.
+                let guard_a = |a: f64| if a.is_finite() { a } else { f64::NAN };
+                // σ only exists when the 9×9 is present (non-grav solved).
+                let sigma = |i: usize| {
+                    cov.map(|c| c[i][i].sqrt())
+                        .filter(|s| s.is_finite())
+                        .unwrap_or(f64::NAN)
+                };
+                if cov.is_some() {
+                    (
+                        guard_a(a1),
+                        guard_a(a2),
+                        guard_a(a3),
+                        sigma(6),
+                        sigma(7),
+                        sigma(8),
+                        ng_rms,
+                        p[0],
+                        p[1],
+                        p[2],
+                    )
+                } else {
+                    // Non-grav not recovered (engine fell back to 6-param
+                    // state-only fit): coefficients are "not recovered", but
+                    // the fit's rms / position are still real.
+                    (
+                        f64::NAN,
+                        f64::NAN,
+                        f64::NAN,
+                        f64::NAN,
+                        f64::NAN,
+                        f64::NAN,
+                        ng_rms,
+                        p[0],
+                        p[1],
+                        p[2],
+                    )
+                }
+            }
+            // A failed non-grav fit is not fatal to the row — the state-only
+            // OD already succeeded; report the non-grav as not recovered.
+            Err(_) => (
+                f64::NAN,
+                f64::NAN,
+                f64::NAN,
+                f64::NAN,
+                f64::NAN,
+                f64::NAN,
+                f64::NAN,
+                f64::NAN,
+                f64::NAN,
+                f64::NAN,
+            ),
+        };
+
     Ok(format!(
-        "ok {:.18e} {:.18e} {:.18e} {:.18e} {:.18e} {:.18e} {} {:.6}",
+        "ok {:.18e} {:.18e} {:.18e} {:.18e} {:.18e} {:.18e} {} {:.6} \
+         {:.18e} {:.18e} {:.18e} {:.18e} {:.18e} {:.18e} \
+         {:.18e} {:.18e} {:.18e} {:.18e} {:.18e}",
         s.position[0],
         s.position[1],
         s.position[2],
@@ -387,6 +497,17 @@ fn daemon_od(ctx: &Context, rest: &str) -> Result<String, String> {
         s.velocity[2],
         result.iterations,
         ms,
+        ng_a1,
+        ng_a2,
+        ng_a3,
+        ng_s1,
+        ng_s2,
+        ng_s3,
+        od_rms,
+        ng_rms,
+        ng_px,
+        ng_py,
+        ng_pz,
     ))
 }
 
@@ -434,7 +555,7 @@ fn run_prop(
     // calls in their long-lived processes; for the CLI's per-invocation
     // model we burn 5 untimed runs so the timing reflects steady-state.
     for _ in 0..5 {
-        let _ = ctx.propagate(&[orbit.clone()], &[target], &cfg);
+        let _ = ctx.propagate(std::slice::from_ref(&orbit), &[target], &cfg);
     }
 
     // Best-of-3 — keeps timing comparable to rust/python/c channels.
@@ -443,7 +564,7 @@ fn run_prop(
     let mut last_vel = [0.0f64; 3];
     for _ in 0..3 {
         let t0 = Instant::now();
-        let result = ctx.propagate(&[orbit.clone()], &[target], &cfg)?;
+        let result = ctx.propagate(std::slice::from_ref(&orbit), &[target], &cfg)?;
         let ms = t0.elapsed().as_secs_f64() * 1000.0;
         if let Some(s) = result.states.first() {
             last_pos = s.position;
@@ -469,7 +590,10 @@ fn run_eph(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let orbit = build_orbit(cli);
     let target = Epoch::from_mjd_tdb(cli.target.expect("--target required for eph"));
-    let obs_code = cli.observer.as_deref().expect("--observer required for eph");
+    let obs_code = cli
+        .observer
+        .as_deref()
+        .expect("--observer required for eph");
 
     // Resolve observer at the target epoch.
     let observers = ctx.get_observers(&[obs_code], &[target])?;
@@ -479,7 +603,7 @@ fn run_eph(
     cfg.propagation.num_threads = std::num::NonZeroUsize::new(1);
 
     // Best-of-3 with one warm-up.
-    let _ = ctx.generate_ephemeris(&[orbit.clone()], &observers, &cfg);
+    let _ = ctx.generate_ephemeris(std::slice::from_ref(&orbit), &observers, &cfg);
     let mut best_ms = f64::INFINITY;
     let mut last_ra = f64::NAN;
     let mut last_dec = f64::NAN;
@@ -487,9 +611,9 @@ fn run_eph(
     let mut last_lt = f64::NAN;
     for _ in 0..3 {
         let t0 = Instant::now();
-        let entries = ctx.generate_ephemeris(&[orbit.clone()], &observers, &cfg)?;
+        let entries = ctx.generate_ephemeris(std::slice::from_ref(&orbit), &observers, &cfg)?;
         let ms = t0.elapsed().as_secs_f64() * 1000.0;
-        if let Some(e) = entries.first() {
+        if let Some(e) = entries.entries.first() {
             last_ra = e.ra_deg;
             last_dec = e.dec_deg;
             last_rho = e.rho_au;

@@ -317,6 +317,8 @@ fn mahalanobis_d2_6(sigma: &[[f64; 6]; 6], delta: &[f64; 6]) -> Option<f64> {
 fn det_via_cholesky_6(sigma: &[[f64; 6]; 6]) -> Option<f64> {
     let l = villeneuve::linalg::mat_cholesky(sigma)?;
     let mut p = 1.0;
+    // Diagonal product over a fixed 6×6 — the index is the matrix coordinate.
+    #[allow(clippy::needless_range_loop)]
     for i in 0..6 {
         p *= l[i][i];
     }
@@ -500,6 +502,8 @@ mod tests {
             );
         }
         // Eigenvectors are columns of identity (up to sign).
+        // Indices are matrix coordinates into the fixed 6×6 eigenvector set.
+        #[allow(clippy::needless_range_loop)]
         for k in 0..6 {
             for i in 0..6 {
                 let v = vecs[i][k];
@@ -668,6 +672,7 @@ mod tests {
         let mut cov = [[0.0_f64; 6]; 6];
         cov[0][0] = 1.0;
         cov[1][1] = 0.01;
+        #[allow(clippy::needless_range_loop)]
         for i in 2..6 {
             cov[i][i] = 0.1;
         }
@@ -684,6 +689,7 @@ mod tests {
         let cs = theta.cos();
         let sn = theta.sin();
         let mut rot = [[0.0_f64; 6]; 6];
+        #[allow(clippy::needless_range_loop)]
         for i in 0..6 {
             rot[i][i] = 1.0;
         }

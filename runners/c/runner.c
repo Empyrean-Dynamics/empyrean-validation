@@ -16,6 +16,14 @@
  *                                       EXCLUDE_NAIF=0 → no exclusion)
  *     → ok x y z vx vy vz iterations time_ms
  *
+ *   odng FORCE EXCLUDE_NAIF ADES_PATH  (same args as `od`, but the fit
+ *                                       solves for state + A1/A2/A3 via
+ *                                       solve_for = StateAndNonGrav)
+ *     → ok a1 a2 a3 a1_sigma a2_sigma a3_sigma iterations time_ms
+ *       a* / a*_sigma are emitted as the token "null" when non-grav was
+ *       not actually recovered (has_covariance_9x9 == 0, or a non-finite
+ *       fitted value) — see the None/NaN guard below.
+ *
  * On any failure: fail <message>
  *
  * usage: runner [data_dir]
@@ -237,7 +245,12 @@ static int handle_eph(EmpyreanContext* ctx, const char* rest) {
     return 0;
 }
 
-static int handle_od(EmpyreanContext* ctx, const char* rest) {
+/* Shared OD driver for both the optical-only (`od`) and non-grav-recovery
+ * (`odng`) modes. `solve_non_grav` flips solve_for from Auto to
+ * StateAndNonGrav and switches the emitted line to the fitted A1/A2/A3 + σ
+ * surface; everything else (config, fixture read, perturber exclusion) is
+ * identical so the two fits agree wherever they overlap. */
+static int handle_od(EmpyreanContext* ctx, const char* rest, int solve_non_grav) {
     int force_model;
     int exclude_naif;
     char ades_path[1024];
@@ -286,11 +299,19 @@ static int handle_od(EmpyreanContext* ctx, const char* rest) {
 
     struct EmpyreanObservation* observations = NULL;
     uintptr_t num_observations = 0;
-    int rc = empyrean_read_ades(content, &observations, &num_observations);
+    /* These OD fixtures are optical-only PSVs; the radar out-params are
+     * present in the current read_ades signature (the C ABI carries radar
+     * astrometry through too) but come back empty here. Capture + free them
+     * so we don't leak if a future fixture grows a `<radar>` table. */
+    struct EmpyreanRadarObservation* radar = NULL;
+    uintptr_t num_radar = 0;
+    int rc = empyrean_read_ades(content, &observations, &num_observations,
+                                &radar, &num_radar);
     free(content);
     if (rc != 0) {
         const char* err = empyrean_last_error();
         printf("fail read_ades: %s\n", err ? err : "");
+        empyrean_radar_observations_free(radar, num_radar);
         return 0;
     }
 
@@ -335,7 +356,12 @@ static int handle_od(EmpyreanContext* ctx, const char* rest) {
     cfg.debiasing.bias_dat_path = NULL; /* DataManager default location */
 
     cfg.use_stm_cache = 1;
-    cfg.solve_for = EMPYREAN_SOLVE_FOR_AUTO;
+    /* Optical-only OD leaves solve_for = Auto (scott's default); the
+     * non-grav-recovery pass explicitly forces StateAndNonGrav so the fit
+     * solves the full (state, A1, A2, A3) parameter set and populates the
+     * 9×9 covariance whose diagonal carries σ_A1/σ_A2/σ_A3. */
+    cfg.solve_for =
+        solve_non_grav ? EMPYREAN_SOLVE_FOR_STATE_AND_NONGRAV : EMPYREAN_SOLVE_FOR_AUTO;
 
     cfg.rejection.enabled = 1;
     cfg.rejection.kind = EMPYREAN_REJECTION_KIND_ADAPTIVE;
@@ -360,11 +386,14 @@ static int handle_od(EmpyreanContext* ctx, const char* rest) {
     struct EmpyreanODResult result;
     memset(&result, 0, sizeof(result));
     double t0 = now_ms();
+    /* radar = NULL, 0 (optical-only fixtures) and no DC seed orbits
+     * (NULL, 0 → let the IOD pipeline produce its own seeds). */
     rc = empyrean_determine(ctx, observations, num_observations,
-                             NULL, 0, &cfg, &result);
+                             radar, num_radar, NULL, 0, &cfg, &result);
     double ms = now_ms() - t0;
 
     empyrean_observations_free(observations, num_observations);
+    empyrean_radar_observations_free(radar, num_radar);
 
     if (rc != 0) {
         const char* err = empyrean_last_error();
@@ -373,10 +402,57 @@ static int handle_od(EmpyreanContext* ctx, const char* rest) {
         return 0;
     }
 
-    printf("ok %.18e %.18e %.18e %.18e %.18e %.18e %u %.6f\n",
-           result.orbit.x, result.orbit.y, result.orbit.z,
-           result.orbit.vx, result.orbit.vy, result.orbit.vz,
-           (unsigned)result.iterations, ms);
+    if (solve_non_grav) {
+        /* Non-grav recovery: emit the fitted A1/A2/A3 (AU/day²) and their 1σ
+         * from the 9×9 covariance diagonal — σ_Ai = sqrt(C9x9[6+i][6+i]).
+         *
+         * Loud-failure guard: if non-grav was NOT actually recovered — i.e.
+         * the 9×9 covariance is absent (has_covariance_9x9 == 0; the fit
+         * silently fell back to a 6-param state-only solve) or the fitted
+         * value/variance is non-finite — emit the literal token "null" for
+         * BOTH the coefficient and its σ so a missing value reads as
+         * "non-grav not recovered" (never 0, never NaN). The driver maps
+         * "null" to JSON null on the od_a1/od_a2/od_a3 and their _sigma
+         * fields. */
+        int have_ng = result.has_non_grav && result.has_covariance_9x9;
+        double a[3] = {result.non_grav.a1, result.non_grav.a2, result.non_grav.a3};
+        double var[3] = {
+            result.covariance_9x9[6][6],
+            result.covariance_9x9[7][7],
+            result.covariance_9x9[8][8],
+        };
+        char a_str[3][32];
+        char sig_str[3][32];
+        for (int i = 0; i < 3; i++) {
+            if (have_ng && isfinite(a[i]) && isfinite(var[i]) && var[i] >= 0.0) {
+                snprintf(a_str[i], sizeof(a_str[i]), "%.18e", a[i]);
+                snprintf(sig_str[i], sizeof(sig_str[i]), "%.18e", sqrt(var[i]));
+            } else {
+                snprintf(a_str[i], sizeof(a_str[i]), "null");
+                snprintf(sig_str[i], sizeof(sig_str[i]), "null");
+            }
+        }
+        /* Trailing rms_combined + fitted heliocentric position (x,y,z) of
+         * the non-grav solution — the driver writes them to the
+         * non_grav_recovery row's od_rms_combined_arcsec / emp_pos_au so it
+         * reports the NON-GRAV fit's residual and state, not the optical
+         * one. Always finite (the state-only fall-back still has both). */
+        printf("ok %s %s %s %s %s %s %u %.6f %.18e %.18e %.18e %.18e\n",
+               a_str[0], a_str[1], a_str[2],
+               sig_str[0], sig_str[1], sig_str[2],
+               (unsigned)result.iterations, ms,
+               result.summary.rms_combined_arcsec,
+               result.orbit.x, result.orbit.y, result.orbit.z);
+    } else {
+        /* Trailing rms_combined so the driver sets the orbit_determination
+         * row's od_rms_combined_arcsec from the c channel's own fit rather
+         * than inheriting the (now-stripped) plan value. */
+        printf("ok %.18e %.18e %.18e %.18e %.18e %.18e %u %.6f %.18e\n",
+               result.orbit.x, result.orbit.y, result.orbit.z,
+               result.orbit.vx, result.orbit.vy, result.orbit.vz,
+               (unsigned)result.iterations, ms,
+               result.summary.rms_combined_arcsec);
+    }
     empyrean_od_result_free(&result);
     return 0;
 }
@@ -413,7 +489,9 @@ int main(int argc, char** argv) {
         } else if (strcmp(mode, "eph") == 0) {
             handle_eph(ctx, rest);
         } else if (strcmp(mode, "od") == 0) {
-            handle_od(ctx, rest);
+            handle_od(ctx, rest, 0);
+        } else if (strcmp(mode, "odng") == 0) {
+            handle_od(ctx, rest, 1);
         } else {
             printf("fail unknown_mode_%s\n", mode);
         }

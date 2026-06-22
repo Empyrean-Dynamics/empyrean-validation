@@ -130,6 +130,16 @@ pub mod test_types {
     /// optical-only [`ORBIT_DETERMINATION`] row so the radar-tightened orbit
     /// is cross-checked against find_orb the same way.
     pub const ORBIT_DETERMINATION_RADAR: &str = "orbit_determination_radar";
+    /// Run differential correction with `solve_for = StateAndNonGrav` on an
+    /// object with a known SBDB non-gravitational signal (`ic_a2 != 0` — the
+    /// Yarkovsky NEOs and the comets) and compare the **fitted** Marsden
+    /// A1/A2/A3 (`od_a1/od_a2/od_a3` ± `od_a*_sigma`) to the JPL SBDB
+    /// reference (`ic_a1/ic_a2/ic_a3`). Emitted as a second OD row alongside
+    /// the optical-only [`ORBIT_DETERMINATION`] row. Guards non-grav
+    /// *recovery* — distinct from [`ORBIT_DETERMINATION`], which only checks
+    /// fitted state + χ² + RMS and so cannot see a silent drop to a
+    /// gravity-only fit.
+    pub const NON_GRAV_RECOVERY: &str = "non_grav_recovery";
 }
 
 /// Canonical [`ValidationResult::propagation_uncertainty`] values.
@@ -263,6 +273,32 @@ pub struct ValidationResult {
     pub od_chi2: Option<f64>,
     /// Reduced chi-squared (`chi2 / (N - k)`).
     pub od_reduced_chi2: Option<f64>,
+
+    // ── Non-grav recovery output ────────────────────────────────────
+    // Populated only on `non_grav_recovery` rows: the fitted Marsden
+    // coefficients from a `StateAndNonGrav` fit, each with its 1σ from the
+    // diagonal of the fitted 9×9 covariance. `None` (not 0, not NaN) when
+    // the fit did not actually solve non-grav (e.g. a silent fall-back to a
+    // 6-param state-only fit, signalled by `has_covariance_9x9 == 0`) — so a
+    // missing σ reads loudly as "non-grav not recovered" in the report.
+    /// Fitted Marsden A1 (radial), AU/day².
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub od_a1: Option<f64>,
+    /// Fitted Marsden A2 (transverse ≈ Yarkovsky), AU/day².
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub od_a2: Option<f64>,
+    /// Fitted Marsden A3 (normal), AU/day².
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub od_a3: Option<f64>,
+    /// 1σ on the fitted A1, √(C₉ₓ₉[6][6]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub od_a1_sigma: Option<f64>,
+    /// 1σ on the fitted A2, √(C₉ₓ₉[7][7]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub od_a2_sigma: Option<f64>,
+    /// 1σ on the fitted A3, √(C₉ₓ₉[8][8]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub od_a3_sigma: Option<f64>,
     /// NAIF IDs of perturbers excluded from the force model during this
     /// OD fit. Populated for SB441-N16 self-perturbers (so the body's
     /// own gravity does not act on itself during integration). Empty
@@ -399,6 +435,12 @@ impl ValidationResult {
             od_rms_combined_arcsec: None,
             od_chi2: None,
             od_reduced_chi2: None,
+            od_a1: None,
+            od_a2: None,
+            od_a3: None,
+            od_a1_sigma: None,
+            od_a2_sigma: None,
+            od_a3_sigma: None,
             excluded_perturbers_naif: Vec::new(),
             propagation_uncertainty: None,
             assist_vs_horizons_km: None,

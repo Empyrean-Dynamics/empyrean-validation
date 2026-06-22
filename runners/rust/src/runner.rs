@@ -158,9 +158,6 @@ pub fn run_propagation_validation(
 
         let mut horizons_ephemeris: HashMap<i64, HorizonsRecord> = HashMap::new();
         for &dt in dt_list {
-            if dt == 0.0 {
-                continue;
-            }
             let target = epoch + dt;
             match villeneuve::io::jpl::horizons::query_horizons(
                 &[obj.horizons_command],
@@ -444,6 +441,12 @@ pub fn run_propagation_validation(
                             od_rms_combined_arcsec: None,
                             od_chi2: None,
                             od_reduced_chi2: None,
+                            od_a1: None,
+                            od_a2: None,
+                            od_a3: None,
+                            od_a1_sigma: None,
+                            od_a2_sigma: None,
+                            od_a3_sigma: None,
                             excluded_perturbers_naif: Vec::new(),
                             propagation_uncertainty: Some(uncertainty_tag.to_string()),
                             assist_vs_horizons_km: None,
@@ -474,9 +477,6 @@ pub fn run_propagation_validation(
 
                 // Ephemeris tests (Standard tier)
                 for &dt in data.dt_list {
-                    if dt == 0.0 {
-                        continue;
-                    }
                     let Some(hor) = data.horizons_ephemeris.get(&(dt as i64)) else {
                         continue;
                     };
@@ -495,8 +495,8 @@ pub fn run_propagation_validation(
 
                     let eph_config = EphemerisConfig::with_force_model(ForceModelTier::Standard);
                     match ctx.generate_ephemeris(&[orbit.clone()], &observers, &eph_config) {
-                        Ok(entries) => {
-                            let Some(entry) = entries.first() else {
+                        Ok(eph) => {
+                            let Some(entry) = eph.entries.first() else {
                                 continue;
                             };
                             // Wrapper returns degrees; Horizons radians.
@@ -509,7 +509,15 @@ pub fn run_propagation_validation(
                                 hor.ra,
                                 hor.dec,
                             );
-                            let d_ra = (emp_ra_rad - hor.ra) * emp_dec_rad.cos();
+                            // Wrap the RA difference to [-π, π] so an object
+                            // near RA = 0 / 2π doesn't produce a spurious ~2π
+                            // residual. (Dec needs no wrap; separation below is
+                            // great-circle and already wrap-safe.)
+                            let mut d_ra_wrapped = (emp_ra_rad - hor.ra).rem_euclid(std::f64::consts::TAU);
+                            if d_ra_wrapped > std::f64::consts::PI {
+                                d_ra_wrapped -= std::f64::consts::TAU;
+                            }
+                            let d_ra = d_ra_wrapped * emp_dec_rad.cos();
                             let d_dec = emp_dec_rad - hor.dec;
                             let d_ra_arcsec = d_ra.to_degrees() * 3600.0;
                             let d_dec_arcsec = d_dec.to_degrees() * 3600.0;
@@ -570,6 +578,12 @@ pub fn run_propagation_validation(
                                 od_rms_combined_arcsec: None,
                                 od_chi2: None,
                                 od_reduced_chi2: None,
+                                od_a1: None,
+                                od_a2: None,
+                                od_a3: None,
+                                od_a1_sigma: None,
+                                od_a2_sigma: None,
+                                od_a3_sigma: None,
                                 excluded_perturbers_naif: Vec::new(),
                                 propagation_uncertainty: Some(uncertainty_tag.to_string()),
                                 assist_vs_horizons_km: None,
@@ -675,9 +689,13 @@ pub fn run_od_validation(
             let mut results: Vec<ValidationResult> = Vec::new();
             let mut captured_orbits: Vec<CapturedOrbit> = Vec::new();
             let mut orbit_comparisons: Vec<OrbitComparison> = Vec::new();
-        // Try common PSV filename variants.
+        // Try common PSV filename variants. Object names with a "/"
+        // (the comets — "2P/Encke", "103P/Hartley 2", the interstellars)
+        // are stored with the slash rewritten to "_" so the name is not
+        // read as a path separator; try that sanitized form too.
         let candidates = [
             fixtures_dir.join(format!("{}.psv", obj.name)),
+            fixtures_dir.join(format!("{}.psv", obj.name.replace('/', "_"))),
             fixtures_dir.join(format!("{}.psv", obj.mpc_designation)),
         ];
         let path = candidates.iter().find(|p| p.exists());
@@ -825,11 +843,19 @@ pub fn run_od_validation(
         // kernel can pair scott_od ↔ sbdb. SBDB returns
         // CometaryCoordinates with covariance for objects that have
         // a published solution; short-arc impactors typically do not.
-        let (sbdb_native, sbdb_captured) =
+        // `sbdb_nongrav` carries SBDB's published Marsden (A1, A2, A3) for
+        // this object — the reference signal the non-grav-recovery second
+        // pass below compares against. `None` when SBDB has no orbit.
+        let (sbdb_native, sbdb_captured, sbdb_nongrav) =
             match empyrean::query_sbdb(&[obj.sbdb_query], sbdb_cache_dir) {
                 Ok(batch) if !batch.orbits.is_empty() => {
                     let sbdb_state = batch.orbits[0].state;
                     let sbdb_orbit_id = batch.orbit_ids.first().cloned();
+                    let sbdb_ng = (
+                        batch.orbits[0].a1,
+                        batch.orbits[0].a2,
+                        batch.orbits[0].a3,
+                    );
                     let captured = match capture_orbit(
                         ctx,
                         obj.name,
@@ -846,15 +872,15 @@ pub fn run_od_validation(
                             None
                         }
                     };
-                    (Some(sbdb_state), captured)
+                    (Some(sbdb_state), captured, Some(sbdb_ng))
                 }
                 Ok(_) => {
                     eprintln!("  {}: SBDB returned empty batch", obj.name);
-                    (None, None)
+                    (None, None, None)
                 }
                 Err(e) => {
                     eprintln!("  {}: SBDB SKIP ({e})", obj.name);
-                    (None, None)
+                    (None, None, None)
                 }
             };
 
@@ -978,6 +1004,12 @@ pub fn run_od_validation(
             od_rms_combined_arcsec: Some(determine_result.summary.rms_combined_arcsec),
             od_chi2: Some(determine_result.summary.chi2),
             od_reduced_chi2: Some(determine_result.summary.reduced_chi2),
+            od_a1: None,
+            od_a2: None,
+            od_a3: None,
+            od_a1_sigma: None,
+            od_a2_sigma: None,
+            od_a3_sigma: None,
             excluded_perturbers_naif: excluded_naif,
             propagation_uncertainty: None,
             assist_vs_horizons_km: None,
@@ -1017,6 +1049,7 @@ pub fn run_od_validation(
             .flat_map(|d| {
                 [
                     d.join(format!("{}.psv", obj.name)),
+                    d.join(format!("{}.psv", obj.name.replace('/', "_"))),
                     d.join(format!("{}.psv", obj.mpc_designation)),
                 ]
             })
@@ -1093,6 +1126,12 @@ pub fn run_od_validation(
                                 od_rms_combined_arcsec: Some(dr.summary.rms_combined_arcsec),
                                 od_chi2: Some(dr.summary.chi2),
                                 od_reduced_chi2: Some(dr.summary.reduced_chi2),
+                                od_a1: None,
+                                od_a2: None,
+                                od_a3: None,
+                                od_a1_sigma: None,
+                                od_a2_sigma: None,
+                                od_a3_sigma: None,
                                 excluded_perturbers_naif: excluded_naif_r,
                                 propagation_uncertainty: None,
                                 assist_vs_horizons_km: None,
@@ -1125,6 +1164,156 @@ pub fn run_od_validation(
                 _ => {}
             }
         }
+
+        // ── Third OD: non-grav recovery (objects with an SBDB A2 signal) ──
+        // For objects whose JPL SBDB reference carries a non-zero
+        // transverse non-grav coefficient (Yarkovsky NEOs like Apophis /
+        // Bennu and the comets), re-fit the SAME optical arc with
+        // `solve_for = StateAndNonGrav` and emit a separate
+        // `non_grav_recovery` row carrying the FITTED A1/A2/A3 ± 1σ so the
+        // report can compare fitted-vs-JPL in σ. The 1σ comes from the
+        // fitted 9×9 (state + A1/A2/A3) covariance diagonal: σ_aᵢ =
+        // sqrt(C9x9[6+i][6+i]).
+        //
+        // Loud-failure rule: if the fit did NOT actually recover non-grav
+        // — the 9×9 is absent (`covariance_9x9 == None`) or a fitted a-value
+        // is non-finite — that axis is emitted as `None` (never 0, never
+        // NaN) so a missing value reads as "non-grav not recovered". (The
+        // engine currently has a bug where StateAndNonGrav can silently
+        // fall back to a 6-param state-only fit, so most of these rows
+        // legitimately come back `None` for now — that is correct.)
+        if let Some((ref_a1, ref_a2, ref_a3)) = sbdb_nongrav
+            && ref_a2 != 0.0 {
+                eprintln!("  {}: + non-grav recovery OD (SBDB A2={ref_a2:.3e})...", obj.name);
+                let ng_config = ODConfig {
+                    solve_for: empyrean::SolveForParams::StateAndNonGrav,
+                    ..od_config.clone()
+                };
+                let t0n = std::time::Instant::now();
+                match ctx.determine(&observations, None, &ng_config) {
+                    Ok(dr) => {
+                        let ms_n = t0n.elapsed().as_secs_f64() * 1000.0;
+                        let orbit_n = dr.state();
+                        // Per-axis sigma from the 9×9 covariance diagonal,
+                        // present only when non-grav was actually solved.
+                        // sqrt() of a non-finite / negative variance yields
+                        // NaN, which the guard below maps back to None.
+                        let sigma = |i: usize| -> Option<f64> {
+                            dr.covariance_9x9
+                                .map(|c| c[6 + i][6 + i].sqrt())
+                                .filter(|s| s.is_finite())
+                        };
+                        // Fitted a-value → Some only when finite; otherwise
+                        // None ("non-grav not recovered"). Pair each fitted
+                        // value with its sigma so a None value never carries
+                        // a stray sigma.
+                        let fitted = |v: f64, i: usize| -> (Option<f64>, Option<f64>) {
+                            if v.is_finite() {
+                                (Some(v), sigma(i))
+                            } else {
+                                (None, None)
+                            }
+                        };
+                        let (od_a1, od_a1_sigma) = fitted(dr.orbit.a1, 0);
+                        let (od_a2, od_a2_sigma) = fitted(dr.orbit.a2, 1);
+                        let (od_a3, od_a3_sigma) = fitted(dr.orbit.a3, 2);
+                        eprintln!(
+                            "    non-grav: converged={} 9x9={} a2_fit={:?} σ_a2={:?} ({:.0}ms)",
+                            dr.converged,
+                            dr.covariance_9x9.is_some(),
+                            od_a2,
+                            od_a2_sigma,
+                            ms_n
+                        );
+                        let excluded_naif_n: Vec<i32> = ng_config
+                            .excluded_perturbers
+                            .iter()
+                            .copied()
+                            .map(Origin::naif_id)
+                            .collect();
+                        results.push(ValidationResult {
+                            object: obj.name.to_string(),
+                            population: obj.population.to_string(),
+                            epoch_mjd_tdb: orbit_n.epoch.mjd_tdb().unwrap_or(f64::NAN),
+                            dt_days: 0.0,
+                            t_mjd_tdb: orbit_n.epoch.mjd_tdb().unwrap_or(f64::NAN),
+                            force_model: tier_str.clone(),
+                            test_type:
+                                empyrean_validation::schema::test_types::NON_GRAV_RECOVERY
+                                    .to_string(),
+                            channel: channel.clone(),
+                            observer: None,
+                            emp_vs_horizons_km: None,
+                            emp_pos_au: Some(orbit_n.position),
+                            emp_time_ms: Some(ms_n),
+                            separation_arcsec: None,
+                            d_ra_arcsec: None,
+                            d_dec_arcsec: None,
+                            d_rho_km: None,
+                            d_light_time_s: None,
+                            ic_pos_au: None,
+                            ic_vel_au_d: None,
+                            ic_a1: Some(ref_a1),
+                            ic_a2: Some(ref_a2),
+                            ic_a3: Some(ref_a3),
+                            ic_g_alpha: None,
+                            ic_g_r0: None,
+                            ic_g_m: None,
+                            ic_g_n: None,
+                            ic_g_k: None,
+                            ic_non_grav_dt: None,
+                            ref_pos_au: None,
+                            ref_vel_au_d: None,
+                            ref_ra_rad: None,
+                            ref_dec_rad: None,
+                            ref_rho_au: None,
+                            ref_light_time_d: None,
+                            n_obs_used: Some(dr.summary.num_selected as u32),
+                            od_iterations: Some(dr.iterations),
+                            od_converged: Some(dr.converged),
+                            od_rms_ra_arcsec: Some(dr.summary.rms_ra_arcsec),
+                            od_rms_dec_arcsec: Some(dr.summary.rms_dec_arcsec),
+                            od_rms_combined_arcsec: Some(dr.summary.rms_combined_arcsec),
+                            od_chi2: Some(dr.summary.chi2),
+                            od_reduced_chi2: Some(dr.summary.reduced_chi2),
+                            od_a1,
+                            od_a2,
+                            od_a3,
+                            od_a1_sigma,
+                            od_a2_sigma,
+                            od_a3_sigma,
+                            excluded_perturbers_naif: excluded_naif_n,
+                            propagation_uncertainty: None,
+                            assist_vs_horizons_km: None,
+                            emp_vs_assist_km: None,
+                            assist_time_ms: None,
+                            speed_ratio: None,
+                            findorb_rms_residual: None,
+                            findorb_n_obs_used: None,
+                            findorb_n_obs_rejected: None,
+                            oorb_vs_horizons_km: None,
+                            emp_vs_oorb_km: None,
+                            oorb_time_ms: None,
+                            oorb_separation_arcsec: None,
+                            oorb_d_ra_arcsec: None,
+                            oorb_d_dec_arcsec: None,
+                            oorb_d_rho_km: None,
+                            orbfit_rms_arcsec: None,
+                            orbfit_n_obs_used: None,
+                            orbfit_n_obs_rejected: None,
+                            orbfit_time_ms: None,
+                            timestamp: timestamp.clone(),
+                            notes: format!(
+                                "non-grav recovery (solve_for=StateAndNonGrav, 9x9={})",
+                                dr.covariance_9x9.is_some()
+                            ),
+                        });
+                    }
+                    Err(e) => {
+                        eprintln!("  {}: non-grav recovery OD FAIL ({e})", obj.name);
+                    }
+                }
+            }
 
         (results, captured_orbits, orbit_comparisons)
     }).collect();

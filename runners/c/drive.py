@@ -58,6 +58,17 @@ def _read_line(proc):
     return out
 
 
+def _float_or_none(tok):
+    """Parse one `odng` coefficient/σ token. The runner emits the literal
+    "null" when non-grav was not actually recovered (9×9 covariance absent
+    or a non-finite fit); map that — and any NaN that slips through — to
+    None so the row reads loudly as "non-grav not recovered" rather than 0."""
+    if tok == "null":
+        return None
+    v = float(tok)
+    return None if math.isnan(v) else v
+
+
 def main() -> int:
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument(
@@ -104,11 +115,29 @@ def main() -> int:
         print("input JSON(s) empty", file=sys.stderr)
         return 1
 
+    # Per-object reference non-grav signal, keyed by object name. The
+    # `orbit_determination` rows null out ic_a1/ic_a2/ic_a3, so read the
+    # JPL SBDB reference off the object's `propagation` rows (which carry
+    # it). Mirrors the rust runner's per-object gate
+    # `data.a1 != 0 || data.a2 != 0 || data.a3 != 0` — only objects with a
+    # known non-grav signal get a second StateAndNonGrav fit.
+    ref_non_grav: dict[str, tuple[float, float, float]] = {}
+    for r in rust_rows:
+        a1 = r.get("ic_a1") or 0.0
+        a2 = r.get("ic_a2") or 0.0
+        a3 = r.get("ic_a3") or 0.0
+        if a1 != 0.0 or a2 != 0.0 or a3 != 0.0:
+            ref_non_grav[r["object"]] = (a1, a2, a3)
+
     cmd = [str(args.runner)]
     if args.data_dir:
         cmd.append(args.data_dir)
     proc = subprocess.Popen(
-        cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+        cmd,
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
     )
 
     # Wait for "ready"
@@ -121,7 +150,10 @@ def main() -> int:
             break
         sys.stderr.write(line)
 
-    print(f"Loaded {len(rust_rows)} rust rows; replaying through C channel...", file=sys.stderr)
+    print(
+        f"Loaded {len(rust_rows)} rust rows; replaying through C channel...",
+        file=sys.stderr,
+    )
 
     timestamp = datetime.now(timezone.utc).isoformat()
     out_rows = []
@@ -144,7 +176,10 @@ def main() -> int:
             proc.stdin.flush()
             out_line = _read_line(proc)
             if not out_line or out_line.startswith("fail"):
-                print(f"  {r['object']} dt={r['dt_days']:+.0f}d prop FAIL: {out_line}", file=sys.stderr)
+                print(
+                    f"  {r['object']} dt={r['dt_days']:+.0f}d prop FAIL: {out_line}",
+                    file=sys.stderr,
+                )
                 n_skipped += 1
                 continue
             parts = out_line.split()
@@ -174,7 +209,10 @@ def main() -> int:
             proc.stdin.flush()
             out_line = _read_line(proc)
             if not out_line or out_line.startswith("fail"):
-                print(f"  {r['object']} dt={r['dt_days']:+.0f}d eph FAIL: {out_line}", file=sys.stderr)
+                print(
+                    f"  {r['object']} dt={r['dt_days']:+.0f}d eph FAIL: {out_line}",
+                    file=sys.stderr,
+                )
                 n_skipped += 1
                 continue
             parts = out_line.split()
@@ -203,7 +241,9 @@ def main() -> int:
                 den = sin_d1 * sin_d2 + cos_d1 * cos_d2 * math.cos(dra)
                 sep_rad = math.atan2(num, den)
                 new["separation_arcsec"] = math.degrees(sep_rad) * 3600.0
-                new["d_ra_arcsec"] = math.degrees((emp_ra_rad - ref_ra) * cos_d1) * 3600.0
+                new["d_ra_arcsec"] = (
+                    math.degrees((emp_ra_rad - ref_ra) * cos_d1) * 3600.0
+                )
                 new["d_dec_arcsec"] = math.degrees(emp_dec_rad - ref_dec) * 3600.0
             ref_rho = r.get("ref_rho_au")
             if ref_rho is not None:
@@ -214,7 +254,10 @@ def main() -> int:
             out_rows.append(new)
 
         elif tt == "orbit_determination":
-            psv = args.fixtures_dir / f"{r['object']}.psv"
+            # Object names with "/" (the comets / interstellars) store the
+            # fixture with the slash rewritten to "_" so it is not read as a
+            # path separator.
+            psv = args.fixtures_dir / f"{r['object'].replace('/', '_')}.psv"
             if not psv.exists():
                 n_skipped += 1
                 continue
@@ -234,20 +277,79 @@ def main() -> int:
                 n_skipped += 1
                 continue
             parts = out_line.split()
-            if len(parts) != 9 or parts[0] != "ok":
+            # ok + state[6] + iters + ms + rms_combined = 10 fields.
+            if len(parts) != 10 or parts[0] != "ok":
                 print(f"  unexpected od output: {out_line!r}", file=sys.stderr)
                 n_skipped += 1
                 continue
             x, y, z = map(float, parts[1:4])
-            ms = float(parts[8])
             iters = int(parts[7])
+            ms = float(parts[8])
+            od_rms = float(parts[9])
             new = dict(r)
             new["channel"] = "c"
             new["timestamp"] = timestamp
             new["emp_pos_au"] = [x, y, z]
             new["emp_time_ms"] = ms
             new["od_iterations"] = iters
+            new["od_rms_combined_arcsec"] = od_rms
             out_rows.append(new)
+
+            # ── Second OD: non-grav recovery ──────────────────────────────
+            # For objects with a known SBDB non-grav signal (a1/a2/a3 != 0,
+            # the same gate the rust runner applies), run a second determine
+            # with solve_for = StateAndNonGrav on the SAME optical fixture and
+            # emit a `non_grav_recovery` row carrying the FITTED A1/A2/A3 + 1σ
+            # (od_a*/od_a*_sigma) so the report can compare fitted-vs-JPL in σ.
+            # The runner emits "null" for both a coefficient and its σ when
+            # non-grav was not actually recovered (9×9 covariance absent — the
+            # current engine bug where StateAndNonGrav silently falls back to a
+            # 6-param state-only fit — or a non-finite value); those map to
+            # None here, never 0/NaN.
+            if r["object"] in ref_non_grav:
+                proc.stdin.write(f"odng {tier} {exclude_naif} {psv}\n")
+                proc.stdin.flush()
+                ng_line = _read_line(proc)
+                if not ng_line or ng_line.startswith("fail"):
+                    print(
+                        f"  {r['object']} non-grav OD FAIL: {ng_line}", file=sys.stderr
+                    )
+                    n_skipped += 1
+                else:
+                    ng_parts = ng_line.split()
+                    # ok + a[3] + sigma[3] + iters + ms + rms + pos[3] = 13.
+                    if len(ng_parts) != 13 or ng_parts[0] != "ok":
+                        print(f"  unexpected odng output: {ng_line!r}", file=sys.stderr)
+                        n_skipped += 1
+                    else:
+                        od_a1 = _float_or_none(ng_parts[1])
+                        od_a2 = _float_or_none(ng_parts[2])
+                        od_a3 = _float_or_none(ng_parts[3])
+                        od_a1_sigma = _float_or_none(ng_parts[4])
+                        od_a2_sigma = _float_or_none(ng_parts[5])
+                        od_a3_sigma = _float_or_none(ng_parts[6])
+                        ng_iters = int(ng_parts[7])
+                        ng_ms = float(ng_parts[8])
+                        # rms + fitted position of the NON-GRAV solution, so
+                        # the row reports the 9-param fit's residual / state
+                        # rather than inheriting the optical-only values.
+                        ng_rms = float(ng_parts[9])
+                        ng_x, ng_y, ng_z = map(float, ng_parts[10:13])
+                        ng_row = dict(r)
+                        ng_row["channel"] = "c"
+                        ng_row["timestamp"] = timestamp
+                        ng_row["test_type"] = "non_grav_recovery"
+                        ng_row["emp_pos_au"] = [ng_x, ng_y, ng_z]
+                        ng_row["emp_time_ms"] = ng_ms
+                        ng_row["od_iterations"] = ng_iters
+                        ng_row["od_rms_combined_arcsec"] = ng_rms
+                        ng_row["od_a1"] = od_a1
+                        ng_row["od_a2"] = od_a2
+                        ng_row["od_a3"] = od_a3
+                        ng_row["od_a1_sigma"] = od_a1_sigma
+                        ng_row["od_a2_sigma"] = od_a2_sigma
+                        ng_row["od_a3_sigma"] = od_a3_sigma
+                        out_rows.append(ng_row)
 
         else:
             n_skipped += 1

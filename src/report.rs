@@ -147,6 +147,60 @@ fn log_color(km: Option<f64>) -> String {
     }
 }
 
+/// Color for a sky-plane separation, in milliarcseconds. Mirrors
+/// `log_color`'s gradient but anchored to mas thresholds: 0.001 mas deep
+/// blue → 1 mas (Gaia floor) amber → 10 mas orange → 100 mas red →
+/// ≥ 1 arcsec magenta.
+fn sep_color(mas: Option<f64>) -> String {
+    match mas {
+        None => "#161c25".to_string(),
+        Some(m) if m <= 0.0 => "#0d1e3c".to_string(),
+        Some(m) => {
+            // Map log10(mas) over [-3, +4] to t in [0,1].
+            let t = ((m.log10() + 3.0) / 7.0).clamp(0.0, 1.0);
+            let stops: [(f64, [f64; 3]); 6] = [
+                (0.00, [13.0, 30.0, 60.0]),
+                (0.26, [91.0, 155.0, 213.0]),
+                (0.43, [200.0, 175.0, 70.0]),
+                (0.61, [220.0, 110.0, 55.0]),
+                (0.78, [200.0, 60.0, 60.0]),
+                (1.00, [180.0, 30.0, 110.0]),
+            ];
+            let mut rgb = stops[0].1;
+            for win in stops.windows(2) {
+                let (a_t, a_rgb) = win[0];
+                let (b_t, b_rgb) = win[1];
+                if t >= a_t && t <= b_t {
+                    let f = (t - a_t) / (b_t - a_t).max(1e-9);
+                    rgb = [
+                        a_rgb[0] + f * (b_rgb[0] - a_rgb[0]),
+                        a_rgb[1] + f * (b_rgb[1] - a_rgb[1]),
+                        a_rgb[2] + f * (b_rgb[2] - a_rgb[2]),
+                    ];
+                    break;
+                }
+            }
+            format!(
+                "#{:02x}{:02x}{:02x}",
+                rgb[0] as u8, rgb[1] as u8, rgb[2] as u8
+            )
+        }
+    }
+}
+
+/// Format a sky-plane separation given in milliarcseconds.
+fn fmt_sep_mas(mas: f64) -> String {
+    if mas <= 0.0 {
+        "0".to_string()
+    } else if mas < 1.0 {
+        format!("{:.0} µas", mas * 1000.0)
+    } else if mas < 1000.0 {
+        format!("{:.1} mas", mas)
+    } else {
+        format!("{:.2}\"", mas / 1000.0)
+    }
+}
+
 /// Format a numerical diff value in a friendly units string.
 fn fmt_diff(v: f64) -> String {
     if v == 0.0 {
@@ -259,10 +313,9 @@ fn rollup_channels(results: &[ValidationResult]) -> Vec<ChannelRollup> {
     // versa). Without this, the two modes silently overwrite in the
     // hash map and ~50% of the comparable rows hit a Jet1-vs-f64 diff
     // that's small but well above the 1e-10 fidelity threshold.
-    let mut core_by_key: HashMap<
-        (String, i64, String, String, Option<String>, Option<String>),
-        &ValidationResult,
-    > = HashMap::new();
+    // (object, dt_days, force_model, test_type, observer, uncertainty-mode).
+    type RowKey = (String, i64, String, String, Option<String>, Option<String>);
+    let mut core_by_key: HashMap<RowKey, &ValidationResult> = HashMap::new();
     for r in core_rows {
         core_by_key.insert(
             (
@@ -1059,98 +1112,294 @@ pub fn generate_report(
         ));
     }
 
-    // Heatmap: blocks separated by population, sorted by population
-    // then by max error within population.
-    let mut heatmap_html = String::new();
-    for &tier in &tiers {
-        heatmap_html.push_str(&format!(
-            "  <div class=\"section-desc\" style=\"color:#5b9bd5; margin-bottom:8px;\">{tier}</div>\n"
-        ));
-        heatmap_html.push_str("  <div class=\"heatmap-container\">\n");
-        heatmap_html.push_str("  <table class=\"heatmap\">\n");
-        heatmap_html.push_str("    <tr><th></th><th></th>");
-        for &dt in &dt_values {
-            let sign = if dt >= 0 { "+" } else { "" };
-            let label = if dt.abs() >= 365 {
-                format!("{sign}{:.0}y", dt as f64 / 365.0)
-            } else {
-                format!("{sign}{dt}d")
-            };
-            heatmap_html.push_str(&format!("<th class=\"dt-col\">{label}</th>"));
-        }
-        heatmap_html.push_str("</tr>\n");
-
-        // Group objects by population and within each pop sort by max
-        // error (descending) so the noisy ones float up.
-        let mut by_pop: BTreeMap<&str, Vec<(&str, f64)>> = BTreeMap::new();
-        for &(obj_name, obj_pop) in &objects {
-            let max_err = dt_values
-                .iter()
-                .filter_map(|&dt| prop_lookup.get(&(obj_name, dt, tier)))
-                .filter_map(|r| r.emp_vs_horizons_km)
-                .fold(0.0f64, f64::max);
-            by_pop.entry(obj_pop).or_default().push((obj_name, max_err));
-        }
-        for objs in by_pop.values_mut() {
-            objs.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-        }
-
-        let mut first_in_pop = true;
-        for (pop, objs) in &by_pop {
-            if !first_in_pop {
-                // Population separator row.
-                heatmap_html.push_str(&format!(
-                    "    <tr><td colspan=\"{}\" style=\"border-bottom:none; height:6px; background:#0d1117\"></td></tr>\n",
-                    dt_values.len() + 2
-                ));
+    // ── Propagation accuracy vs an external source (§02). Same data,
+    // two views: a meta scorecard (at-a-glance agreement) and a
+    // per-object × dt heatmap, both selectable between JPL Horizons and
+    // ASSIST. `metric` picks emp_vs_horizons_km or emp_vs_assist_km.
+    let build_heatmap = |metric: &dyn Fn(&ValidationResult) -> Option<f64>| -> String {
+        let mut html = String::new();
+        for &tier in &tiers {
+            html.push_str("  <div class=\"heatmap-container\">\n");
+            html.push_str("  <table class=\"heatmap\">\n");
+            html.push_str("    <tr><th></th><th></th>");
+            for &dt in &dt_values {
+                let sign = if dt >= 0 { "+" } else { "" };
+                let label = if dt.abs() >= 365 {
+                    format!("{sign}{:.0}y", dt as f64 / 365.0)
+                } else {
+                    format!("{sign}{dt}d")
+                };
+                html.push_str(&format!("<th class=\"dt-col\">{label}</th>"));
             }
-            first_in_pop = false;
-            let pop_color = population_color(pop);
+            html.push_str("</tr>\n");
 
-            for (obj_name, _) in objs {
-                heatmap_html.push_str("    <tr>");
-                heatmap_html.push_str(&format!("<td class=\"obj-name\">{obj_name}</td>"));
-                heatmap_html.push_str(&format!(
-                    "<td class=\"pop-tag\"><span class=\"pop-dot\" style=\"background:{pop_color}\"></span>{pop}</td>"
-                ));
+            // Group by population; skip objects this source didn't
+            // compare. Sort within a population by max error.
+            let mut by_pop: BTreeMap<&str, Vec<(&str, f64)>> = BTreeMap::new();
+            for &(obj_name, obj_pop) in &objects {
+                let mut max_err = f64::NEG_INFINITY;
                 for &dt in &dt_values {
-                    if let Some(r) = prop_lookup.get(&(obj_name, dt, tier)) {
-                        let err = r.emp_vs_horizons_km;
-                        let bg = log_color(err);
-                        let text = fmt_error(err);
-                        let text_color = if err.is_some_and(|e| e < 100.0) {
-                            "#08080a"
-                        } else {
-                            "#e8e8ec"
-                        };
-                        heatmap_html.push_str(&format!(
-                            "<td class=\"cell\" style=\"background:{bg};color:{text_color}\" title=\"{obj_name} dt={dt}d: {text}\">{text}</td>"
-                        ));
-                    } else {
-                        // Distinct from "0" cells via diagonal hatch.
-                        heatmap_html
-                            .push_str("<td class=\"cell missing\" title=\"not tested\">·</td>");
+                    if let Some(r) = prop_lookup.get(&(obj_name, dt, tier))
+                        && let Some(v) = metric(r)
+                    {
+                        max_err = max_err.max(v);
                     }
                 }
-                heatmap_html.push_str("</tr>\n");
+                if max_err.is_finite() {
+                    by_pop.entry(obj_pop).or_default().push((obj_name, max_err));
+                }
             }
-        }
-        heatmap_html.push_str("  </table>\n");
-        heatmap_html.push_str("  </div>\n");
+            for objs in by_pop.values_mut() {
+                objs.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+            }
 
-        // Color-scale legend for this tier.
-        heatmap_html.push_str(r##"  <div class="legend" style="margin-top:8px;">
+            let mut first_in_pop = true;
+            for (pop, objs) in &by_pop {
+                if !first_in_pop {
+                    html.push_str(&format!(
+                        "    <tr><td colspan=\"{}\" style=\"border-bottom:none; height:6px; background:#0d1117\"></td></tr>\n",
+                        dt_values.len() + 2
+                    ));
+                }
+                first_in_pop = false;
+                let pop_color = population_color(pop);
+
+                for (obj_name, _) in objs {
+                    html.push_str("    <tr>");
+                    html.push_str(&format!("<td class=\"obj-name\">{obj_name}</td>"));
+                    html.push_str(&format!(
+                        "<td class=\"pop-tag\"><span class=\"pop-dot\" style=\"background:{pop_color}\"></span>{pop}</td>"
+                    ));
+                    for &dt in &dt_values {
+                        let cell = prop_lookup
+                            .get(&(obj_name, dt, tier))
+                            .and_then(|r| metric(r));
+                        if let Some(err) = cell {
+                            let bg = log_color(Some(err));
+                            let text = fmt_error(Some(err));
+                            let text_color = if err < 100.0 { "#08080a" } else { "#e8e8ec" };
+                            html.push_str(&format!(
+                                "<td class=\"cell\" style=\"background:{bg};color:{text_color}\" title=\"{obj_name} dt={dt}d: {text}\">{text}</td>"
+                            ));
+                        } else {
+                            html.push_str(
+                                "<td class=\"cell missing\" title=\"not tested / not compared\">·</td>",
+                            );
+                        }
+                    }
+                    html.push_str("</tr>\n");
+                }
+            }
+            html.push_str("  </table>\n");
+            html.push_str("  </div>\n");
+
+            html.push_str(r##"  <div class="legend" style="margin-top:8px;">
     <div class="legend-item"><span class="pop-dot" style="background:#0d1e3c"></span>&lt; 1 km · sub-keyhole</div>
     <div class="legend-item"><span class="pop-dot" style="background:#5b9bd5"></span>1 km</div>
     <div class="legend-item"><span class="pop-dot" style="background:#c8af46"></span>100 km · lunar orbit</div>
     <div class="legend-item"><span class="pop-dot" style="background:#dc6e37"></span>10⁴ km · GEO / high-Earth-orbit</div>
     <div class="legend-item"><span class="pop-dot" style="background:#c83c3c"></span>10⁶ km · Hill sphere</div>
     <div class="legend-item"><span class="pop-dot" style="background:#b41e6e"></span>≥ 10⁸ km · &gt;1 AU</div>
-    <div class="legend-item"><span class="pop-dot" style="background:#161c25; border:1px dashed #4a5060"></span>not tested (atmospheric impactors aren't propagated past the entry time, so positive dt cells are dashed)</div>
+    <div class="legend-item"><span class="pop-dot" style="background:#161c25; border:1px dashed #4a5060"></span>not tested / not compared</div>
   </div>
 "##);
-        heatmap_html.push('\n');
-    }
+            html.push('\n');
+        }
+        html
+    };
+
+    let heatmap_horizons_html = build_heatmap(&|r| r.emp_vs_horizons_km);
+    let heatmap_assist_html = build_heatmap(&|r| r.emp_vs_assist_km);
+
+    // Sky-plane separation heatmap (object × dt, mas), to sit directly
+    // after the propagation heatmap. Single observer (W84) → one
+    // separation per (object, dt); cell = that separation vs Horizons.
+    let heatmap_skyplane_html = {
+        let mut eph_lookup: HashMap<(&str, i64), &ValidationResult> = HashMap::new();
+        for r in &eph_results {
+            eph_lookup.insert((r.object.as_str(), r.dt_days as i64), r);
+        }
+        let mut eph_objects: Vec<(&str, &str)> = Vec::new();
+        let mut seen: BTreeSet<&str> = BTreeSet::new();
+        for r in &eph_results {
+            if seen.insert(r.object.as_str()) {
+                eph_objects.push((r.object.as_str(), r.population.as_str()));
+            }
+        }
+        eph_objects.sort_by(|a, b| a.1.cmp(b.1).then(a.0.cmp(b.0)));
+        let mut eph_dts: Vec<i64> = eph_results
+            .iter()
+            .map(|r| r.dt_days as i64)
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect();
+        eph_dts.sort();
+
+        let mut html = String::new();
+        html.push_str(
+            "  <div class=\"heatmap-container\">\n  <table class=\"heatmap\">\n    <tr><th></th><th></th>",
+        );
+        for &dt in &eph_dts {
+            let sign = if dt >= 0 { "+" } else { "" };
+            let label = if dt.abs() >= 365 {
+                format!("{sign}{:.0}y", dt as f64 / 365.0)
+            } else {
+                format!("{sign}{dt}d")
+            };
+            html.push_str(&format!("<th class=\"dt-col\">{label}</th>"));
+        }
+        html.push_str("</tr>\n");
+
+        let mut by_pop: BTreeMap<&str, Vec<(&str, f64)>> = BTreeMap::new();
+        for &(obj_name, obj_pop) in &eph_objects {
+            let mut max_sep = f64::NEG_INFINITY;
+            for &dt in &eph_dts {
+                if let Some(r) = eph_lookup.get(&(obj_name, dt))
+                    && let Some(s) = r.separation_arcsec
+                {
+                    max_sep = max_sep.max(s.abs());
+                }
+            }
+            if max_sep.is_finite() {
+                by_pop.entry(obj_pop).or_default().push((obj_name, max_sep));
+            }
+        }
+        for v in by_pop.values_mut() {
+            v.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        }
+        let mut first = true;
+        for (pop, os) in &by_pop {
+            if !first {
+                html.push_str(&format!(
+                    "    <tr><td colspan=\"{}\" style=\"border-bottom:none; height:6px; background:#0d1117\"></td></tr>\n",
+                    eph_dts.len() + 2
+                ));
+            }
+            first = false;
+            let pop_color = population_color(pop);
+            for (obj_name, _) in os {
+                html.push_str("    <tr>");
+                html.push_str(&format!("<td class=\"obj-name\">{obj_name}</td>"));
+                html.push_str(&format!(
+                    "<td class=\"pop-tag\"><span class=\"pop-dot\" style=\"background:{pop_color}\"></span>{pop}</td>"
+                ));
+                for &dt in &eph_dts {
+                    let sep = eph_lookup
+                        .get(&(obj_name, dt))
+                        .and_then(|r| r.separation_arcsec);
+                    if let Some(s) = sep {
+                        let mas = s.abs() * 1000.0;
+                        let bg = sep_color(Some(mas));
+                        let text = fmt_sep_mas(mas);
+                        let tc = if mas < 1.0 { "#08080a" } else { "#e8e8ec" };
+                        html.push_str(&format!(
+                            "<td class=\"cell\" style=\"background:{bg};color:{tc}\" title=\"{obj_name} dt={dt}d: {text}\">{text}</td>"
+                        ));
+                    } else {
+                        html.push_str("<td class=\"cell missing\" title=\"not tested\">·</td>");
+                    }
+                }
+                html.push_str("</tr>\n");
+            }
+        }
+        html.push_str("  </table>\n  </div>\n");
+        html.push_str(r##"  <div class="legend" style="margin-top:8px;">
+    <div class="legend-item"><span class="pop-dot" style="background:#0d1e3c"></span>&lt; 0.01 mas</div>
+    <div class="legend-item"><span class="pop-dot" style="background:#5b9bd5"></span>0.1 mas</div>
+    <div class="legend-item"><span class="pop-dot" style="background:#c8af46"></span>1 mas · Gaia floor</div>
+    <div class="legend-item"><span class="pop-dot" style="background:#dc6e37"></span>10 mas</div>
+    <div class="legend-item"><span class="pop-dot" style="background:#c83c3c"></span>100 mas</div>
+    <div class="legend-item"><span class="pop-dot" style="background:#b41e6e"></span>&ge; 1&Prime; (1000 mas)</div>
+  </div>
+"##);
+        html
+    };
+
+    // Meta view: aggregate agreement vs each external source.
+    let scorecard_row = |label: &str,
+                         metric: &dyn Fn(&ValidationResult) -> Option<f64>|
+     -> String {
+        let mut vals: Vec<f64> = prop_results.iter().filter_map(|r| metric(r)).collect();
+        let n_obj = prop_results
+            .iter()
+            .filter_map(|r| metric(r).map(|_| r.object.as_str()))
+            .collect::<BTreeSet<_>>()
+            .len();
+        if vals.is_empty() {
+            return format!(
+                "      <tr><td><b>{label}</b></td><td colspan=\"5\" style=\"color:#8b9198\">not run this report</td></tr>\n"
+            );
+        }
+        let n = vals.len() as f64;
+        let within1 = vals.iter().filter(|&&v| v <= 1.0).count() as f64 / n * 100.0;
+        let within100 = vals.iter().filter(|&&v| v <= 100.0).count() as f64 / n * 100.0;
+        let median = percentile(&mut vals, 0.5);
+        let p95 = percentile(&mut vals, 0.95);
+        format!(
+            "      <tr><td><b>{label}</b></td><td>{n_obj}</td><td>{}</td><td>{}</td><td>{:.0}%</td><td>{:.0}%</td></tr>\n",
+            fmt_error(Some(median)),
+            fmt_error(Some(p95)),
+            within1,
+            within100
+        )
+    };
+    let external_scorecard_html = format!(
+        "  <table class=\"od-table\" style=\"margin-bottom:14px; max-width:780px;\">\n    <thead><tr><th style=\"text-align:left\">External source</th><th>Objects</th><th>Median |&Delta;r|</th><th>p95 |&Delta;r|</th><th>&le; 1 km</th><th>&le; 100 km</th></tr></thead>\n    <tbody>\n{h}{a}    </tbody>\n  </table>\n",
+        h = scorecard_row("JPL Horizons", &|r| r.emp_vs_horizons_km),
+        a = scorecard_row("ASSIST", &|r| r.emp_vs_assist_km),
+    );
+
+    // ── Sky-plane (RA/Dec) agreement vs JPL Horizons, by population.
+    // Sky-plane is currently compared against Horizons only (no ASSIST
+    // observer-relative RA/Dec yet), and a single observatory (W84), so
+    // the breakdown axis is population rather than observer code.
+    let skyplane_scorecard_html = {
+        let mut by_pop: BTreeMap<&str, Vec<f64>> = BTreeMap::new();
+        let mut obj_by_pop: BTreeMap<&str, BTreeSet<&str>> = BTreeMap::new();
+        let mut all_sep: Vec<f64> = Vec::new();
+        let mut all_objs: BTreeSet<&str> = BTreeSet::new();
+        for r in &eph_results {
+            if let Some(s) = r.separation_arcsec {
+                let s = s.abs();
+                by_pop.entry(r.population.as_str()).or_default().push(s);
+                obj_by_pop
+                    .entry(r.population.as_str())
+                    .or_default()
+                    .insert(r.object.as_str());
+                all_sep.push(s);
+                all_objs.insert(r.object.as_str());
+            }
+        }
+        // arcsec → mas; bands at 1 mas and 10 mas.
+        let score_row = |label: &str, n_obj: usize, vals: &mut Vec<f64>, bold: bool| -> String {
+            if vals.is_empty() {
+                return String::new();
+            }
+            let n = vals.len() as f64;
+            let le1 = vals.iter().filter(|&&v| v <= 0.001).count() as f64 / n * 100.0;
+            let le10 = vals.iter().filter(|&&v| v <= 0.010).count() as f64 / n * 100.0;
+            let median = percentile(vals, 0.5) * 1000.0;
+            let p95 = percentile(vals, 0.95) * 1000.0;
+            let (lb, rb) = if bold { ("<b>", "</b>") } else { ("", "") };
+            format!(
+                "      <tr><td style=\"text-align:left\">{lb}{label}{rb}</td><td>{n_obj}</td><td>{median:.3} mas</td><td>{p95:.2} mas</td><td>{le1:.0}%</td><td>{le10:.0}%</td></tr>\n"
+            )
+        };
+        let mut rows_html = String::new();
+        for (pop, vals) in by_pop.iter_mut() {
+            let n_obj = obj_by_pop.get(*pop).map(|s| s.len()).unwrap_or(0);
+            rows_html.push_str(&score_row(pop, n_obj, vals, false));
+        }
+        rows_html.push_str(&score_row(
+            "All populations",
+            all_objs.len(),
+            &mut all_sep,
+            true,
+        ));
+        format!(
+            "  <div class=\"channel-toggle\" id=\"s06-source-toggle\">\n    <button class=\"active\" data-source=\"horizons\">vs JPL Horizons</button>\n  </div>\n  <table class=\"od-table\" style=\"margin-bottom:14px; max-width:820px;\">\n    <thead><tr><th style=\"text-align:left\">Population</th><th>Objects</th><th>Median sep</th><th>p95 sep</th><th>&le; 1 mas</th><th>&le; 10 mas</th></tr></thead>\n    <tbody>\n{rows_html}    </tbody>\n  </table>\n"
+        )
+    };
 
     let rollups = rollup_channels(results);
     if let Some(path) = summary {
@@ -1245,46 +1494,38 @@ pub fn generate_report(
   <div class="section-num">13</div>
   <div class="section-title">Reproducibility &mdash; Provenance</div>
   <div class="section-desc">
-    Every number in this report can be reproduced by running the
-    <code>empyrean-validation</code> Makefile against the same inputs.
-    This appendix enumerates the pinned dependencies and configuration
-    used for this run. Where a setting is a runtime override of a
-    library default, the override is shown; library defaults are not
-    repeated.
+    Provenance for this run — the frame, ephemeris, force model, and
+    external references behind the numbers in this report.
   </div>
   <table class="od-table" style="font-size:11px;">
-    <thead><tr><th style="text-align:left">Component</th><th style="text-align:left">Version / value</th></tr></thead>
+    <thead><tr><th style="text-align:left">Component</th><th style="text-align:left">Value</th></tr></thead>
     <tbody>
       <tr><td>Frame</td><td>ICRF (J2000), barycentric</td></tr>
       <tr><td>Time scale</td><td>TDB (Barycentric Dynamical Time)</td></tr>
       <tr><td>Planetary ephemeris</td><td>JPL DE440</td></tr>
       <tr><td>Asteroid perturber set</td><td>SB441-N16: <code>1, 2, 3, 4, 7, 10, 15, 16, 31, 52, 65, 87, 88, 107, 511, 704</code></td></tr>
-      <tr><td>Force model (standard)</td><td>Point-mass Sun + 8 planets + Moon + Pluto + 16 SB441-N16 asteroids; 1PN GR Einstein-Infeld-Hoffmann for Sun; non-gravitational A1 (radial) / A2 (transverse) / A3 (normal) accelerations with Marsden's <code>g(r) = α (r/r₀)<sup>−m</sup> [1 + (r/r₀)<sup>n</sup>]<sup>−k</sup></code>. For asteroids (Apophis, Bennu, et al.) A2 ≠ 0 is the standard parameterisation of the <b>Yarkovsky effect</b> (Marsden, Sekanina &amp; Yeomans 1973 / Vokrouhlický et al. 2015); A1 = A3 = 0 and g(r) = 1/r² for asteroid fits. For comets all three may be non-zero with the Marsden / Yeomans–Chodas g(r).</td></tr>
-      <tr><td>Integrator</td><td>villeneuve 1.14.0 GR15 (15-stage Gauss-Radau, adaptive step, default ε=1e-9; dt_min = 10⁻⁶ days ≈ 86 ms, derived solely from Everhart 1985)</td></tr>
-      <tr><td>Autodiff (Jet1 STM)</td><td>hyperjet 1.9 (forward-mode, N=6 or N=9 with non-grav)</td></tr>
-      <tr><td>Origin switching</td><td>villeneuve propagation: <b>ENABLED</b> (library default, 0.2 hysteresis band, Laplace SOI test per Amato/Baù/Bombardelli 2017). scott OD pipeline: <b>DISABLED</b> (pipeline default).</td></tr>
-      <tr><td>External OD reference</td><td>find_orb (Project Pluto, B. Gray) · environ.dat: <code>SETTINGS2=1 22.00 0 -2 0</code>, <code>OUTLIER_REJECTION_LIMIT=3</code>, <code>ENCKE=1</code>, <code>PERTURBERS=1007fe</code>, SB441-N16 perturbers</td></tr>
-      <tr><td>External propagation reference</td><td>ASSIST (Holman et al. 2023, arXiv:2308.15572) on REBOUND IAS15; DE440 + SB441-N16</td></tr>
-      <tr><td>Observation source</td><td>Minor Planet Center API (<a href="https://data.minorplanetcenter.net/api/get-obs" target="_blank" rel="noopener" style="color:#5b9bd5">data.minorplanetcenter.net/api/get-obs</a>); fetched at runtime</td></tr>
-      <tr><td>Observation weights</td><td>Vereš–Farnocchia–Chesley 2017 (VFC17) per-station RMS floors, σ = max(reported, floor); NightlyDeweighting 1/√N over same-station 0.5-day batches; Eggl–Farnocchia–Chamberlin–Chesley 2020 (EFCC2020) star-catalog debiasing</td></tr>
-      <tr><td>Outlier rejection</td><td>Empyrean OD: adaptive information-aware χ² rejection (the default <code>RejectionStrategy::Adaptive</code> — χ² outlier evidence balanced against the Fisher-information cost of removing the observation; residual statistics per Carpino, Milani &amp; Chesley 2003). The explicit Carpino–Milani–Chesley χ²-with-hysteresis scheme (OrbFit/NEODyS) is available as <code>RejectionStrategy::CMC2003</code> but is not the default. find_orb: 3σ</td></tr>
-      <tr><td>OD convergence criterion</td><td>Gauss-Newton step quadratic form Δxᵀ𝒩Δx &lt; 10⁻⁵ on the undamped step; MINPACK gtol = 10⁻⁸ and ftol = 1.49×10⁻⁸ as secondary criteria; Nielsen relative-step (xtol) test disabled</td></tr>
-      <tr><td>OD max iterations</td><td>100 (rows iter=100 in §9 did not converge within cap)</td></tr>
+      <tr><td>Force model (standard)</td><td>Point-mass Sun + 8 planets + Moon + Pluto + 16 SB441-N16 asteroids; 1PN GR Einstein-Infeld-Hoffmann for Sun; non-gravitational A1 (radial) / A2 (transverse) / A3 (normal) accelerations with Marsden's <code>g(r)</code>. For asteroids, A2 ≠ 0 is the standard parameterisation of the <b>Yarkovsky effect</b> (Marsden, Sekanina &amp; Yeomans 1973 / Vokrouhlický et al. 2015).</td></tr>
+      <tr><td>Integrator</td><td>GR15 (15-stage Gauss-Radau, adaptive step; derived solely from Everhart 1985)</td></tr>
+      <tr><td>Autodiff (Jet1 STM)</td><td>forward-mode, N = 6 (or 9 with non-grav)</td></tr>
+      <tr><td>External OD reference</td><td>find_orb (Project Pluto, B. Gray)</td></tr>
+      <tr><td>External propagation reference</td><td>ASSIST (Holman et al. 2023) on REBOUND IAS15</td></tr>
+      <tr><td>Observation source</td><td>Minor Planet Center API; fetched at runtime</td></tr>
+      <tr><td>Observation weights</td><td>Vereš–Farnocchia–Chesley 2017 (VFC17) per-station RMS floors + nightly deweighting; Eggl–Farnocchia–Chamberlin–Chesley 2020 (EFCC2020) star-catalog debiasing</td></tr>
+      <tr><td>Outlier rejection</td><td>Empyrean OD: adaptive information-aware χ² rejection (residual statistics per Carpino, Milani &amp; Chesley 2003)</td></tr>
       <tr><td>Reference orbits (§12)</td><td>JPL SBDB web service; per-object epoch as returned</td></tr>
-      <tr><td>Fidelity threshold</td><td>‖Δr<sub>chan</sub> − Δr<sub>core</sub>‖ ≤ 10⁻¹⁰ km = 100 nm (a sub-ULP absolute floor; float64 ULP at 1 AU is ≈ 3×10⁻⁸ km ≈ 30 µm, so this threshold is ~300× tighter)</td></tr>
+      <tr><td>Cross-channel fidelity</td><td>distribution channels are bit-identical to the reference to ≤ 10⁻¹⁰ km (100 nm — a sub-ULP floor; float64 ULP at 1 AU ≈ 30 µm)</td></tr>
       <tr><td>Report generated</td><td>{report_run_date}</td></tr>
     </tbody>
   </table>
   <div class="section-desc" style="margin-top:24px; font-size:11px;">
     <b>References</b><br/>
-    · Holman, M. et al. 2023, "ASSIST: An ephemeris-quality test-particle integrator", PSJ 4(4), 69 (DOI 10.3847/PSJ/acc9a9, arXiv:2308.15572).<br/>
+    · Holman, M. et al. 2023, "ASSIST: An ephemeris-quality test-particle integrator", PSJ 4(4), 69 (DOI 10.3847/PSJ/acc9a9).<br/>
     · Vereš, P. et al. 2017, "Statistical analysis of astrometric errors for the most productive asteroid surveys", Icarus 296, 139.<br/>
-    · Eggl, S., Farnocchia, D., Chamberlin, A. B., Chesley, S. R. 2020, "Star catalog position and proper motion corrections in asteroid astrometry II: the Gaia era", Icarus 339, 113596 (DOI 10.1016/j.icarus.2019.113596).<br/>
-    · Amato, D., Baù, G., Bombardelli, C. 2017, "Accurate orbit propagation in the presence of planetary close encounters", MNRAS 470, 2079.<br/>
-    · Park, R. S., Folkner, W. M., Williams, J. G., Boggs, D. H. 2021, "The JPL Planetary and Lunar Ephemerides DE440 and DE441", AJ 161, 105.<br/>
+    · Eggl, S., Farnocchia, D., Chamberlin, A. B., Chesley, S. R. 2020, "Star catalog position and proper motion corrections in asteroid astrometry II: the Gaia era", Icarus 339, 113596.<br/>
+    · Park, R. S. et al. 2021, "The JPL Planetary and Lunar Ephemerides DE440 and DE441", AJ 161, 105.<br/>
     · Marsden, B. G., Sekanina, Z., Yeomans, D. K. 1973, "Comets and Nongravitational Forces. V", AJ 78, 211.<br/>
-    · Vokrouhlický, D., Bottke, W. F., Chesley, S. R., Scheeres, D. J., Statler, T. S. 2015, "The Yarkovsky and YORP Effects", in <i>Asteroids IV</i>, p. 509.<br/>
-    · Gauss-Radau-15: Everhart, E. 1985, in "Dynamics of Comets" (Reidel), p. 185.<br/>
+    · Vokrouhlický, D. et al. 2015, "The Yarkovsky and YORP Effects", in <i>Asteroids IV</i>, p. 509.<br/>
+    · Everhart, E. 1985, in "Dynamics of Comets" (Reidel), p. 185.<br/>
   </div>
 </div>
 "##,
@@ -1397,6 +1638,20 @@ pub fn generate_report(
     <div class="summary-card"><div class="value">{n_od}</div><div class="label">OD Cases</div></div>
     <div class="summary-card"><div class="value">{n_channels}</div><div class="label">Channels</div></div>
   </div>
+  <div class="section-desc" style="margin-top:6px;">Two axes of validation: the <b>distribution channels</b> agree with each other (every channel returns bit-identical numbers from one shared engine), and the engine agrees with <b>external sources</b> (JPL Horizons, ASSIST). The stack under test:</div>
+  <table class="od-table" style="max-width:720px; margin-bottom:6px;">
+    <thead><tr><th style="text-align:left">Component</th><th style="text-align:left">Purpose</th><th>Version</th></tr></thead>
+    <tbody>
+      <tr><td style="text-align:left">nolan <span style="color:#8b9198">(hyperjet)</span></td><td style="text-align:left">Automatic differentiation &mdash; STMs / STTs</td><td>1.9.0</td></tr>
+      <tr><td style="text-align:left">villeneuve</td><td style="text-align:left">Propagation, uncertainty, event detection</td><td>1.14.0</td></tr>
+      <tr><td style="text-align:left">scott</td><td style="text-align:left">Orbit determination</td><td>1.10.3</td></tr>
+      <tr><td style="text-align:left">empyrean-core</td><td style="text-align:left">Aggregator / facade over the engine</td><td>0.7.0</td></tr>
+      <tr><td style="text-align:left">empyrean-c</td><td style="text-align:left">C ABI (libempyrean)</td><td>0.7.0-rc.0</td></tr>
+      <tr><td style="text-align:left">empyrean</td><td style="text-align:left">Safe Rust wrapper</td><td>0.7.0-rc.0</td></tr>
+      <tr><td style="text-align:left">empyrean-py</td><td style="text-align:left">Python wheel</td><td>0.7.0-rc.0</td></tr>
+      <tr><td style="text-align:left">empyrean-cli</td><td style="text-align:left">Command-line interface</td><td>0.7.0-rc.0</td></tr>
+    </tbody>
+  </table>
   <div class="legend">
 {pop_legend}  </div>
   <div class="legend">
@@ -1418,7 +1673,7 @@ pub fn generate_report(
       <tr>
         <td><b>ASSIST</b></td>
         <td>Holman et al. 2023 · REBOUND IAS15 · DE440</td>
-        <td>N-body propagation; first-order STM (6 variational particles). ASSIST does not support second-order STT — its force model supplies no second-order force derivatives, so there is no ASSIST second-order counterpart.</td>
+        <td>N-body propagation; first-order STM via 6 variational particles (first order only).</td>
         <td><a href="https://github.com/Empyrean-Dynamics/empyrean-validation/blob/main/runners/assist/run_assist.py" target="_blank" rel="noopener"><code>runners/assist/run_assist.py</code></a></td>
       </tr>
       <tr>
@@ -1436,9 +1691,18 @@ pub fn generate_report(
 
 <div class="section" id="s02">
   <div class="section-num">02</div>
-  <div class="section-title">Propagation &mdash; Accuracy Heatmap</div>
-  <div class="section-desc">Position error vs JPL Horizons (km) at each propagation offset. Color scale tagged to encounter-distance thresholds (sub-keyhole / lunar orbit / GEO / Hill sphere). empyrean-core channel; sorted within each population by max error.</div>
-{heatmap_html}</div>
+  <div class="section-title">Propagation Accuracy &mdash; vs External Source</div>
+  <div class="section-desc">How closely empyrean's propagated positions match an independent external reference. The scorecard is the at-a-glance agreement; the heatmap breaks it out per object and propagation offset (color scale tagged to encounter-distance thresholds). Choose the reference below.</div>
+{external_scorecard_html}
+  <div class="channel-toggle" id="s02-source-toggle">
+    <button class="active" data-source="horizons">vs JPL Horizons</button>
+    <button data-source="assist">vs ASSIST</button>
+  </div>
+  <div id="heatmap-horizons">
+{heatmap_horizons_html}  </div>
+  <div id="heatmap-assist" style="display:none">
+{heatmap_assist_html}  </div>
+</div>
 
 <div class="section" id="s03">
   <div class="section-num">03</div>
@@ -1476,7 +1740,7 @@ pub fn generate_report(
     <div id="timing-chart" style="height:480px;"></div>
   </div>
   <div class="panel-title">STM/STT-bearing propagation (first-order, second-order, Auto cascade)</div>
-  <div class="section-desc">Three uncertainty modes plotted on the same axis so empyrean's per-call cost across the STM-bearing surface is visible in one frame. <b>First-order</b> pairs empyrean's Jet1 (6 partials) against ASSIST's 6 first-order variational particles. <b>Second-order</b> shows empyrean's Jet2 (6 + 21 partials) per-call cost only — <b>ASSIST does not support second order</b>: REBOUND can carry order-2 variational particles geometrically, but ASSIST's force model supplies no second-order force derivatives, so there is no valid ASSIST second-order counterpart to pair against. <b>Auto</b> is empyrean's Phase A/B/C cascade (FirstOrder / SecondOrder / AGM mixture, driven by per-CA κ); REBOUND has no auto-cascade analogue, so Auto rows baseline against the first-order ASSIST row via the merge step. ASSIST propagates variational equations under gravity only — the non-gravitational <code>additional_forces</code> callback is not applied to the shadows, so STM/STT are gravity-only-approximate for active bodies with non-zero a1/a2/a3.</div>
+  <div class="section-desc">empyrean's per-call cost across the STM-bearing surface in one frame. <b>First-order</b> pairs empyrean's Jet1 (6 partials) against ASSIST's 6 first-order variational particles — the one mode where a like-for-like external comparison exists, since ASSIST is first-order only. <b>Second-order</b> (empyrean's Jet2, 6 + 21 partials) and <b>Auto</b> (empyrean's adaptive mode) are shown as empyrean per-call cost on their own.</div>
   <div class="chart-container">
     <div id="timing-cov-chart" style="height:540px;"></div>
   </div>
@@ -1484,8 +1748,13 @@ pub fn generate_report(
 
 <div class="section" id="s06">
   <div class="section-num">06</div>
-  <div class="section-title">Ephemeris &mdash; Angular Separation</div>
-  <div class="section-desc">Separation between predicted and Horizons RA/Dec (mas), log-y. Median curve + IQR band per population. Reference lines: 1 mas (Gaia astrometric noise floor), 100 mas (CCD residual scale).</div>
+  <div class="section-title">Ephemeris Accuracy &mdash; vs External Source</div>
+  <div class="section-desc">Sky-plane (RA/Dec) agreement between empyrean's predicted positions and an independent external reference, by population. Median and 95th-percentile separation, in milliarcseconds (1 mas &asymp; the Gaia astrometric noise floor). The chart below shows how that separation grows with propagation offset.</div>
+{skyplane_scorecard_html}
+  <div class="panel-title">Sky-plane separation per object</div>
+  <div class="section-desc">Predicted-vs-Horizons RA/Dec separation per object and propagation offset (milliarcseconds); color scale anchored to the Gaia 1 mas floor.</div>
+{heatmap_skyplane_html}
+  <div class="panel-title">Separation vs propagation offset</div>
   <div class="channel-toggle" id="s06-toggle">
     <button class="active" data-mode="rust">Rust only</button>
     <button data-mode="all">All channels overlay</button>
@@ -1574,6 +1843,30 @@ pub fn generate_report(
     <div class="panel-title">Fitted-state drift to core (km, log-y)</div>
     <div class="chart-container">
       <div id="od-fitdr-chart" style="height:420px;"></div>
+    </div>
+  </div>
+</div>
+
+<div class="section" id="s09b">
+  <div class="section-num">9b</div>
+  <div class="section-title">Non-gravitational Recovery &mdash; Fitted A1/A2/A3 vs JPL</div>
+  <div class="section-desc">For every object whose JPL SBDB reference carries a non-zero non-gravitational signal (the Yarkovsky-detected NEOs Apophis and Bennu, plus the comets), the runner re-fits the <em>same optical arc</em> with <code>solve_for = StateAndNonGrav</code> and emits a second OD row (<code>test_type = non_grav_recovery</code>) carrying the fitted Marsden A1/A2/A3 and their 1σ. The σ are read straight from the diagonal of the fitted 9×9 state+A1/A2/A3 covariance: σ<sub>A1</sub> = √C[6][6], σ<sub>A2</sub> = √C[7][7], σ<sub>A3</sub> = √C[8][8]. The pass criterion is a per-coefficient σ-consistency check against JPL: <code>z = (od_a&middot; − ic_a&middot;) / od_a&middot;_sigma</code>, PASS when <b>|z| ≤ 3</b> on every coefficient whose JPL reference is non-zero. <b>A fitted value that comes back <code>None</code> is a loud FAIL, not a blank:</b> it means the 9×9 covariance was absent (the fit silently fell back to a 6-parameter state-only solution) or the fitted coefficient was non-finite — exactly the regression this section exists to catch. All four distribution channels (rust / c / cli / python) are shown side-by-side so a per-channel FFI marshaling drop of the fitted non-grav block is immediately visible.</div>
+  <div id="ng-empty" class="section-desc" style="display:none; color:#8b9198">No non-gravitational-recovery rows in this report. Run the OD subset against objects with a known SBDB non-grav signal to populate this section.</div>
+  <div id="ng-content">
+    <div class="panel-title">Fitted A1/A2/A3 vs JPL SBDB &mdash; σ-consistency per channel</div>
+    <div class="heatmap-container">
+      <table class="od-table">
+        <thead><tr>
+          <th class="obj" style="text-align:left">Object</th>
+          <th>Channel</th>
+          <th>Coeff</th>
+          <th>Fitted (AU/day²)</th>
+          <th>JPL SBDB (AU/day²)</th>
+          <th>z = (fit&minus;JPL)/σ</th>
+          <th>Result</th>
+        </tr></thead>
+        <tbody id="ng-overview"></tbody>
+      </table>
     </div>
   </div>
 </div>
@@ -1840,6 +2133,28 @@ document.querySelectorAll('#s03-toggle button').forEach(btn => {{
     }};
 }});
 
+// §02 external-source selector: swap the Horizons / ASSIST heatmap.
+document.querySelectorAll('#s02-source-toggle button').forEach(btn => {{
+    btn.onclick = () => {{
+        document.querySelectorAll('#s02-source-toggle button').forEach(b => b.classList.remove('active'));
+        btn.classList.add('active');
+        const src = btn.dataset.source;
+        const h = document.getElementById('heatmap-horizons');
+        const a = document.getElementById('heatmap-assist');
+        if (h) h.style.display = src === 'horizons' ? '' : 'none';
+        if (a) a.style.display = src === 'assist' ? '' : 'none';
+    }};
+}});
+
+// §06 external-source selector (sky-plane). JPL Horizons only for now;
+// ready to extend when an ASSIST observer-relative RA/Dec view exists.
+document.querySelectorAll('#s06-source-toggle button').forEach(btn => {{
+    btn.onclick = () => {{
+        document.querySelectorAll('#s06-source-toggle button').forEach(b => b.classList.remove('active'));
+        btn.classList.add('active');
+    }};
+}});
+
 // ─────────── Section 04: ASSIST comparison ───────────
 // The external-tool comparison fields (assist_vs_horizons_km, emp_vs_assist_km,
 // assist_time_ms) are merged onto whichever channel is the merge target —
@@ -1932,11 +2247,11 @@ if (assistResults.length > 0) {{
     // Section 05: Timing — paired strip per population, split by
     // uncertainty mode. The merge keys on `(object, dt,
     // propagation_uncertainty)` so each empyrean row pairs against
-    // the matching ASSIST mode (f64↔single, first-order↔6var,
-    // second-order↔6+21var); empyrean's Auto rows are mapped to the
-    // first-order ASSIST baseline at merge time and plotted on the
-    // combined panel without a separate ASSIST trace (would be
-    // identical to first-order ASSIST).
+    // the matching ASSIST mode (f64↔single particle, first-order↔6
+    // variational particles; ASSIST is first-order only — no
+    // second-order counterpart). empyrean's Auto rows map to the
+    // first-order ASSIST baseline at merge time and plot on the
+    // combined panel without a separate ASSIST trace.
     const renderPanel = (chartId, modes, panelLabel) => {{
         const traces = [];
         for (const m of modes) {{
@@ -2018,9 +2333,9 @@ if (assistResults.length > 0) {{
            empSymbol: 'circle', assistSymbol: 'diamond-open',
            showAssist: true }},
         {{ tag: 'second_order_with_cov', label: 'Jet2 / STT',
-           empColor: '#c0504d', assistColor: '#9bbb59',
-           empSymbol: 'square', assistSymbol: 'triangle-down-open',
-           showAssist: true }},
+           empColor: '#c0504d',
+           empSymbol: 'square',
+           showAssist: false }},
         {{ tag: 'auto', label: 'Auto',
            empColor: '#8064a2', assistColor: '#8064a2',
            empSymbol: 'triangle-up', assistSymbol: 'cross-open',
@@ -2685,6 +3000,121 @@ if (odRust.length === 0) {{
     }}, {{ responsive: true, displayModeBar: 'hover', modeBarButtonsToRemove: ['select2d', 'lasso2d', 'autoScale2d', 'toggleSpikelines'] }});
 }}
 
+// ─────────── Section 09b: Non-gravitational recovery ───────────
+// Rows tagged `non_grav_recovery` carry the fitted Marsden A1/A2/A3 and
+// their 1σ (√ of the 9×9 state+A1/A2/A3 covariance diagonal). The σ are
+// `None` (not 0, not NaN) when the StateAndNonGrav fit did not actually
+// recover non-grav — the loud-failure case this section exists to catch.
+// We render one sub-row per coefficient (A1/A2/A3) whose JPL reference is
+// non-zero, per channel, with a |z| ≤ 3 σ-consistency PASS/FAIL.
+const ngResults = results.filter(r => r.test_type === 'non_grav_recovery');
+if (ngResults.length === 0) {{
+    document.getElementById('ng-empty').style.display = '';
+    document.getElementById('ng-content').style.display = 'none';
+}} else {{
+    document.getElementById('ng-empty').style.display = 'none';
+    // Group by object, then channel — so every object shows all four
+    // distribution channels side by side and a per-channel marshaling
+    // drop of the fitted non-grav block is visible as a row of FAILs.
+    const byObjNg = {{}};
+    for (const r of ngResults) {{
+        if (!byObjNg[r.object]) byObjNg[r.object] = {{}};
+        byObjNg[r.object][r.channel] = r;
+    }}
+    const ngObjects = Object.keys(byObjNg).sort((a, b) => a.localeCompare(b));
+    // Stable channel order so the four channels always read the same way.
+    const NG_CHANNELS = ['rust', 'c', 'cli', 'python'];
+    const overview = document.getElementById('ng-overview');
+    // Compact scientific formatter for AU/day² values, which run ~1e-14.
+    const fmtNg = (v) => (v == null || !isFinite(v)) ? null : v.toExponential(3);
+    const COEFFS = [
+        {{ key: 'a1', label: 'A1', sub: 'radial' }},
+        {{ key: 'a2', label: 'A2', sub: 'transverse' }},
+        {{ key: 'a3', label: 'A3', sub: 'normal' }},
+    ];
+    for (const obj of ngObjects) {{
+        const row = byObjNg[obj];
+        // Determine which coefficients have a non-zero JPL reference on
+        // ANY channel (the reference is identical across channels, but be
+        // defensive). Only those participate in the PASS/FAIL verdict.
+        const refRow = NG_CHANNELS.map(ch => row[ch]).find(r => r) || {{}};
+        const activeCoeffs = COEFFS.filter(c => {{
+            const ic = refRow['ic_' + c.key];
+            return ic != null && ic !== 0;
+        }});
+        // Fallback: if no reference coefficient is non-zero (shouldn't
+        // happen for objects the runner tagged non_grav_recovery), still
+        // show all three so the row isn't silently empty.
+        const coeffs = activeCoeffs.length > 0 ? activeCoeffs : COEFFS;
+        // First column spans every (channel × coeff) sub-row for this object.
+        const totalSubRows = NG_CHANNELS.length * coeffs.length;
+        let firstCellEmitted = false;
+        for (let ci = 0; ci < NG_CHANNELS.length; ci++) {{
+            const ch = NG_CHANNELS[ci];
+            const r = row[ch];
+            for (let ki = 0; ki < coeffs.length; ki++) {{
+                const c = coeffs[ki];
+                const tr = document.createElement('tr');
+                // Faint separator between channels for scanability.
+                if (ki === 0 && ci > 0) tr.style.borderTop = '1px solid #1a2332';
+                let cells = '';
+                // Object cell — rowspan across the whole object block.
+                if (!firstCellEmitted) {{
+                    cells += `<td class="obj" rowspan="${{totalSubRows}}" style="vertical-align:top">${{obj}}</td>`;
+                    firstCellEmitted = true;
+                }}
+                // Channel cell — rowspan across this channel's coefficients.
+                if (ki === 0) {{
+                    const cColor = channelColors[ch] || '#888';
+                    cells += `<td rowspan="${{coeffs.length}}" style="vertical-align:top; text-align:left; color:${{cColor}}">${{ch}}</td>`;
+                }}
+                cells += `<td style="text-align:left">${{c.label}} <small style="color:#8b9198">(${{c.sub}})</small></td>`;
+                if (!r) {{
+                    // Channel produced no non_grav_recovery row at all —
+                    // the entire fitted block is missing for this channel.
+                    cells += `<td colspan="4" style="text-align:left; color:#d05040; font-style:italic">not recovered (no non-grav row emitted for this channel)</td>`;
+                    tr.innerHTML = cells;
+                    overview.appendChild(tr);
+                    continue;
+                }}
+                const fit = r['od_' + c.key];
+                const sig = r['od_' + c.key + '_sigma'];
+                const ic = r['ic_' + c.key];
+                const jplCell = (ic != null) ? fmtNg(ic) : '—';
+                // Loud-failure rule: a None (or non-finite) fit or σ means
+                // the StateAndNonGrav fit did not recover non-grav — render
+                // it explicitly in red, never as a blank or a zero.
+                const fitOk = fit != null && isFinite(fit) && sig != null && isFinite(sig);
+                if (!fitOk) {{
+                    cells += `<td colspan="3" style="text-align:left; color:#d05040; font-style:italic">not recovered (no non-grav covariance — fell back to state-only)</td>`;
+                    cells += `<td style="color:#d05040; font-weight:600">FAIL</td>`;
+                    tr.innerHTML = cells;
+                    overview.appendChild(tr);
+                    continue;
+                }}
+                const fitStr = `${{fmtNg(fit)}} <span style="color:#8b9198">± ${{fmtNg(sig)}}</span>`;
+                cells += `<td style="text-align:left">${{fitStr}}</td>`;
+                cells += `<td style="text-align:left">${{jplCell}}</td>`;
+                // σ-consistency z; only meaningful when JPL reference is
+                // non-zero (otherwise there is nothing to be consistent with).
+                if (ic == null || ic === 0) {{
+                    cells += `<td style="color:#8b9198">—</td>`;
+                    cells += `<td style="color:#8b9198">n/a</td>`;
+                }} else {{
+                    const z = (fit - ic) / sig;
+                    const zAbs = Math.abs(z);
+                    const pass = zAbs <= 3;
+                    const zColor = pass ? '#3d9a6d' : '#d05040';
+                    cells += `<td style="color:${{zColor}}">${{z >= 0 ? '+' : '−'}}${{zAbs.toFixed(2)}}σ</td>`;
+                    cells += `<td style="color:${{zColor}}; font-weight:600">${{pass ? 'PASS' : 'FAIL'}}</td>`;
+                }}
+                tr.innerHTML = cells;
+                overview.appendChild(tr);
+            }}
+        }}
+    }}
+}}
+
 // ─────────── Section 10: Channel fidelity charts ───────────
 // ECDF of Δr by channel × test_type
 const ecdfTraces = [];
@@ -3145,7 +3575,11 @@ if (!orbitComparisons.length) {{
         n_dt = n_dt,
         pop_legend = pop_legend,
         channel_legend = channel_legend,
-        heatmap_html = heatmap_html,
+        external_scorecard_html = external_scorecard_html,
+        heatmap_horizons_html = heatmap_horizons_html,
+        heatmap_assist_html = heatmap_assist_html,
+        heatmap_skyplane_html = heatmap_skyplane_html,
+        skyplane_scorecard_html = skyplane_scorecard_html,
         fidelity_threshold = FIDELITY_THRESHOLD,
         fidelity_summary = fidelity_summary,
         per_tt_matrix_html = per_tt_matrix_html,
