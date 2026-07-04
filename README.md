@@ -81,3 +81,30 @@ empyrean-validation depends on
 [villeneuve](https://github.com/Empyrean-Dynamics/villeneuve) for the
 SBDB / Horizons clients used by the plan generator. It does not depend on
 scott, empyrean-core, or empyrean — those are the things being validated.
+
+## Versioning and local development overrides
+
+This harness is versioned in lockstep with the distribution release it
+validates: checking out validation `vX.Y.Z` and running it reproduces the
+validation-of-record for empyrean `X.Y.Z`. The committed manifests
+therefore pin only published, tagged artifacts — the runners consume
+`empyrean` from crates.io (whose `empyrean-sys` downloads the
+checksum-pinned engine of that release), and the plan generator pins the
+villeneuve tag of the same release generation. The core reference channel
+(`validate-core`) builds from the `empyrean-core` tag of that generation.
+
+Validating unreleased work is a deliberate, **uncommitted** local
+override — never commit these:
+
+```toml
+# In the relevant Cargo.toml(s), temporarily:
+empyrean = { path = "../../../empyrean/empyrean" }        # runner: local wrapper
+
+[patch."ssh://git@github.com/Empyrean-Dynamics/villeneuve.git"]
+villeneuve = { path = "../villeneuve" }                    # plan generator: local engine
+```
+
+Note that Cargo honors `[patch]` only from the build-root manifest, and a
+path patch to a missing sibling breaks every cargo command in that
+checkout — keep overrides scoped to the manifest you are actually
+building from, and revert them before committing.

@@ -1,7 +1,8 @@
 [package]
 name = "empyrean-validation"
-version = "0.1.0"
+version = "0.7.0"
 edition = "2024"
+publish = false
 rust-version = "1.90.0"
 authors = ["Joachim Moeyens <joachim@empyrean-dynamics.com>", "Empyrean Dynamics"]
 description = "Cross-channel validation framework for the empyrean astrodynamics stack — schema, test catalog, plan generator, report renderer, and external-reference runners (ASSIST, find_orb, kete) shared by every empyrean repo's CI."
@@ -24,22 +25,12 @@ clap = { version = "4", features = ["derive"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 # villeneuve provides the SBDB / Horizons disk-cached query clients used
-# by the plan generator. Pinned to a tagged version here; sibling-checkout
-# local development resolves to ../villeneuve via the [patch] block below.
-villeneuve = { git = "ssh://git@github.com/Empyrean-Dynamics/villeneuve.git", tag = "v1.13.1", features = ["jpl"] }
+# by the plan generator. Pinned to the release generation this harness
+# version validates (empyrean 0.7.0 binds villeneuve v1.14.0 through
+# empyrean-core v0.7.0). Validating unreleased engine work is a deliberate,
+# uncommitted local override — see "Local development overrides" in the
+# README.
+villeneuve = { git = "ssh://git@github.com/Empyrean-Dynamics/villeneuve.git", tag = "v1.14.0", features = ["jpl"] }
 
 [dev-dependencies]
 tempfile = "3"
-
-# Sibling-checkout development: when this repo is laid out next to a
-# villeneuve clone (either at ../villeneuve in the same parent directory,
-# or at the canonical empyrean monorepo layout), cargo resolves the
-# [dependencies] declaration above to that local path instead of fetching
-# the tagged release. CI without a sibling checkout pulls the tagged
-# version. Same pattern as scott / empyrean-core / empyrean.
-[patch."ssh://git@github.com/Empyrean-Dynamics/villeneuve.git"]
-villeneuve = { path = "../villeneuve" }
-
-# No nolan patch: villeneuve 1.12 depends on the renamed crate `hyperjet`
-# from crates.io, not the private git `nolan`, so there is nothing for an
-# `ssh://.../nolan.git` patch to override.

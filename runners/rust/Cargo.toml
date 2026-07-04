@@ -13,7 +13,11 @@ path = "src/main.rs"
 
 [dependencies]
 # Public API via the safe wrapper — same C ABI other channels ride.
-empyrean = { path = "../../../empyrean/empyrean" }
+# Pinned to the PUBLISHED release this harness version validates, so a
+# checkout of a validation tag reproduces the validation-of-record for
+# that release. Dev-tree validation is an uncommitted local override —
+# see "Local development overrides" in the README.
+empyrean = "0.7.0"
 # Shared validation framework: schema (`ValidationResult`,
 # `ValidationPlan`), test object catalog, position-error / angular-
 # separation metric helpers, and the HTML report renderer. Owned
