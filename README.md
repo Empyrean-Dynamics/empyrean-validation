@@ -5,6 +5,7 @@ Cross-channel and external-reference validation for the empyrean astrodynamics s
 
 <a href="https://github.com/Empyrean-Dynamics/empyrean-validation/actions/workflows/rust.yml"><img src="https://github.com/Empyrean-Dynamics/empyrean-validation/actions/workflows/rust.yml/badge.svg" alt="CI"></a>
 <a href="https://github.com/Empyrean-Dynamics/empyrean-validation/actions/workflows/validation.yml"><img src="https://github.com/Empyrean-Dynamics/empyrean-validation/actions/workflows/validation.yml/badge.svg" alt="Validation Suite"></a>
+<a href="https://github.com/Empyrean-Dynamics/empyrean/releases/tag/v0.8.1"><img src="https://img.shields.io/badge/validates-empyrean%200.8.1-1a1a2e?style=flat-square" alt="validates empyrean 0.8.1"></a>
 <br>
 <a href="https://claude.ai"><img src="https://img.shields.io/badge/Built%20with-Claude%20Code-D97757?logo=anthropic&logoColor=white&style=flat-square" alt="Built with Claude Code"></a>
 <a href="https://www.empyrean-dynamics.com"><img src="https://img.shields.io/badge/Website-empyrean--dynamics.com-1a1a2e?logo=data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHdpZHRoPSIyNCIgaGVpZ2h0PSIyNCIgdmlld0JveD0iMCAwIDI0IDI0IiBmaWxsPSJub25lIiBzdHJva2U9IndoaXRlIiBzdHJva2Utd2lkdGg9IjIiIHN0cm9rZS1saW5lY2FwPSJyb3VuZCIgc3Ryb2tlLWxpbmVqb2luPSJyb3VuZCI+PGNpcmNsZSBjeD0iMTIiIGN5PSIxMiIgcj0iMTAiLz48bGluZSB4MT0iMiIgeTE9IjEyIiB4Mj0iMjIiIHkyPSIxMiIvPjxwYXRoIGQ9Ik0xMiAyYTE1LjMgMTUuMyAwIDAgMSA0IDEwIDE1LjMgMTUuMyAwIDAgMS00IDEwIDE1LjMgMTUuMyAwIDAgMS00LTEwIDE1LjMgMTUuMyAwIDAgMSA0LTEweiIvPjwvc3ZnPg==&logoColor=white&style=flat-square" alt="Website"></a>
@@ -31,20 +32,20 @@ distances), and timing.
 **Distribution channels** — the same physics reached through every binding;
 `core` is the reference channel the others are compared against:
 
-| Channel | Path into the stack |
-|---------|---------------------|
-| `core` | `validate-core` binary linking empyrean-core directly (no FFI) |
-| `rust` | the `empyrean` wrapper crate |
-| `python` | the `empyrean` Python wheel (PyO3) |
-| `c` | `libempyrean` C ABI |
-| `cli` | the `empyrean-cli` binary |
+| Channel | Path into the stack | Runner |
+|---------|---------------------|--------|
+| `core` | `validate-core` binary linking empyrean-core directly (no FFI) — **the reference channel** | sibling `empyrean-core` |
+| `rust` | the `empyrean` wrapper crate | [![rs](https://img.shields.io/badge/rs-B7410E?style=flat-square&logo=rust&logoColor=white)](runners/rust/) |
+| `python` | the `empyrean` Python wheel (PyO3) | [![py](https://img.shields.io/badge/py-3776AB?style=flat-square&logo=python&logoColor=white)](runners/python/) |
+| `c` | `libempyrean` C ABI | [![c](https://img.shields.io/badge/c-555555?style=flat-square)](runners/c/) |
+| `cli` | the `empyrean-cli` binary | [![cli](https://img.shields.io/badge/cli-1a1a2e?style=flat-square)](runners/cli/) |
 
 **External references** — independent implementations run against the same
 plan; results are folded onto the core channel's rows:
 
 | Tool | Origin | Axes compared |
 |------|--------|---------------|
-| [ASSIST](https://github.com/matthewholman/assist) | Holman et al. — ephemeris-driven REBOUND | propagation (f64 and first-order STM modes), timing |
+| [ASSIST](https://github.com/matthewholman/assist) | Holman et al. — ephemeris-driven REBOUND (pinned 1.2.3 / rebound 4.6.0) | propagation (f64 and first-order STM modes), timing |
 | [find_orb](https://github.com/Bill-Gray/find_orb) | Bill Gray / Project Pluto | orbit determination, fitted orbits |
 | [OpenOrb](https://github.com/oorb/oorb) | Granvik et al., University of Helsinki | propagation, ephemeris |
 | [OrbFit](http://adams.dm.unipi.it/orbfit/) | OrbFit Consortium / MPC (opt-in, `WITH_ORBFIT=1`) | orbit determination (CMC2003 rejection) |
@@ -86,7 +87,9 @@ scott, empyrean-core, or empyrean — those are the things being validated.
 
 This harness is versioned in lockstep with the distribution release it
 validates: checking out validation `vX.Y.Z` and running it reproduces the
-validation-of-record for empyrean `X.Y.Z`. The committed manifests
+validation-of-record for empyrean `X.Y.Z`. The `validates empyrean X.Y.Z`
+badge above is part of the same atomic pin-bump artifact — it always
+states the published release the committed manifests point at. The committed manifests
 therefore pin only published, tagged artifacts — the runners consume
 `empyrean` from crates.io (whose `empyrean-sys` downloads the
 checksum-pinned engine of that release), and the plan generator pins the
