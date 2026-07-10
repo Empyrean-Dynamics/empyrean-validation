@@ -33,12 +33,14 @@ fi
 source "$VENV_DIR/bin/activate"
 
 # ── Install dependencies ────────────────────────────────
+# Exact pins: the comparator must be reproducible, and unpinned floats
+# have broken this build before. Installed with pip rather than `uv pip`:
+# assist ships sdist-only and its setup.py shells out to git during the
+# build, which dies on uv's sdist cache layout
+# ("fatal: invalid gitfile format: .../uv/sdists-v9/.git").
 echo "Installing dependencies..."
-if command -v uv &>/dev/null; then
-    uv pip install "rebound>=4.4" "assist>=1.1.9" "numpy>=1.24"
-else
-    pip install "rebound>=4.4" "assist>=1.1.9" "numpy>=1.24"
-fi
+python -m pip install --upgrade pip >/dev/null
+python -m pip install "rebound==4.6.0" "assist==1.2.3" "numpy>=1.24,<3"
 
 # ── Download ASSIST ephemeris data ──────────────────────
 mkdir -p "$DATA_DIR"

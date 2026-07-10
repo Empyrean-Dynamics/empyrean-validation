@@ -16,5 +16,5 @@ path = "src/main.rs"
 # user invoking `empyrean propagate` from a shell would.
 # Pinned to the PUBLISHED release this harness version validates (see
 # the rust runner's manifest note).
-empyrean = "0.7.0"
+empyrean = "=0.8.1"
 clap = { version = "4", features = ["derive"] }

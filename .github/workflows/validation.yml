@@ -71,6 +71,11 @@ env:
   CARGO_NET_GIT_FETCH_WITH_CLI: true
   GCS_BUCKET: gs://empyrean-validation
   EMPYREAN_DATA_DIR: ${{ github.workspace }}/data
+  # The numerical-parity suite runs on a single interpreter by design: the
+  # empyrean python channel ships as an abi3 wheel, so its compiled binary is
+  # byte-identical across CPython 3.10–3.14 — running the (expensive) suite per
+  # version would add cost with no signal. Per-version *Python* coverage lives in
+  # the empyrean repo's own CI (lint + mypy + tests across the support range).
   PYTHON_VERSION: "3.12"
   OBJECTS: ${{ inputs.objects || 'Apophis,Bennu,Eros,Vesta,2018 LA' }}
   TIER: ${{ inputs.tier || 'standard' }}
@@ -185,6 +190,14 @@ jobs:
       - uses: actions-rust-lang/setup-rust-toolchain@v1
         with:
           rustflags: ""
+          # The repo checks out under empyrean-validation/ (sibling
+          # layout), so the embedded rust-cache must be pointed at the
+          # actual crate roots — with no config it runs cargo metadata
+          # at the workspace root, finds no Cargo.toml, and errors.
+          cache-workspaces: |
+            empyrean-validation
+            empyrean-validation/runners/rust
+            empyrean-validation/runners/cli
 
       - uses: actions/setup-python@v5
         with:
