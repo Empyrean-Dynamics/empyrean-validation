@@ -8,12 +8,10 @@ use std::collections::HashMap;
 use std::time::Instant;
 
 use rayon::prelude::*;
-use villeneuve::io::cache::DiskCache;
-use villeneuve::io::jpl::horizons::HorizonsRecord;
 
 use empyrean::{
-    Context, CoordinateState, EphemerisConfig, Epoch, ForceModelTier, Frame, ODConfig, Orbit,
-    Origin, PropagationConfig, Representation, UncertaintyMethod,
+    Context, CoordinateState, EphemerisConfig, EphemerisEntry, Epoch, ForceModelTier, Frame,
+    ODConfig, Orbit, Origin, PropagationConfig, Representation, UncertaintyMethod,
 };
 use empyrean_validation::catalog::{DEFAULT_DT_DAYS, FORCE_MODEL_TIERS, ValidationObject};
 use empyrean_validation::compare;
@@ -59,8 +57,8 @@ pub fn run_propagation_validation(
     ctx: &Context,
     objs: &[&ValidationObject],
     config: &ValidateConfig,
-    horizons_cache: &mut DiskCache,
-    sbdb_cache: &mut DiskCache,
+    horizons_cache_dir: &std::path::Path,
+    sbdb_cache_dir: &std::path::Path,
     num_threads: Option<usize>,
 ) -> Vec<ValidationResult> {
     let timestamp = chrono::Utc::now().to_rfc3339();
@@ -86,7 +84,7 @@ pub fn run_propagation_validation(
         ng_dt: Option<f64>,
         dt_list: &'static [f64],
         horizons_vectors: HashMap<i64, ([f64; 3], [f64; 3])>,
-        horizons_ephemeris: HashMap<i64, HorizonsRecord>,
+        horizons_ephemeris: HashMap<i64, EphemerisEntry>,
     }
 
     let obs_codes = empyrean_validation::catalog::OBSERVER_CODES;
@@ -94,20 +92,29 @@ pub fn run_propagation_validation(
     let mut obj_data: Vec<ObjData> = Vec::new();
 
     for obj in objs {
-        let sbdb = match villeneuve::io::jpl::sbdb::query_sbdb(&[obj.sbdb_query], Some(sbdb_cache))
-        {
-            Ok(o) => o,
+        let sbdb = match empyrean::query_sbdb(&[obj.sbdb_query], Some(sbdb_cache_dir)) {
+            Ok(b) if !b.orbits.is_empty() => b,
+            Ok(_) => {
+                eprintln!("  {}: SKIP (SBDB: empty result)", obj.name);
+                continue;
+            }
             Err(e) => {
                 eprintln!("  {}: SKIP (SBDB: {e})", obj.name);
                 continue;
             }
         };
-        let epoch = sbdb.coordinates()[0].time().mjd_tdb();
+        let epoch = match sbdb.orbits[0].state.epoch.mjd_tdb() {
+            Ok(t) => t,
+            Err(e) => {
+                eprintln!("  {}: SKIP (SBDB epoch: {e})", obj.name);
+                continue;
+            }
+        };
 
-        let (hor_pos, hor_vel) = match villeneuve::io::jpl::horizons::query_horizons_vectors(
+        let (hor_pos, hor_vel) = match empyrean::query_horizons_vectors(
             obj.horizons_command,
             epoch,
-            Some(horizons_cache),
+            Some(horizons_cache_dir),
         ) {
             Ok(h) => h,
             Err(e) => {
@@ -122,15 +129,23 @@ pub fn run_propagation_validation(
         // water-ice for comets. `dt` is the SBDB time-delay (days)
         // applied to g(r) — non-zero for Jupiter-family comets and
         // some interstellar objects (67P=+45.7d, 2I/Borisov=−65.1d).
-        let (a1, a2, a3, ng_alpha, ng_r0, ng_m, ng_n, ng_k, ng_dt) = match sbdb.non_grav_params(0) {
-            Some(ng) => {
-                let g = match &ng.model {
-                    villeneuve::dynamics::forces::non_gravitational::NonGravModel::MarsdenSekanina(g) => g.clone(),
-                    _ => villeneuve::dynamics::forces::non_gravitational::GFunction::inverse_square(),
-                };
-                (ng.a1, ng.a2, ng.a3, g.alpha, g.r0, g.m, g.n, g.k, ng.dt)
-            }
-            None => (0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, None),
+        let (a1, a2, a3, ng_alpha, ng_r0, ng_m, ng_n, ng_k, ng_dt) = {
+            let o = &sbdb.orbits[0];
+            // The wrapper carries the Marsden g(r) parameters as flat
+            // fields with an all-zero sentinel for the inverse-square
+            // default; record the canonical inverse-square constants
+            // (α=1, r0=1, m=2, n=0, k=0) in that case.
+            let has_g = o.ng_alpha != 0.0
+                || o.ng_r0 != 0.0
+                || o.ng_m != 0.0
+                || o.ng_n != 0.0
+                || o.ng_k != 0.0;
+            let (ga, gr0, gm, gn, gk) = if has_g {
+                (o.ng_alpha, o.ng_r0, o.ng_m, o.ng_n, o.ng_k)
+            } else {
+                (1.0, 1.0, 2.0, 0.0, 0.0)
+            };
+            (o.a1, o.a2, o.a3, ga, gr0, gm, gn, gk, o.non_grav_dt)
         };
 
         eprintln!(
@@ -142,10 +157,10 @@ pub fn run_propagation_validation(
         let mut horizons_vectors: HashMap<i64, ([f64; 3], [f64; 3])> = HashMap::new();
         for &dt in dt_list {
             let target = epoch + dt;
-            match villeneuve::io::jpl::horizons::query_horizons_vectors(
+            match empyrean::query_horizons_vectors(
                 obj.horizons_command,
                 target,
-                Some(horizons_cache),
+                Some(horizons_cache_dir),
             ) {
                 Ok(h) => {
                     horizons_vectors.insert(dt as i64, h);
@@ -156,14 +171,14 @@ pub fn run_propagation_validation(
             }
         }
 
-        let mut horizons_ephemeris: HashMap<i64, HorizonsRecord> = HashMap::new();
+        let mut horizons_ephemeris: HashMap<i64, EphemerisEntry> = HashMap::new();
         for &dt in dt_list {
             let target = epoch + dt;
-            match villeneuve::io::jpl::horizons::query_horizons(
+            match empyrean::query_horizons(
                 &[obj.horizons_command],
                 obs_code,
                 &[target],
-                Some(horizons_cache),
+                Some(horizons_cache_dir),
             ) {
                 Ok(r) if !r.is_empty() => {
                     horizons_ephemeris.insert(dt as i64, r.into_iter().next().unwrap());
@@ -228,8 +243,8 @@ pub fn run_propagation_validation(
     //                                 + 21 second-order variational
     //                                 particles (28 + 84 = 112 dual
     //                                 numbers per state).
-    //   - "auto"                   — UncertaintyMethod::Auto: villeneuve
-    //                                 v1.10.0 Phase A/B/C cascade
+    //   - "auto"                   — UncertaintyMethod::Auto: the
+    //                                 engine's Phase A/B/C cascade
     //                                 (FirstOrder / SecondOrder / AGM
     //                                 mixture, driven by per-CA κ and
     //                                 IP-skip thresholds). No REBOUND
@@ -480,6 +495,12 @@ pub fn run_propagation_validation(
                     let Some(hor) = data.horizons_ephemeris.get(&(dt as i64)) else {
                         continue;
                     };
+                    // Reference entries carry degrees over the wrapper
+                    // surface; comparisons below are in radians.
+                    let hor_ra_rad = hor.ra_deg.to_radians();
+                    let hor_dec_rad = hor.dec_deg.to_radians();
+                    let hor_light_time_d =
+                        (!hor.light_time_days.is_nan()).then_some(hor.light_time_days);
                     let target = Epoch::from_mjd_tdb(data.epoch + dt);
 
                     let observers = match ctx.get_observers(&[obs_code], &[target]) {
@@ -499,32 +520,33 @@ pub fn run_propagation_validation(
                             let Some(entry) = eph.entries.first() else {
                                 continue;
                             };
-                            // Wrapper returns degrees; Horizons radians.
+                            // Wrapper returns degrees; compare in radians.
                             let emp_ra_rad = entry.ra_deg.to_radians();
                             let emp_dec_rad = entry.dec_deg.to_radians();
 
                             let sep = compare::angular_separation_arcsec(
                                 emp_ra_rad,
                                 emp_dec_rad,
-                                hor.ra,
-                                hor.dec,
+                                hor_ra_rad,
+                                hor_dec_rad,
                             );
                             // Wrap the RA difference to [-π, π] so an object
                             // near RA = 0 / 2π doesn't produce a spurious ~2π
                             // residual. (Dec needs no wrap; separation below is
                             // great-circle and already wrap-safe.)
-                            let mut d_ra_wrapped = (emp_ra_rad - hor.ra).rem_euclid(std::f64::consts::TAU);
+                            let mut d_ra_wrapped =
+                                (emp_ra_rad - hor_ra_rad).rem_euclid(std::f64::consts::TAU);
                             if d_ra_wrapped > std::f64::consts::PI {
                                 d_ra_wrapped -= std::f64::consts::TAU;
                             }
                             let d_ra = d_ra_wrapped * emp_dec_rad.cos();
-                            let d_dec = emp_dec_rad - hor.dec;
+                            let d_dec = emp_dec_rad - hor_dec_rad;
                             let d_ra_arcsec = d_ra.to_degrees() * 3600.0;
                             let d_dec_arcsec = d_dec.to_degrees() * 3600.0;
 
-                            let d_rho_km = Some((entry.rho_au - hor.rho) * compare::AU_KM);
+                            let d_rho_km = Some((entry.rho_au - hor.rho_au) * compare::AU_KM);
                             let d_lt_s = if entry.light_time_days.is_finite() {
-                                hor.light_time
+                                hor_light_time_d
                                     .map(|h| (entry.light_time_days - h) * 86400.0)
                             } else {
                                 None
@@ -566,10 +588,10 @@ pub fn run_propagation_validation(
                                 ic_non_grav_dt: data.ng_dt,
                                 ref_pos_au: None,
                                 ref_vel_au_d: None,
-                                ref_ra_rad: Some(hor.ra),
-                                ref_dec_rad: Some(hor.dec),
-                                ref_rho_au: Some(hor.rho),
-                                ref_light_time_d: hor.light_time,
+                                ref_ra_rad: Some(hor_ra_rad),
+                                ref_dec_rad: Some(hor_dec_rad),
+                                ref_rho_au: Some(hor.rho_au),
+                                ref_light_time_d: hor_light_time_d,
                                 n_obs_used: None,
                                 od_iterations: None,
                                 od_converged: None,
@@ -634,8 +656,8 @@ pub struct OdValidationOutput {
     ///   at-native-epoch records and any propagated records used as inputs
     ///   to the comparison kernel.
     pub captured_orbits: Vec<CapturedOrbit>,
-    /// Bidirectional comparisons: per (scott_od, reference) pair, one
-    /// comparison at the scott epoch and one at the reference epoch.
+    /// Bidirectional comparisons: per (empyrean_od, reference) pair, one
+    /// comparison at the fit epoch and one at the reference epoch.
     pub orbit_comparisons: Vec<OrbitComparison>,
 }
 
@@ -648,7 +670,7 @@ pub struct OdValidationOutput {
 ///
 /// Also emits [`CapturedOrbit`] sidecar records for the
 /// orbit-comparison panel:
-/// - one per successful scott fit (`source = "scott_od"`), and
+/// - one per successful OD fit (`source = "empyrean_od"`), and
 /// - one per object that has a JPL SBDB entry (`source = "sbdb"`).
 ///
 /// The comparison kernel pairs these by `object` to produce the
@@ -672,7 +694,7 @@ pub fn run_od_validation(
     .to_string();
 
     // Parallelize across catalog objects. Each fit is independent (no
-    // shared mutable state in scott's determine pipeline); empyrean::Context
+    // shared mutable state in the engine's determine pipeline); empyrean::Context
     // is Send + Sync (see empyrean/src/context.rs:22-23 — "concurrent
     // propagation calls are safe") so the same `&ctx` is safely shared
     // across Rayon workers. Per-object output is collected into a Vec of
@@ -815,32 +837,32 @@ pub fn run_od_validation(
         // origin) the validation channel records.
         let orbit = determine_result.state();
 
-        // Capture scott's fitted state + cov in three coordinate views
+        // Capture the fitted state + cov in three coordinate views
         // (native Cartesian, Sun-centered ICRF Cartesian, Sun-centered
         // ecliptic-J2000 Keplerian) for the orbit-comparison panel.
         // Transformation via `ctx.transform` propagates covariance
         // through the Jacobian.
-        let scott_native = propagated_state_to_coord(&orbit);
+        let fit_native = propagated_state_to_coord(&orbit);
         let empy_version = empyrean::version_string().ok();
-        let scott_captured = match capture_orbit(
+        let fit_captured = match capture_orbit(
             ctx,
             obj.name,
-            orbit_sources::SCOTT_OD,
+            orbit_sources::EMPYREAN_OD,
             empy_version.clone(),
-            &scott_native,
+            &fit_native,
         ) {
             Ok(captured) => Some(captured),
             Err(e) => {
-                eprintln!("  {}: scott orbit-capture transform FAIL ({e})", obj.name);
+                eprintln!("  {}: fit orbit-capture transform FAIL ({e})", obj.name);
                 None
             }
         };
-        if let Some(c) = &scott_captured {
+        if let Some(c) = &fit_captured {
             captured_orbits.push(c.clone());
         }
 
         // Capture SBDB's published orbit (if any) so the comparison
-        // kernel can pair scott_od ↔ sbdb. SBDB returns
+        // kernel can pair empyrean_od ↔ sbdb. SBDB returns
         // CometaryCoordinates with covariance for objects that have
         // a published solution; short-arc impactors typically do not.
         // `sbdb_nongrav` carries SBDB's published Marsden (A1, A2, A3) for
@@ -884,14 +906,14 @@ pub fn run_od_validation(
                 }
             };
 
-        // Bidirectional orbit-vs-orbit comparison. For each (scott,
+        // Bidirectional orbit-vs-orbit comparison. For each (fit,
         // sbdb) pair, propagate one side to the other's epoch and
         // compare in Keplerian space. This produces two rows per pair
-        // — one at the scott epoch, one at the sbdb epoch — so the
+        // — one at the fit epoch, one at the sbdb epoch — so the
         // report can show how much each side's uncertainty inflates
         // under propagation.
-        if let (Some(scott_c), Some(sbdb_native), Some(sbdb_c)) =
-            (&scott_captured, &sbdb_native, &sbdb_captured)
+        if let (Some(fit_c), Some(sbdb_native), Some(sbdb_c)) =
+            (&fit_captured, &sbdb_native, &sbdb_captured)
         {
             let prop_cfg = empyrean::PropagationConfig {
                 force_model: tier,
@@ -900,64 +922,64 @@ pub fn run_od_validation(
                 ..empyrean::PropagationConfig::default()
             };
 
-            // Direction A: bring sbdb to scott's epoch; compare at scott's epoch.
+            // Direction A: bring sbdb to fit's epoch; compare at fit's epoch.
             match propagate_and_capture(
                 ctx,
                 obj.name,
-                "sbdb_at_scott_epoch",
+                "sbdb_at_fit_epoch",
                 empy_version.clone(),
                 sbdb_native,
-                scott_c.epoch_mjd_tdb,
+                fit_c.epoch_mjd_tdb,
                 &prop_cfg,
             ) {
-                Ok(sbdb_at_scott) => {
-                    captured_orbits.push(sbdb_at_scott.clone());
+                Ok(sbdb_at_fit) => {
+                    captured_orbits.push(sbdb_at_fit.clone());
                     // Re-tag as canonical SBDB so the kernel pairs it
-                    // with scott_od (kernel only matches the two
+                    // with empyrean_od (kernel only matches the two
                     // canonical source tags).
-                    let mut sbdb_at_scott_as_sbdb = sbdb_at_scott.clone();
-                    sbdb_at_scott_as_sbdb.source = orbit_sources::SBDB.to_string();
-                    let mut rows = compare_orbits(&[scott_c.clone(), sbdb_at_scott_as_sbdb], 1.0);
+                    let mut sbdb_at_fit_as_sbdb = sbdb_at_fit.clone();
+                    sbdb_at_fit_as_sbdb.source = orbit_sources::SBDB.to_string();
+                    let mut rows = compare_orbits(&[fit_c.clone(), sbdb_at_fit_as_sbdb], 1.0);
                     for r in rows.iter_mut() {
-                        r.common_epoch_source = "scott".to_string();
+                        r.common_epoch_source = "fit".to_string();
                         r.notes
-                            .push("reference (SBDB) propagated to scott epoch via STM".to_string());
+                            .push("reference (SBDB) propagated to fit epoch via STM".to_string());
                     }
                     orbit_comparisons.extend(rows);
                 }
                 Err(e) => {
-                    eprintln!("  {}: propagate SBDB→scott_epoch FAIL ({e})", obj.name,);
+                    eprintln!("  {}: propagate SBDB→fit_epoch FAIL ({e})", obj.name,);
                 }
             }
 
-            // Direction B: bring scott to sbdb's epoch; compare at sbdb's epoch.
+            // Direction B: bring fit to sbdb's epoch; compare at sbdb's epoch.
             match propagate_and_capture(
                 ctx,
                 obj.name,
-                "scott_at_sbdb_epoch",
+                "fit_at_sbdb_epoch",
                 empy_version.clone(),
-                &scott_native,
+                &fit_native,
                 sbdb_c.epoch_mjd_tdb,
                 &prop_cfg,
             ) {
-                Ok(scott_at_sbdb) => {
-                    captured_orbits.push(scott_at_sbdb.clone());
-                    // Manually pair: kernel only pairs scott_od ↔
+                Ok(fit_at_sbdb) => {
+                    captured_orbits.push(fit_at_sbdb.clone());
+                    // Manually pair: kernel only pairs empyrean_od ↔
                     // sbdb|findorb, so we synthesize a comparison
-                    // record by feeding a scott_od-tagged copy of the
+                    // record by feeding an empyrean_od-tagged copy of the
                     // propagated state.
-                    let mut scott_at_sbdb_as_scott = scott_at_sbdb.clone();
-                    scott_at_sbdb_as_scott.source = orbit_sources::SCOTT_OD.to_string();
-                    let mut rows = compare_orbits(&[scott_at_sbdb_as_scott, sbdb_c.clone()], 1.0);
+                    let mut fit_at_sbdb_as_fit = fit_at_sbdb.clone();
+                    fit_at_sbdb_as_fit.source = orbit_sources::EMPYREAN_OD.to_string();
+                    let mut rows = compare_orbits(&[fit_at_sbdb_as_fit, sbdb_c.clone()], 1.0);
                     for r in rows.iter_mut() {
                         r.common_epoch_source = "sbdb".to_string();
                         r.notes
-                            .push("scott propagated to SBDB epoch via STM".to_string());
+                            .push("fit propagated to SBDB epoch via STM".to_string());
                     }
                     orbit_comparisons.extend(rows);
                 }
                 Err(e) => {
-                    eprintln!("  {}: propagate scott→sbdb_epoch FAIL ({e})", obj.name,);
+                    eprintln!("  {}: propagate fit→sbdb_epoch FAIL ({e})", obj.name,);
                 }
             }
         }
@@ -1364,7 +1386,7 @@ fn propagate_and_capture(
 }
 
 /// Promote an `empyrean::PropagatedState` (OD output shape) to a full
-/// [`CoordinateState`] so it can flow through `ctx.transform`. scott's
+/// [`CoordinateState`] so it can flow through `ctx.transform`. fit's
 /// OD output is always Cartesian.
 fn propagated_state_to_coord(orbit: &empyrean::PropagatedState) -> CoordinateState {
     CoordinateState {

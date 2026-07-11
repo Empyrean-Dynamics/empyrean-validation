@@ -8,57 +8,42 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
-  CARGO_NET_GIT_FETCH_WITH_CLI: true
 
 jobs:
   # ── Build & Lint ────────────────────────────────────────────────
+  # The harness and the rust runner consume only published crates
+  # (`empyrean`, `hyperjet`), so CI needs no private checkouts or
+  # tokens — a plain clone builds everything below.
   build-lint:
     name: Build & Lint
     runs-on: ubuntu-latest
     steps:
-      # `Cargo.toml` patches villeneuve + nolan to `../villeneuve` and
-      # `../nolan` for sibling-checkout development. CI replicates that
-      # layout: this repo lands at `<workspace>/empyrean-validation/`,
-      # the patched siblings live alongside it. Without these checkouts
-      # cargo aborts with `failed to load source for dependency
-      # 'villeneuve' / No such file or directory`.
-      - name: Checkout empyrean-validation (default)
+      - name: Checkout
         uses: actions/checkout@v4
-        with:
-          path: empyrean-validation
-
-      - name: Checkout villeneuve (sibling for [patch])
-        uses: actions/checkout@v4
-        with:
-          repository: Empyrean-Dynamics/villeneuve
-          path: villeneuve
-          token: ${{ secrets.GH_PAT }}
-
-      - name: Checkout nolan (sibling for [patch])
-        uses: actions/checkout@v4
-        with:
-          repository: Empyrean-Dynamics/nolan
-          path: nolan
-          token: ${{ secrets.GH_PAT }}
-
-      - name: Configure git for private dependencies
-        run: git config --global url."https://x-access-token:${{ secrets.GH_PAT }}@github.com/".insteadOf "ssh://git@github.com/"
 
       - name: Install Rust toolchain
         uses: actions-rust-lang/setup-rust-toolchain@v1
         with:
           components: rustfmt, clippy
           rustflags: ""
+          cache-workspaces: |
+            .
+            runners/rust
 
-      - name: Build
-        working-directory: empyrean-validation
+      - name: Build (harness)
         run: cargo build --verbose
 
-      - name: Lint
-        working-directory: empyrean-validation
+      - name: Lint (harness)
         run: |
           cargo fmt -- --check
           cargo clippy --all-targets --all-features
+
+      - name: Build + Lint (rust runner)
+        working-directory: runners/rust
+        run: |
+          cargo build --verbose
+          cargo fmt -- --check
+          cargo clippy --all-targets
 
   # ── Test ────────────────────────────────────────────────────────
   test:
@@ -66,27 +51,8 @@ jobs:
     needs: build-lint
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout empyrean-validation (default)
+      - name: Checkout
         uses: actions/checkout@v4
-        with:
-          path: empyrean-validation
-
-      - name: Checkout villeneuve (sibling for [patch])
-        uses: actions/checkout@v4
-        with:
-          repository: Empyrean-Dynamics/villeneuve
-          path: villeneuve
-          token: ${{ secrets.GH_PAT }}
-
-      - name: Checkout nolan (sibling for [patch])
-        uses: actions/checkout@v4
-        with:
-          repository: Empyrean-Dynamics/nolan
-          path: nolan
-          token: ${{ secrets.GH_PAT }}
-
-      - name: Configure git for private dependencies
-        run: git config --global url."https://x-access-token:${{ secrets.GH_PAT }}@github.com/".insteadOf "ssh://git@github.com/"
 
       - name: Install Rust toolchain
         uses: actions-rust-lang/setup-rust-toolchain@v1
@@ -94,5 +60,4 @@ jobs:
           rustflags: ""
 
       - name: Unit tests
-        working-directory: empyrean-validation
         run: cargo test --verbose
