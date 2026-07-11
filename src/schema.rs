@@ -479,8 +479,8 @@ pub type ValidationPlan = Vec<ValidationResult>;
 
 /// Canonical [`CapturedOrbit::source`] values.
 pub mod orbit_sources {
-    /// Orbit fitted by scott (this crate's OD runner).
-    pub const SCOTT_OD: &str = "scott_od";
+    /// Orbit fitted by empyrean's OD channel (this crate's OD runner).
+    pub const EMPYREAN_OD: &str = "empyrean_od";
     /// Orbit fitted by find_orb (Bill Gray / Project Pluto).
     pub const FINDORB: &str = "findorb";
     /// Orbit published by JPL Small-Body Database.
@@ -491,14 +491,14 @@ pub mod orbit_sources {
 /// to [`ValidationResult`] for the orbit-comparison panel.
 ///
 /// Each tool that produces a fitted (or published) orbit + covariance
-/// — scott OD, find_orb, JPL SBDB — emits one [`CapturedOrbit`] record
+/// — empyrean OD, find_orb, JPL SBDB — emits one [`CapturedOrbit`] record
 /// per object. The orbit-comparison kernel consumes these to compare
-/// scott's fit to find_orb and to SBDB in Keplerian element space at a
+/// the empyrean fit to find_orb and to SBDB in Keplerian element space at a
 /// common epoch.
 ///
 /// Each record carries the orbit in three coordinate views:
 /// 1. **Native** — the representation the tool produced (Cartesian for
-///    scott + find_orb; Cometary for SBDB).
+///    the fit + find_orb; Cometary for SBDB).
 /// 2. **Sun-centered ICRF Cartesian** — the common interchange basis,
 ///    used by the propagation step when transporting an orbit from one
 ///    tool's native epoch to another.
@@ -513,10 +513,10 @@ pub mod orbit_sources {
 pub struct CapturedOrbit {
     /// Object name (matches [`crate::catalog::ValidationObject::name`]).
     pub object: String,
-    /// Source tool. One of [`orbit_sources::SCOTT_OD`],
+    /// Source tool. One of [`orbit_sources::EMPYREAN_OD`],
     /// [`orbit_sources::FINDORB`], [`orbit_sources::SBDB`].
     pub source: String,
-    /// Optional source-tool version tag (e.g., scott crate version,
+    /// Optional source-tool version tag (e.g., engine version,
     /// find_orb build date, SBDB orbit solution name like "JPL#256").
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source_version: Option<String>,
@@ -574,10 +574,10 @@ impl CapturedOrbit {
 /// Per-object, per-reference orbit comparison. Emitted by the
 /// orbit-comparison kernel; consumed by the report panel.
 ///
-/// Each row compares scott's fitted orbit + covariance to one
+/// Each row compares the fitted orbit + covariance to one
 /// reference (SBDB or find_orb) in Keplerian element space at one
 /// common epoch. The same (object, reference) pair may produce
-/// multiple rows: one per common-epoch choice (scott's fit epoch,
+/// multiple rows: one per common-epoch choice (the fit epoch,
 /// reference's native epoch).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
@@ -589,34 +589,34 @@ pub struct OrbitComparison {
     pub reference: String,
     /// Common epoch all states are propagated to (MJD TDB).
     pub common_epoch_mjd_tdb: f64,
-    /// Whose native epoch is the common epoch: `"scott"`, `"sbdb"`,
+    /// Whose native epoch is the common epoch: `"fit"`, `"sbdb"`,
     /// or `"findorb"`.
     pub common_epoch_source: String,
     /// Comparison representation (currently always `"keplerian"`).
     pub repr: String,
-    /// Scott's state at common epoch (Keplerian).
-    pub state_scott: [f64; 6],
+    /// The fitted state at common epoch (Keplerian).
+    pub state_fit: [f64; 6],
     /// Reference's state at common epoch (Keplerian).
     pub state_ref: [f64; 6],
-    /// `state_scott - state_ref` (element-wise; angle elements
+    /// `state_fit - state_ref` (element-wise; angle elements
     /// wrapped to `(-180°, 180°]`).
     pub delta: [f64; 6],
-    /// Per-element 1σ from scott's covariance diagonal. Per-element
+    /// Per-element 1σ from the fit covariance diagonal. Per-element
     /// NaNs (when the source has no covariance) round-trip as JSON
     /// `null`.
     #[serde(with = "f64_array6_nan_null")]
-    pub sigma_scott: [f64; 6],
+    pub sigma_fit: [f64; 6],
     /// Per-element 1σ from reference's covariance diagonal.
     #[serde(with = "f64_array6_nan_null")]
     pub sigma_ref: [f64; 6],
-    /// `Δᵀ Σ_scott⁻¹ Δ` — is the reference inside scott's ellipsoid?
-    /// NaN (round-trip as `null`) when Σ_scott is not SPD or missing.
+    /// `Δᵀ Σ_fit⁻¹ Δ` — is the reference inside the fit's ellipsoid?
+    /// NaN (round-trip as `null`) when Σ_fit is not SPD or missing.
     #[serde(with = "f64_nan_null")]
-    pub mahalanobis_d2_scott_metric: f64,
-    /// `Δᵀ Σ_ref⁻¹ Δ` — is scott inside the reference's ellipsoid?
+    pub mahalanobis_d2_fit_metric: f64,
+    /// `Δᵀ Σ_ref⁻¹ Δ` — is the fit inside the reference's ellipsoid?
     #[serde(with = "f64_nan_null")]
     pub mahalanobis_d2_ref_metric: f64,
-    /// `Δᵀ (Σ_scott + Σ_ref)⁻¹ Δ` — symmetric consistency metric.
+    /// `Δᵀ (Σ_fit + Σ_ref)⁻¹ Δ` — symmetric consistency metric.
     #[serde(with = "f64_nan_null")]
     pub mahalanobis_d2_combined_metric: f64,
     /// `Σ_k (Δ_k / σ_combined,k)²` — sum of squared marginal z-scores.
@@ -630,21 +630,21 @@ pub struct OrbitComparison {
     /// `√(d²_combined / 6)` — 6-DOF χ-equivalent sigma.
     #[serde(with = "f64_nan_null")]
     pub sigma_equiv_combined: f64,
-    /// Sorted-descending eigenvalues of `Σ_scott` (Keplerian
-    /// element-space). Same units as `sigma_scott²`.
+    /// Sorted-descending eigenvalues of `Σ_fit` (Keplerian
+    /// element-space). Same units as `sigma_fit²`.
     #[serde(with = "f64_array6_nan_null")]
-    pub eigenvalues_scott: [f64; 6],
+    pub eigenvalues_fit: [f64; 6],
     /// Sorted-descending eigenvalues of `Σ_ref`.
     #[serde(with = "f64_array6_nan_null")]
     pub eigenvalues_ref: [f64; 6],
-    /// Principal-axis rotation between `Σ_scott` and `Σ_ref` in
-    /// degrees: `arccos(|v₁_scott · v₁_ref|)` where v₁ is the
+    /// Principal-axis rotation between `Σ_fit` and `Σ_ref` in
+    /// degrees: `arccos(|v₁_fit · v₁_ref|)` where v₁ is the
     /// eigenvector of the largest eigenvalue. Small angle means
     /// ellipsoids are aligned; a large angle with similar eigenvalue
     /// spectra is the "rotation" pathology signature.
     #[serde(with = "f64_nan_null")]
     pub principal_axis_rotation_deg: f64,
-    /// `det(Σ_scott) / det(Σ_ref)` — overall ellipsoid volume ratio.
+    /// `det(Σ_fit) / det(Σ_ref)` — overall ellipsoid volume ratio.
     /// Retained for backward compatibility; the eigenvalue spectra
     /// above are more interpretable.
     #[serde(with = "f64_nan_null")]

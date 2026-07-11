@@ -322,18 +322,18 @@ static int handle_od(EmpyreanContext* ctx, const char* rest, int solve_non_grav)
      * comment) so a parallel driver doesn't blow ulimit -u. */
     cfg.num_threads = 1;
 
-    /* Production OD defaults — must mirror scott::od::ODConfig::default()
-     * field-for-field so the c channel's fits agree with the core
-     * channel (validate-core, which calls scott directly). Several
+    /* Production OD defaults — must mirror the engine's
+     * ODConfig::default() field-for-field so the c channel's fits agree
+     * with the core channel (validate-core, which calls it directly). Several
      * EmpyreanODConfig fields are read unconditionally on the FFI side,
      * so zero-init silently sets them to non-production values:
      *
-     *   - weighting.enabled = 0 → uniform 1″ (scott default: VFC17)
-     *   - debiasing.enabled = 0 → no catalog debiasing (scott: EFCC2020)
-     *   - use_stm_cache = 0 → STM cache off (scott default: on)
-     *   - solve_for = 0 → STATE_ONLY (scott default: Auto)
-     *   - rejection.enabled = 0 → no outlier rejection (scott: Adaptive)
-     *   - rejection.lambda = 0 → 0.0 information weight (scott: 1.0;
+     *   - weighting.enabled = 0 → uniform 1″ (engine default: VFC17)
+     *   - debiasing.enabled = 0 → no catalog debiasing (engine: EFCC2020)
+     *   - use_stm_cache = 0 → STM cache off (engine default: on)
+     *   - solve_for = 0 → STATE_ONLY (engine default: Auto)
+     *   - rejection.enabled = 0 → no outlier rejection (engine: Adaptive)
+     *   - rejection.lambda = 0 → 0.0 information weight (engine: 1.0;
      *     `-1.0` is the "use upstream default" sentinel)
      *
      * Each one would silently move the c channel's fit away from the
@@ -356,7 +356,7 @@ static int handle_od(EmpyreanContext* ctx, const char* rest, int solve_non_grav)
     cfg.debiasing.bias_dat_path = NULL; /* DataManager default location */
 
     cfg.use_stm_cache = 1;
-    /* Optical-only OD leaves solve_for = Auto (scott's default); the
+    /* Optical-only OD leaves solve_for = Auto (the engine default); the
      * non-grav-recovery pass explicitly forces StateAndNonGrav so the fit
      * solves the full (state, A1, A2, A3) parameter set and populates the
      * 9×9 covariance whose diagonal carries σ_A1/σ_A2/σ_A3. */
@@ -365,7 +365,7 @@ static int handle_od(EmpyreanContext* ctx, const char* rest, int solve_non_grav)
 
     cfg.rejection.enabled = 1;
     cfg.rejection.kind = EMPYREAN_REJECTION_KIND_ADAPTIVE;
-    cfg.rejection.lambda = -1.0; /* sentinel: use scott's default (1.0) */
+    cfg.rejection.lambda = -1.0; /* sentinel: use the engine default (1.0) */
 
     /* Self-perturber exclusion (SB441-N16 bodies that would otherwise
      * pull on themselves through the perturber set). The driver passes
@@ -376,10 +376,10 @@ static int handle_od(EmpyreanContext* ctx, const char* rest, int solve_non_grav)
         cfg.excluded_perturbers_naif = &excluded_naif_storage;
     }
     /* Remaining zero-init fields are guarded on the FFI side with
-     * "use scott default if 0/null" sentinels: max_iterations,
+     * "use engine default if 0/null" sentinels: max_iterations,
      * convergence_tol, epsilon, max_light_time_iterations,
-     * output_epoch.mode (0 = MidArc, matches scott),
-     * acceptability/auto_escalation thresholds (0 = use scott),
+     * output_epoch.mode (0 = MidArc, matches the engine),
+     * acceptability/auto_escalation thresholds (0 = use the engine),
      * rejection.chi2_base (0 = use 9.21), rejection.max_threshold
      * (0 = use 100.0). */
 

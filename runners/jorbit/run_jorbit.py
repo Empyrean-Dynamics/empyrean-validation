@@ -75,7 +75,7 @@ def _build_particle(
     given as a bare jnp array are interpreted as TDB JD (the same scale
     empyrean's MJD TDB is on, just shifted by 2_400_000.5). The
     integration frame is barycentric (DE440 + 16-body asteroid set) —
-    matches scott's Standard tier defaults.
+    matches empyrean's Standard tier defaults.
     """
     return jorbit.Particle(
         x=jnp.asarray([float(pos_au[0]), float(pos_au[1]), float(pos_au[2])]),

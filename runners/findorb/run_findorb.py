@@ -101,7 +101,7 @@ def fetch_mpc_observations(designation: str) -> Optional[str]:
     """Fetch observations from MPC API and return as ADES PSV string.
 
     The MPC API returns JSON which we convert to ADES PSV format
-    for consumption by both scott and find_orb.
+    for consumption by both empyrean and find_orb.
     """
     url = f"https://data.minorplanetcenter.net/api/get-obs?designation={urllib.parse.quote(designation)}&return_type=json"
     try:
@@ -174,7 +174,7 @@ def populate_fo_directory(working_dir: str, data_dir: Optional[pathlib.Path] = N
     # Perturbers: all planets + Pluto + Moon + asteroid perturbers (hex)
     lines.append('PERTURBERS=1007fe')
 
-    # Asteroid perturbers: SB441-N16 set (matches villeneuve/ASSIST)
+    # Asteroid perturbers: SB441-N16 set (matches empyrean/ASSIST)
     lines.append('ASTEROID_PERT_LIST=1,3,4,7,10,15,16,31,52,65,70,87,88,107,511,704')
 
     # Observation weighting on, auto central object, no EFCC18 debiasing

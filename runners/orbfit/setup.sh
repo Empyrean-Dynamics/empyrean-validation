@@ -5,7 +5,7 @@
 # software developed by the OrbFit Consortium (University of Pisa) and
 # adopted by the IAU Minor Planet Center as their production OD pipeline.
 # It is the canonical reference for the Carpino-Milani-Chesley (2003)
-# χ²-with-hysteresis rejection scheme that scott implements as
+# χ²-with-hysteresis rejection scheme that empyrean implements as
 # `RejectionKind::CMC2003`.
 #
 # OrbFit is GPL-licensed and never linked into empyrean. This script

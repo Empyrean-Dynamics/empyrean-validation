@@ -2594,7 +2594,7 @@ if (odRust.length === 0) {{
         const tr = document.createElement('tr');
         if (diverged) tr.classList.add('diverged');
         // empyrean-8l28 + empyrean-ih9f follow-up: when the OD failed
-        // explicitly (scott returned a DetermineError), render a
+        // explicitly (the OD channel returned a DetermineError), render a
         // visually distinct row with a colspan failure cell rather
         // than a sea of '—' that could be misread as "we just don't
         // have these numbers" instead of "the fit didn't produce
@@ -2813,7 +2813,7 @@ if (odRust.length === 0) {{
         return {{ used: r.findorb_n_obs_used, total, pct: (r.findorb_n_obs_used / total) * 100 }};
     }};
     const foCovLabel = (c) => c == null ? '' : `<br>obs: ${{c.used}}/${{c.total}} (${{c.pct.toFixed(1)}}%)${{c.pct < 5 ? ' — placeholder' : c.pct < 50 ? ' — low coverage' : ''}}`;
-    const scottStatusLabel = (r) => {{
+    const fitStatusLabel = (r) => {{
         if (r == null) return '';
         const parts = [];
         if (r.n_obs_used != null) parts.push(`obs used: ${{r.n_obs_used}}`);
@@ -2827,14 +2827,14 @@ if (odRust.length === 0) {{
             x: odObjects, y: odObjects.map(o => (byObj[o].rust && byObj[o].rust.od_rms_ra_arcsec) || null),
             type: 'bar', name: 'rust dRA RMS',
             marker: {{ color: '#5b9bd5' }},
-            customdata: odObjects.map(o => scottStatusLabel(byObj[o].rust)),
+            customdata: odObjects.map(o => fitStatusLabel(byObj[o].rust)),
             hovertemplate: 'rust dRA RMS<br>%{{x}}: %{{y:.3f}}″%{{customdata}}<extra></extra>',
         }},
         {{
             x: odObjects, y: odObjects.map(o => (byObj[o].rust && byObj[o].rust.od_rms_dec_arcsec) || null),
             type: 'bar', name: 'rust dDec RMS',
             marker: {{ color: '#5b9bd5aa' }},
-            customdata: odObjects.map(o => scottStatusLabel(byObj[o].rust)),
+            customdata: odObjects.map(o => fitStatusLabel(byObj[o].rust)),
             hovertemplate: 'rust dDec RMS<br>%{{x}}: %{{y:.3f}}″%{{customdata}}<extra></extra>',
         }},
     ];
@@ -2845,7 +2845,7 @@ if (odRust.length === 0) {{
             mode: 'markers', name: 'rust combined RMS',
             marker: {{ color: '#5b9bd5', size: 10, symbol: 'circle', line: {{ color: '#1f4e79', width: 1.5 }} }},
             type: 'scatter',
-            customdata: odObjects.map(o => scottStatusLabel(byObj[o].rust)),
+            customdata: odObjects.map(o => fitStatusLabel(byObj[o].rust)),
             hovertemplate: 'rust combined<br>%{{x}}: %{{y:.3f}}″%{{customdata}}<extra></extra>',
         }});
     }}
@@ -2880,11 +2880,11 @@ if (odRust.length === 0) {{
         margin: {{ ...baseLayout.margin, b: 100 }},
     }}, {{ responsive: true, displayModeBar: 'hover', modeBarButtonsToRemove: ['select2d', 'lasso2d', 'autoScale2d', 'toggleSpikelines'] }});
 
-    // Chart 3b: scott combined RMS vs find_orb RMS — y=x scatter.
+    // Chart 3b: empyrean combined RMS vs find_orb RMS — y=x scatter.
     // Marker color encodes find_orb's obs coverage so the reader can
     // see at a glance when a point is "find_orb gave up and returned
     // the 2.2-AU placeholder" rather than a comparable fit. Hover
-    // boxes carry the obs accounting and scott's reduced χ² on both
+    // boxes carry the obs accounting and the fit's reduced χ² on both
     // sides for the same reason.
     const rmsPairs = odObjects
         .map(o => {{
@@ -2896,12 +2896,12 @@ if (odRust.length === 0) {{
             const s = r.od_rms_combined_arcsec;
             const f = r.findorb_rms_residual;
             if (s == null || f == null || s <= 0 || f <= 0) return null;
-            return {{ obj: o, row: r, scott: s, findorb: f }};
+            return {{ obj: o, row: r, fit: s, findorb: f }};
         }})
         .filter(p => p != null);
     if (rmsPairs.length > 0) {{
         const xs = rmsPairs.map(p => p.findorb);
-        const ys = rmsPairs.map(p => p.scott);
+        const ys = rmsPairs.map(p => p.fit);
         const lo = Math.min(...xs, ...ys) * 0.5;
         const hi = Math.max(...xs, ...ys) * 2.0;
         // Per-point color: green for high coverage, orange for low,
@@ -2919,7 +2919,7 @@ if (odRust.length === 0) {{
             const sChi = p.row.od_reduced_chi2;
             const lines = [
                 `find_orb: ${{p.findorb.toFixed(3)}}″`,
-                `Empyrean combined: ${{p.scott.toFixed(3)}}″`,
+                `Empyrean combined: ${{p.fit.toFixed(3)}}″`,
             ];
             if (sChi != null) lines.push(`Empyrean χ²ᵣ: ${{sChi.toExponential(2)}}`);
             if (p.row.n_obs_used != null) lines.push(`Empyrean obs used: ${{p.row.n_obs_used}}`);
@@ -3353,12 +3353,12 @@ if (uncRust.length === 0 && uncCore.length === 0) {{
 
 // ─────────── Section 12: Fitted orbit + covariance vs references ───────────
 const orbitComparisons = ORBIT_COMPARISONS_JSON;
-// User-facing relabel — the sidecar embeds "scott" / "sbdb" as the
-// `common_epoch_source` enum because scott is the internal Rust crate
+// User-facing relabel — the sidecar embeds "fit" / "sbdb" as the
+// `common_epoch_source` enum tags
 // name for the OD library; surface as "Empyrean fit" / "SBDB" for the
 // reader.
 function relabelEpochSource(s) {{
-    if (s === 'scott') return 'Empyrean fit';
+    if (s === 'fit') return 'Empyrean fit';
     if (s === 'sbdb') return 'SBDB';
     if (s === 'findorb') return 'find_orb';
     return s;
@@ -3403,9 +3403,9 @@ if (!orbitComparisons.length) {{
         return '';
     }}
     // Tiny inline SVG "eigen-spectrum strip": six log-scale dots
-    // overlaying scott (#f85149) and reference (#5b9bd5) eigenvalues.
+    // overlaying the fit (#f85149) and reference (#5b9bd5) eigenvalues.
     function eigenSpectrumStrip(c) {{
-        const es = c.eigenvalues_scott, er = c.eigenvalues_ref;
+        const es = c.eigenvalues_fit, er = c.eigenvalues_ref;
         if (!es || !er) return '<span style="color:#666">—</span>';
         const all = [...es, ...er].filter(v => isFinite(v) && v > 0);
         if (!all.length) return '<span style="color:#666">—</span>';
@@ -3422,7 +3422,7 @@ if (!orbitComparisons.length) {{
         let svg = `<svg width="${{W}}" height="${{H}}" style="vertical-align:middle">`;
         // Track line.
         svg += `<line x1="${{pad}}" y1="${{H/2}}" x2="${{W-pad}}" y2="${{H/2}}" stroke="#2a3340" stroke-width="1"/>`;
-        // Scott (red) dots above center line, reference (blue) below.
+        // Fit (red) dots above center line, reference (blue) below.
         for (const v of es) {{
             const x = scaleX(v);
             svg += `<circle cx="${{x}}" cy="${{H/2 - 4}}" r="2" fill="#f85149"/>`;
@@ -3439,7 +3439,7 @@ if (!orbitComparisons.length) {{
         const W = 360, H = 96, padL = 32, padR = 8, padT = 8, padB = 18;
         const innerW = W - padL - padR, innerH = H - padT - padB;
         const zs = KEP_LABELS.map((_, k) => {{
-            const ss = c.sigma_scott[k] || 0, sr = c.sigma_ref[k] || 0;
+            const ss = c.sigma_fit[k] || 0, sr = c.sigma_ref[k] || 0;
             const sc = Math.sqrt(ss*ss + sr*sr);
             return (sc > 0 && isFinite(c.delta[k])) ? c.delta[k] / sc : 0;
         }});
@@ -3488,7 +3488,7 @@ if (!orbitComparisons.length) {{
         const tr = document.createElement('tr');
         tr.style.cursor = 'pointer';
         const sigRatio_a = (c.sigma_ref && c.sigma_ref[0] > 0)
-            ? (c.sigma_scott[0] / c.sigma_ref[0]) : null;
+            ? (c.sigma_fit[0] / c.sigma_ref[0]) : null;
         const ratio = (isFinite(c.mahalanobis_d2_combined_metric)
                        && isFinite(c.mahalanobis_d2_marginal)
                        && c.mahalanobis_d2_marginal > 1e-30)
@@ -3506,7 +3506,7 @@ if (!orbitComparisons.length) {{
             <td>${{fmtSci(c.delta[3])}}</td>
             <td>${{fmtSci(c.delta[4])}}</td>
             <td>${{fmtSci(c.delta[5])}}</td>
-            <td>${{fmtSci(c.sigma_scott[0])}}</td>
+            <td>${{fmtSci(c.sigma_fit[0])}}</td>
             <td>${{fmtSci(c.sigma_ref[0])}}</td>
             <td>${{fmtSci(sigRatio_a, 2)}}</td>
             <td>${{fmtSci(c.mahalanobis_d2_marginal, 2)}}</td>
@@ -3685,23 +3685,23 @@ mod tests {
             object: "Apophis".to_string(),
             reference: "sbdb".to_string(),
             common_epoch_mjd_tdb: 53371.835,
-            common_epoch_source: "scott".to_string(),
+            common_epoch_source: "fit".to_string(),
             repr: "keplerian".to_string(),
-            state_scott: [0.92, 0.19, 3.33, 204.5, 126.3, 105.9],
+            state_fit: [0.92, 0.19, 3.33, 204.5, 126.3, 105.9],
             state_ref: [0.92, 0.19, 3.34, 203.9, 126.7, 312.8],
             delta: [0.0, -2e-8, -0.01, 0.6, -0.35, -153.0],
-            sigma_scott: [4.4e-10, 3.5e-8, 1.3e-6, 1.9e-5, 1.8e-5, 8.2e-6],
+            sigma_fit: [4.4e-10, 3.5e-8, 1.3e-6, 1.9e-5, 1.8e-5, 8.2e-6],
             sigma_ref: [1.7e-9, 1.6e-9, 9.9e-8, 3.1e-6, 3.3e-6, 7.8e-7],
-            mahalanobis_d2_scott_metric: 7807.0,
+            mahalanobis_d2_fit_metric: 7807.0,
             mahalanobis_d2_ref_metric: 574700.0,
             mahalanobis_d2_combined_metric: 1186.0,
             mahalanobis_d2_marginal: 0.01,
             sigma_equiv_combined: 14.06,
-            eigenvalues_scott: [1.5e-9, 6.7e-10, 3.4e-10, 9.0e-12, 3.3e-13, 1.9e-19],
+            eigenvalues_fit: [1.5e-9, 6.7e-10, 3.4e-10, 9.0e-12, 3.3e-13, 1.9e-19],
             eigenvalues_ref: [1.3e-11, 1.1e-11, 2.3e-12, 4.2e-15, 1.2e-17, 2.5e-19],
             principal_axis_rotation_deg: 64.3,
             cov_volume_ratio: 1.2e11,
-            notes: vec!["reference (SBDB) propagated to scott epoch via STM".to_string()],
+            notes: vec!["reference (SBDB) propagated to fit epoch via STM".to_string()],
         }];
         let dir = tempfile::tempdir().unwrap();
         let out = dir.path().join("report.html");

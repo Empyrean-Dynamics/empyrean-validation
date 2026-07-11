@@ -6,6 +6,8 @@ Cross-channel and external-reference validation for the empyrean astrodynamics s
 <a href="https://github.com/Empyrean-Dynamics/empyrean-validation/actions/workflows/rust.yml"><img src="https://github.com/Empyrean-Dynamics/empyrean-validation/actions/workflows/rust.yml/badge.svg" alt="CI"></a>
 <a href="https://github.com/Empyrean-Dynamics/empyrean-validation/actions/workflows/validation.yml"><img src="https://github.com/Empyrean-Dynamics/empyrean-validation/actions/workflows/validation.yml/badge.svg" alt="Validation Suite"></a>
 <a href="https://github.com/Empyrean-Dynamics/empyrean/releases/tag/v0.8.1"><img src="https://img.shields.io/badge/validates-empyrean%200.8.1-1a1a2e?style=flat-square" alt="validates empyrean 0.8.1"></a>
+<a href="https://zenodo.org/badge/latestdoi/1225313390"><img src="https://zenodo.org/badge/1225313390.svg" alt="DOI"></a>
+<a href="LICENSE"><img src="https://img.shields.io/badge/License-BSD_3--Clause-blue.svg?style=flat-square" alt="License: BSD 3-Clause"></a>
 <br>
 <a href="https://claude.ai"><img src="https://img.shields.io/badge/Built%20with-Claude%20Code-D97757?logo=anthropic&logoColor=white&style=flat-square" alt="Built with Claude Code"></a>
 <a href="https://www.empyrean-dynamics.com"><img src="https://img.shields.io/badge/Website-empyrean--dynamics.com-1a1a2e?logo=data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHdpZHRoPSIyNCIgaGVpZ2h0PSIyNCIgdmlld0JveD0iMCAwIDI0IDI0IiBmaWxsPSJub25lIiBzdHJva2U9IndoaXRlIiBzdHJva2Utd2lkdGg9IjIiIHN0cm9rZS1saW5lY2FwPSJyb3VuZCIgc3Ryb2tlLWxpbmVqb2luPSJyb3VuZCI+PGNpcmNsZSBjeD0iMTIiIGN5PSIxMiIgcj0iMTAiLz48bGluZSB4MT0iMiIgeTE9IjEyIiB4Mj0iMjIiIHkyPSIxMiIvPjxwYXRoIGQ9Ik0xMiAyYTE1LjMgMTUuMyAwIDAgMSA0IDEwIDE1LjMgMTUuMyAwIDAgMS00IDEwIDE1LjMgMTUuMyAwIDAgMS00LTEwIDE1LjMgMTUuMyAwIDAgMSA0LTEweiIvPjwvc3ZnPg==&logoColor=white&style=flat-square" alt="Website"></a>
@@ -95,8 +97,8 @@ badge above is part of the same atomic pin-bump artifact — it always
 states the published release the committed manifests point at. The committed manifests
 therefore pin only published, tagged artifacts — the runners consume
 `empyrean` from crates.io (whose `empyrean-sys` downloads the
-checksum-pinned engine of that release), and the plan generator pins the
-villeneuve tag of the same release generation. The core reference channel
+checksum-pinned engine of that release), and the plan generator's JPL
+query clients come from the same published crate. The core reference channel
 (`validate-core`) builds from the `empyrean-core` tag of that generation.
 
 Validating unreleased work is a deliberate, **uncommitted** local

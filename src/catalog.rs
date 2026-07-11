@@ -97,7 +97,7 @@ pub const OBSERVER_CODES: &[&str] = &["W84", "F51", "X05", "500", "I41"];
 /// Population color from the brand palette.
 ///
 /// Returns the hex string used by the validation report's heatmap +
-/// time-series traces. Mirrors the spielberg chart palette
+/// time-series traces. Mirrors the Empyrean app chart palette
 /// (`variables.css`) so reports and the web frontend stay visually
 /// consistent.
 pub fn population_color(pop: &str) -> &'static str {

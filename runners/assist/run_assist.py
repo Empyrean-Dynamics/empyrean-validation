@@ -50,7 +50,7 @@ AU_KM = 149_597_870.700
 class HorizonsCache:
     """Disk cache for Horizons state vectors.
 
-    Compatible with villeneuve's DiskCache format: each entry is a JSON
+    Compatible with empyrean's disk-cache format: each entry is a JSON
     file named by sanitized key, containing {key, response}.
     """
 
@@ -137,7 +137,7 @@ class HorizonsCache:
     def put(self, command: str, epoch_mjd: float, pos, vel):
         """Store a fetched result in the index and write to disk.
 
-        Writes in villeneuve DiskCache format so Rust can read it back.
+        Writes in empyrean's disk-cache format so Rust can read it back.
         We store the raw Horizons JSON response (with "result" text).
         """
         key = (command, round(epoch_mjd, 6))
