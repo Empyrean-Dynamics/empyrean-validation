@@ -17,7 +17,7 @@ are a Goldstone DSS-14 → DSS-13 transmit/receive pair (`trx=253`, `rcv=252`;
 `trx != rcv`), independently verified 1:1 against the live JPL API. It was
 originally radar-only; it is now a fittable catalog object — `src/catalog.rs`
 carries a `Toutatis` NEO entry and `../psv/Toutatis.psv` holds its optical arc
-(7155 post-1972 MPC records; pre-1972 precovery is dropped because villeneuve's
+(7155 post-1972 MPC records; pre-1972 precovery is dropped because the engine's
 UTC→TDB conversion requires post-1972 epochs).
 
 The optical table is byte-identical to `../psv/<name>.psv`; the radar table is a
@@ -28,19 +28,17 @@ mapped to MPC obs codes (−14→253 Goldstone DSS-14, −1→251 Arecibo, …).
 
 ## Why these are staged here, not in `../psv/`
 
-The validation runner reads `fixtures/psv/<name>.psv`. The empyrean OD channel
-currently builds against an **optical-only scott** whose PSV reader does not know
-the radar `frq`/`com` columns and **hard-errors** on a radar table
-(`ParseFloat … "rmsDoppler"`). So these live outside the runner's path until the
-suite builds against a radar-capable scott. Each file is round-trip-verified
-through the radar-branch scott parser (optical + radar counts above).
+The validation runner reads `fixtures/psv/<name>.psv`, so the OD comparison
+matrix is optical-only today. The distribution itself already carries radar
+end-to-end (`read_ades` → `determine` — guarded by
+`runners/rust/tests/radar_regression.rs`, which fits the Apophis
+optical+radar arc through the wrapper); these fixtures are staged until the
+OD comparison rows and report columns are extended to radar residuals.
 
-## Activating (the P6 "radar distribution exposure" step)
+## Activating
 
-Once scott PR #63 (radar OD) is merged and empyrean-core / the wrapper / the C
-ABI carry radar through `parse_ades` → `determine`, point the Rust runner's
-`fixtures_dir` (`runners/rust/src/main.rs`) at `fixtures/psv-radar/` (or copy
-these over `../psv/`). Then:
+Point the Rust runner's `fixtures_dir` (`runners/rust/src/main.rs`) at
+`fixtures/psv-radar/` (or copy these over `../psv/`). Then:
 
 - the **empyrean channel** fits optical + radar (e.g. Apophis ~60× position
   tightening, 1576.8 km → 26.1 km 1σ), and
@@ -52,14 +50,13 @@ displaying radar fits will want new delay/Doppler residual columns.
 
 ## Regenerating / extending
 
-Built from the scott radar branch (`feature/radar-observation-type`) via scott's
-own I/O so the result round-trips by construction:
+Built through the engine's own JPL `sb_radar` client and ADES writer, so the
+result round-trips by construction:
 
 ```
-villeneuve::io::jpl::query_radar(["<des>"])   // live JPL sb_radar astrometry
-  → RadarObservation::from_jpl_radar           // JPL → ADES-native (µs→s, station map)
-  → ADESData{ block.radar = … }
-  → write_psv_string                           // emit the <radar> table
+JPL sb_radar query for "<des>"       # live delay/Doppler astrometry
+  → JPL → ADES-native conversion     # µs→s, station-code map
+  → emit the <radar> PSV table
   → append to the curated optical ../psv/<name>.psv
 ```
 

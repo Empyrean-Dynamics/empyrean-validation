@@ -51,3 +51,37 @@ python3                   oorb/run_oorb.py       --input validation_plan.json --
 
 Outputs are merged by the empyrean-validation report renderer into a
 single multi-channel HTML page.
+
+## Add a runner
+
+To plug another implementation into the suite, copy the shape of the
+existing runners — `kete/` is the simplest full-featured template
+(propagation + ephemeris + OD), `jorbit/` the simplest minimal one
+(propagation + ephemeris only):
+
+1. **Create `runners/<tool>/`** with a `setup.sh` that installs the
+   upstream tool into a self-contained environment (its own venv or
+   build tree — GPL tools stay subprocess/venv-isolated and are never
+   linked), and a single `run_<tool>.py` entry point. Any language
+   works; the contract is JSON in, JSON out.
+2. **Read the plan** (`results/validation_plan.json`). Each row is one
+   test case: `test_type` is `propagation` (propagate the
+   initial condition to `t_mjd_tdb`), `ephemeris` (also compute the
+   observed RA/Dec/range for `observer` at that epoch), or
+   `orbit_determination` (fit the object's MPC astrometry from
+   `fixtures/psv/`). Initial conditions are Cartesian SSB-centered
+   ICRF, in au and au/day (`ic_pos_au` / `ic_vel_au_d`), with Marsden
+   non-grav parameters (`ic_a1`…`ic_g_k`, `ic_non_grav_dt`) when the
+   object has them — no network access needed to replay a row.
+   Skip row kinds your tool doesn't support (several runners skip OD).
+3. **Emit one JSON array of rows** in the
+   [`ValidationResult`](../src/schema.rs) shape, with `channel` set to
+   your tool's name and the fields you can't populate left `null`.
+   Copy the reference values (`ref_*`) through from the plan row so
+   your rows are self-contained.
+4. **Render**: pass your output alongside the other channel JSONs —
+   `empyrean-validation report --results validation_rust.json
+   validation_<tool>.json --output report.html` — and your tool shows
+   up as another column in the comparison. The CLI installs with
+   `cargo install --git https://github.com/Empyrean-Dynamics/empyrean-validation`
+   (no private dependencies).

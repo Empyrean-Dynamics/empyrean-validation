@@ -24,7 +24,7 @@ name: Validation Suite
 #                         Fires immediately because every push to
 #                         either of those is the next release
 #                         candidate users will feel.
-#   - sibling-tag-push  : villeneuve / scott / nolan tag a release.
+#   - sibling-tag-push  : a private engine repo tags a release.
 #                         Pre-tag main pushes are not dispatched —
 #                         the tag is the moment the upstream commits
 #                         to "this is the version the rest of the
@@ -71,6 +71,11 @@ env:
   CARGO_NET_GIT_FETCH_WITH_CLI: true
   GCS_BUCKET: gs://empyrean-validation
   EMPYREAN_DATA_DIR: ${{ github.workspace }}/data
+  # The numerical-parity suite runs on a single interpreter by design: the
+  # empyrean python channel ships as an abi3 wheel, so its compiled binary is
+  # byte-identical across CPython 3.10–3.14 — running the (expensive) suite per
+  # version would add cost with no signal. Per-version *Python* coverage lives in
+  # the empyrean repo's own CI (lint + mypy + tests across the support range).
   PYTHON_VERSION: "3.12"
   OBJECTS: ${{ inputs.objects || 'Apophis,Bennu,Eros,Vesta,2018 LA' }}
   TIER: ${{ inputs.tier || 'standard' }}
@@ -127,7 +132,7 @@ jobs:
       #   <workspace>/empyrean/                 (rust / python / c / cli runners)
       #   <workspace>/empyrean-core/            (validate-core binary)
       #   <workspace>/empyrean-validation/      (this repo: framework + Makefile + externals)
-      #   <workspace>/{scott,villeneuve,nolan}/ (transitive sibling deps for [patch])
+      #   <workspace>/<engine siblings>/ (empyrean-core's private deps for [patch])
       # All paths in the Makefile resolve from `..` of the empyrean-validation
       # checkout, which means each repo MUST sit alongside it. We do that by
       # checking the default repo out under `path: empyrean-validation/`
@@ -153,18 +158,18 @@ jobs:
 
       # Transitive deps — needed by the [patch] sections in
       # empyrean / empyrean-core / empyrean-validation Cargo.toml so
-      # cargo resolves villeneuve / scott / nolan to local sibling
+      # cargo resolves empyrean-core's private deps to local sibling
       # checkouts instead of the tagged git URLs (which would
       # otherwise duplicate the dep tree and produce incompatible
       # `Orbits<AU>` types across the workspace).
-      - name: Checkout scott (transitive)
+      - name: Checkout core dep (transitive)
         uses: actions/checkout@v4
         with:
           repository: Empyrean-Dynamics/scott
           path: scott
           token: ${{ secrets.GH_PAT }}
 
-      - name: Checkout villeneuve (transitive)
+      - name: Checkout core dep 2 (transitive)
         uses: actions/checkout@v4
         with:
           repository: Empyrean-Dynamics/villeneuve
@@ -185,6 +190,14 @@ jobs:
       - uses: actions-rust-lang/setup-rust-toolchain@v1
         with:
           rustflags: ""
+          # The repo checks out under empyrean-validation/ (sibling
+          # layout), so the embedded rust-cache must be pointed at the
+          # actual crate roots — with no config it runs cargo metadata
+          # at the workspace root, finds no Cargo.toml, and errors.
+          cache-workspaces: |
+            empyrean-validation
+            empyrean-validation/runners/rust
+            empyrean-validation/runners/cli
 
       - uses: actions/setup-python@v5
         with:
@@ -286,9 +299,9 @@ jobs:
       # python and core are both expected to be bit-exact to the rust
       # reference at 1e-10 fidelity. python tests that the PyO3 bridge
       # round-trips without precision loss; core tests that the FFI
-      # surface (rust) and direct-scott surface (core) don't drift apart
+      # surface (rust) and the direct engine surface (core) don't drift apart
       # on the v0.7.0 ODConfig defaults. A failure here usually means a
-      # config-default regression in either the wrapper or scott.
+      # config-default regression in either the wrapper or the engine.
       - name: ci-check (gate on python + core parity)
         working-directory: empyrean-validation
         run: |
@@ -310,7 +323,7 @@ jobs:
         run: |
           TIMESTAMP=$(date -u +%Y%m%d_%H%M%S)
 
-          # GCS layout consumed by spielberg's ValidationPage
+          # GCS layout consumed by the app's validation page
           # (https://validation.empyrean-dynamics.com/latest/...):
           #
           #   latest/validation.json         ← merged rust prop+eph (canonical, backwards-compat)

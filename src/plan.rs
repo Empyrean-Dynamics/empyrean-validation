@@ -8,7 +8,8 @@
 //!
 //! # Network behaviour
 //!
-//! Both SBDB and Horizons queries go through [`villeneuve::io::cache::DiskCache`]
+//! Both SBDB and Horizons queries go through the published `empyrean`
+//! crate's disk-cached JPL clients (`cache_dir`-keyed)
 //! — the first run hits the network and writes to disk; subsequent runs
 //! against the same cache are network-free. CI environments should
 //! commit the cache as a workflow artifact (or pull it from GCS) so the
@@ -31,8 +32,7 @@
 
 use std::collections::HashMap;
 
-use villeneuve::io::cache::DiskCache;
-use villeneuve::io::jpl::horizons::HorizonsRecord;
+use empyrean::EphemerisEntry;
 
 use crate::catalog::{DEFAULT_DT_DAYS, OBSERVER_CODES, ValidationObject};
 use crate::schema::{ValidationPlan, ValidationResult, channels, test_types, uncertainty_modes};
@@ -83,8 +83,8 @@ impl Default for PlanConfig {
 pub fn build_plan(
     objects: &[&ValidationObject],
     config: &PlanConfig,
-    sbdb_cache: &mut DiskCache,
-    horizons_cache: &mut DiskCache,
+    sbdb_cache_dir: &std::path::Path,
+    horizons_cache_dir: &std::path::Path,
 ) -> ValidationPlan {
     let timestamp = chrono::Utc::now().to_rfc3339();
     let obs_code = OBSERVER_CODES[0];
@@ -102,21 +102,30 @@ pub fn build_plan(
 
     for obj in objects {
         // 1. SBDB → IC epoch + non-grav parameters.
-        let sbdb = match villeneuve::io::jpl::sbdb::query_sbdb(&[obj.sbdb_query], Some(sbdb_cache))
-        {
-            Ok(o) => o,
+        let sbdb = match empyrean::query_sbdb(&[obj.sbdb_query], Some(sbdb_cache_dir)) {
+            Ok(b) if !b.orbits.is_empty() => b,
+            Ok(_) => {
+                eprintln!("  {}: SKIP (SBDB: empty result)", obj.name);
+                continue;
+            }
             Err(e) => {
                 eprintln!("  {}: SKIP (SBDB: {e})", obj.name);
                 continue;
             }
         };
-        let epoch = sbdb.coordinates()[0].time().mjd_tdb();
+        let epoch = match sbdb.orbits[0].state.epoch.mjd_tdb() {
+            Ok(t) => t,
+            Err(e) => {
+                eprintln!("  {}: SKIP (SBDB epoch: {e})", obj.name);
+                continue;
+            }
+        };
 
         // 2. Horizons IC at SBDB epoch.
-        let (ic_pos, ic_vel) = match villeneuve::io::jpl::horizons::query_horizons_vectors(
+        let (ic_pos, ic_vel) = match empyrean::query_horizons_vectors(
             obj.horizons_command,
             epoch,
-            Some(horizons_cache),
+            Some(horizons_cache_dir),
         ) {
             Ok(h) => h,
             Err(e) => {
@@ -129,15 +138,24 @@ pub fn build_plan(
         // asteroids and water-ice for comets. `dt` is the SBDB time-delay
         // (days) applied to g(r) — non-zero for Jupiter-family comets and
         // some interstellar objects (67P=+45.7d, 2I/Borisov=−65.1d).
-        let (a1, a2, a3, g_alpha, g_r0, g_m, g_n, g_k, ng_dt) = match sbdb.non_grav_params(0) {
-            Some(ng) => {
-                let g = match &ng.model {
-                    villeneuve::dynamics::forces::non_gravitational::NonGravModel::MarsdenSekanina(g) => g.clone(),
-                    _ => villeneuve::dynamics::forces::non_gravitational::GFunction::inverse_square(),
-                };
-                (ng.a1, ng.a2, ng.a3, g.alpha, g.r0, g.m, g.n, g.k, ng.dt)
-            }
-            None => (0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, None),
+        let (a1, a2, a3, g_alpha, g_r0, g_m, g_n, g_k, ng_dt) = {
+            let o = &sbdb.orbits[0];
+            // The wrapper carries the Marsden g(r) parameters as flat
+            // fields with an all-zero sentinel for the inverse-square
+            // default; the plan rows record the canonical inverse-square
+            // constants (α=1, r0=1, m=2, n=0, k=0) in that case, exactly
+            // as the engine-typed client did.
+            let has_g = o.ng_alpha != 0.0
+                || o.ng_r0 != 0.0
+                || o.ng_m != 0.0
+                || o.ng_n != 0.0
+                || o.ng_k != 0.0;
+            let (ga, gr0, gm, gn, gk) = if has_g {
+                (o.ng_alpha, o.ng_r0, o.ng_m, o.ng_n, o.ng_k)
+            } else {
+                (1.0, 1.0, 2.0, 0.0, 0.0)
+            };
+            (o.a1, o.a2, o.a3, ga, gr0, gm, gn, gk, o.non_grav_dt)
         };
 
         eprintln!(
@@ -150,10 +168,10 @@ pub fn build_plan(
         let mut horizons_vectors: HashMap<i64, ([f64; 3], [f64; 3])> = HashMap::new();
         for &dt in dt_list {
             let target = epoch + dt;
-            match villeneuve::io::jpl::horizons::query_horizons_vectors(
+            match empyrean::query_horizons_vectors(
                 obj.horizons_command,
                 target,
-                Some(horizons_cache),
+                Some(horizons_cache_dir),
             ) {
                 Ok(h) => {
                     horizons_vectors.insert(dt as i64, h);
@@ -164,17 +182,17 @@ pub fn build_plan(
             }
         }
 
-        let mut horizons_ephemeris: HashMap<i64, HorizonsRecord> = HashMap::new();
+        let mut horizons_ephemeris: HashMap<i64, EphemerisEntry> = HashMap::new();
         for &dt in dt_list {
             if dt == 0.0 {
                 continue;
             }
             let target = epoch + dt;
-            match villeneuve::io::jpl::horizons::query_horizons(
+            match empyrean::query_horizons(
                 &[obj.horizons_command],
                 obs_code,
                 &[target],
-                Some(horizons_cache),
+                Some(horizons_cache_dir),
             ) {
                 Ok(r) if !r.is_empty() => {
                     horizons_ephemeris.insert(dt as i64, r.into_iter().next().unwrap());
@@ -317,7 +335,7 @@ fn ephemeris_plan_row(
     ic_pos: [f64; 3],
     ic_vel: [f64; 3],
     nongrav: (f64, f64, f64, f64, f64, f64, f64, f64, Option<f64>),
-    hor: &HorizonsRecord,
+    hor: &EphemerisEntry,
     uncertainty: Option<&str>,
     timestamp: &str,
 ) -> ValidationResult {
@@ -343,10 +361,12 @@ fn ephemeris_plan_row(
     r.ic_g_n = Some(g_n);
     r.ic_g_k = Some(g_k);
     r.ic_non_grav_dt = ng_dt;
-    r.ref_ra_rad = Some(hor.ra);
-    r.ref_dec_rad = Some(hor.dec);
-    r.ref_rho_au = Some(hor.rho);
-    r.ref_light_time_d = hor.light_time;
+    r.ref_ra_rad = Some(hor.ra_deg.to_radians());
+    r.ref_dec_rad = Some(hor.dec_deg.to_radians());
+    r.ref_rho_au = Some(hor.rho_au);
+    // The wrapper reports light time as a plain f64 with NaN for
+    // unavailable; preserve the Option semantics of the plan schema.
+    r.ref_light_time_d = (!hor.light_time_days.is_nan()).then_some(hor.light_time_days);
     r.propagation_uncertainty = uncertainty.map(|s| s.to_string());
     r.timestamp = timestamp.to_string();
     r.notes = obj.notes.to_string();

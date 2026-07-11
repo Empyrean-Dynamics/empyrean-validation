@@ -1,7 +1,7 @@
 //! Orbit + covariance comparison kernel.
 //!
-//! Compare two [`CapturedOrbit`] records (e.g., scott OD vs JPL SBDB,
-//! or scott OD vs find_orb) and produce an [`OrbitComparison`] with
+//! Compare two [`CapturedOrbit`] records (e.g., the empyrean OD fit vs JPL
+//! SBDB, or the fit vs find_orb) and produce an [`OrbitComparison`] with
 //! per-element Δ, σ ratios, three Mahalanobis distances, and a
 //! covariance volume ratio.
 //!
@@ -16,22 +16,22 @@
 //! # Common epoch (current scope)
 //!
 //! This module assumes the two records are **already at the same
-//! epoch**. Bringing them to a common epoch (propagating scott forward
+//! epoch**. Bringing them to a common epoch (propagating the fit forward
 //! / SBDB backward, or driving find_orb with `fo -tjd <jd>`) is the
 //! orchestrating runner's job — this kernel is pure data + math.
 //!
 //! # Mahalanobis flavors
 //!
-//! For Δ = scott − ref (with angle elements wrapped to (-180°, 180°]):
+//! For Δ = fit − ref (with angle elements wrapped to (-180°, 180°]):
 //!
 //! \\[
-//! d^2_\text{scott}    = \Delta^\top \Sigma_\text{scott}^{-1}     \Delta
+//! d^2_\text{fit}    = \Delta^\top \Sigma_\text{fit}^{-1}     \Delta
 //! \\]
 //! \\[
 //! d^2_\text{ref}      = \Delta^\top \Sigma_\text{ref}^{-1}       \Delta
 //! \\]
 //! \\[
-//! d^2_\text{combined} = \Delta^\top (\Sigma_\text{scott} + \Sigma_\text{ref})^{-1} \Delta
+//! d^2_\text{combined} = \Delta^\top (\Sigma_\text{fit} + \Sigma_\text{ref})^{-1} \Delta
 //! \\]
 //!
 //! The first two answer "is the other side inside my error ellipsoid?";
@@ -44,8 +44,8 @@
 
 use crate::schema::{CapturedOrbit, OrbitComparison};
 
-/// Pair scott_od orbits with reference orbits by object name and emit
-/// one [`OrbitComparison`] per matched (scott, reference) pair.
+/// Pair empyrean_od orbits with reference orbits by object name and emit
+/// one [`OrbitComparison`] per matched (fit, reference) pair.
 ///
 /// Records without a Keplerian covariance are skipped (no `σ` available
 /// → can't compute Mahalanobis). Records with mismatched epochs (Δ >
@@ -62,15 +62,15 @@ pub fn compare_orbits(
 ) -> Vec<OrbitComparison> {
     use crate::schema::orbit_sources;
 
-    let scott_records: Vec<&CapturedOrbit> = captured
+    let fit_records: Vec<&CapturedOrbit> = captured
         .iter()
-        .filter(|c| c.source == orbit_sources::SCOTT_OD)
+        .filter(|c| c.source == orbit_sources::EMPYREAN_OD)
         .collect();
     let mut comparisons = Vec::new();
 
-    for scott in &scott_records {
-        for reference in captured.iter().filter(|c| c.object == scott.object) {
-            if reference.source == orbit_sources::SCOTT_OD {
+    for fit in &fit_records {
+        for reference in captured.iter().filter(|c| c.object == fit.object) {
+            if reference.source == orbit_sources::EMPYREAN_OD {
                 continue;
             }
             if reference.source != orbit_sources::SBDB && reference.source != orbit_sources::FINDORB
@@ -78,36 +78,36 @@ pub fn compare_orbits(
                 continue;
             }
             let mut notes: Vec<String> = Vec::new();
-            let dt = (reference.epoch_mjd_tdb - scott.epoch_mjd_tdb).abs();
+            let dt = (reference.epoch_mjd_tdb - fit.epoch_mjd_tdb).abs();
             if dt > epoch_tolerance_days {
                 notes.push(format!(
-                    "epoch mismatch: scott={:.3} ref={:.3} Δ={:.3}d (no propagation applied)",
-                    scott.epoch_mjd_tdb, reference.epoch_mjd_tdb, dt
+                    "epoch mismatch: fit={:.3} ref={:.3} Δ={:.3}d (no propagation applied)",
+                    fit.epoch_mjd_tdb, reference.epoch_mjd_tdb, dt
                 ));
             }
-            comparisons.push(compare_pair(scott, reference, notes));
+            comparisons.push(compare_pair(fit, reference, notes));
         }
     }
     comparisons
 }
 
 fn compare_pair(
-    scott: &CapturedOrbit,
+    fit: &CapturedOrbit,
     reference: &CapturedOrbit,
     mut notes: Vec<String>,
 ) -> OrbitComparison {
-    let state_scott = scott.state_kep_ecliptic_sun;
+    let state_fit = fit.state_kep_ecliptic_sun;
     let state_ref = reference.state_kep_ecliptic_sun;
-    let delta = delta_keplerian(&state_scott, &state_ref);
+    let delta = delta_keplerian(&state_fit, &state_ref);
 
-    let (sigma_scott, sigma_ref) = (
-        diag_sigmas(scott.cov_kep_ecliptic_sun_6x6.as_ref()),
+    let (sigma_fit, sigma_ref) = (
+        diag_sigmas(fit.cov_kep_ecliptic_sun_6x6.as_ref()),
         diag_sigmas(reference.cov_kep_ecliptic_sun_6x6.as_ref()),
     );
 
     // Three Mahalanobis flavors. Each is f64::NAN if the corresponding
     // covariance is missing or ill-conditioned.
-    let d2_scott_metric = scott
+    let d2_fit_metric = fit
         .cov_kep_ecliptic_sun_6x6
         .as_ref()
         .map(|c| mahalanobis_d2_6(c, &delta))
@@ -120,7 +120,7 @@ fn compare_pair(
         .unwrap_or(None)
         .unwrap_or(f64::NAN);
     let d2_combined_metric = match (
-        &scott.cov_kep_ecliptic_sun_6x6,
+        &fit.cov_kep_ecliptic_sun_6x6,
         &reference.cov_kep_ecliptic_sun_6x6,
     ) {
         (Some(a), Some(b)) => {
@@ -143,7 +143,7 @@ fn compare_pair(
     // example).
     let d2_marginal = (0..6)
         .map(|k| {
-            let var_combined = sigma_scott[k].powi(2) + sigma_ref[k].powi(2);
+            let var_combined = sigma_fit[k].powi(2) + sigma_ref[k].powi(2);
             if var_combined > 0.0 && var_combined.is_finite() {
                 delta[k].powi(2) / var_combined
             } else {
@@ -159,11 +159,10 @@ fn compare_pair(
     // pointing different directions) from the "correlation" pathology
     // (small rotation angle, scaled spectrum: same shape, different
     // size).
-    let (eig_scott, eigvecs_scott) =
-        eigen_of_kep_cov(&scott.cov_kep_ecliptic_sun_6x6, &mut notes, "scott");
+    let (eig_fit, eigvecs_fit) = eigen_of_kep_cov(&fit.cov_kep_ecliptic_sun_6x6, &mut notes, "fit");
     let (eig_ref, eigvecs_ref) =
         eigen_of_kep_cov(&reference.cov_kep_ecliptic_sun_6x6, &mut notes, "reference");
-    let principal_axis_rotation_deg = match (eigvecs_scott, eigvecs_ref) {
+    let principal_axis_rotation_deg = match (eigvecs_fit, eigvecs_ref) {
         (Some(vs), Some(vr)) => {
             // First column of each = eigenvector of largest eigenvalue.
             let mut dot = 0.0_f64;
@@ -177,7 +176,7 @@ fn compare_pair(
 
     // Covariance volume ratio. det(Σ) = (∏ L_ii)² for cholesky factor L.
     let vol_ratio = match (
-        &scott.cov_kep_ecliptic_sun_6x6,
+        &fit.cov_kep_ecliptic_sun_6x6,
         &reference.cov_kep_ecliptic_sun_6x6,
     ) {
         (Some(a), Some(b)) => {
@@ -195,22 +194,22 @@ fn compare_pair(
     };
 
     OrbitComparison {
-        object: scott.object.clone(),
+        object: fit.object.clone(),
         reference: reference.source.clone(),
-        common_epoch_mjd_tdb: scott.epoch_mjd_tdb,
-        common_epoch_source: "scott".to_string(),
+        common_epoch_mjd_tdb: fit.epoch_mjd_tdb,
+        common_epoch_source: "fit".to_string(),
         repr: "keplerian".to_string(),
-        state_scott,
+        state_fit,
         state_ref,
         delta,
-        sigma_scott,
+        sigma_fit,
         sigma_ref,
-        mahalanobis_d2_scott_metric: d2_scott_metric,
+        mahalanobis_d2_fit_metric: d2_fit_metric,
         mahalanobis_d2_ref_metric: d2_ref_metric,
         mahalanobis_d2_combined_metric: d2_combined_metric,
         mahalanobis_d2_marginal: d2_marginal,
         sigma_equiv_combined,
-        eigenvalues_scott: eig_scott,
+        eigenvalues_fit: eig_fit,
         eigenvalues_ref: eig_ref,
         principal_axis_rotation_deg,
         cov_volume_ratio: vol_ratio,
@@ -240,14 +239,14 @@ fn eigen_of_kep_cov(
 }
 
 /// 6×6 wrapper for `nolan::linalg::mat_symmetric_eigen`, accessed
-/// through villeneuve's `pub use nolan::linalg::*` re-export so we
+/// straight from `hyperjet` (nolan's crates.io name) so we
 /// don't add a direct nolan dependency to empyrean-validation.
 ///
 /// The algorithm + tolerance logic (relative-to-Frobenius-scale
 /// convergence — critical for small-scale physical-units covariance
 /// matrices) lives in nolan.
 fn jacobi_eigen_6(a: &[[f64; 6]; 6]) -> Option<([f64; 6], [[f64; 6]; 6])> {
-    villeneuve::linalg::mat_symmetric_eigen(a)
+    hyperjet::linalg::mat_symmetric_eigen(a)
 }
 
 /// Wrap an angle into the half-open interval `(-180°, 180°]`.
@@ -261,16 +260,16 @@ fn wrap_angle_deg(x: f64) -> f64 {
     y
 }
 
-/// `scott - ref` for Keplerian `(a, e, i, Ω, ω, M)` with `i`, `Ω`,
+/// `fit - ref` for Keplerian `(a, e, i, Ω, ω, M)` with `i`, `Ω`,
 /// `ω`, `M` wrapped to `(-180°, 180°]`.
-fn delta_keplerian(scott: &[f64; 6], reference: &[f64; 6]) -> [f64; 6] {
+fn delta_keplerian(fit: &[f64; 6], reference: &[f64; 6]) -> [f64; 6] {
     [
-        scott[0] - reference[0],
-        scott[1] - reference[1],
-        wrap_angle_deg(scott[2] - reference[2]),
-        wrap_angle_deg(scott[3] - reference[3]),
-        wrap_angle_deg(scott[4] - reference[4]),
-        wrap_angle_deg(scott[5] - reference[5]),
+        fit[0] - reference[0],
+        fit[1] - reference[1],
+        wrap_angle_deg(fit[2] - reference[2]),
+        wrap_angle_deg(fit[3] - reference[3]),
+        wrap_angle_deg(fit[4] - reference[4]),
+        wrap_angle_deg(fit[5] - reference[5]),
     ]
 }
 
@@ -297,7 +296,7 @@ fn mat6_add(a: &[[f64; 6]; 6], b: &[[f64; 6]; 6]) -> [[f64; 6]; 6] {
 /// `d² = Δᵀ Σ⁻¹ Δ` via Cholesky: factor Σ = L Lᵀ, forward-solve
 /// `L y = Δ`, then `d² = ‖y‖²`. Returns `None` if Σ is not SPD.
 fn mahalanobis_d2_6(sigma: &[[f64; 6]; 6], delta: &[f64; 6]) -> Option<f64> {
-    let l = villeneuve::linalg::mat_cholesky(sigma)?;
+    let l = hyperjet::linalg::mat_cholesky(sigma)?;
     let mut y = *delta;
     // Forward sub: y_i = (Δ_i − Σ_{j<i} L_ij y_j) / L_ii
     for i in 0..6 {
@@ -315,7 +314,7 @@ fn mahalanobis_d2_6(sigma: &[[f64; 6]; 6], delta: &[f64; 6]) -> Option<f64> {
 
 /// `det(Σ) = (∏ L_ii)²` for `Σ = L Lᵀ`. Returns `None` if Σ is not SPD.
 fn det_via_cholesky_6(sigma: &[[f64; 6]; 6]) -> Option<f64> {
-    let l = villeneuve::linalg::mat_cholesky(sigma)?;
+    let l = hyperjet::linalg::mat_cholesky(sigma)?;
     let mut p = 1.0;
     // Diagonal product over a fixed 6×6 — the index is the matrix coordinate.
     #[allow(clippy::needless_range_loop)]
@@ -353,9 +352,9 @@ mod tests {
 
     #[test]
     fn delta_keplerian_wraps_angles() {
-        let scott = [1.0, 0.1, 5.0, 359.0, 10.0, 200.0];
+        let fit = [1.0, 0.1, 5.0, 359.0, 10.0, 200.0];
         let reference = [1.0, 0.1, 5.0, 1.0, 10.0, 0.0];
-        let d = delta_keplerian(&scott, &reference);
+        let d = delta_keplerian(&fit, &reference);
         assert_eq!(d[0], 0.0);
         assert_eq!(d[1], 0.0);
         assert_eq!(d[2], 0.0);
@@ -370,7 +369,7 @@ mod tests {
     fn identical_orbits_give_zero_distance() {
         use crate::schema::orbit_sources;
         let s = make_orbit(
-            orbit_sources::SCOTT_OD,
+            orbit_sources::EMPYREAN_OD,
             60000.0,
             [1.0, 0.1, 5.0, 100.0, 50.0, 200.0],
             [0.01, 0.01, 0.1, 0.1, 0.1, 0.1],
@@ -385,7 +384,7 @@ mod tests {
         assert_eq!(comps.len(), 1);
         let c = &comps[0];
         assert!(c.delta.iter().all(|d| d.abs() < 1e-12));
-        assert!(c.mahalanobis_d2_scott_metric.abs() < 1e-12);
+        assert!(c.mahalanobis_d2_fit_metric.abs() < 1e-12);
         assert!(c.mahalanobis_d2_combined_metric.abs() < 1e-12);
         assert!(c.sigma_equiv_combined.abs() < 1e-12);
         // Identical covariances → volume ratio = 1.
@@ -395,11 +394,11 @@ mod tests {
     #[test]
     fn one_sigma_offset_gives_d2_near_one_in_combined_metric() {
         use crate::schema::orbit_sources;
-        // Two identical orbits with σ_a = 0.01. Offset scott by 1σ
-        // along `a`. Combined cov is 2× scott's; expect
+        // Two identical orbits with σ_a = 0.01. Offset fit by 1σ
+        // along `a`. Combined cov is 2× fit's; expect
         // d²_combined = (Δa)² / (2 σ_a²) = (0.01)² / (2·0.0001) = 0.5.
         let s = make_orbit(
-            orbit_sources::SCOTT_OD,
+            orbit_sources::EMPYREAN_OD,
             60000.0,
             [1.01, 0.1, 5.0, 100.0, 50.0, 200.0],
             [0.01, 0.01, 0.1, 0.1, 0.1, 0.1],
@@ -417,8 +416,8 @@ mod tests {
             "d²_combined = {}",
             c.mahalanobis_d2_combined_metric,
         );
-        // d²_scott_metric and d²_ref_metric both = (Δa/σ_a)² = 1.
-        assert!((c.mahalanobis_d2_scott_metric - 1.0).abs() < 1e-9);
+        // d²_fit_metric and d²_ref_metric both = (Δa/σ_a)² = 1.
+        assert!((c.mahalanobis_d2_fit_metric - 1.0).abs() < 1e-9);
         assert!((c.mahalanobis_d2_ref_metric - 1.0).abs() < 1e-9);
     }
 
@@ -426,7 +425,7 @@ mod tests {
     fn epoch_mismatch_annotated_in_notes() {
         use crate::schema::orbit_sources;
         let s = make_orbit(
-            orbit_sources::SCOTT_OD,
+            orbit_sources::EMPYREAN_OD,
             60000.0,
             [1.0, 0.1, 5.0, 100.0, 50.0, 200.0],
             [0.01; 6],
@@ -451,11 +450,11 @@ mod tests {
     #[test]
     fn singular_covariance_yields_nan_in_its_own_metric() {
         use crate::schema::orbit_sources;
-        // Scott with zero covariance → Cholesky fails for scott's
+        // A fit with zero covariance → Cholesky fails for fit's
         // metric but Σ_combined = 0 + Σ_ref is SPD, so combined is
         // finite. Asserts both behaviors.
         let mut s = make_orbit(
-            orbit_sources::SCOTT_OD,
+            orbit_sources::EMPYREAN_OD,
             60000.0,
             [1.01, 0.1, 5.0, 100.0, 50.0, 200.0],
             [0.01; 6],
@@ -468,12 +467,12 @@ mod tests {
             [0.01; 6],
         );
         let comps = compare_orbits(&[s, r], 1.0);
-        assert!(comps[0].mahalanobis_d2_scott_metric.is_nan());
+        assert!(comps[0].mahalanobis_d2_fit_metric.is_nan());
         // Σ_combined = Σ_ref is SPD → combined finite.
         assert!(comps[0].mahalanobis_d2_combined_metric.is_finite());
         // d²_ref_metric = (Δa)² / σ_a² = (0.01)² / (0.01)² = 1.
         assert!((comps[0].mahalanobis_d2_ref_metric - 1.0).abs() < 1e-9);
-        // Volume ratio is NaN (det(Σ_scott) = 0, but the check guards
+        // Volume ratio is NaN (det(Σ_fit) = 0, but the check guards
         // det_b > 0 — det_a = 0 actually gives ratio = 0, not NaN).
         // Let the assertion follow what the helper returns:
         assert!(
@@ -559,7 +558,7 @@ mod tests {
         // and joint d² must agree exactly (ratio = 1, no off-diagonal
         // to explain anything joint-only).
         let s = make_orbit(
-            orbit_sources::SCOTT_OD,
+            orbit_sources::EMPYREAN_OD,
             60000.0,
             [1.01, 0.1, 5.0, 100.0, 50.0, 200.0],
             [0.01, 0.01, 0.1, 0.1, 0.1, 0.1],
@@ -581,7 +580,7 @@ mod tests {
 
     #[test]
     fn jacobi_handles_small_scale_keplerian_covariance() {
-        // Apophis scott-propagated-to-SBDB-epoch Keplerian covariance.
+        // Apophis fit-propagated-to-SBDB-epoch Keplerian covariance.
         // Entries span (1e-19, 1e-10). With an absolute convergence
         // tolerance, Jacobi would falsely declare immediate
         // convergence and return sorted diagonals — known-bad
@@ -664,7 +663,7 @@ mod tests {
 
     #[test]
     fn rotation_pathology_principal_axis_angle() {
-        // Σ_scott and Σ_ref have identical eigenvalues but Σ_ref is
+        // Σ_fit and Σ_ref have identical eigenvalues but Σ_ref is
         // rotated 45° in the (a, e) plane. principal_axis_rotation_deg
         // should be ≈ 45° (modulo arccos sign ambiguity — answer is
         // always in [0, 90°]).
@@ -677,7 +676,7 @@ mod tests {
             cov[i][i] = 0.1;
         }
         let mut s = make_orbit(
-            orbit_sources::SCOTT_OD,
+            orbit_sources::EMPYREAN_OD,
             60000.0,
             [1.0, 0.1, 5.0, 100.0, 50.0, 200.0],
             [1.0, 0.1, 0.32, 0.32, 0.32, 0.32],
@@ -722,7 +721,7 @@ mod tests {
         // Same eigenvalues on both sides.
         for k in 0..6 {
             assert!(
-                (c.eigenvalues_scott[k] - c.eigenvalues_ref[k]).abs() < 1e-9,
+                (c.eigenvalues_fit[k] - c.eigenvalues_ref[k]).abs() < 1e-9,
                 "eig mismatch at k={k}",
             );
         }

@@ -1,0 +1,22 @@
+cff-version: 1.2.0
+message: "If you use this software, please cite it as below."
+title: "empyrean-validation: cross-channel and external-reference validation for the empyrean astrodynamics toolkit"
+authors:
+  - family-names: Moeyens
+    given-names: Joachim
+    orcid: "https://orcid.org/0000-0001-5820-3925"
+version: 0.8.1
+date-released: 2026-07-11
+url: "https://github.com/Empyrean-Dynamics/empyrean-validation"
+repository-code: "https://github.com/Empyrean-Dynamics/empyrean-validation"
+license: BSD-3-Clause
+keywords:
+  - astrodynamics
+  - orbital propagation
+  - orbit determination
+  - ephemeris
+  - validation
+  - JPL Horizons
+  - solar system
+  - asteroids
+  - comets

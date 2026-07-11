@@ -14,7 +14,6 @@
 use std::path::PathBuf;
 
 use clap::{Parser, Subcommand};
-use villeneuve::io::cache::DiskCache;
 
 use empyrean::Context;
 
@@ -84,7 +83,7 @@ struct OdArgs {
     /// Force model tier.
     #[arg(long, default_value = "standard")]
     tier: String,
-    /// Max DC iterations. Default 100 matches scott's library default
+    /// Max DC iterations. Default 100 matches the engine's library default
     /// so all five validation channels (rust / python / c / cli / core)
     /// use the same iteration cap.
     #[arg(long, default_value_t = 100)]
@@ -167,7 +166,7 @@ fn od(args: OdArgs) -> Result<(), Box<dyn std::error::Error>> {
         orbits_path.display()
     );
 
-    // Sidecar 2: bidirectional (scott vs SBDB / find_orb) Mahalanobis
+    // Sidecar 2: bidirectional (fitted orbit vs SBDB / find_orb) Mahalanobis
     // comparisons in Keplerian element space.
     let cmp_path = sidecar_path(&args.output, "_compare.jsonl");
     write_jsonl(&cmp_path, &orbit_comparisons)?;
@@ -207,8 +206,10 @@ fn run(args: RunArgs) -> Result<(), Box<dyn std::error::Error>> {
     let ctx = Context::from_data_dir(args.data_dir.as_deref())?;
 
     let cache_dir = expand_tilde(&args.cache_dir);
-    let mut sbdb_cache = DiskCache::new(cache_dir.join("sbdb"));
-    let mut horizons_cache = DiskCache::new(cache_dir.join("horizons"));
+    let sbdb_cache_dir = cache_dir.join("sbdb");
+    let horizons_cache_dir = cache_dir.join("horizons");
+    std::fs::create_dir_all(&sbdb_cache_dir)?;
+    std::fs::create_dir_all(&horizons_cache_dir)?;
 
     let all_objects = empyrean_validation::catalog::all_objects();
     let selected: Vec<&empyrean_validation::catalog::ValidationObject> = if args.only.is_empty() {
@@ -234,8 +235,8 @@ fn run(args: RunArgs) -> Result<(), Box<dyn std::error::Error>> {
         &ctx,
         &selected,
         &config,
-        &mut horizons_cache,
-        &mut sbdb_cache,
+        &horizons_cache_dir,
+        &sbdb_cache_dir,
         args.threads,
     );
 

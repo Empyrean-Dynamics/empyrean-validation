@@ -1,7 +1,7 @@
 # OrbFit external-reference runner
 
 External orbit-determination reference for the empyrean validation
-suite. Compares scott's OD pipeline against OrbFit, the orbit
+suite. Compares empyrean's OD pipeline against OrbFit, the orbit
 determination code developed by the OrbFit Consortium (University of
 Pisa) and adopted by the IAU Minor Planet Center as their production
 fitting pipeline.
@@ -13,7 +13,7 @@ OrbFit is particularly valuable as a comparison point because:
   OrbFit directly closes the loop on the catalog → fit → catalog
   round-trip.
 - It is the canonical implementation of **Carpino-Milani-Chesley
-  (2003) χ²-with-hysteresis rejection**, which scott implements as
+  (2003) χ²-with-hysteresis rejection**, which empyrean implements as
   `RejectionKind::CMC2003`. Per-row rejection-decision parity against
   OrbFit is a strong test of that path.
 - Federica Spoto (MPC) maintains the public Docker image, so the

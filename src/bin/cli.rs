@@ -32,7 +32,6 @@ use empyrean_validation::{
     report::generate_report,
     schema::{OrbitComparison, ValidationResult},
 };
-use villeneuve::io::cache::DiskCache;
 
 #[derive(Parser, Debug)]
 #[command(
@@ -180,15 +179,15 @@ fn plan(args: PlanArgs) -> Result<(), Box<dyn std::error::Error>> {
     );
 
     let cache_dir = expand_tilde(&args.cache_dir);
-    let mut sbdb_cache = DiskCache::new(cache_dir.join("sbdb"));
-    let mut horizons_cache = DiskCache::new(cache_dir.join("horizons"));
+    let sbdb_cache_dir = cache_dir.join("sbdb");
+    let horizons_cache_dir = cache_dir.join("horizons");
 
     let config = PlanConfig {
         tiers: args.tiers,
         uncertainty_axis: args.uncertainty_axis,
     };
 
-    let plan = build_plan(&selected, &config, &mut sbdb_cache, &mut horizons_cache);
+    let plan = build_plan(&selected, &config, &sbdb_cache_dir, &horizons_cache_dir);
 
     if let Some(parent) = args.output.parent() {
         std::fs::create_dir_all(parent)?;

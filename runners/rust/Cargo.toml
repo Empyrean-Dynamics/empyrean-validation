@@ -17,27 +17,15 @@ path = "src/main.rs"
 # checkout of a validation tag reproduces the validation-of-record for
 # that release. Dev-tree validation is an uncommitted local override —
 # see "Local development overrides" in the README.
-empyrean = "0.7.0"
+empyrean = "=0.8.1"
 # Shared validation framework: schema (`ValidationResult`,
 # `ValidationPlan`), test object catalog, position-error / angular-
 # separation metric helpers, and the HTML report renderer. Owned
 # by the empyrean-validation repo; consumed here so this rust
 # runner emits the same row shape every other channel does.
 empyrean-validation = { path = "../.." }
-# villeneuve is only used for the SBDB / Horizons disk-cached query
-# helpers (Phase A — fetch initial conditions + Horizons references).
-# The propagation hot path goes entirely through `empyrean::Context`
-# so this runner exercises the same code path the python / c / cli
-# channels use.
-villeneuve = { path = "../../../villeneuve", features = ["jpl"] }
 chrono = { version = "0.4", features = ["serde"] }
 clap = { version = "4", features = ["derive"] }
 rayon = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-
-[patch."ssh://git@github.com/Empyrean-Dynamics/villeneuve.git"]
-villeneuve = { path = "../../../villeneuve" }
-
-# No nolan patch: villeneuve 1.12 depends on the renamed crate `hyperjet`
-# from crates.io, not the private git `nolan`.

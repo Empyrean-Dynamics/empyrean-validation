@@ -303,7 +303,7 @@ def _determine_one(
         return None
 
     obs_dict = {"ades": psv_text}
-    # Mirror scott::od::ODConfig::default(): solve_for=Auto so comets can
+    # Mirror the engine's ODConfig::default(): solve_for=Auto so comets can
     # escalate to a non-grav fit. Inherit convergence_tol from the library
     # default (1e-3, sigma-quality) — overriding it here would diverge
     # this channel from the rust / c / cli / core channels.

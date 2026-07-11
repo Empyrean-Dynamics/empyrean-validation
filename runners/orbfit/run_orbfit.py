@@ -101,9 +101,9 @@ Output files (in `<workdir>`):
 
 The COV block on the .fel file gives equinoctial elements covariance.
 empyrean reports Cartesian — converting requires the Jacobian from
-equinoctial to Cartesian, which villeneuve already implements. For the
+equinoctial to Cartesian, which empyrean already implements. For the
 runner, we'll emit both: the raw equinoctial + cov from OrbFit, AND
-the Cartesian state derived via villeneuve's conversion at the same
+the Cartesian state derived via empyrean's conversion at the same
 epoch. The report compares Cartesian-vs-Cartesian.
 """
 
@@ -212,7 +212,7 @@ def run_orbfit_container(
     Uses `fitobs.x` end-to-end: Gauss IOD (main menu 2 → inputele 4 →
     prelimet 2) followed by CMC2003-autoreject DC (main menu 3 →
     difcomod 1). No seed orbit is required — Gauss IOD computes
-    elements from observations alone, matching scott's IOD + DC
+    elements from observations alone, matching empyrean's IOD + DC
     pipeline against the same astrometry.
 
     NEOCP fresh-discovery cases (arcs days-to-weeks) would normally
@@ -479,7 +479,7 @@ def process_od_row_real(row: Dict[str, Any], image: str, platform: str) -> Dict[
 
     # IOD is handled inside the container by `neocp_prelim.x` running
     # before `fitobs.x`, so no caller-supplied seed orbit is required.
-    # The two-binary chain mirrors scott's IOD + DC pipeline.
+    # The two-binary chain mirrors empyrean's IOD + DC pipeline.
     t0 = time.monotonic()
     res = run_orbfit_container(
         desig=desig, obs_psv=obs_psv,
@@ -495,7 +495,7 @@ def process_od_row_real(row: Dict[str, Any], image: str, platform: str) -> Dict[
     # The natively-Cartesian fields stay None for now — we report
     # equinoctial + covariance verbatim. Cartesian conversion (which
     # the report consumes for the cross-channel position-delta plot)
-    # is best done downstream where villeneuve's Cartesian/equinoctial
+    # is best done downstream where empyrean's Cartesian/equinoctial
     # bridge already lives. The runner just emits raw OrbFit data.
     out["orbfit_equinoctial"] = res["equinoctial"]
     out["orbfit_epoch_mjd_tdb"] = res["epoch_mjd_tdt"]  # ≈ TDB to sub-ms

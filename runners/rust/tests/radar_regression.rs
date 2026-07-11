@@ -2,10 +2,10 @@
 //!
 //! Loads the suite's full multi-apparition Apophis fixture (9520 optical
 //! 2004–2021 + 50 JPL `sb_radar` records) and runs `ctx.determine` — the same
-//! wrapper → C-ABI → empyrean-core → scott path the python / c / cli channels
-//! use. Before scott v1.10.1, a cold IOD-seeded joint optical+radar fit on this
-//! arc STALLED (`NotConverged`); v1.10.1 seeds the joint fit from an
-//! optical-only orbit so it converges. This test guards that fix end-to-end
+//! wrapper → C-ABI → empyrean-core path the python / c / cli channels use.
+//! In earlier engine releases, a cold IOD-seeded joint optical+radar fit on
+//! this arc STALLED (`NotConverged`); the engine now seeds the joint fit from
+//! an optical-only orbit so it converges. This test guards that fix end-to-end
 //! across the distribution chain. Gated on the data tier being available.
 
 use empyrean::{Context, ODConfig};
@@ -42,10 +42,10 @@ fn apophis_optical_plus_radar_converges_through_channel() {
         "expected the dense multi-apparition optical arc"
     );
 
-    // The fit must converge (it stalled before scott v1.10.1).
+    // The fit must converge (it stalled before the optical-first seeding fix).
     let result = ctx
         .determine(&observations, None, &ODConfig::default())
-        .expect("optical+radar determine must converge through the channel (scott v1.10.1)");
+        .expect("optical+radar determine must converge through the channel");
     assert!(
         result.converged,
         "Apophis multi-apparition optical+radar fit must converge"

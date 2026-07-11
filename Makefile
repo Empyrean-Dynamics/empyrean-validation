@@ -13,7 +13,7 @@
 #     ├── empyrean/                 ← rust / python / c / cli channels
 #     ├── empyrean-core/            ← core channel (validate-core binary)
 #     ├── empyrean-validation/      ← this repo (Makefile + framework + externals)
-#     ├── scott/  villeneuve/  nolan/   (transitive sibling deps)
+#     ├── (empyrean-core's private engine deps as siblings — core channel only)
 #
 # Usage:
 #   make setup     # one-time: install ASSIST venv + DE440, build find_orb
