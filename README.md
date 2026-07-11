@@ -78,10 +78,13 @@ Channel repos sit as siblings of this checkout (`../empyrean`,
 SBDB / Horizons. `cargo test` covers the schema, comparison kernel, and
 report rendering.
 
-empyrean-validation depends on
-[villeneuve](https://github.com/Empyrean-Dynamics/villeneuve) for the
-SBDB / Horizons clients used by the plan generator. It does not depend on
-scott, empyrean-core, or empyrean — those are the things being validated.
+The harness itself consumes only **public crates**: the published
+`empyrean` wrapper supplies the SBDB / Horizons query clients the plan
+generator uses, and `hyperjet` supplies the linear-algebra kernels the
+covariance comparison uses. It has no private dependencies — the private
+repos enter only as the optional `core` reference channel (built from a
+sibling `empyrean-core` checkout when present) and as the things being
+validated.
 
 ## Versioning and local development overrides
 
@@ -101,10 +104,10 @@ override — never commit these:
 
 ```toml
 # In the relevant Cargo.toml(s), temporarily:
-empyrean = { path = "../../../empyrean/empyrean" }        # runner: local wrapper
+empyrean = { path = "../../../empyrean/empyrean" }   # runner: local wrapper
 
-[patch."ssh://git@github.com/Empyrean-Dynamics/villeneuve.git"]
-villeneuve = { path = "../villeneuve" }                    # plan generator: local engine
+[patch.crates-io]
+empyrean = { path = "../empyrean/empyrean" }          # harness: local wrapper
 ```
 
 Note that Cargo honors `[patch]` only from the build-root manifest, and a

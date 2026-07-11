@@ -240,14 +240,14 @@ fn eigen_of_kep_cov(
 }
 
 /// 6×6 wrapper for `nolan::linalg::mat_symmetric_eigen`, accessed
-/// through villeneuve's `pub use nolan::linalg::*` re-export so we
+/// straight from `hyperjet` (nolan's crates.io name) so we
 /// don't add a direct nolan dependency to empyrean-validation.
 ///
 /// The algorithm + tolerance logic (relative-to-Frobenius-scale
 /// convergence — critical for small-scale physical-units covariance
 /// matrices) lives in nolan.
 fn jacobi_eigen_6(a: &[[f64; 6]; 6]) -> Option<([f64; 6], [[f64; 6]; 6])> {
-    villeneuve::linalg::mat_symmetric_eigen(a)
+    hyperjet::linalg::mat_symmetric_eigen(a)
 }
 
 /// Wrap an angle into the half-open interval `(-180°, 180°]`.
@@ -297,7 +297,7 @@ fn mat6_add(a: &[[f64; 6]; 6], b: &[[f64; 6]; 6]) -> [[f64; 6]; 6] {
 /// `d² = Δᵀ Σ⁻¹ Δ` via Cholesky: factor Σ = L Lᵀ, forward-solve
 /// `L y = Δ`, then `d² = ‖y‖²`. Returns `None` if Σ is not SPD.
 fn mahalanobis_d2_6(sigma: &[[f64; 6]; 6], delta: &[f64; 6]) -> Option<f64> {
-    let l = villeneuve::linalg::mat_cholesky(sigma)?;
+    let l = hyperjet::linalg::mat_cholesky(sigma)?;
     let mut y = *delta;
     // Forward sub: y_i = (Δ_i − Σ_{j<i} L_ij y_j) / L_ii
     for i in 0..6 {
@@ -315,7 +315,7 @@ fn mahalanobis_d2_6(sigma: &[[f64; 6]; 6], delta: &[f64; 6]) -> Option<f64> {
 
 /// `det(Σ) = (∏ L_ii)²` for `Σ = L Lᵀ`. Returns `None` if Σ is not SPD.
 fn det_via_cholesky_6(sigma: &[[f64; 6]; 6]) -> Option<f64> {
-    let l = villeneuve::linalg::mat_cholesky(sigma)?;
+    let l = hyperjet::linalg::mat_cholesky(sigma)?;
     let mut p = 1.0;
     // Diagonal product over a fixed 6×6 — the index is the matrix coordinate.
     #[allow(clippy::needless_range_loop)]

@@ -24,13 +24,14 @@ chrono = { version = "0.4", default-features = false, features = ["clock"] }
 clap = { version = "4", features = ["derive"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-# villeneuve provides the SBDB / Horizons disk-cached query clients used
-# by the plan generator. Pinned to the release generation this harness
-# version validates (empyrean 0.7.0 binds villeneuve v1.14.0 through
-# empyrean-core v0.7.0). Validating unreleased engine work is a deliberate,
-# uncommitted local override — see "Local development overrides" in the
-# README.
-villeneuve = { git = "ssh://git@github.com/Empyrean-Dynamics/villeneuve.git", tag = "v1.14.0", features = ["jpl"] }
+# The harness consumes only PUBLIC crates: the published `empyrean`
+# wrapper supplies the SBDB / Horizons query clients (disk-cached via
+# `cache_dir`) used by the plan generator, and `hyperjet` supplies the
+# linear-algebra kernels the covariance comparison uses. Both are pinned
+# exactly to the release generation this harness version validates, so a
+# checkout of a validation tag reproduces the validation-of-record.
+empyrean = "=0.8.1"
+hyperjet = "=1.9.0"
 
 [dev-dependencies]
 tempfile = "3"
