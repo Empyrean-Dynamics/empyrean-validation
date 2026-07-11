@@ -80,6 +80,11 @@ Channel repos sit as siblings of this checkout (`../empyrean`,
 SBDB / Horizons. `cargo test` covers the schema, comparison kernel, and
 report rendering.
 
+Want to benchmark another implementation against the same plan? See
+[Add a runner](runners/README.md#add-a-runner) — external runners are
+self-contained (read the plan JSON, emit rows in the shared schema) and
+the six existing ones are working templates.
+
 The harness itself consumes only **public crates**: the published
 `empyrean` wrapper supplies the SBDB / Horizons query clients the plan
 generator uses, and `hyperjet` supplies the linear-algebra kernels the
