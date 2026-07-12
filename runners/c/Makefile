@@ -10,7 +10,12 @@ INCLUDE_DIR := $(EMPYREAN_ROOT)/include
 LIB_DIR := $(EMPYREAN_ROOT)/target/release
 
 CC := cc
-CFLAGS := -O2 -Wall -Wextra -std=c11 -I$(INCLUDE_DIR)
+# -std=c11 keeps strict ISO C syntax, but under it glibc hides POSIX/BSD
+# library functions (clock_gettime / CLOCK_MONOTONIC, etc.) unless a
+# feature-test macro is set — macOS headers expose them regardless, so
+# this only bites on Linux. _DEFAULT_SOURCE enables glibc's full default
+# function set without loosening the language dialect.
+CFLAGS := -O2 -Wall -Wextra -std=c11 -D_DEFAULT_SOURCE -I$(INCLUDE_DIR)
 LDFLAGS := -L$(LIB_DIR) -lempyrean -Wl,-rpath,$(abspath $(LIB_DIR))
 
 runner: runner.c $(INCLUDE_DIR)/empyrean.h
