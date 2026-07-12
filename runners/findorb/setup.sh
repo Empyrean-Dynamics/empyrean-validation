@@ -17,6 +17,7 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PREFIX="${1:-$SCRIPT_DIR/install}"
 BUILD_DIR="$SCRIPT_DIR/build"
+NPROC="$(nproc 2>/dev/null || sysctl -n hw.ncpu 2>/dev/null || echo 4)"
 
 echo "find_orb setup"
 echo "  build dir: $BUILD_DIR"
@@ -25,65 +26,56 @@ echo
 
 mkdir -p "$BUILD_DIR" "$PREFIX/bin"
 
-# ── Clone repositories ──────────────────────────────────
-cd "$BUILD_DIR"
+# find_orb and its dependencies (lunar/jpl_eph/sat_code) are cloned at
+# unpinned upstream HEAD and aren't release-tagged, so a version skew
+# between the four Bill-Gray repos periodically breaks the from-source
+# build (e.g. jpl_url.c in lunar references a symbol liblunar.a doesn't
+# yet export). find_orb is one of several optional external OD
+# references, so any failure anywhere in this toolchain is non-fatal:
+# the function returns non-zero, we warn loudly, and leave no `fo`
+# binary — so the suite runs without this one comparator rather than
+# failing the whole validation. The absence is surfaced by the runner
+# skip and by the report, never silently substituted. (Invoked as an
+# `if` condition, so `set -e` is suspended inside it and the explicit
+# `|| return 1` guards drive the control flow.)
+build_findorb() {
+    # Clone / update the four repos.
+    cd "$BUILD_DIR"
+    for repo in lunar jpl_eph sat_code find_orb; do
+        if [ ! -d "$repo" ]; then
+            echo "Cloning $repo..."
+            git clone "https://github.com/Bill-Gray/$repo.git" || return 1
+        else
+            echo "$repo: already cloned"
+            ( cd "$repo" && git pull --ff-only ) || return 1
+        fi
+    done
 
-for repo in lunar jpl_eph sat_code find_orb; do
-    if [ ! -d "$repo" ]; then
-        echo "Cloning $repo..."
-        git clone "https://github.com/Bill-Gray/$repo.git"
-    else
-        echo "$repo: already cloned"
-        cd "$repo" && git pull --ff-only && cd ..
-    fi
-done
+    echo
+    echo "Building lunar library..."
+    ( cd "$BUILD_DIR/lunar" && make -j"$NPROC" && make install ) || return 1
 
-# ── Build and install lunar (dependency) ─────────────────
-echo
-echo "Building lunar library..."
-cd "$BUILD_DIR/lunar"
-make -j$(nproc 2>/dev/null || sysctl -n hw.ncpu 2>/dev/null || echo 4)
-make install
-cd ..
+    echo
+    echo "Building jpl_eph library..."
+    ( cd "$BUILD_DIR/jpl_eph" && make -j"$NPROC" && make install ) || return 1
 
-# ── Build and install jpl_eph (dependency) ───────────────
-echo
-echo "Building jpl_eph library..."
-cd "$BUILD_DIR/jpl_eph"
-make -j$(nproc 2>/dev/null || sysctl -n hw.ncpu 2>/dev/null || echo 4)
-make install
-cd ..
+    # sat_code is itself optional even when the rest builds.
+    echo
+    echo "Building sat_code library..."
+    ( cd "$BUILD_DIR/sat_code" && make -j"$NPROC" ) \
+        || echo "Warning: sat_code build failed (non-critical, continuing)"
 
-# ── Build sat_code (optional dependency) ────────────────
-echo
-echo "Building sat_code library..."
-cd "$BUILD_DIR/sat_code"
-make -j$(nproc 2>/dev/null || sysctl -n hw.ncpu 2>/dev/null || echo 4) || {
-    echo "Warning: sat_code build failed (non-critical, continuing)"
+    echo
+    echo "Building find_orb..."
+    ( cd "$BUILD_DIR/find_orb" && make -j"$NPROC" fo && cp fo "$PREFIX/bin/fo" ) || return 1
+
+    return 0
 }
-cd ..
 
-# ── Build find_orb (command-line version) ───────────────
-echo
-echo "Building find_orb..."
-cd "$BUILD_DIR/find_orb"
-
-# Build the command-line version (fo), not the GUI. find_orb and its
-# dependencies (lunar/jpl_eph/sat_code) are cloned at upstream HEAD and
-# are not release-tagged, so a version skew between the four repos can
-# break this build (e.g. a symbol jpl_url.c references that liblunar.a
-# doesn't yet export). find_orb is one of several optional external OD
-# references, so treat a build failure as non-fatal — like sat_code
-# above — and let the suite run without this comparator rather than
-# failing the whole validation. The missing channel is surfaced by the
-# runner skip below and by its absence from the report (not silently
-# substituted).
-if make -j$(nproc 2>/dev/null || sysctl -n hw.ncpu 2>/dev/null || echo 4) fo \
-    && cp fo "$PREFIX/bin/fo"; then
+if build_findorb; then
     echo
     echo "find_orb built successfully."
     echo "  binary: $PREFIX/bin/fo"
-    echo
 else
     echo
     echo "############################################################"
@@ -95,8 +87,7 @@ else
     echo
     rm -f "$PREFIX/bin/fo"
 fi
-echo "Test with:"
-echo "  $PREFIX/bin/fo --help"
+
 echo
 echo "Run OD comparison with:"
-echo "  python $SCRIPT_DIR/run_findorb.py --findorb-bin $PREFIX/bin/fo --input observations.psv --output findorb_results.json"
+echo "  python $SCRIPT_DIR/run_findorb.py --fo-binary $PREFIX/bin/fo <psv_dir> --output findorb_results.json"
