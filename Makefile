@@ -162,7 +162,11 @@ help:
 all: build run report
 
 # ── Setup (one-time) ───────────────────────────────────────
-setup: setup-assist setup-findorb setup-oorb setup-orbfit
+# OrbFit's runner is gated on WITH_ORBFIT (see `run`), so only set it up
+# when it will actually run — otherwise `make setup` pulls a Docker image
+# for a comparator that never executes (and fails the setup if Docker is
+# unavailable).
+setup: setup-assist setup-findorb setup-oorb $(if $(WITH_ORBFIT),setup-orbfit,)
 	@echo
 	@echo "External dependencies installed."
 
@@ -358,11 +362,20 @@ $(OORB_BIN):
 	@cd $(EMP_VAL_RUNNERS)/oorb && ./setup.sh
 
 run-oorb: $(OORB_OUT)
-$(OORB_OUT): $(PLAN) $(OORB_BIN) $(ASSIST_PY)
-	@echo "──── OpenOrb: external prop + ephemeris reference ──────"
-	@$(ASSIST_PY) $(EMP_VAL_RUNNERS)/oorb/run_oorb.py \
-	    --input $(PLAN) --output $(OORB_OUT) \
-	    --prefix $(EMP_VAL_RUNNERS)/oorb/install
+# oorb's binary is an optional, non-fatal build (see oorb/setup.sh). When
+# it's absent, skip the comparison and emit an empty result file so the
+# merge step still has a valid input — the missing comparator is surfaced
+# here and by its absence from the report, never silently faked.
+$(OORB_OUT): $(PLAN) $(ASSIST_PY)
+	@if [ -x "$(OORB_BIN)" ]; then \
+	    echo "──── OpenOrb: external prop + ephemeris reference ──────"; \
+	    $(ASSIST_PY) $(EMP_VAL_RUNNERS)/oorb/run_oorb.py \
+	        --input $(PLAN) --output $(OORB_OUT) \
+	        --prefix $(EMP_VAL_RUNNERS)/oorb/install; \
+	else \
+	    echo "──── OpenOrb: SKIPPED (binary not built — see setup warning) ──"; \
+	    echo '[]' > $(OORB_OUT); \
+	fi
 
 # ── OrbFit external comparison — orbit determination ─────────────
 # OrbFit Consortium (University of Pisa) / IAU Minor Planet Center.

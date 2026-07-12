@@ -304,7 +304,13 @@ jobs:
       # ── Pipeline ───────────────────────────────────────────────
       # `make setup` only runs the per-runner setup scripts that produce
       # things the cache might not have (or that are cheap to re-check).
-      - name: One-time external setup (ASSIST venv + find_orb build)
+      # OpenOrb links against LAPACK/BLAS, which aren't on the runner by
+      # default (its Fortran build otherwise fails at `ld: cannot find
+      # -llapack`). gfortran is already present.
+      - name: Install system libraries (LAPACK/BLAS for OpenOrb)
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends liblapack-dev libblas-dev
+
+      - name: One-time external setup (ASSIST venv + find_orb + OpenOrb build)
         working-directory: empyrean-validation
         env:
           DATA_DIR: ${{ env.EMPYREAN_DATA_DIR }}
