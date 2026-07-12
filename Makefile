@@ -325,15 +325,25 @@ run-assist: $(PLAN) $(ASSIST_PY)
 	    --horizons-cache $(CACHE_DIR)/horizons \
 	    --data-dir $(DATA_DIR)
 
-run-findorb: $(FO_BIN) $(ASSIST_PY)
-	@echo "──── find_orb: external OD reference ───────────────────"
-	@$(ASSIST_PY) $(EMP_VAL_RUNNERS)/findorb/run_findorb.py $(FIXTURES_PSV) \
-	    --output $(FINDORB_OUT) --fo-binary $(FO_BIN) \
-	    --data-dir $(DATA_DIR)
-	@echo "──── find_orb: radar-augmented OD reference (psv-radar) ─"
-	@$(ASSIST_PY) $(EMP_VAL_RUNNERS)/findorb/run_findorb.py $(FIXTURES_PSV_RADAR) \
-	    --output $(FINDORB_RADAR_OUT) --fo-binary $(FO_BIN) \
-	    --data-dir $(DATA_DIR) --test-type orbit_determination_radar
+# find_orb's binary is an optional, non-fatal build (see findorb/setup.sh).
+# When it's absent, skip the comparison and emit empty result files so the
+# merge step still has valid (empty) inputs — the missing comparator is
+# surfaced here and by its absence from the report, never silently faked.
+run-findorb: $(ASSIST_PY)
+	@if [ -x "$(FO_BIN)" ]; then \
+	    echo "──── find_orb: external OD reference ───────────────────"; \
+	    $(ASSIST_PY) $(EMP_VAL_RUNNERS)/findorb/run_findorb.py $(FIXTURES_PSV) \
+	        --output $(FINDORB_OUT) --fo-binary $(FO_BIN) \
+	        --data-dir $(DATA_DIR); \
+	    echo "──── find_orb: radar-augmented OD reference (psv-radar) ─"; \
+	    $(ASSIST_PY) $(EMP_VAL_RUNNERS)/findorb/run_findorb.py $(FIXTURES_PSV_RADAR) \
+	        --output $(FINDORB_RADAR_OUT) --fo-binary $(FO_BIN) \
+	        --data-dir $(DATA_DIR) --test-type orbit_determination_radar; \
+	else \
+	    echo "──── find_orb: SKIPPED (binary not built — see setup warning) ──"; \
+	    echo '[]' > $(FINDORB_OUT); \
+	    echo '[]' > $(FINDORB_RADAR_OUT); \
+	fi
 
 # ── OpenOrb (oorb) external comparison — propagation + ephemeris ─
 # Independent Fortran implementation (Granvik et al., University of

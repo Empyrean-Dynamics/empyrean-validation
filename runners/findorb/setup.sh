@@ -68,16 +68,33 @@ echo
 echo "Building find_orb..."
 cd "$BUILD_DIR/find_orb"
 
-# Build the command-line version (fo), not the GUI
-make -j$(nproc 2>/dev/null || sysctl -n hw.ncpu 2>/dev/null || echo 4) fo
-
-# Copy binary
-cp fo "$PREFIX/bin/fo"
-
-echo
-echo "find_orb built successfully."
-echo "  binary: $PREFIX/bin/fo"
-echo
+# Build the command-line version (fo), not the GUI. find_orb and its
+# dependencies (lunar/jpl_eph/sat_code) are cloned at upstream HEAD and
+# are not release-tagged, so a version skew between the four repos can
+# break this build (e.g. a symbol jpl_url.c references that liblunar.a
+# doesn't yet export). find_orb is one of several optional external OD
+# references, so treat a build failure as non-fatal — like sat_code
+# above — and let the suite run without this comparator rather than
+# failing the whole validation. The missing channel is surfaced by the
+# runner skip below and by its absence from the report (not silently
+# substituted).
+if make -j$(nproc 2>/dev/null || sysctl -n hw.ncpu 2>/dev/null || echo 4) fo \
+    && cp fo "$PREFIX/bin/fo"; then
+    echo
+    echo "find_orb built successfully."
+    echo "  binary: $PREFIX/bin/fo"
+    echo
+else
+    echo
+    echo "############################################################"
+    echo "WARNING: find_orb build FAILED (upstream HEAD version skew)."
+    echo "The find_orb external OD comparison will be SKIPPED; all other"
+    echo "channels and comparators are unaffected. Pin the four Bill-Gray"
+    echo "repos to a compatible commit set to restore it."
+    echo "############################################################"
+    echo
+    rm -f "$PREFIX/bin/fo"
+fi
 echo "Test with:"
 echo "  $PREFIX/bin/fo --help"
 echo
