@@ -213,9 +213,21 @@ build-cli:
 	@echo "──── Building CLI runner ───────────────────────────────"
 	@cd $(EMPYREAN_RUNNERS)/cli && cargo build --release
 
-build-wheel:
+# The python / c / cli channels all run through this venv's interpreter,
+# and the python channel imports the empyrean extension that maturin
+# compiles into it here. Nothing else creates the venv, so bootstrap it
+# (with maturin) as a prerequisite.
+$(WHEEL_VENV)/bin/maturin:
+	@echo "──── Creating empyrean-py build venv (maturin) ─────────"
+	@python3 -m venv $(WHEEL_VENV)
+	@$(WHEEL_PY) -m pip install --quiet --upgrade pip maturin
+
+build-wheel: $(WHEEL_VENV)/bin/maturin
 	@echo "──── Building empyrean-py wheel ────────────────────────"
-	@cd $(EMPYREAN_ROOT)/empyrean-py && $(WHEEL_VENV)/bin/maturin develop --release
+	@# maturin develop installs into VIRTUAL_ENV; set it explicitly so it
+	@# targets this venv rather than auto-discovering a different one.
+	@cd $(EMPYREAN_ROOT)/empyrean-py && \
+	    VIRTUAL_ENV=$(abspath $(WHEEL_VENV)) $(WHEEL_VENV)/bin/maturin develop --release
 
 # Optional: empyrean-core "core" channel runner. Only invoked when the
 # sibling empyrean-core tree exists (WITH_CORE auto-detected above).
