@@ -224,10 +224,15 @@ $(WHEEL_VENV)/bin/maturin:
 
 build-wheel: $(WHEEL_VENV)/bin/maturin
 	@echo "──── Building empyrean-py wheel ────────────────────────"
-	@# maturin develop installs into VIRTUAL_ENV; set it explicitly so it
-	@# targets this venv rather than auto-discovering a different one.
+	@# Build the wheel and pip-install it, rather than `maturin develop`.
+	@# develop resolves the project's dev dependency-groups (which include
+	@# the private empyrean-sphinx-theme docs dep) and fails offline; a
+	@# plain wheel install pulls only the public runtime deps from the
+	@# wheel metadata — PEP 735 groups are never in wheel metadata.
+	@rm -rf $(WHEEL_VENV)/wheelhouse
 	@cd $(EMPYREAN_ROOT)/empyrean-py && \
-	    VIRTUAL_ENV=$(abspath $(WHEEL_VENV)) $(WHEEL_VENV)/bin/maturin develop --release
+	    $(WHEEL_VENV)/bin/maturin build --release --out $(WHEEL_VENV)/wheelhouse
+	@$(WHEEL_PY) -m pip install --quiet --force-reinstall $(WHEEL_VENV)/wheelhouse/*.whl
 
 # Optional: empyrean-core "core" channel runner. Only invoked when the
 # sibling empyrean-core tree exists (WITH_CORE auto-detected above).
