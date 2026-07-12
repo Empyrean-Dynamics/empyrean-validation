@@ -237,8 +237,14 @@ jobs:
           get -o earth_2025_250826_2125_predict.bpc https://naif.jpl.nasa.gov/pub/naif/generic_kernels/pck/earth_2025_250826_2125_predict.bpc
           get -o moon_pa_de440_200625.bpc https://naif.jpl.nasa.gov/pub/naif/generic_kernels/pck/moon_pa_de440_200625.bpc
           get -o sb441-n16.bsp https://ssd.jpl.nasa.gov/ftp/eph/small_bodies/asteroids_de441/sb441-n16.bsp
-          get https://minorplanetcenter.net/Extended_Files/obscodes_extended.json.gz | gunzip > obscodes_extended.json
           get -o linux_p1550p2650.440 https://ssd.jpl.nasa.gov/ftp/eph/planets/Linux/de440/linux_p1550p2650.440
+          # Observatory codes: vendored in-repo rather than fetched. MPC
+          # (minorplanetcenter.net) throttles GitHub Actions IP ranges, so
+          # a live fetch reliably times out in CI even with retries; the
+          # file is ~77 KB and the observatories used never move, so
+          # pinning it also makes the validation inputs reproducible.
+          # Refresh by re-downloading into assets/ (see assets/README.md).
+          gunzip -c "$GITHUB_WORKSPACE/empyrean-validation/assets/obscodes_extended.json.gz" > obscodes_extended.json
 
       # Runs only on a fresh, successful download (a bare `if:` implies
       # success()), so the cache is populated exactly once per key with a
