@@ -24,7 +24,12 @@ echo
 if [ ! -d "$VENV_DIR" ]; then
     echo "Creating virtual environment..."
     if command -v uv &>/dev/null; then
-        uv venv --python 3.12 "$VENV_DIR"
+        # --seed installs pip/setuptools into the venv. A bare `uv venv`
+        # is pip-less, which breaks the `python -m pip install` below
+        # ("No module named pip"). We deliberately install with pip
+        # rather than `uv pip` (see the dependency-install note), so the
+        # venv must actually carry pip.
+        uv venv --seed --python 3.12 "$VENV_DIR"
     else
         python3 -m venv "$VENV_DIR"
     fi

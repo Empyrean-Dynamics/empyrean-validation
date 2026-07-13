@@ -162,7 +162,11 @@ help:
 all: build run report
 
 # ── Setup (one-time) ───────────────────────────────────────
-setup: setup-assist setup-findorb setup-oorb setup-orbfit
+# OrbFit's runner is gated on WITH_ORBFIT (see `run`), so only set it up
+# when it will actually run — otherwise `make setup` pulls a Docker image
+# for a comparator that never executes (and fails the setup if Docker is
+# unavailable).
+setup: setup-assist setup-findorb setup-oorb $(if $(WITH_ORBFIT),setup-orbfit,)
 	@echo
 	@echo "External dependencies installed."
 
@@ -209,9 +213,26 @@ build-cli:
 	@echo "──── Building CLI runner ───────────────────────────────"
 	@cd $(EMPYREAN_RUNNERS)/cli && cargo build --release
 
-build-wheel:
+# The python / c / cli channels all run through this venv's interpreter,
+# and the python channel imports the empyrean extension that maturin
+# compiles into it here. Nothing else creates the venv, so bootstrap it
+# (with maturin) as a prerequisite.
+$(WHEEL_VENV)/bin/maturin:
+	@echo "──── Creating empyrean-py build venv (maturin) ─────────"
+	@python3 -m venv $(WHEEL_VENV)
+	@$(WHEEL_PY) -m pip install --quiet --upgrade pip maturin
+
+build-wheel: $(WHEEL_VENV)/bin/maturin
 	@echo "──── Building empyrean-py wheel ────────────────────────"
-	@cd $(EMPYREAN_ROOT)/empyrean-py && $(WHEEL_VENV)/bin/maturin develop --release
+	@# Build the wheel and pip-install it, rather than `maturin develop`.
+	@# develop resolves the project's dev dependency-groups (which include
+	@# the private empyrean-sphinx-theme docs dep) and fails offline; a
+	@# plain wheel install pulls only the public runtime deps from the
+	@# wheel metadata — PEP 735 groups are never in wheel metadata.
+	@rm -rf $(WHEEL_VENV)/wheelhouse
+	@cd $(EMPYREAN_ROOT)/empyrean-py && \
+	    $(WHEEL_VENV)/bin/maturin build --release --out $(WHEEL_VENV)/wheelhouse
+	@$(WHEEL_PY) -m pip install --quiet --force-reinstall $(WHEEL_VENV)/wheelhouse/*.whl
 
 # Optional: empyrean-core "core" channel runner. Only invoked when the
 # sibling empyrean-core tree exists (WITH_CORE auto-detected above).
@@ -325,15 +346,25 @@ run-assist: $(PLAN) $(ASSIST_PY)
 	    --horizons-cache $(CACHE_DIR)/horizons \
 	    --data-dir $(DATA_DIR)
 
-run-findorb: $(FO_BIN) $(ASSIST_PY)
-	@echo "──── find_orb: external OD reference ───────────────────"
-	@$(ASSIST_PY) $(EMP_VAL_RUNNERS)/findorb/run_findorb.py $(FIXTURES_PSV) \
-	    --output $(FINDORB_OUT) --fo-binary $(FO_BIN) \
-	    --data-dir $(DATA_DIR)
-	@echo "──── find_orb: radar-augmented OD reference (psv-radar) ─"
-	@$(ASSIST_PY) $(EMP_VAL_RUNNERS)/findorb/run_findorb.py $(FIXTURES_PSV_RADAR) \
-	    --output $(FINDORB_RADAR_OUT) --fo-binary $(FO_BIN) \
-	    --data-dir $(DATA_DIR) --test-type orbit_determination_radar
+# find_orb's binary is an optional, non-fatal build (see findorb/setup.sh).
+# When it's absent, skip the comparison and emit empty result files so the
+# merge step still has valid (empty) inputs — the missing comparator is
+# surfaced here and by its absence from the report, never silently faked.
+run-findorb: $(ASSIST_PY)
+	@if [ -x "$(FO_BIN)" ]; then \
+	    echo "──── find_orb: external OD reference ───────────────────"; \
+	    $(ASSIST_PY) $(EMP_VAL_RUNNERS)/findorb/run_findorb.py $(FIXTURES_PSV) \
+	        --output $(FINDORB_OUT) --fo-binary $(FO_BIN) \
+	        --data-dir $(DATA_DIR); \
+	    echo "──── find_orb: radar-augmented OD reference (psv-radar) ─"; \
+	    $(ASSIST_PY) $(EMP_VAL_RUNNERS)/findorb/run_findorb.py $(FIXTURES_PSV_RADAR) \
+	        --output $(FINDORB_RADAR_OUT) --fo-binary $(FO_BIN) \
+	        --data-dir $(DATA_DIR) --test-type orbit_determination_radar; \
+	else \
+	    echo "──── find_orb: SKIPPED (binary not built — see setup warning) ──"; \
+	    echo '[]' > $(FINDORB_OUT); \
+	    echo '[]' > $(FINDORB_RADAR_OUT); \
+	fi
 
 # ── OpenOrb (oorb) external comparison — propagation + ephemeris ─
 # Independent Fortran implementation (Granvik et al., University of
@@ -348,11 +379,20 @@ $(OORB_BIN):
 	@cd $(EMP_VAL_RUNNERS)/oorb && ./setup.sh
 
 run-oorb: $(OORB_OUT)
-$(OORB_OUT): $(PLAN) $(OORB_BIN) $(ASSIST_PY)
-	@echo "──── OpenOrb: external prop + ephemeris reference ──────"
-	@$(ASSIST_PY) $(EMP_VAL_RUNNERS)/oorb/run_oorb.py \
-	    --input $(PLAN) --output $(OORB_OUT) \
-	    --prefix $(EMP_VAL_RUNNERS)/oorb/install
+# oorb's binary is an optional, non-fatal build (see oorb/setup.sh). When
+# it's absent, skip the comparison and emit an empty result file so the
+# merge step still has a valid input — the missing comparator is surfaced
+# here and by its absence from the report, never silently faked.
+$(OORB_OUT): $(PLAN) $(ASSIST_PY)
+	@if [ -x "$(OORB_BIN)" ]; then \
+	    echo "──── OpenOrb: external prop + ephemeris reference ──────"; \
+	    $(ASSIST_PY) $(EMP_VAL_RUNNERS)/oorb/run_oorb.py \
+	        --input $(PLAN) --output $(OORB_OUT) \
+	        --prefix $(EMP_VAL_RUNNERS)/oorb/install; \
+	else \
+	    echo "──── OpenOrb: SKIPPED (binary not built — see setup warning) ──"; \
+	    echo '[]' > $(OORB_OUT); \
+	fi
 
 # ── OrbFit external comparison — orbit determination ─────────────
 # OrbFit Consortium (University of Pisa) / IAU Minor Planet Center.

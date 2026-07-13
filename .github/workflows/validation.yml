@@ -207,29 +207,54 @@ jobs:
         run: pip install uv
 
       # ── Caches ─────────────────────────────────────────────────
-      # SPICE kernels + DE440 + bias.dat — large (~2 GB), rebuilt only
-      # when the cache key changes. Bump the suffix when adding a kernel.
-      - name: Cache empyrean data kernels
+      # SPICE kernels + DE440 + bias.dat — large (~2 GB). Restore by key,
+      # but SAVE only after a complete, successful download (the explicit
+      # save step below) so a transient NAIF/JPL outage mid-download can
+      # never poison the cache with a partial kernel set that later runs
+      # would silently trust. Bump the suffix when adding a kernel.
+      - name: Restore empyrean data kernels
         id: cache-data
-        uses: actions/cache@v4
+        uses: actions/cache/restore@v4
         with:
           path: data
           key: empyrean-data-v2
 
       - name: Download empyrean data kernels
         if: steps.cache-data.outputs.cache-hit != 'true'
+        # Retry transient network failures instead of failing the whole
+        # suite: --retry-all-errors covers connection timeouts (curl exit
+        # 28, seen when naif.jpl.nasa.gov is briefly unreachable), and
+        # --connect-timeout caps a single hung attempt so it fails fast
+        # into the next retry rather than stalling for minutes.
         run: |
           mkdir -p data
           cd data
-          curl -sSfL -o de440.bsp https://naif.jpl.nasa.gov/pub/naif/generic_kernels/spk/planets/de440.bsp
-          curl -sSfL -o gm_de440.tpc https://naif.jpl.nasa.gov/pub/naif/generic_kernels/pck/gm_de440.tpc
-          curl -sSfL -o earth_latest_high_prec.bpc https://naif.jpl.nasa.gov/pub/naif/generic_kernels/pck/earth_latest_high_prec.bpc
-          curl -sSfL -o earth_620120_250826.bpc https://naif.jpl.nasa.gov/pub/naif/generic_kernels/pck/earth_620120_250826.bpc
-          curl -sSfL -o earth_2025_250826_2125_predict.bpc https://naif.jpl.nasa.gov/pub/naif/generic_kernels/pck/earth_2025_250826_2125_predict.bpc
-          curl -sSfL -o moon_pa_de440_200625.bpc https://naif.jpl.nasa.gov/pub/naif/generic_kernels/pck/moon_pa_de440_200625.bpc
-          curl -sSfL -o sb441-n16.bsp https://ssd.jpl.nasa.gov/ftp/eph/small_bodies/asteroids_de441/sb441-n16.bsp
-          curl -sSfL https://minorplanetcenter.net/Extended_Files/obscodes_extended.json.gz | gunzip > obscodes_extended.json
-          curl -sSfL -o linux_p1550p2650.440 https://ssd.jpl.nasa.gov/ftp/eph/planets/Linux/de440/linux_p1550p2650.440
+          get() { curl -sSfL --retry 5 --retry-delay 10 --retry-all-errors --connect-timeout 60 "$@"; }
+          get -o de440.bsp https://naif.jpl.nasa.gov/pub/naif/generic_kernels/spk/planets/de440.bsp
+          get -o gm_de440.tpc https://naif.jpl.nasa.gov/pub/naif/generic_kernels/pck/gm_de440.tpc
+          get -o earth_latest_high_prec.bpc https://naif.jpl.nasa.gov/pub/naif/generic_kernels/pck/earth_latest_high_prec.bpc
+          get -o earth_620120_250826.bpc https://naif.jpl.nasa.gov/pub/naif/generic_kernels/pck/earth_620120_250826.bpc
+          get -o earth_2025_250826_2125_predict.bpc https://naif.jpl.nasa.gov/pub/naif/generic_kernels/pck/earth_2025_250826_2125_predict.bpc
+          get -o moon_pa_de440_200625.bpc https://naif.jpl.nasa.gov/pub/naif/generic_kernels/pck/moon_pa_de440_200625.bpc
+          get -o sb441-n16.bsp https://ssd.jpl.nasa.gov/ftp/eph/small_bodies/asteroids_de441/sb441-n16.bsp
+          get -o linux_p1550p2650.440 https://ssd.jpl.nasa.gov/ftp/eph/planets/Linux/de440/linux_p1550p2650.440
+          # Observatory codes: vendored in-repo rather than fetched. MPC
+          # (minorplanetcenter.net) throttles GitHub Actions IP ranges, so
+          # a live fetch reliably times out in CI even with retries; the
+          # file is ~77 KB and the observatories used never move, so
+          # pinning it also makes the validation inputs reproducible.
+          # Refresh by re-downloading into assets/ (see assets/README.md).
+          gunzip -c "$GITHUB_WORKSPACE/empyrean-validation/assets/obscodes_extended.json.gz" > obscodes_extended.json
+
+      # Runs only on a fresh, successful download (a bare `if:` implies
+      # success()), so the cache is populated exactly once per key with a
+      # complete kernel set — never a partial one from a failed run.
+      - name: Save empyrean data kernels
+        if: steps.cache-data.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: data
+          key: empyrean-data-v2
 
       # JPL Horizons + SBDB API responses — the rust runner caches every
       # IC and reference vector the first time it fetches them, so warm
@@ -279,7 +304,13 @@ jobs:
       # ── Pipeline ───────────────────────────────────────────────
       # `make setup` only runs the per-runner setup scripts that produce
       # things the cache might not have (or that are cheap to re-check).
-      - name: One-time external setup (ASSIST venv + find_orb build)
+      # OpenOrb links against LAPACK/BLAS, which aren't on the runner by
+      # default (its Fortran build otherwise fails at `ld: cannot find
+      # -llapack`). gfortran is already present.
+      - name: Install system libraries (LAPACK/BLAS for OpenOrb)
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends liblapack-dev libblas-dev
+
+      - name: One-time external setup (ASSIST venv + find_orb + OpenOrb build)
         working-directory: empyrean-validation
         env:
           DATA_DIR: ${{ env.EMPYREAN_DATA_DIR }}
