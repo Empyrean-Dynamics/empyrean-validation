@@ -366,7 +366,15 @@ jobs:
           # archive/{TIMESTAMP}/ mirrors the same structure for history.
 
           alias_canonical() { cp "$1" "$2"; }
-          alias_canonical results/validation_rust_merged.json results/validation.json
+          # The merged-with-externals result is core-keyed when the core
+          # channel ran (WITH_CORE) and rust-keyed otherwise. `make all`
+          # only produces one of the two, so alias whichever exists —
+          # cp under `set -e` would abort the upload on the missing name.
+          if [ -f results/validation_core_merged.json ]; then
+            alias_canonical results/validation_core_merged.json results/validation.json
+          else
+            alias_canonical results/validation_rust_merged.json  results/validation.json
+          fi
           alias_canonical results/validation_rust_od.json      results/od_validation.json
 
           # latest/ — overwrite each upload
