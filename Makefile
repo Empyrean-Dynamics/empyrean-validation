@@ -112,6 +112,9 @@ OORB_OUT := $(RESULTS_DIR)/validation_oorb.json
 ORBFIT_OUT := $(RESULTS_DIR)/validation_orbfit.json
 KETE_OUT := $(RESULTS_DIR)/validation_kete.json
 JORBIT_OUT := $(RESULTS_DIR)/validation_jorbit.json
+# layup external OD reference (opt-in, WITH_LAYUP=1); its rows attach to the
+# `orbit_determination` OD rows in the merge, alongside find_orb + OrbFit.
+LAYUP_OUT := $(RESULTS_DIR)/validation_layup.json
 # Merged-with-external version of the rust unified file. ASSIST and find_orb
 # references attach onto the rust prop+eph and OD rows in a single pass.
 RUST_MERGED := $(RESULTS_DIR)/validation_rust_merged.json
@@ -137,10 +140,10 @@ REPORT_INPUTS := $(if $(WITH_CORE),$(RUST)$(comma)$(PYTHON)$(comma)$(C_OUT)$(com
 
 # ── Targets ────────────────────────────────────────────────
 .PHONY: all setup build run report clean help \
-        setup-assist setup-findorb setup-oorb setup-orbfit setup-kete setup-jorbit \
+        setup-assist setup-findorb setup-oorb setup-orbfit setup-kete setup-jorbit setup-layup \
         build-empyrean-c build-rust build-c build-cli build-wheel build-core build-empyrean-validation \
         run-rust run-python run-c run-cli run-assist run-findorb run-oorb run-orbfit \
-        run-core run-kete run-jorbit \
+        run-core run-kete run-jorbit run-layup \
         merge-external plan
 
 help:
@@ -166,7 +169,7 @@ all: build run report
 # when it will actually run — otherwise `make setup` pulls a Docker image
 # for a comparator that never executes (and fails the setup if Docker is
 # unavailable).
-setup: setup-assist setup-findorb setup-oorb $(if $(WITH_ORBFIT),setup-orbfit,)
+setup: setup-assist setup-findorb setup-oorb $(if $(WITH_ORBFIT),setup-orbfit,) $(if $(WITH_LAYUP),setup-layup,)
 	@echo
 	@echo "External dependencies installed."
 
@@ -265,8 +268,13 @@ build-empyrean-validation:
 # (Cartesian seed orbit + equinoctial→Cartesian conversion pending).
 # Set `WITH_ORBFIT=1` to opt in once those are in place.
 WITH_ORBFIT ?=
+# layup is opt-in too (WITH_LAYUP=1) — brand-new upstream (v0.0.1) with a heavy
+# C-extension build, so it stays out of the default `make all` path, same as
+# OrbFit.
+WITH_LAYUP ?=
 run: run-rust run-python run-c run-cli run-assist run-findorb run-oorb \
      $(if $(WITH_ORBFIT),run-orbfit,) \
+     $(if $(WITH_LAYUP),run-layup,) \
      $(if $(WITH_CORE),run-core,)
 
 # Rust channel: two binary subcommands (`validate run` for prop+eph,
@@ -461,6 +469,35 @@ $(JORBIT_OUT): $(PLAN) $(JORBIT_PY)
 	@$(JORBIT_PY) $(EMP_VAL_RUNNERS)/jorbit/run_jorbit.py \
 	    --input $(PLAN) --output $(JORBIT_OUT)
 
+# ── layup (opt-in external OD reference) ─────────────────────
+# MIT-licensed, ASSIST-backed orbit fitter (Smithsonian / CfA; Matthew
+# Holman et al.). Fits the optical OD fixtures directly from ADES PSV and
+# folds χ² / reduced-χ² / n_obs / convergence onto the OD rows alongside
+# find_orb + OrbFit. Opt-in via WITH_LAYUP=1 (heavy C-extension build).
+LAYUP_VENV := $(EMP_VAL_RUNNERS)/layup/.venv
+LAYUP_PY := $(LAYUP_VENV)/bin/python
+
+setup-layup: $(LAYUP_PY)
+$(LAYUP_PY):
+	@echo "──── Setting up layup venv (clone + build + bootstrap) ─"
+	@cd $(EMP_VAL_RUNNERS)/layup && ./setup.sh
+
+run-layup: $(LAYUP_OUT)
+# layup's venv is an optional, heavy build (see layup/setup.sh). When it's
+# absent, skip the fit and emit an empty result file so the merge step still
+# has a valid input — the missing comparator is surfaced here and by its
+# absence from the report, never silently faked.
+$(LAYUP_OUT): $(FIXTURES_PSV)
+	@if [ -x "$(LAYUP_PY)" ]; then \
+	    echo "──── layup: external OD reference (ADES PSV) ───────────"; \
+	    $(LAYUP_PY) $(EMP_VAL_RUNNERS)/layup/run_layup.py $(FIXTURES_PSV) \
+	        --output $(LAYUP_OUT); \
+	else \
+	    echo "──── layup: SKIPPED (venv not built — run 'make setup-layup') ──"; \
+	    mkdir -p $(RESULTS_DIR); \
+	    echo '[]' > $(LAYUP_OUT); \
+	fi
+
 # ── Merge external + report ────────────────────────────────
 # Channel-agnostic meta operations live in this repo's CLI binary. It
 # owns the schema, so its merge / report / ci-check stays in lockstep
@@ -480,21 +517,23 @@ INCLUDE_OPTIONAL ?=
 # folding onto rust rows for backward compat.
 merge-external: $(if $(WITH_CORE),$(CORE_MERGED),$(RUST_MERGED))
 $(CORE_MERGED): $(CORE_OUT) $(ASSIST_OUT) $(FINDORB_OUT) $(FINDORB_RADAR_OUT) $(OORB_OUT) \
-                $(if $(WITH_ORBFIT),$(ORBFIT_OUT),) $(EMP_VAL_BIN)
-	@echo "──── Merge ASSIST + find_orb + OpenOrb$(if $(WITH_ORBFIT), + OrbFit,) into core ──"
+                $(if $(WITH_ORBFIT),$(ORBFIT_OUT),) $(if $(WITH_LAYUP),$(LAYUP_OUT),) $(EMP_VAL_BIN)
+	@echo "──── Merge ASSIST + find_orb + OpenOrb$(if $(WITH_ORBFIT), + OrbFit,)$(if $(WITH_LAYUP), + layup,) into core ──"
 	@$(EMP_VAL_BIN) merge-external -i $(CORE_OUT) -o $(CORE_MERGED) \
 	    --assist $(ASSIST_OUT) --findorb $(FINDORB_OUT) \
 	    --findorb-radar $(FINDORB_RADAR_OUT) \
 	    --oorb $(OORB_OUT) \
-	    $(if $(WITH_ORBFIT),--orbfit $(ORBFIT_OUT),)
+	    $(if $(WITH_ORBFIT),--orbfit $(ORBFIT_OUT),) \
+	    $(if $(WITH_LAYUP),--layup $(LAYUP_OUT),)
 $(RUST_MERGED): $(RUST) $(ASSIST_OUT) $(FINDORB_OUT) $(FINDORB_RADAR_OUT) $(OORB_OUT) \
-                $(if $(WITH_ORBFIT),$(ORBFIT_OUT),) $(EMP_VAL_BIN)
-	@echo "──── Merge ASSIST + find_orb + OpenOrb$(if $(WITH_ORBFIT), + OrbFit,) into rust (fallback) ──"
+                $(if $(WITH_ORBFIT),$(ORBFIT_OUT),) $(if $(WITH_LAYUP),$(LAYUP_OUT),) $(EMP_VAL_BIN)
+	@echo "──── Merge ASSIST + find_orb + OpenOrb$(if $(WITH_ORBFIT), + OrbFit,)$(if $(WITH_LAYUP), + layup,) into rust (fallback) ──"
 	@$(EMP_VAL_BIN) merge-external -i $(RUST) -o $(RUST_MERGED) \
 	    --assist $(ASSIST_OUT) --findorb $(FINDORB_OUT) \
 	    --findorb-radar $(FINDORB_RADAR_OUT) \
 	    --oorb $(OORB_OUT) \
-	    $(if $(WITH_ORBFIT),--orbfit $(ORBFIT_OUT),)
+	    $(if $(WITH_ORBFIT),--orbfit $(ORBFIT_OUT),) \
+	    $(if $(WITH_LAYUP),--layup $(LAYUP_OUT),)
 
 report: $(RUST) $(PYTHON) $(C_OUT) $(CLI_OUT) $(if $(WITH_CORE),$(CORE_MERGED),$(RUST_MERGED)) $(EMP_VAL_BIN)
 	@echo "──── Generating combined HTML report ───────────────────"

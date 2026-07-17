@@ -18,6 +18,13 @@ runners/findorb/build/
 runners/findorb/install/
 runners/oorb/build/
 runners/oorb/install/
+# layup: setup.sh clones the upstream repo (recursive submodules) here and
+# builds it into the runner's venv.
+runners/layup/build/
+# layup's LayupLogger writes timestamped log/err files to the CWD (repo root
+# when invoked via `make run-layup` / `layup-bootstrap`); never track them.
+layup-*.log
+layup-*.err
 
 # Per-runner Python venvs (each .venv has its own auto-generated
 # .gitignore but be explicit so a stray `git add .` doesn't pull

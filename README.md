@@ -54,6 +54,7 @@ plan; results are folded onto the core channel's rows:
 | [OrbFit](http://adams.dm.unipi.it/orbfit/) | OrbFit Consortium / MPC (opt-in, `WITH_ORBFIT=1`) | orbit determination (CMC2003 rejection) |
 | [kete](https://github.com/dahlend/kete) | Dar Dahlen (opt-in) | propagation, ephemeris, OD sanity check |
 | [jorbit](https://github.com/ben-cassese/jorbit) | Ben Cassese — JAX-based (opt-in) | propagation, OD sanity check |
+| [layup](https://github.com/Smithsonian/layup) | Matthew Holman / Smithsonian — ASSIST-backed orbit fitter (opt-in, `WITH_LAYUP=1`) | orbit determination (χ² / reduced-χ² / n_obs / convergence) |
 
 Initial conditions come from **JPL SBDB**; reference states and observed
 quantities come from **JPL Horizons**. ASSIST runs only first-order
@@ -84,7 +85,7 @@ report rendering.
 Want to benchmark another implementation against the same plan? See
 [Add a runner](runners/README.md#add-a-runner) — external runners are
 self-contained (read the plan JSON, emit rows in the shared schema) and
-the six existing ones are working templates.
+the seven existing ones are working templates.
 
 The harness itself consumes only **public crates**: the published
 `empyrean` wrapper supplies the SBDB / Horizons query clients the plan
