@@ -110,6 +110,11 @@ struct MergeExternalArgs {
     /// rust rows.
     #[arg(long)]
     orbfit: Option<PathBuf>,
+    /// layup per-channel JSON (from `runners/layup/run_layup.py`).
+    /// Folds OD-row fields (χ² / reduced-χ² / observation count /
+    /// convergence) onto matching rows.
+    #[arg(long)]
+    layup: Option<PathBuf>,
 }
 
 #[derive(Parser, Debug)]
@@ -225,6 +230,10 @@ fn merge_external(args: MergeExternalArgs) -> Result<(), Box<dyn std::error::Err
     if let Some(path) = &args.orbfit {
         let n = merge_orbfit(&mut rows, path)?;
         eprintln!("Merged {n} OrbFit rows");
+    }
+    if let Some(path) = &args.layup {
+        let n = merge_layup(&mut rows, path)?;
+        eprintln!("Merged {n} layup rows");
     }
 
     let out_path = args.output.unwrap_or(args.input);
@@ -448,6 +457,43 @@ fn merge_orbfit(
     Ok(n)
 }
 
+/// Fold layup per-channel JSON into the OD rows.
+///
+/// layup covers orbit determination only (independent MIT-licensed,
+/// ASSIST-backed fitter; Smithsonian / CfA). Keyed by object — same as
+/// `merge_orbfit` — since OD rows have one fit per object per arc. layup
+/// reports a weighted χ² (not an arcsec RMS), so the folded fields are
+/// χ² / reduced-χ² / observation count / convergence.
+fn merge_layup(
+    rows: &mut [ValidationResult],
+    path: &std::path::Path,
+) -> Result<usize, Box<dyn std::error::Error>> {
+    let txt = std::fs::read_to_string(path).map_err(|e| format!("read {}: {e}", path.display()))?;
+    let lu: Vec<serde_json::Value> = serde_json::from_str(&txt)?;
+    let mut idx: std::collections::HashMap<String, &serde_json::Value> = Default::default();
+    for f in &lu {
+        if let Some(o) = f["object"].as_str() {
+            idx.insert(o.to_string(), f);
+        }
+    }
+    let mut n = 0;
+    for r in rows.iter_mut() {
+        if r.test_type != "orbit_determination" {
+            continue;
+        }
+        let Some(f) = idx.get(&r.object) else {
+            continue;
+        };
+        r.layup_chi2 = f["layup_chi2"].as_f64();
+        r.layup_reduced_chi2 = f["layup_reduced_chi2"].as_f64();
+        r.layup_n_obs_used = f["layup_n_obs_used"].as_u64().map(|v| v as u32);
+        r.layup_converged = f["layup_converged"].as_bool();
+        r.layup_time_ms = f["layup_time_ms"].as_f64();
+        n += 1;
+    }
+    Ok(n)
+}
+
 fn report(args: ReportArgs) -> Result<(), Box<dyn std::error::Error>> {
     let mut all: Vec<ValidationResult> = Vec::new();
     let mut orbit_comparisons: Vec<OrbitComparison> = Vec::new();
@@ -609,4 +655,64 @@ fn expand_tilde(p: &std::path::Path) -> PathBuf {
         return PathBuf::from(home).join(rest);
     }
     p.to_path_buf()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Write;
+
+    fn od_row(object: &str) -> ValidationResult {
+        let mut r = ValidationResult::empty();
+        r.object = object.into();
+        r.test_type = "orbit_determination".into();
+        r
+    }
+
+    #[test]
+    fn merge_layup_folds_onto_od_rows_only() {
+        // A propagation row for the same object must be left untouched: layup
+        // is an OD-only reference, keyed by (object, orbit_determination).
+        let mut rows = vec![od_row("Eros"), {
+            let mut p = ValidationResult::empty();
+            p.object = "Eros".into();
+            p.test_type = "propagation".into();
+            p
+        }];
+
+        let mut f = tempfile::NamedTempFile::new().unwrap();
+        write!(
+            f,
+            r#"[{{"object":"Eros","test_type":"orbit_determination",
+                 "layup_chi2":10.5,"layup_reduced_chi2":1.05,
+                 "layup_n_obs_used":512,"layup_converged":true,
+                 "layup_time_ms":42.0}}]"#
+        )
+        .unwrap();
+
+        let n = merge_layup(&mut rows, f.path()).unwrap();
+        assert_eq!(n, 1, "exactly the OD row should be merged");
+
+        let od = &rows[0];
+        assert_eq!(od.layup_chi2, Some(10.5));
+        assert_eq!(od.layup_reduced_chi2, Some(1.05));
+        assert_eq!(od.layup_n_obs_used, Some(512));
+        assert_eq!(od.layup_converged, Some(true));
+        assert_eq!(od.layup_time_ms, Some(42.0));
+
+        // Propagation row for the same object stays clear.
+        assert_eq!(rows[1].layup_chi2, None);
+    }
+
+    #[test]
+    fn merge_layup_skips_objects_without_a_layup_record() {
+        // An OD row whose object has no layup fit stays None — no silent
+        // fabrication, no cross-object leakage.
+        let mut rows = vec![od_row("Bennu")];
+        let mut f = tempfile::NamedTempFile::new().unwrap();
+        write!(f, r#"[{{"object":"Eros","layup_chi2":9.0}}]"#).unwrap();
+        let n = merge_layup(&mut rows, f.path()).unwrap();
+        assert_eq!(n, 0);
+        assert_eq!(rows[0].layup_chi2, None);
+    }
 }

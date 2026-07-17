@@ -379,6 +379,47 @@ pub struct ValidationResult {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub orbfit_time_ms: Option<f64>,
 
+    // ── layup external reference ────────────────────────────────────
+    // OD reference. Independent orbit fitter (Smithsonian / CfA; Matthew
+    // Holman et al.), MIT-licensed, ASSIST-backed (DE441 + SB441-N16 —
+    // the same dynamical model the ASSIST propagation channel uses).
+    // Populated by `merge-external` from the layup runner's output.
+    //
+    // layup reports a χ² (`csq`) and its degrees of freedom (`ndof`),
+    // NOT an arcsec post-fit residual RMS, so — unlike
+    // `findorb_rms_residual` / `orbfit_rms_arcsec` — the OD-quality
+    // quantities to fold are χ² and reduced χ² (≈1 for a good fit).
+    // Fabricating an arcsec RMS from χ² would require the per-observation
+    // weights layup does not emit, so none is reported here. Note `csq`
+    // depends on each tool's observation weighting / debiasing / error
+    // model, so it is not strictly apples-to-apples with `od_chi2`;
+    // reduced χ² (≈1) is the more tool-agnostic comparison.
+    /// layup post-fit χ² (`csq` from the orbitfit output). Compare to
+    /// empyrean's `od_chi2`, modulo each tool's weighting/error model.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub layup_chi2: Option<f64>,
+    /// layup reduced χ² (`csq / ndof`). Compare to `od_reduced_chi2`;
+    /// ≈1 for a statistically consistent fit, and the most tool-agnostic
+    /// of the OD-quality metrics.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub layup_reduced_chi2: Option<f64>,
+    /// layup fittable-observation count (`nobs_fit`). Comparable to
+    /// `n_obs_used`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub layup_n_obs_used: Option<u32>,
+    /// Whether layup's fit was well-conditioned and converged
+    /// (`flag == 0` in the orbitfit output). Comparable to `od_converged`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub layup_converged: Option<bool>,
+    /// layup wall-clock per fit (ms). This is cold-subprocess time (one
+    /// `layup-orbitfit` process per object), so it is dominated by layup's
+    /// per-process startup — import/JIT/SPICE-kernel/ASSIST init — not the
+    /// fit kernel. NOT comparable to `emp_time_ms` (warm, in-process); see
+    /// the runner's design note. Not folded into a `speed_ratio` for that
+    /// reason.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub layup_time_ms: Option<f64>,
+
     // ── Metadata ────────────────────────────────────────────────────
     /// ISO 8601 timestamp at row creation.
     pub timestamp: String,
@@ -461,6 +502,11 @@ impl ValidationResult {
             orbfit_n_obs_used: None,
             orbfit_n_obs_rejected: None,
             orbfit_time_ms: None,
+            layup_chi2: None,
+            layup_reduced_chi2: None,
+            layup_n_obs_used: None,
+            layup_converged: None,
+            layup_time_ms: None,
             timestamp: String::new(),
             notes: String::new(),
         }
@@ -688,6 +734,37 @@ mod tests {
             !s.contains("excluded_perturbers_naif"),
             "excluded_perturbers_naif should be omitted",
         );
+    }
+
+    #[test]
+    fn layup_fields_round_trip_and_omit_when_none() {
+        // Populated layup fields must survive a JSON round-trip, and the
+        // skip_serializing_if attributes must omit them entirely when None
+        // (so the default JSON contract the app/website consume is unchanged
+        // until a WITH_LAYUP merge actually populates them).
+        let none = ValidationResult::empty();
+        let s_none = serde_json::to_string(&none).unwrap();
+        for key in [
+            "layup_chi2",
+            "layup_reduced_chi2",
+            "layup_n_obs_used",
+            "layup_converged",
+            "layup_time_ms",
+        ] {
+            assert!(!s_none.contains(key), "{key} must be omitted when None");
+        }
+
+        let mut r = ValidationResult::empty();
+        r.test_type = "orbit_determination".into();
+        r.layup_chi2 = Some(41.7);
+        r.layup_reduced_chi2 = Some(1.03);
+        r.layup_n_obs_used = Some(4135);
+        r.layup_converged = Some(true);
+        r.layup_time_ms = Some(1234.5);
+        let s = serde_json::to_string(&r).unwrap();
+        assert!(s.contains("layup_chi2"));
+        let r2: ValidationResult = serde_json::from_str(&s).unwrap();
+        assert_eq!(r, r2);
     }
 
     #[test]

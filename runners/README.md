@@ -1,7 +1,8 @@
 # External Reference Runners
 
-Standalone Python runners that exercise three independent astrodynamics
-implementations (ASSIST, find_orb, kete) against the same canonical
+Standalone runners that exercise independent astrodynamics
+implementations (ASSIST, find_orb, OpenOrb, OrbFit, kete, jorbit, layup)
+against the same canonical
 validation plan and emit JSON conforming to the
 [`ValidationResult`](../src/schema.rs) schema. The empyrean validation
 report folds these into a multi-channel comparison so each empyrean
@@ -24,6 +25,7 @@ flags.
 | [`kete/`](kete/) | [kete](https://github.com/dahlend/kete) (Dahl & friends) | BSD-3-Clause | Propagation, ephemeris generation, and OD. Pure Python (rebuild-from-PyPI). |
 | [`oorb/`](oorb/) | [OpenOrb](https://github.com/oorb/oorb) (Granvik et al., Fortran orbit-computation library) | GPL-3.0 | Propagation and ephemeris generation. Built from upstream Fortran source via `setup.sh`; the runner shells out to the `oorb` CLI binary. The pip-installable Python wrapper (`pyoorb`) is intentionally not used — it has the same Fortran build dependency anyway and its sdist breaks on Python 3.12. OD skipped (Ranging/LSL doesn't fit per-row replay). |
 | [`jorbit/`](jorbit/) | [jorbit](https://github.com/ben-cassese/jorbit) (Cassese, JAX-based N-body integrator) | GPL-3.0 | Propagation and ephemeris generation. jorbit is GPL and never linked into empyrean — runs in its own venv (also keeps the JAX dep tree off the rest of the suite). OD skipped. |
+| [`layup/`](layup/) | [layup](https://github.com/Smithsonian/layup) (Holman / Smithsonian, ASSIST-backed orbit fitter) | MIT | Orbit determination from ADES PSV astrometry. Opt-in (`WITH_LAYUP=1`); folds χ² / reduced-χ² / n_obs / convergence onto the OD rows. Runs in its own venv (heavy C-extension + `sorcha`/`jax` dep graph). |
 
 ## Workflow
 
@@ -40,6 +42,7 @@ implementation, and writes its own per-channel JSON.
 ./kete/setup.sh
 ./oorb/setup.sh
 ./jorbit/setup.sh
+./layup/setup.sh
 
 # Run.
 ./assist/.venv/bin/python assist/run_assist.py   --plan  validation_plan.json --output validation_assist.json
@@ -47,6 +50,7 @@ implementation, and writes its own per-channel JSON.
 ./kete/.venv/bin/python   kete/run_kete.py       --input validation_plan.json --output validation_kete.json
 python3                   oorb/run_oorb.py       --input validation_plan.json --output validation_oorb.json
 ./jorbit/.venv/bin/python jorbit/run_jorbit.py   --input validation_plan.json --output validation_jorbit.json
+./layup/.venv/bin/python  layup/run_layup.py     ../fixtures/psv           --output validation_layup.json
 ```
 
 Outputs are merged by the empyrean-validation report renderer into a
