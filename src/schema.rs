@@ -140,6 +140,26 @@ pub mod test_types {
     /// fitted state + χ² + RMS and so cannot see a silent drop to a
     /// gravity-only fit.
     pub const NON_GRAV_RECOVERY: &str = "non_grav_recovery";
+    /// Run differential correction solving for the non-grav time delay DT
+    /// (`solve_for` includes DT, on top of Marsden A1/A2/A3) on a comet
+    /// with a known SBDB DT signal (67P = +45.689 d, 2I/Borisov =
+    /// −65.130 d) and compare the fitted DT ± σ (`od_dt` ± `od_dt_sigma`,
+    /// σ from the solved covariance's DT slot) across channels. Distinct
+    /// from [`NON_GRAV_RECOVERY`]: guards DT *recovery* — a fit that
+    /// silently dropped DT reads loudly as a missing `od_dt`.
+    pub const DT_RECOVERY: &str = "dt_recovery";
+    /// Run a post-OD photometric H/G fit on an object with reported
+    /// magnitudes and compare the fitted H ± σ plus slopes (`od_h`,
+    /// `od_g1`, `od_g2`) and the admitted model (`od_photometry_model`)
+    /// across channels. Photometry is fit after the orbit is solved and
+    /// never touches the state.
+    pub const PHOTOMETRY_RECOVERY: &str = "photometry_recovery";
+    /// Run differential correction solving for thrust Δv segments on an
+    /// object with a known maneuver and compare the fitted Δv ± σ
+    /// (`od_thrust_dv_m_per_s`) across channels. Scaffolded — the schema
+    /// and core-reference replay exist, but there is no maneuvering-object
+    /// fixture yet, so no channel emits these rows today.
+    pub const THRUST_RECOVERY: &str = "thrust_recovery";
 }
 
 /// Canonical [`ValidationResult::propagation_uncertainty`] values.
@@ -253,6 +273,46 @@ pub struct ValidationResult {
     /// Horizons truth one-way light time (days).
     pub ref_light_time_d: Option<f64>,
 
+    // ── JPL SBDB OD-fit reference ───────────────────────────────────
+    // JPL's own reported orbit-solution quality for this object, read
+    // from the SBDB `orbit` block (the same solution Horizons propagates,
+    // so Horizons + SBDB are one "JPL" source of truth). Populated on OD
+    // rows by `merge-external --jpl-sbdb-cache`. All `skip_serializing_if
+    // = is_none`, so the on-disk contract is byte-unchanged until a JPL
+    // merge fills them.
+    /// SBDB normalized (weighted, dimensionless) RMS of the fit residuals
+    /// — `sqrt(mean((residual/σ)²))`. NOT an arcsec RMS; ≈ √(reduced χ²).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ref_od_rms_normalized: Option<f64>,
+    /// Reduced χ² implied by the SBDB normalized RMS (`rms²`). Comparable
+    /// to layup's `layup_reduced_chi2` (drops the k-dof correction).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ref_od_reduced_chi2: Option<f64>,
+    /// SBDB `n_obs_used` — optical observations used in the JPL fit.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ref_od_n_obs_used: Option<u32>,
+    /// SBDB `n_del_obs_used` — radar delay (range) measurements used.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ref_od_n_del_obs_used: Option<u32>,
+    /// SBDB `n_dop_obs_used` — radar Doppler (range-rate) measurements used.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ref_od_n_dop_obs_used: Option<u32>,
+    /// SBDB `data_arc` — observed-arc span in days.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ref_od_data_arc_days: Option<u32>,
+    /// SBDB `condition_code` — MPC orbit-uncertainty parameter (0 best, 9 worst).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ref_od_condition_code: Option<u8>,
+    /// SBDB `soln_date` — date the JPL solution was computed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ref_od_soln_date: Option<String>,
+    /// SBDB `pe_used` — planetary ephemeris of the JPL fit (e.g. DE441).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ref_od_pe_used: Option<String>,
+    /// SBDB `sb_used` — small-body perturber set of the JPL fit (e.g. SB441-N16).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ref_od_sb_used: Option<String>,
+
     // ── OD-specific output ──────────────────────────────────────────
     /// Observation count after rejection. Populated when
     /// `test_type == "orbit_determination"`.
@@ -299,6 +359,57 @@ pub struct ValidationResult {
     /// 1σ on the fitted A3, √(C₉ₓ₉[8][8]).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub od_a3_sigma: Option<f64>,
+
+    // Populated only on `dt_recovery` rows: the fitted non-grav time
+    // delay DT and its 1σ from the solved covariance's DT slot. `None`
+    // (not 0/NaN) when the fit did not actually solve DT — a missing σ
+    // reads loudly as "DT not recovered".
+    /// Fitted non-grav time delay DT (days).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub od_dt: Option<f64>,
+    /// 1σ on the fitted DT (days), √(C[dt_slot][dt_slot]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub od_dt_sigma: Option<f64>,
+
+    // Populated only on `photometry_recovery` rows: the fitted H/G
+    // parameters ± 1σ (from the 3×3 photometric covariance) plus the
+    // admitted model. `None` when photometry did not run or fit.
+    /// Fitted absolute magnitude H (mag).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub od_h: Option<f64>,
+    /// 1σ on the fitted H (mag).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub od_h_sigma: Option<f64>,
+    /// Fitted first slope parameter (G / G12 / G1 by model).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub od_g1: Option<f64>,
+    /// 1σ on the fitted first slope.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub od_g1_sigma: Option<f64>,
+    /// Fitted second slope parameter (G2 for HG1G2; `None` otherwise).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub od_g2: Option<f64>,
+    /// 1σ on the fitted second slope.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub od_g2_sigma: Option<f64>,
+    /// Photometric model actually fitted (`honly`/`hg`/`hg12`/`hg1g2`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub od_photometry_model: Option<String>,
+    /// Reduced χ² of the photometric fit.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub od_photometry_reduced_chi2: Option<f64>,
+
+    // Populated only on `thrust_recovery` rows: fitted thrust Δv per
+    // segment (m/s, integration-frame components) ± 1σ. Empty when no
+    // thrust was recovered. Scaffolded — no fixture emits these yet.
+    /// Fitted thrust Δv per segment (m/s, integration-frame components).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub od_thrust_dv_m_per_s: Vec<[f64; 3]>,
+    /// Per-component 1σ on the fitted thrust Δv (m/s), same layout as
+    /// [`od_thrust_dv_m_per_s`](Self::od_thrust_dv_m_per_s).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub od_thrust_dv_sigma_m_per_s: Vec<[f64; 3]>,
+
     /// NAIF IDs of perturbers excluded from the force model during this
     /// OD fit. Populated for SB441-N16 self-perturbers (so the body's
     /// own gravity does not act on itself during integration). Empty
@@ -468,6 +579,16 @@ impl ValidationResult {
             ref_dec_rad: None,
             ref_rho_au: None,
             ref_light_time_d: None,
+            ref_od_rms_normalized: None,
+            ref_od_reduced_chi2: None,
+            ref_od_n_obs_used: None,
+            ref_od_n_del_obs_used: None,
+            ref_od_n_dop_obs_used: None,
+            ref_od_data_arc_days: None,
+            ref_od_condition_code: None,
+            ref_od_soln_date: None,
+            ref_od_pe_used: None,
+            ref_od_sb_used: None,
             n_obs_used: None,
             od_iterations: None,
             od_converged: None,
@@ -482,6 +603,18 @@ impl ValidationResult {
             od_a1_sigma: None,
             od_a2_sigma: None,
             od_a3_sigma: None,
+            od_dt: None,
+            od_dt_sigma: None,
+            od_h: None,
+            od_h_sigma: None,
+            od_g1: None,
+            od_g1_sigma: None,
+            od_g2: None,
+            od_g2_sigma: None,
+            od_photometry_model: None,
+            od_photometry_reduced_chi2: None,
+            od_thrust_dv_m_per_s: Vec::new(),
+            od_thrust_dv_sigma_m_per_s: Vec::new(),
             excluded_perturbers_naif: Vec::new(),
             propagation_uncertainty: None,
             assist_vs_horizons_km: None,

@@ -87,7 +87,6 @@ pub fn build_plan(
     horizons_cache_dir: &std::path::Path,
 ) -> ValidationPlan {
     let timestamp = chrono::Utc::now().to_rfc3339();
-    let obs_code = OBSERVER_CODES[0];
     let mut plan: ValidationPlan = Vec::new();
     let uncertainty_modes_to_emit: &[Option<&str>] = if config.uncertainty_axis {
         &[
@@ -182,26 +181,33 @@ pub fn build_plan(
             }
         }
 
-        let mut horizons_ephemeris: HashMap<i64, EphemerisEntry> = HashMap::new();
-        for &dt in dt_list {
-            if dt == 0.0 {
-                continue;
-            }
-            let target = epoch + dt;
-            match empyrean::query_horizons(
-                &[obj.horizons_command],
-                obs_code,
-                &[target],
-                Some(horizons_cache_dir),
-            ) {
-                Ok(r) if !r.is_empty() => {
-                    horizons_ephemeris.insert(dt as i64, r.into_iter().next().unwrap());
+        // Ephemeris (RA/Dec) is observer-dependent (topocentric parallax /
+        // light-time), so fetch it from every site in OBSERVER_CODES; the
+        // report averages the pairwise sky-plane separation over the sites.
+        // (Propagation state vectors above are observer-independent — one
+        // per (object, dt) — so they are not looped over observers.)
+        let mut horizons_ephemeris: HashMap<(&str, i64), EphemerisEntry> = HashMap::new();
+        for &obs in OBSERVER_CODES {
+            for &dt in dt_list {
+                if dt == 0.0 {
+                    continue;
                 }
-                Ok(_) => {
-                    eprintln!("  {}: dt={dt:+.0}d ephemeris SKIP (empty)", obj.name);
-                }
-                Err(e) => {
-                    eprintln!("  {}: dt={dt:+.0}d ephemeris SKIP ({e})", obj.name);
+                let target = epoch + dt;
+                match empyrean::query_horizons(
+                    &[obj.horizons_command],
+                    obs,
+                    &[target],
+                    Some(horizons_cache_dir),
+                ) {
+                    Ok(r) if !r.is_empty() => {
+                        horizons_ephemeris.insert((obs, dt as i64), r.into_iter().next().unwrap());
+                    }
+                    Ok(_) => {
+                        eprintln!("  {}: {obs} dt={dt:+.0}d ephemeris SKIP (empty)", obj.name);
+                    }
+                    Err(e) => {
+                        eprintln!("  {}: {obs} dt={dt:+.0}d ephemeris SKIP ({e})", obj.name);
+                    }
                 }
             }
         }
@@ -233,26 +239,28 @@ pub fn build_plan(
         // 4b. Ephemeris plan rows (only the Standard tier — matches the
         // existing rust runner's behaviour where ephemeris validation
         // doesn't iterate force-model tiers).
-        for &dt in dt_list {
-            if dt == 0.0 {
-                continue;
-            }
-            let Some(hor) = horizons_ephemeris.get(&(dt as i64)) else {
-                continue;
-            };
-            for &uncertainty in uncertainty_modes_to_emit {
-                plan.push(ephemeris_plan_row(
-                    obj,
-                    epoch,
-                    dt,
-                    obs_code,
-                    ic_pos,
-                    ic_vel,
-                    (a1, a2, a3, g_alpha, g_r0, g_m, g_n, g_k, ng_dt),
-                    hor,
-                    uncertainty,
-                    &timestamp,
-                ));
+        for &obs in OBSERVER_CODES {
+            for &dt in dt_list {
+                if dt == 0.0 {
+                    continue;
+                }
+                let Some(hor) = horizons_ephemeris.get(&(obs, dt as i64)) else {
+                    continue;
+                };
+                for &uncertainty in uncertainty_modes_to_emit {
+                    plan.push(ephemeris_plan_row(
+                        obj,
+                        epoch,
+                        dt,
+                        obs,
+                        ic_pos,
+                        ic_vel,
+                        (a1, a2, a3, g_alpha, g_r0, g_m, g_n, g_k, ng_dt),
+                        hor,
+                        uncertainty,
+                        &timestamp,
+                    ));
+                }
             }
         }
 

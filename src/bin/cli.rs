@@ -115,6 +115,13 @@ struct MergeExternalArgs {
     /// convergence) onto matching rows.
     #[arg(long)]
     layup: Option<PathBuf>,
+    /// JPL SBDB cache directory (e.g. `$CACHE_DIR/sbdb`). Reads each OD
+    /// object's cached SBDB response and folds JPL's own reported fit
+    /// quality (normalized RMS, n_obs_used, radar counts, data-arc,
+    /// condition code, provenance) onto its OD rows as the `ref_od_*`
+    /// reference — making JPL a full OD tool alongside find_orb / layup.
+    #[arg(long)]
+    jpl_sbdb_cache: Option<PathBuf>,
 }
 
 #[derive(Parser, Debug)]
@@ -234,6 +241,10 @@ fn merge_external(args: MergeExternalArgs) -> Result<(), Box<dyn std::error::Err
     if let Some(path) = &args.layup {
         let n = merge_layup(&mut rows, path)?;
         eprintln!("Merged {n} layup rows");
+    }
+    if let Some(dir) = &args.jpl_sbdb_cache {
+        let n = merge_jpl(&mut rows, dir)?;
+        eprintln!("Merged {n} JPL SBDB OD-reference rows");
     }
 
     let out_path = args.output.unwrap_or(args.input);
@@ -494,6 +505,102 @@ fn merge_layup(
     Ok(n)
 }
 
+/// JPL's own reported orbit-solution quality, parsed from a cached SBDB
+/// response. Fields mirror the SBDB `orbit` block; SBDB reports several as
+/// JSON strings, so parsing is number-or-string tolerant.
+#[derive(Clone)]
+struct SbdbOdRef {
+    rms: Option<f64>,
+    n_obs_used: Option<u32>,
+    n_del_obs_used: Option<u32>,
+    n_dop_obs_used: Option<u32>,
+    data_arc_days: Option<u32>,
+    condition_code: Option<u8>,
+    soln_date: Option<String>,
+    pe_used: Option<String>,
+    sb_used: Option<String>,
+}
+
+/// Read `{sbdb_cache_dir}/{sbdb_query with spaces→underscores}.json` and
+/// extract the JPL fit quality from `response.orbit`. Returns `None` if the
+/// cache file is absent or has no orbit block (the object is simply skipped).
+fn read_sbdb_od_ref(sbdb_cache_dir: &std::path::Path, sbdb_query: &str) -> Option<SbdbOdRef> {
+    let fname = format!("{}.json", sbdb_query.replace(' ', "_"));
+    let txt = std::fs::read_to_string(sbdb_cache_dir.join(fname)).ok()?;
+    let d: serde_json::Value = serde_json::from_str(&txt).ok()?;
+    let o = &d["response"]["orbit"];
+    if !o.is_object() {
+        return None;
+    }
+    let f64_of = |v: &serde_json::Value| {
+        v.as_f64()
+            .or_else(|| v.as_str().and_then(|s| s.trim().parse().ok()))
+    };
+    let u32_of = |v: &serde_json::Value| {
+        v.as_u64()
+            .map(|x| x as u32)
+            .or_else(|| v.as_str().and_then(|s| s.trim().parse().ok()))
+    };
+    let u8_of = |v: &serde_json::Value| {
+        v.as_u64()
+            .map(|x| x as u8)
+            .or_else(|| v.as_str().and_then(|s| s.trim().parse().ok()))
+    };
+    let str_of = |v: &serde_json::Value| v.as_str().map(|s| s.to_string());
+    Some(SbdbOdRef {
+        rms: f64_of(&o["rms"]),
+        n_obs_used: u32_of(&o["n_obs_used"]),
+        n_del_obs_used: u32_of(&o["n_del_obs_used"]),
+        n_dop_obs_used: u32_of(&o["n_dop_obs_used"]),
+        data_arc_days: u32_of(&o["data_arc"]),
+        condition_code: u8_of(&o["condition_code"]),
+        soln_date: str_of(&o["soln_date"]),
+        pe_used: str_of(&o["pe_used"]),
+        sb_used: str_of(&o["sb_used"]),
+    })
+}
+
+/// Fold JPL's SBDB fit quality onto every OD row as the `ref_od_*` reference.
+/// Objects are matched to their SBDB record via the catalog's `sbdb_query`;
+/// each cache file is read at most once. `ref_od_reduced_chi2` is `rms²`
+/// (the SBDB normalized RMS ≈ √reduced-χ², so this is comparable to layup's
+/// reduced χ², modulo the k-dof correction).
+fn merge_jpl(
+    rows: &mut [ValidationResult],
+    sbdb_cache_dir: &std::path::Path,
+) -> Result<usize, Box<dyn std::error::Error>> {
+    let query_of: std::collections::HashMap<&str, &str> = all_objects()
+        .into_iter()
+        .map(|o| (o.name, o.sbdb_query))
+        .collect();
+    let mut cache: std::collections::HashMap<String, Option<SbdbOdRef>> = Default::default();
+    let mut n = 0;
+    for r in rows.iter_mut() {
+        if r.test_type != "orbit_determination" {
+            continue;
+        }
+        let Some(&query) = query_of.get(r.object.as_str()) else {
+            continue;
+        };
+        let od = cache
+            .entry(query.to_string())
+            .or_insert_with(|| read_sbdb_od_ref(sbdb_cache_dir, query));
+        let Some(od) = od else { continue };
+        r.ref_od_rms_normalized = od.rms;
+        r.ref_od_reduced_chi2 = od.rms.map(|x| x * x);
+        r.ref_od_n_obs_used = od.n_obs_used;
+        r.ref_od_n_del_obs_used = od.n_del_obs_used;
+        r.ref_od_n_dop_obs_used = od.n_dop_obs_used;
+        r.ref_od_data_arc_days = od.data_arc_days;
+        r.ref_od_condition_code = od.condition_code;
+        r.ref_od_soln_date = od.soln_date.clone();
+        r.ref_od_pe_used = od.pe_used.clone();
+        r.ref_od_sb_used = od.sb_used.clone();
+        n += 1;
+    }
+    Ok(n)
+}
+
 fn report(args: ReportArgs) -> Result<(), Box<dyn std::error::Error>> {
     let mut all: Vec<ValidationResult> = Vec::new();
     let mut orbit_comparisons: Vec<OrbitComparison> = Vec::new();
@@ -714,5 +821,62 @@ mod tests {
         let n = merge_layup(&mut rows, f.path()).unwrap();
         assert_eq!(n, 0);
         assert_eq!(rows[0].layup_chi2, None);
+    }
+
+    /// Write a mock SBDB cache file under `dir/{query}.json` for `merge_jpl`.
+    fn write_sbdb(dir: &std::path::Path, query: &str, orbit_json: &str) {
+        std::fs::write(
+            dir.join(format!("{}.json", query.replace(' ', "_"))),
+            format!(r#"{{"response":{{"orbit":{orbit_json}}}}}"#),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn merge_jpl_folds_sbdb_fit_quality_onto_od_rows() {
+        // SBDB reports several fields as JSON strings (rms, data_arc,
+        // condition_code); the merge must parse them, and reduced_chi2 = rms².
+        let dir = tempfile::tempdir().unwrap();
+        write_sbdb(
+            dir.path(),
+            "Apophis",
+            r#"{"rms":".28","n_obs_used":7370,"n_del_obs_used":20,
+                "n_dop_obs_used":30,"data_arc":"6599","condition_code":"0",
+                "soln_date":"2024-01-01 00:00:00","pe_used":"DE441","sb_used":"SB441-N16"}"#,
+        );
+        let mut rows = vec![od_row("Apophis"), {
+            let mut p = ValidationResult::empty();
+            p.object = "Apophis".into();
+            p.test_type = "propagation".into();
+            p
+        }];
+        let n = merge_jpl(&mut rows, dir.path()).unwrap();
+        assert_eq!(n, 1, "only the OD row is merged");
+
+        let od = &rows[0];
+        assert_eq!(od.ref_od_rms_normalized, Some(0.28));
+        assert_eq!(od.ref_od_reduced_chi2, Some(0.28 * 0.28)); // rms²
+        assert_eq!(od.ref_od_n_obs_used, Some(7370));
+        assert_eq!(od.ref_od_n_del_obs_used, Some(20));
+        assert_eq!(od.ref_od_n_dop_obs_used, Some(30));
+        assert_eq!(od.ref_od_data_arc_days, Some(6599));
+        assert_eq!(od.ref_od_condition_code, Some(0));
+        assert_eq!(od.ref_od_pe_used.as_deref(), Some("DE441"));
+        // Propagation row for the same object stays clear.
+        assert_eq!(rows[1].ref_od_n_obs_used, None);
+    }
+
+    #[test]
+    fn merge_jpl_handles_space_in_query_and_skips_missing() {
+        // "2020 AV2" resolves to cache file "2020_AV2.json"; an object whose
+        // cache file is absent is silently skipped (no fabrication).
+        let dir = tempfile::tempdir().unwrap();
+        write_sbdb(dir.path(), "2020 AV2", r#"{"rms":".5","n_obs_used":402}"#);
+        let mut rows = vec![od_row("2020 AV2"), od_row("Bennu")];
+        let n = merge_jpl(&mut rows, dir.path()).unwrap();
+        assert_eq!(n, 1);
+        assert_eq!(rows[0].ref_od_n_obs_used, Some(402));
+        assert_eq!(rows[0].ref_od_reduced_chi2, Some(0.25));
+        assert_eq!(rows[1].ref_od_n_obs_used, None); // no cache file for Bennu
     }
 }

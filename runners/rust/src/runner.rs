@@ -84,11 +84,10 @@ pub fn run_propagation_validation(
         ng_dt: Option<f64>,
         dt_list: &'static [f64],
         horizons_vectors: HashMap<i64, ([f64; 3], [f64; 3])>,
-        horizons_ephemeris: HashMap<i64, EphemerisEntry>,
+        horizons_ephemeris: HashMap<(&'static str, i64), EphemerisEntry>,
     }
 
     let obs_codes = empyrean_validation::catalog::OBSERVER_CODES;
-    let obs_code = obs_codes[0];
     let mut obj_data: Vec<ObjData> = Vec::new();
 
     for obj in objs {
@@ -171,23 +170,34 @@ pub fn run_propagation_validation(
             }
         }
 
-        let mut horizons_ephemeris: HashMap<i64, EphemerisEntry> = HashMap::new();
-        for &dt in dt_list {
-            let target = epoch + dt;
-            match empyrean::query_horizons(
-                &[obj.horizons_command],
-                obs_code,
-                &[target],
-                Some(horizons_cache_dir),
-            ) {
-                Ok(r) if !r.is_empty() => {
-                    horizons_ephemeris.insert(dt as i64, r.into_iter().next().unwrap());
-                }
-                Ok(_) => {
-                    eprintln!("  {}: dt={dt:+.0}d ephemeris SKIP (empty)", obj.name);
-                }
-                Err(e) => {
-                    eprintln!("  {}: dt={dt:+.0}d ephemeris SKIP ({e})", obj.name);
+        // Ephemeris (RA/Dec) is observer-dependent — fetch from every site so
+        // the report can average the sky-plane separation over the sites.
+        let mut horizons_ephemeris: HashMap<(&'static str, i64), EphemerisEntry> = HashMap::new();
+        for &obs_code in obs_codes {
+            for &dt in dt_list {
+                let target = epoch + dt;
+                match empyrean::query_horizons(
+                    &[obj.horizons_command],
+                    obs_code,
+                    &[target],
+                    Some(horizons_cache_dir),
+                ) {
+                    Ok(r) if !r.is_empty() => {
+                        horizons_ephemeris
+                            .insert((obs_code, dt as i64), r.into_iter().next().unwrap());
+                    }
+                    Ok(_) => {
+                        eprintln!(
+                            "  {}: {obs_code} dt={dt:+.0}d ephemeris SKIP (empty)",
+                            obj.name
+                        );
+                    }
+                    Err(e) => {
+                        eprintln!(
+                            "  {}: {obs_code} dt={dt:+.0}d ephemeris SKIP ({e})",
+                            obj.name
+                        );
+                    }
                 }
             }
         }
@@ -448,6 +458,16 @@ pub fn run_propagation_validation(
                             ref_dec_rad: None,
                             ref_rho_au: None,
                             ref_light_time_d: None,
+                            ref_od_rms_normalized: None,
+                            ref_od_reduced_chi2: None,
+                            ref_od_n_obs_used: None,
+                            ref_od_n_del_obs_used: None,
+                            ref_od_n_dop_obs_used: None,
+                            ref_od_data_arc_days: None,
+                            ref_od_condition_code: None,
+                            ref_od_soln_date: None,
+                            ref_od_pe_used: None,
+                            ref_od_sb_used: None,
                             n_obs_used: None,
                             od_iterations: None,
                             od_converged: None,
@@ -495,9 +515,10 @@ pub fn run_propagation_validation(
                     }
                 }
 
-                // Ephemeris tests (Standard tier)
+                // Ephemeris tests (Standard tier) — one row per observing site.
+                for &obs_code in obs_codes {
                 for &dt in data.dt_list {
-                    let Some(hor) = data.horizons_ephemeris.get(&(dt as i64)) else {
+                    let Some(hor) = data.horizons_ephemeris.get(&(obs_code, dt as i64)) else {
                         continue;
                     };
                     // Reference entries carry degrees over the wrapper
@@ -597,6 +618,16 @@ pub fn run_propagation_validation(
                                 ref_dec_rad: Some(hor_dec_rad),
                                 ref_rho_au: Some(hor.rho_au),
                                 ref_light_time_d: hor_light_time_d,
+                                ref_od_rms_normalized: None,
+                                ref_od_reduced_chi2: None,
+                                ref_od_n_obs_used: None,
+                                ref_od_n_del_obs_used: None,
+                                ref_od_n_dop_obs_used: None,
+                                ref_od_data_arc_days: None,
+                                ref_od_condition_code: None,
+                                ref_od_soln_date: None,
+                                ref_od_pe_used: None,
+                                ref_od_sb_used: None,
                                 n_obs_used: None,
                                 od_iterations: None,
                                 od_converged: None,
@@ -645,6 +676,7 @@ pub fn run_propagation_validation(
                         }
                     }
                 }
+                } // end for &obs_code (observing sites)
                 } // end for &attach
 
                 results
@@ -1028,6 +1060,16 @@ pub fn run_od_validation(
             ref_dec_rad: None,
             ref_rho_au: None,
             ref_light_time_d: None,
+            ref_od_rms_normalized: None,
+            ref_od_reduced_chi2: None,
+            ref_od_n_obs_used: None,
+            ref_od_n_del_obs_used: None,
+            ref_od_n_dop_obs_used: None,
+            ref_od_data_arc_days: None,
+            ref_od_condition_code: None,
+            ref_od_soln_date: None,
+            ref_od_pe_used: None,
+            ref_od_sb_used: None,
             n_obs_used: Some(determine_result.summary.num_selected as u32),
             od_iterations: Some(determine_result.iterations),
             od_converged: Some(determine_result.converged),
@@ -1155,6 +1197,16 @@ pub fn run_od_validation(
                                 ref_dec_rad: None,
                                 ref_rho_au: None,
                                 ref_light_time_d: None,
+                                ref_od_rms_normalized: None,
+                                ref_od_reduced_chi2: None,
+                                ref_od_n_obs_used: None,
+                                ref_od_n_del_obs_used: None,
+                                ref_od_n_dop_obs_used: None,
+                                ref_od_data_arc_days: None,
+                                ref_od_condition_code: None,
+                                ref_od_soln_date: None,
+                                ref_od_pe_used: None,
+                                ref_od_sb_used: None,
                                 n_obs_used: Some(dr.summary.num_selected as u32),
                                 od_iterations: Some(dr.iterations),
                                 od_converged: Some(dr.converged),
@@ -1310,6 +1362,16 @@ pub fn run_od_validation(
                             ref_dec_rad: None,
                             ref_rho_au: None,
                             ref_light_time_d: None,
+                            ref_od_rms_normalized: None,
+                            ref_od_reduced_chi2: None,
+                            ref_od_n_obs_used: None,
+                            ref_od_n_del_obs_used: None,
+                            ref_od_n_dop_obs_used: None,
+                            ref_od_data_arc_days: None,
+                            ref_od_condition_code: None,
+                            ref_od_soln_date: None,
+                            ref_od_pe_used: None,
+                            ref_od_sb_used: None,
                             n_obs_used: Some(dr.summary.num_selected as u32),
                             od_iterations: Some(dr.iterations),
                             od_converged: Some(dr.converged),
