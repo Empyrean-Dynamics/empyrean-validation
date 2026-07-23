@@ -18,6 +18,7 @@ import math
 import sys
 import time
 from datetime import datetime, timezone
+from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
 
 import numpy as np
@@ -38,6 +39,22 @@ _TIER_TO_INT = {"approximate": 0, "basic": 1, "standard": 2}
 _FRAME_ICRF = 0
 _REP_CARTESIAN = 0
 _AU_KM = 149_597_870.700
+
+
+def _wheel_source_version() -> str:
+    """Provenance string stamped on every python-channel row.
+
+    The python channel IS the empyrean wheel — it calls the binding directly
+    — so it reports the installed wheel version. No-hidden-fallbacks: when the
+    version can't be resolved, stamp an explicit ``unknown (<reason>)`` rather
+    than a silent blank or a fabricated value.
+    """
+    try:
+        return f"empyrean {version('empyrean')} (python wheel)"
+    except PackageNotFoundError:
+        return "empyrean unknown (empyrean distribution not found)"
+    except Exception as e:  # noqa: BLE001
+        return f"empyrean unknown ({e})"
 
 
 def _ensure_initialized(data_dir: str | None) -> None:
@@ -436,6 +453,7 @@ def main() -> int:
     )
 
     timestamp = datetime.now(timezone.utc).isoformat()
+    source_version = _wheel_source_version()
 
     # Per-object JPL SBDB reference non-grav, keyed by object name. The
     # optical-only orbit_determination rows carry ic_a1/a2/a3 = None, but the
@@ -473,6 +491,10 @@ def main() -> int:
         new = dict(r)
         new["channel"] = "python"
         new["timestamp"] = timestamp
+        # This channel exercised the wheel, not the rust engine the input row
+        # carried; overwrite the inherited source_version with our own. The
+        # non_grav_recovery row is a dict(new) copy, so it inherits this stamp.
+        new["source_version"] = source_version
         # Reset all empyrean-output fields; we'll repopulate from the Python channel.
         for k in (
             "emp_vs_horizons_km",

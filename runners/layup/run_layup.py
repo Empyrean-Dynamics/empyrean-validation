@@ -373,6 +373,15 @@ def main() -> int:
 
     timestamp = datetime.now(timezone.utc).isoformat()
     version = _layup_version(orbitfit_bin) if orbitfit_bin else None
+    # Provenance stamped on every record. Reuse the version already resolved
+    # from the layup venv above (the same interpreter this runs under).
+    # No-hidden-fallbacks: an unresolved version stamps an explicit
+    # "unknown (<reason>)" rather than a silent blank.
+    source_version = (
+        f"layup {version}"
+        if version
+        else "layup unknown (layup-orbitfit version not resolved)"
+    )
 
     records: list[dict] = []
     if not _HAVE_PANDAS or orbitfit_bin is None:
@@ -411,6 +420,7 @@ def main() -> int:
             "object": obj_name,
             "test_type": "orbit_determination",
             "timestamp": timestamp,
+            "source_version": source_version,
             "layup_version": version,
             # Provenance for the χ² interpretation: which weighting produced csq.
             "layup_weighting": ("veres2017" if args.weight_data else "flat_default")

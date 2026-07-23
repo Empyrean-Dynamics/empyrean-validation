@@ -20,11 +20,31 @@ import math
 import subprocess
 import sys
 from datetime import datetime, timezone
+from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
 
 
 _TIER_TO_INT = {"approximate": 0, "basic": 1, "standard": 2}
 _AU_KM = 149_597_870.700
+
+
+def _driver_source_version() -> str:
+    """Provenance string stamped on every c-channel row.
+
+    The C runner is a separate binary linked against the empyrean C ABI and
+    exposes no version command, so this driver reports the version of the
+    ``empyrean`` distribution installed in its own environment — labelled
+    ``(driver-reported)`` because it is the driver's view, which may differ
+    from the binary's linked libempyrean if they were built separately.
+    No-hidden-fallbacks: an unresolved version stamps an explicit
+    ``unknown (<reason>)`` rather than a silent blank.
+    """
+    try:
+        return f"empyrean {version('empyrean')} (driver-reported)"
+    except PackageNotFoundError:
+        return "empyrean unknown (empyrean distribution not found)"
+    except Exception as e:  # noqa: BLE001
+        return f"empyrean unknown ({e})"
 
 
 def _ic_line(r):
@@ -156,6 +176,7 @@ def main() -> int:
     )
 
     timestamp = datetime.now(timezone.utc).isoformat()
+    source_version = _driver_source_version()
     out_rows = []
     n_skipped = 0
 
@@ -191,6 +212,7 @@ def main() -> int:
             new = dict(r)
             new["channel"] = "c"
             new["timestamp"] = timestamp
+            new["source_version"] = source_version
             new["emp_pos_au"] = [x, y, z]
             new["emp_time_ms"] = ms
             ref = r.get("ref_pos_au")
@@ -224,6 +246,7 @@ def main() -> int:
             new = dict(r)
             new["channel"] = "c"
             new["timestamp"] = timestamp
+            new["source_version"] = source_version
             new["emp_time_ms"] = ms
             ref_ra = r.get("ref_ra_rad")
             ref_dec = r.get("ref_dec_rad")
@@ -289,6 +312,7 @@ def main() -> int:
             new = dict(r)
             new["channel"] = "c"
             new["timestamp"] = timestamp
+            new["source_version"] = source_version
             new["emp_pos_au"] = [x, y, z]
             new["emp_time_ms"] = ms
             new["od_iterations"] = iters
@@ -338,6 +362,7 @@ def main() -> int:
                         ng_row = dict(r)
                         ng_row["channel"] = "c"
                         ng_row["timestamp"] = timestamp
+                        ng_row["source_version"] = source_version
                         ng_row["test_type"] = "non_grav_recovery"
                         ng_row["emp_pos_au"] = [ng_x, ng_y, ng_z]
                         ng_row["emp_time_ms"] = ng_ms

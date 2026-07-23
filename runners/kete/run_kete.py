@@ -38,6 +38,7 @@ import statistics
 import sys
 import time
 from datetime import datetime, timezone
+from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
 
 try:
@@ -49,6 +50,21 @@ except Exception as e:
 
 
 _AU_KM = 149_597_870.700
+
+
+def _kete_source_version() -> str:
+    """Provenance string stamped on every kete-channel row.
+
+    Reports the installed ``kete`` distribution version. No-hidden-fallbacks:
+    when kete is absent or its version can't be read, stamp an explicit
+    ``kete unknown (<reason>)`` rather than a silent blank.
+    """
+    try:
+        return f"kete {version('kete')}"
+    except PackageNotFoundError:
+        return "kete unknown (distribution not found)"
+    except Exception as e:  # noqa: BLE001
+        return f"kete unknown ({e})"
 
 
 def _angular_sep_arcsec(ra1: float, dec1: float, ra2: float, dec2: float) -> float:
@@ -345,6 +361,7 @@ def main() -> int:
     print(f"Loaded {len(plan)} plan rows; running through kete...", file=sys.stderr)
 
     timestamp = datetime.now(timezone.utc).isoformat()
+    source_version = _kete_source_version()
     out_rows: list[dict] = []
     n_skipped = 0
 
@@ -358,6 +375,7 @@ def main() -> int:
         new = dict(r)
         new["channel"] = "kete"
         new["timestamp"] = timestamp
+        new["source_version"] = source_version
         tt = r.get("test_type")
         if tt == "propagation":
             update = _propagate_with_kete(r)

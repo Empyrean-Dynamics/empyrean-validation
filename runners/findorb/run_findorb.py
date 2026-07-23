@@ -98,6 +98,35 @@ ALL_OBJECTS = [
 ]
 
 
+# ── Provenance ──────────────────────────────────────────
+
+
+def resolve_source_version() -> str:
+    """Provenance string stamped on every find_orb-channel record.
+
+    find_orb is built from a git checkout under ``build/find_orb`` (see
+    setup.sh); report the checked-out commit so the merged report records
+    exactly which find_orb build produced the fit. No-hidden-fallbacks: when
+    the sha cannot be resolved (build tree absent, git missing), stamp an
+    explicit ``find_orb unknown (<reason>)`` rather than a silent blank.
+    """
+    try:
+        proc = subprocess.run(
+            ["git", "-C", str(FO_FILES_DIR), "rev-parse", "--short", "HEAD"],
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+    except Exception as e:
+        return f"find_orb unknown ({e})"
+    if proc.returncode != 0:
+        tail = (proc.stderr or "").strip().splitlines()
+        reason = tail[-1] if tail else f"git rev-parse rc={proc.returncode}"
+        return f"find_orb unknown ({reason})"
+    sha = proc.stdout.strip()
+    return f"find_orb {sha}" if sha else "find_orb unknown (empty git sha)"
+
+
 # ── MPC Observation Fetching ────────────────────────────
 
 
@@ -517,6 +546,7 @@ def main():
     print()
 
     timestamp = datetime.now(timezone.utc).isoformat()
+    source_version = resolve_source_version()
     results = []
 
     for psv_path in psv_files:
@@ -555,6 +585,7 @@ def main():
             "object": name.replace("_", "/"),  # undo safe_name encoding
             "test_type": args.test_type,
             "timestamp": timestamp,
+            "source_version": source_version,
 
             # find_orb results
             "fo_elements": elements,
@@ -591,6 +622,7 @@ def main():
                 results.append({
                     "object": obj_name, "test_type": "propagation",
                     "dt_days": dt, "timestamp": timestamp,
+                    "source_version": source_version,
                     "fo_geo_pos_au": v["pos"], "fo_geo_vel_au_d": v["vel"],
                 })
                 n_vec += 1
@@ -602,6 +634,7 @@ def main():
                     results.append({
                         "object": obj_name, "test_type": "ephemeris",
                         "dt_days": dt, "observer": code, "timestamp": timestamp,
+                        "source_version": source_version,
                         "fo_ra_deg": o["ra_deg"], "fo_dec_deg": o["dec_deg"],
                         "fo_delta_au": o["delta_au"],
                     })

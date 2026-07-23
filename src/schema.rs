@@ -607,6 +607,18 @@ pub struct ValidationResult {
     pub layup_time_ms: Option<f64>,
 
     // ── Metadata ────────────────────────────────────────────────────
+    /// Version of the tool/engine the emitting channel actually exercised,
+    /// carried for provenance so a merged report (and the archived per-channel
+    /// JSONs) records exactly which code produced each row. Each channel stamps
+    /// its OWN version — the rust channel the empyrean-core/villeneuve/scott/
+    /// nolan engine string, the python channel the `empyrean` wheel version, the
+    /// external channels their respective tool versions. `None` where a channel
+    /// has not (yet) been taught to stamp itself (e.g. the core channel). The
+    /// `default` keeps older channel JSONs (and `Value`-based external merges)
+    /// deserializing; `skip_serializing_if` keeps rows that never set it
+    /// byte-identical to the pre-provenance schema.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_version: Option<String>,
     /// ISO 8601 timestamp at row creation.
     pub timestamp: String,
     /// Free-form notes (e.g., known close approaches, IOD pathologies).
@@ -729,6 +741,7 @@ impl ValidationResult {
             layup_n_obs_used: None,
             layup_converged: None,
             layup_time_ms: None,
+            source_version: None,
             timestamp: String::new(),
             notes: String::new(),
         }
@@ -987,6 +1000,65 @@ mod tests {
         assert!(s.contains("layup_chi2"));
         let r2: ValidationResult = serde_json::from_str(&s).unwrap();
         assert_eq!(r, r2);
+    }
+
+    #[test]
+    fn source_version_round_trips_and_omits_when_none() {
+        // Provenance field contract, three ways:
+        //   1. None is omitted entirely (skip_serializing_if), so rows that
+        //      never stamp it stay byte-identical to the pre-provenance schema.
+        //   2. A stamped value survives a serialize -> deserialize round trip.
+        //   3. An "old" JSON written before this field existed (no
+        //      `source_version` key at all) deserializes cleanly to None via
+        //      serde default, even under deny_unknown_fields — this is what
+        //      keeps historical channel JSONs and the core channel (which does
+        //      not yet stamp) loading through the same `validate report` path.
+        let none = ValidationResult::empty();
+        let s_none = serde_json::to_string(&none).unwrap();
+        assert!(
+            !s_none.contains("source_version"),
+            "source_version must be omitted when None",
+        );
+
+        let mut r = ValidationResult::empty();
+        r.channel = "rust".into();
+        r.source_version =
+            Some("empyrean-core 0.9.0\nvilleneuve 1.20.2\nscott 1.15.0\nnolan 0.9.2".into());
+        let s = serde_json::to_string(&r).unwrap();
+        assert!(s.contains("source_version"));
+        let r2: ValidationResult = serde_json::from_str(&s).unwrap();
+        assert_eq!(r, r2);
+        assert_eq!(r2.source_version, r.source_version);
+
+        // An old JSON with the full known field set but NO source_version key.
+        let old = r#"{
+            "object": "Apophis", "population": "NEO",
+            "epoch_mjd_tdb": 0.0, "dt_days": 0.0, "t_mjd_tdb": 0.0,
+            "force_model": "standard", "test_type": "propagation",
+            "channel": "core", "observer": null,
+            "emp_vs_horizons_km": null, "emp_pos_au": null, "emp_time_ms": null,
+            "separation_arcsec": null, "d_ra_arcsec": null, "d_dec_arcsec": null,
+            "d_rho_km": null, "d_light_time_s": null,
+            "ic_pos_au": null, "ic_vel_au_d": null,
+            "ic_a1": null, "ic_a2": null, "ic_a3": null,
+            "ic_g_alpha": null, "ic_g_r0": null, "ic_g_m": null,
+            "ic_g_n": null, "ic_g_k": null,
+            "ref_pos_au": null, "ref_vel_au_d": null,
+            "ref_ra_rad": null, "ref_dec_rad": null,
+            "ref_rho_au": null, "ref_light_time_d": null,
+            "n_obs_used": null, "od_iterations": null, "od_converged": null,
+            "od_rms_ra_arcsec": null, "od_rms_dec_arcsec": null,
+            "od_rms_combined_arcsec": null,
+            "od_chi2": null, "od_reduced_chi2": null,
+            "assist_vs_horizons_km": null, "emp_vs_assist_km": null,
+            "assist_time_ms": null, "speed_ratio": null,
+            "findorb_rms_residual": null, "findorb_n_obs_used": null,
+            "findorb_n_obs_rejected": null,
+            "timestamp": "", "notes": ""
+        }"#;
+        let loaded: ValidationResult =
+            serde_json::from_str(old).expect("old JSON without source_version must load");
+        assert_eq!(loaded.source_version, None);
     }
 
     #[test]

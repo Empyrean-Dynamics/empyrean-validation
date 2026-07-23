@@ -631,6 +631,11 @@ def main():
     print(f"Objects: {len(obj_data)}")
 
     timestamp = datetime.now(timezone.utc).isoformat()
+    # Provenance: the ASSIST channel exercises both assist and its REBOUND
+    # integrator backend, so stamp both versions. Both modules are guaranteed
+    # imported (the top-of-file import guard exits otherwise), so no fallback
+    # is needed here.
+    source_version = f"assist {assist.__version__} + rebound {rebound.__version__}"
     results = []
     n_runs = args.n_timing_runs
 
@@ -760,6 +765,7 @@ def main():
                         "a3": a3,
                         "timestamp": timestamp,
                         "notes": data["notes"],
+                        "source_version": source_version,
                         "assist_version": assist.__version__,
                         "rebound_version": rebound.__version__,
                     }

@@ -63,6 +63,12 @@ pub fn run_propagation_validation(
 ) -> Vec<ValidationResult> {
     let timestamp = chrono::Utc::now().to_rfc3339();
     let channel = "rust".to_string();
+    // Provenance: the exact empyrean engine (empyrean-core / villeneuve /
+    // scott / nolan) this channel exercises. Stamped on every row so the
+    // merged report records which code produced the numbers. `None` only if
+    // the version FFI fails — same accessor the CapturedOrbit sidecar uses,
+    // so a row and its sidecar always agree.
+    let engine_version = empyrean::version_string().ok();
 
     eprintln!("Fetching initial conditions...");
 
@@ -575,6 +581,7 @@ pub fn run_propagation_validation(
                             layup_n_obs_used: None,
                             layup_converged: None,
                             layup_time_ms: None,
+                            source_version: engine_version.clone(),
                             timestamp: timestamp.clone(),
                             notes: data.notes.clone(),
                         });
@@ -804,6 +811,7 @@ pub fn run_propagation_validation(
                                 layup_n_obs_used: None,
                                 layup_converged: None,
                                 layup_time_ms: None,
+                                source_version: engine_version.clone(),
                                 timestamp: timestamp.clone(),
                                 notes: data.notes.clone(),
                             });
@@ -865,6 +873,13 @@ pub fn run_od_validation(
 ) -> OdValidationOutput {
     let timestamp = chrono::Utc::now().to_rfc3339();
     let channel = "rust".to_string();
+    // Provenance: the exact empyrean engine (empyrean-core / villeneuve /
+    // scott / nolan) this channel exercises. Stamped on every row (including
+    // the OD-failure row) so the merged report records which code produced —
+    // or failed to produce — the fit. `None` only if the version FFI fails;
+    // same accessor the CapturedOrbit sidecar uses, so a row and its sidecar
+    // always agree.
+    let engine_version = empyrean::version_string().ok();
     let tier_str = match tier {
         ForceModelTier::Approximate => "approximate",
         ForceModelTier::Basic => "basic",
@@ -993,6 +1008,7 @@ pub fn run_od_validation(
                 row.od_iterations = Some(max_iterations);
                 row.emp_time_ms = Some(ms_fail);
                 row.excluded_perturbers_naif = excluded_naif.clone();
+                row.source_version = engine_version.clone();
                 row.timestamp = chrono::Utc::now().to_rfc3339();
                 row.notes = format!("determine FAIL: {e}");
                 results.push(row);
@@ -1022,7 +1038,7 @@ pub fn run_od_validation(
         // Transformation via `ctx.transform` propagates covariance
         // through the Jacobian.
         let fit_native = propagated_state_to_coord(&orbit);
-        let empy_version = empyrean::version_string().ok();
+        let empy_version = engine_version.clone();
         let fit_captured = match capture_orbit(
             ctx,
             obj.name,
@@ -1272,6 +1288,7 @@ pub fn run_od_validation(
             layup_n_obs_used: None,
             layup_converged: None,
             layup_time_ms: None,
+            source_version: empy_version.clone(),
             timestamp: timestamp.clone(),
             notes: obj.notes.to_string(),
         });
@@ -1435,6 +1452,7 @@ pub fn run_od_validation(
                                 layup_n_obs_used: None,
                                 layup_converged: None,
                                 layup_time_ms: None,
+                                source_version: empy_version.clone(),
                                 timestamp: timestamp.clone(),
                                 notes: format!("optical+radar ({} radar obs)", obs_r.radar_len()),
                             });
@@ -1626,6 +1644,7 @@ pub fn run_od_validation(
                             layup_n_obs_used: None,
                             layup_converged: None,
                             layup_time_ms: None,
+                            source_version: empy_version.clone(),
                             timestamp: timestamp.clone(),
                             notes: format!(
                                 "non-grav recovery (solve_for=StateAndNonGrav, 9x9={})",

@@ -476,6 +476,35 @@ def _is_nongrav(ic: Dict[str, Any]) -> bool:
 # ───────────────────────────────────────────────────────────────────
 
 
+def orbfit_source_version(image: str) -> str:
+    """Provenance string stamped on every orbfit-channel row.
+
+    OrbFit runs from the ``minorplanetcenter/orbfit`` Docker container; the
+    image's content id (sha256) pins the exact ``neofit2.x`` build. No-hidden-
+    fallbacks: when the id can't be resolved (docker missing / image not
+    pulled), stamp an explicit ``orbfit unknown (<reason>)`` rather than a
+    silent blank.
+    """
+    try:
+        proc = subprocess.run(
+            ["docker", "image", "inspect", "--format", "{{.Id}}", image],
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+    except Exception as e:  # noqa: BLE001
+        return f"orbfit unknown ({e})"
+    if proc.returncode != 0:
+        tail = (proc.stderr or "").strip().splitlines()
+        reason = tail[-1] if tail else f"docker inspect rc={proc.returncode}"
+        return f"orbfit unknown ({reason})"
+    image_id = (proc.stdout or "").strip()
+    if not image_id:
+        return "orbfit unknown (empty image id)"
+    digest = image_id.split(":", 1)[1] if ":" in image_id else image_id
+    return f"orbfit {digest[:12]}"
+
+
 def process_od_row(
     row: Dict[str, Any],
     rows_by_object: Dict[str, List[Dict[str, Any]]],
@@ -483,6 +512,7 @@ def process_od_row(
     image: str,
     platform: str,
     timeout_s: float,
+    source_version: str,
 ) -> Dict[str, Any]:
     """Refit one OD object through OrbFit and decorate its row.
 
@@ -492,6 +522,7 @@ def process_od_row(
     """
     out = dict(row)
     out["channel"] = "orbfit"
+    out["source_version"] = source_version
     object_name = row.get("object", "")
 
     def fail(msg: str, t_ms: Optional[float] = None) -> Dict[str, Any]:
@@ -642,6 +673,9 @@ def main() -> int:
         od_rows = od_rows[: args.limit]
     print(f"  {len(rows)} total rows, {len(od_rows)} OD rows to replay")
 
+    source_version = orbfit_source_version(args.image)
+    print(f"  source_version: {source_version}")
+
     out_rows: List[Dict[str, Any]] = []
     timings: List[float] = []
     failures = 0
@@ -655,6 +689,7 @@ def main() -> int:
             image=args.image,
             platform=args.platform,
             timeout_s=args.timeout,
+            source_version=source_version,
         )
         out_rows.append(decorated)
         if decorated.get("orbfit_error"):

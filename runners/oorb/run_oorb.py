@@ -426,6 +426,44 @@ def _executive_summary(rows: list[dict]) -> str:
     return "\n".join(lines)
 
 
+def _oorb_source_version(oorb_bin: Path) -> str:
+    """Provenance string stamped on every oorb-channel row.
+
+    Prefer the git commit of the oorb source checkout (``build/oorb``, cloned
+    by setup.sh); fall back to the binary's ``--version`` banner when the
+    source tree is absent. No-hidden-fallbacks: when neither resolves, stamp
+    an explicit ``oorb unknown (<reason>)`` rather than a silent blank.
+    """
+    build_tree = Path(__file__).parent / "build" / "oorb"
+    try:
+        proc = subprocess.run(
+            ["git", "-C", str(build_tree), "rev-parse", "--short", "HEAD"],
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        if proc.returncode == 0 and proc.stdout.strip():
+            return f"oorb {proc.stdout.strip()}"
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        proc = subprocess.run(
+            [str(oorb_bin), "--version"],
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+    except Exception as e:  # noqa: BLE001
+        return f"oorb unknown ({e})"
+    if proc.returncode == 0:
+        banner = (proc.stdout or "").strip().splitlines()
+        if banner:
+            return f"oorb {banner[0].strip()}"
+    reason = (proc.stderr or "").strip().splitlines()
+    reason = reason[-1] if reason else f"--version rc={proc.returncode}"
+    return f"oorb unknown (no source tree; {reason})"
+
+
 def main() -> int:
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--input", required=True, type=Path, help="validation plan JSON")
@@ -502,6 +540,7 @@ def main() -> int:
             sun_epoch[r["object"]] = (r["ref_sun_pos_au"], r["ref_sun_vel_au_d"])
 
     timestamp = datetime.now(timezone.utc).isoformat()
+    source_version = _oorb_source_version(oorb_bin)
     out_rows: list[dict] = []
     n_skipped = 0
 
@@ -516,6 +555,7 @@ def main() -> int:
         new = dict(r)
         new["channel"] = "oorb"
         new["timestamp"] = timestamp
+        new["source_version"] = source_version
         tt = r.get("test_type")
         if tt == "propagation":
             update = _propagate(r, oorb_bin, env, sun_epoch)

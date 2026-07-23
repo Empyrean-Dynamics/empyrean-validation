@@ -33,6 +33,7 @@ import statistics
 import sys
 import time
 from datetime import datetime, timezone
+from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
 
 try:
@@ -49,6 +50,21 @@ except Exception as e:  # noqa: BLE001
 
 _AU_KM = 149_597_870.700
 _MJD_TO_JD = 2_400_000.5
+
+
+def _jorbit_source_version() -> str:
+    """Provenance string stamped on every jorbit-channel row.
+
+    Reports the installed ``jorbit`` distribution version. No-hidden-fallbacks:
+    when jorbit is absent or its version can't be read, stamp an explicit
+    ``jorbit unknown (<reason>)`` rather than a silent blank.
+    """
+    try:
+        return f"jorbit {version('jorbit')}"
+    except PackageNotFoundError:
+        return "jorbit unknown (distribution not found)"
+    except Exception as e:  # noqa: BLE001
+        return f"jorbit unknown ({e})"
 
 
 def _angular_sep_arcsec(ra1: float, dec1: float, ra2: float, dec2: float) -> float:
@@ -320,6 +336,7 @@ def main() -> int:
     )
 
     timestamp = datetime.now(timezone.utc).isoformat()
+    source_version = _jorbit_source_version()
     out_rows: list[dict] = []
     n_skipped = 0
 
@@ -335,6 +352,7 @@ def main() -> int:
         new = dict(r)
         new["channel"] = "jorbit"
         new["timestamp"] = timestamp
+        new["source_version"] = source_version
         tt = r.get("test_type")
         if tt == "propagation":
             update = _propagate_with_jorbit(r)
