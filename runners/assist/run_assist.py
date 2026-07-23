@@ -572,6 +572,15 @@ def main():
     if asteroids_path.exists():
         ephem_kw["asteroids_path"] = str(asteroids_path)
     ephem = assist.Ephem(**ephem_kw)
+    # Self-perturber objects (SB441-N16 members: Iris/Vesta/Pallas/Hygiea)
+    # CANNOT be propagated with the asteroid-perturber set loaded: ASSIST has
+    # no per-body exclusion, so the test particle starts on top of its own
+    # 1/r² singularity and is ejected (~7e8 km error within 30 days,
+    # measured). Empyrean excludes only the self body; ASSIST's closest
+    # honest equivalent is a planets-only force model for these objects —
+    # their residual therefore retains the other-15-asteroid signal, which
+    # is stated, not hidden.
+    ephem_planets_only = assist.Ephem(planets_path=str(planets_path))
 
     # Horizons cache (read empyrean's cache directly)
     cache_dir = Path(args.horizons_cache) if args.horizons_cache else Path.home() / ".empyrean" / "cache" / "horizons_assist"
@@ -638,6 +647,14 @@ def main():
             print(f"{name}: SKIP (not in ASSIST object catalog)")
             continue
 
+        # Self-perturbers: planets-only forces (see ephem_planets_only note).
+        if data["population"] == "Self-Perturber":
+            obj_ephem = ephem_planets_only
+            print(f"{name}: self-perturber — ASSIST runs planets-only "
+                  "(no per-body exclusion; asteroid set would include the object itself)")
+        else:
+            obj_ephem = ephem
+
         print(f"{name} ({data['population']})")
 
         # Get initial conditions from Horizons (with cache)
@@ -697,7 +714,7 @@ def main():
                 try:
                     # warmup
                     propagate_assist(
-                        pos0, vel0, epoch, target, ephem,
+                        pos0, vel0, epoch, target, obj_ephem,
                         a1=a1, a2=a2, a3=a3,
                         gr_alpha=gr_alpha, gr_nk=gr_nk, gr_nm=gr_nm,
                         gr_nn=gr_nn, gr_r0=gr_r0,
@@ -709,7 +726,7 @@ def main():
                     ast_stm = None
                     for _ in range(n_runs):
                         ast_pos, ast_vel, ms, ast_stm = propagate_assist(
-                            pos0, vel0, epoch, target, ephem,
+                            pos0, vel0, epoch, target, obj_ephem,
                             a1=a1, a2=a2, a3=a3,
                             gr_alpha=gr_alpha, gr_nk=gr_nk, gr_nm=gr_nm,
                             gr_nn=gr_nn, gr_r0=gr_r0,

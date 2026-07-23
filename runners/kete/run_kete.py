@@ -84,6 +84,49 @@ def _kete_state(epoch_mjd_tdb: float, pos_au, vel_au_d):
     )
 
 
+# kete's include_asteroids force set is Ceres, Pallas, Interamnia, Hygiea and
+# Vesta — three of which the suite propagates AS test objects. kete has no
+# per-body exclusion, so for those objects the massive-asteroid set would
+# include the object itself (a 1/r² self-singularity, the same failure mode
+# measured at ~7e8 km/30 d with ASSIST). Propagate them planets-only.
+_KETE_MASSIVE = {"Vesta", "Pallas", "Hygiea"}
+
+
+def _kete_prop_opts(row: dict) -> dict:
+    """include_asteroids + non_gravs options for one plan row.
+
+    Non-grav: the plan's Marsden A1/A2/A3 + g(r) (alpha, r0, m, n, k) + dt
+    delay map 1:1 onto kete's NonGravModel.new_comet — without this, comets
+    propagate gravity-only while Empyrean models the full non-grav term
+    (1e3–1e5 km of apples-to-oranges over ±15 yr).
+    """
+    opts: dict = {"include_asteroids": row.get("object") not in _KETE_MASSIVE}
+    if not opts["include_asteroids"]:
+        print(
+            f"  {row.get('object')}: kete runs planets-only "
+            "(object is in kete's massive-asteroid set; no per-body exclusion)",
+            file=sys.stderr,
+        )
+    a1 = row.get("ic_a1") or 0.0
+    a2 = row.get("ic_a2") or 0.0
+    a3 = row.get("ic_a3") or 0.0
+    if a1 != 0.0 or a2 != 0.0 or a3 != 0.0:
+        opts["non_gravs"] = [
+            kete.propagation.NonGravModel.new_comet(
+                a1=a1,
+                a2=a2,
+                a3=a3,
+                alpha=row.get("ic_g_alpha") or 1.0,
+                r_0=row.get("ic_g_r0") or 1.0,
+                m=row.get("ic_g_m") or 2.0,
+                n=row.get("ic_g_n") or 0.0,
+                k=row.get("ic_g_k") or 0.0,
+                dt=row.get("ic_non_grav_dt") or 0.0,
+            )
+        ]
+    return opts
+
+
 def _propagate_with_kete(row: dict) -> dict | None:
     if not _HAVE_KETE:
         return None
@@ -95,7 +138,7 @@ def _propagate_with_kete(row: dict) -> dict | None:
     t0 = time.perf_counter()
     try:
         state = _kete_state(row["epoch_mjd_tdb"], ic_pos, ic_vel)
-        out = kete.propagate_n_body([state], target_jd, include_asteroids=True)
+        out = kete.propagate_n_body([state], target_jd, **_kete_prop_opts(row))
     except Exception as e:
         print(f"  {row['object']} dt={row.get('dt_days', 0):+.0f} prop FAIL: {e}", file=sys.stderr)
         return None
@@ -129,7 +172,7 @@ def _ephemeris_with_kete(row: dict) -> dict | None:
     t0 = time.perf_counter()
     try:
         state = _kete_state(row["epoch_mjd_tdb"], ic_pos, ic_vel)
-        prop = kete.propagate_n_body([state], target_jd, include_asteroids=True)
+        prop = kete.propagate_n_body([state], target_jd, **_kete_prop_opts(row))
         if not prop or not prop[0].is_finite:
             return None
         # Observer state at the target epoch — re-center to SSB (NAIF 0)
@@ -138,11 +181,22 @@ def _ephemeris_with_kete(row: dict) -> dict | None:
         # mutate). mpc_code_to_ecliptic defaults to Sun-centered (NAIF 10).
         obs_state = kete.spice.mpc_code_to_ecliptic(obs_code, target_jd)
         obs_state = obs_state.change_center(0)
-        target_state = prop[0].as_equatorial
         obs_state_eq = obs_state.as_equatorial
         ox, oy, oz = obs_state_eq.pos.x, obs_state_eq.pos.y, obs_state_eq.pos.z
-        tx, ty, tz = target_state.pos.x, target_state.pos.y, target_state.pos.z
-        vec = kete.Vector([tx - ox, ty - oy, tz - oz], kete.Frames.Equatorial)
+        # Astrometric direction: iterate the light-time correction (the
+        # object is seen where it WAS τ = ρ/c ago). A same-instant geometric
+        # subtraction is off by v·τ ≈ 15-20″ at 1-2 AU — measured as a
+        # uniform ~19″ offset vs the Horizons astrometric reference before
+        # this fix. The τ back-step uses two-body propagation from the
+        # n-body state, which is exact to far below a µas over ~15 min.
+        c_au_per_day = 173.144632674240
+        tau = 0.0
+        vec = None
+        for _ in range(3):
+            lagged = kete.propagate_two_body([prop[0]], target_jd - tau)[0].as_equatorial
+            tx, ty, tz = lagged.pos.x, lagged.pos.y, lagged.pos.z
+            vec = kete.Vector([tx - ox, ty - oy, tz - oz], kete.Frames.Equatorial)
+            tau = vec.r / c_au_per_day
         # Vector.ra / .dec are degrees; convert to radians to match
         # empyrean's ref_ra_rad / ref_dec_rad units.
         ra_rad = math.radians(vec.ra)

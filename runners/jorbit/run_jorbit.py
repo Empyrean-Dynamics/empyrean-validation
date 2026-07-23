@@ -66,7 +66,7 @@ def _angular_sep_arcsec(ra1: float, dec1: float, ra2: float, dec2: float) -> flo
 
 
 def _build_particle(
-    epoch_mjd_tdb: float, pos_au, vel_au_d, name: str = ""
+    epoch_mjd_tdb: float, pos_au, vel_au_d, name: str = "", gravity: str = "default solar system"
 ) -> "jorbit.Particle":
     """Construct a jorbit Particle for a Cartesian SSB-ICRF IC.
 
@@ -82,7 +82,33 @@ def _build_particle(
         v=jnp.asarray([float(vel_au_d[0]), float(vel_au_d[1]), float(vel_au_d[2])]),
         time=jnp.asarray(epoch_mjd_tdb + _MJD_TO_JD),
         name=name,
+        gravity=gravity,
     )
+
+
+def _row_gravity(row: dict) -> str:
+    """Pick jorbit's gravity preset for one plan row.
+
+    The default ("default solar system") includes the SB441-N16 asteroid
+    set — which contains Iris/Vesta/Pallas/Hygiea, four objects this suite
+    propagates AS test particles. jorbit has no per-body exclusion, so the
+    particle would sit inside its own 1/r² singularity; use the PPN
+    planets-only preset ("gr planets") for them, stated loudly.
+    """
+    if row.get("population") == "Self-Perturber":
+        print(
+            f"  {row.get('object')}: jorbit runs 'gr planets' (planets-only) — "
+            "the default asteroid set would include the object itself",
+            file=sys.stderr,
+        )
+        return "gr planets"
+    if (row.get("ic_a1") or row.get("ic_a2") or row.get("ic_a3")) and row.get("dt_days") == 0.0:
+        print(
+            f"  {row.get('object')}: NOTE — jorbit models gravity only; the "
+            "non-grav (A1/A2/A3) signal remains in its residual",
+            file=sys.stderr,
+        )
+    return "default solar system"
 
 
 def _propagate_with_jorbit(row: dict) -> dict | None:
@@ -96,7 +122,8 @@ def _propagate_with_jorbit(row: dict) -> dict | None:
     t0 = time.perf_counter()
     try:
         particle = _build_particle(
-            row["epoch_mjd_tdb"], ic_pos, ic_vel, name=row["object"]
+            row["epoch_mjd_tdb"], ic_pos, ic_vel, name=row["object"],
+            gravity=_row_gravity(row),
         )
         target_jd = jnp.asarray([float(row["t_mjd_tdb"]) + _MJD_TO_JD])
         positions, _velocities = particle.integrate(times=target_jd)
@@ -141,22 +168,47 @@ def _ephemeris_with_jorbit(row: dict) -> dict | None:
     t0 = time.perf_counter()
     try:
         particle = _build_particle(
-            row["epoch_mjd_tdb"], ic_pos, ic_vel, name=row["object"]
+            row["epoch_mjd_tdb"], ic_pos, ic_vel, name=row["object"],
+            gravity=_row_gravity(row),
         )
         # `Particle.ephemeris(times, observer)` returns an astropy
-        # `SkyCoord` in ICRS, including light-time correction. Times
-        # passed as a bare jnp array are interpreted as TDB JD.
-        target_jd = jnp.asarray([float(row["t_mjd_tdb"]) + _MJD_TO_JD])
-        sky = particle.ephemeris(times=target_jd, observer=str(obs_code))
+        # `SkyCoord` in ICRS, including light-time correction. The
+        # docstring accepts a bare jnp array (TDB JD), but the
+        # implementation dereferences `.jd` — pass an astropy Time
+        # explicitly (upstream array path is broken).
+        from astropy.time import Time
+        target_t = Time(float(row["t_mjd_tdb"]) + _MJD_TO_JD, format="jd", scale="tdb")
+        # jorbit resolves observer strings via the Horizons API: '@' marks a
+        # Horizons-interpretable code, so MPC site codes need the '@399'
+        # (Earth topocentric) suffix. The string-observer branch of
+        # Particle.ephemeris additionally trips an astropy units bug, so
+        # fetch the barycentric observer position ourselves and hand the
+        # vector over (the jnp.ndarray branch works).
+        from jorbit.observation import get_observer_positions
+        obs_pos = get_observer_positions(
+            times=target_t,
+            observatories=f"{obs_code}@399",
+            de_ephemeris_version="de440",
+        )
+        sky = particle.ephemeris(times=target_t, observer=jnp.asarray(obs_pos))
         # SkyCoord.ra / .dec are astropy Longitude / Latitude objects;
         # `.rad` extracts the radian-scaled float. `.distance.to('au')`
         # gives the geocentric range. Use the first (and only) entry.
         ra_rad = float(sky.ra.rad[0]) if sky.ra.shape else float(sky.ra.rad)
         dec_rad = float(sky.dec.rad[0]) if sky.dec.shape else float(sky.dec.rad)
-        rho_obj = sky.distance
-        rho_au = float(rho_obj.to("au").value[0]) if rho_obj.shape else float(
-            rho_obj.to("au").value
-        )
+        # jorbit's ephemeris SkyCoord carries RA/Dec only — its distance is a
+        # dimensionless placeholder, and .to("au") on it raises. Range is
+        # simply not available from this API; emit angles only.
+        rho_au = None
+        try:
+            import astropy.units as u
+            if sky.distance.unit.physical_type == "length":
+                rho_obj = sky.distance
+                rho_au = float(rho_obj.to("au").value[0]) if rho_obj.shape else float(
+                    rho_obj.to("au").value
+                )
+        except Exception:
+            rho_au = None
     except Exception as e:  # noqa: BLE001
         print(
             f"  {row['object']} dt={row.get('dt_days', 0):+.0f} eph FAIL: {e}",
@@ -176,7 +228,7 @@ def _ephemeris_with_jorbit(row: dict) -> dict | None:
         )
         res["jorbit_d_dec_arcsec"] = math.degrees(dec_rad - ref_dec) * 3600.0
     ref_rho = row.get("ref_rho_au")
-    if ref_rho is not None:
+    if ref_rho is not None and rho_au is not None:
         res["jorbit_d_rho_km"] = (rho_au - ref_rho) * _AU_KM
     return res
 
