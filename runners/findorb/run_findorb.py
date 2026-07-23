@@ -29,6 +29,7 @@ import re
 import shutil
 import subprocess
 import tempfile
+import time
 import urllib.parse
 import urllib.request
 from datetime import datetime, timezone
@@ -294,10 +295,12 @@ def run_findorb(
 
         # Run find_orb: -c = command line mode
         cmd = f"{fo_bin} {obs_file} -c -d 2 -D {tmp_dir}/environ.dat -O {tmp_dir}"
+        t_fit0 = time.perf_counter()
         result = subprocess.run(
             cmd, shell=True, cwd=tmp_dir,
             text=True, capture_output=True, timeout=120,
         )
+        fit_ms = (time.perf_counter() - t_fit0) * 1000.0
 
         if result.returncode != 0:
             print(f"    find_orb failed (rc={result.returncode})")
@@ -379,6 +382,7 @@ def run_findorb(
         return {
             "vectors": vectors,
             "observables": observables,
+            "fo_time_ms": fit_ms,
             "elements": elements,
             "covariance_6x6": covar_json.get("covar"),
             "state_vector": covar_json.get("state_vect"),
@@ -562,6 +566,7 @@ def main():
             "fo_n_obs_total": fo_result["n_obs_total"],
             "fo_n_obs_used": fo_result["n_obs_used"],
             "fo_n_obs_rejected": fo_result["n_obs_rejected"],
+            "fo_time_ms": fo_result.get("fo_time_ms"),
             "fo_residuals": fo_result["residuals"],
         }
         results.append(result)

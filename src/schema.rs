@@ -499,6 +499,19 @@ pub struct ValidationResult {
     /// find_orb range diff vs Horizons (km). Ephemeris rows.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub findorb_d_rho_km: Option<f64>,
+    /// find_orb OD fit wall clock (ms). Per-fit subprocess cost including
+    /// the full astrometry pipeline — NOT comparable to per-row propagation
+    /// times (fo's marginal per-epoch propagation cost is ~0; the ~5-8 s
+    /// invocation toll dominates).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub findorb_time_ms: Option<f64>,
+    /// kete wall clock per row (ms). In-process (Rust core).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kete_time_ms: Option<f64>,
+    /// jorbit wall clock per row (ms). In-process but JAX: dominated by a
+    /// ~1 s per-call JIT/dispatch floor in this per-row replay harness.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub jorbit_time_ms: Option<f64>,
 
     // ── OpenOrb (oorb) external reference ───────────────────────────
     // Propagation + ephemeris reference. Independent Fortran
@@ -689,6 +702,9 @@ impl ValidationResult {
             findorb_d_ra_arcsec: None,
             findorb_d_dec_arcsec: None,
             findorb_d_rho_km: None,
+            findorb_time_ms: None,
+            kete_time_ms: None,
+            jorbit_time_ms: None,
             oorb_vs_horizons_km: None,
             emp_vs_oorb_km: None,
             oorb_time_ms: None,

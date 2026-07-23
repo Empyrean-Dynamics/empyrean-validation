@@ -115,6 +115,15 @@ struct MergeExternalArgs {
     /// convergence) onto matching rows.
     #[arg(long)]
     layup: Option<PathBuf>,
+    /// kete per-channel JSON (from `runners/kete/run_kete.py`). Currently
+    /// folds per-row wall-clock timing only (`kete_time_ms`) — kete is not
+    /// yet a selectable comparison tool in the report registry.
+    #[arg(long)]
+    kete: Option<PathBuf>,
+    /// jorbit per-channel JSON (from `runners/jorbit/run_jorbit.py`).
+    /// Folds per-row wall-clock timing only (`jorbit_time_ms`).
+    #[arg(long)]
+    jorbit: Option<PathBuf>,
     /// JPL SBDB cache directory (e.g. `$CACHE_DIR/sbdb`). Reads each OD
     /// object's cached SBDB response and folds JPL's own reported fit
     /// quality (normalized RMS, n_obs_used, radar counts, data-arc,
@@ -246,6 +255,16 @@ fn merge_external(args: MergeExternalArgs) -> Result<(), Box<dyn std::error::Err
         let n = merge_layup(&mut rows, path)?;
         eprintln!("Merged {n} layup rows");
     }
+    if let Some(path) = &args.kete {
+        let n = merge_tool_times(&mut rows, path, "kete_time_ms", |r, v| r.kete_time_ms = v)?;
+        eprintln!("Merged {n} kete timing rows");
+    }
+    if let Some(path) = &args.jorbit {
+        let n = merge_tool_times(&mut rows, path, "jorbit_time_ms", |r, v| {
+            r.jorbit_time_ms = v
+        })?;
+        eprintln!("Merged {n} jorbit timing rows");
+    }
     if let Some(dir) = &args.jpl_sbdb_cache {
         let n = merge_jpl(&mut rows, dir)?;
         eprintln!("Merged {n} JPL SBDB OD-reference rows");
@@ -354,6 +373,7 @@ fn merge_findorb(
         };
         r.findorb_rms_residual = f["fo_rms_residual"].as_f64();
         r.findorb_n_obs_used = f["fo_n_obs_used"].as_u64().map(|v| v as u32);
+        r.findorb_time_ms = f["fo_time_ms"].as_f64();
         r.findorb_n_obs_rejected = f["fo_n_obs_rejected"].as_u64().map(|v| v as u32);
         n += 1;
     }
@@ -505,6 +525,44 @@ fn merge_layup(
         r.layup_converged = f["layup_converged"].as_bool();
         r.layup_time_ms = f["layup_time_ms"].as_f64();
         n += 1;
+    }
+    Ok(n)
+}
+
+/// Fold one external tool's per-row wall-clock timings onto matching rows,
+/// keyed by (object, test_type, dt, observer?). Used for the kete / jorbit
+/// runners, whose comparison axes are not yet wired into the report
+/// registry — only their timing feeds the performance strip.
+fn merge_tool_times(
+    rows: &mut [ValidationResult],
+    path: &std::path::Path,
+    field: &str,
+    set: impl Fn(&mut ValidationResult, Option<f64>),
+) -> Result<usize, Box<dyn std::error::Error>> {
+    let txt = std::fs::read_to_string(path).map_err(|e| format!("read {}: {e}", path.display()))?;
+    let ext: Vec<serde_json::Value> = serde_json::from_str(&txt)?;
+    let mut idx: std::collections::HashMap<(String, String, i64, String), f64> = Default::default();
+    for o in &ext {
+        let (Some(name), Some(tt)) = (o["object"].as_str(), o["test_type"].as_str()) else {
+            continue;
+        };
+        let Some(t) = o[field].as_f64() else { continue };
+        let dt = o["dt_days"].as_f64().unwrap_or(0.0) as i64;
+        let obs = o["observer"].as_str().unwrap_or("").to_string();
+        idx.insert((name.to_string(), tt.to_string(), dt, obs), t);
+    }
+    let mut n = 0;
+    for r in rows.iter_mut() {
+        let key = (
+            r.object.clone(),
+            r.test_type.clone(),
+            r.dt_days as i64,
+            r.observer.clone().unwrap_or_default(),
+        );
+        if let Some(&t) = idx.get(&key) {
+            set(r, Some(t));
+            n += 1;
+        }
     }
     Ok(n)
 }

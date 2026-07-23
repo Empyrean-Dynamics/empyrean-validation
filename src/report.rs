@@ -1242,6 +1242,16 @@ pub fn generate_report(
   #tool-selector select:focus {{ outline: none; border-color: var(--ed-accent); box-shadow: 0 0 0 2px var(--ed-focus-ring); }}
   #tool-swap {{ background: var(--ed-input-bg); color: var(--ed-text-secondary); border: 1px solid var(--ed-input-border); border-radius: var(--ed-radius-sm); padding: 5px 9px; cursor: pointer; font-family: var(--ed-font-mono); }}
   #tool-swap:hover {{ color: var(--ed-accent); border-color: var(--ed-accent); }}
+  /* Performance strip */
+  .speed-group {{ margin: 18px 0 6px; }}
+  .speed-group-title {{ font-family: var(--ed-font-mono); font-size: 10px; letter-spacing: 2px; text-transform: uppercase; color: var(--ed-text-secondary); margin-bottom: 8px; }}
+  .speed-row {{ display: flex; align-items: center; gap: 10px; margin: 5px 0; }}
+  .speed-label {{ font-family: var(--ed-font-mono); font-size: 11px; color: var(--ed-text-primary); flex: 0 0 170px; text-align: right; }}
+  .speed-track {{ flex: 1 1 auto; position: relative; height: 20px; background: var(--ed-surface); border-radius: var(--ed-radius-sm); overflow: hidden; }}
+  .speed-bar {{ position: absolute; inset: 0 auto 0 0; border-radius: var(--ed-radius-sm); min-width: 2%; }}
+  .speed-val {{ font-family: var(--ed-font-mono); font-size: 11px; color: var(--ed-text-primary); flex: 0 0 76px; }}
+  .speed-chip {{ font-family: var(--ed-font-mono); font-size: 9px; color: var(--ed-text-muted); flex: 0 0 190px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }}
+  @media (max-width: 700px) {{ .speed-chip {{ display: none; }} .speed-label {{ flex-basis: 120px; }} }}
   /* Keyboard focus visibility for interactive controls (WCAG 2.4.7) */
   .page-tab:focus-visible, .channel-toggle button:focus-visible, #tool-swap:focus-visible,
   #tool-selector select:focus-visible, [role="button"]:focus-visible {{
@@ -1483,6 +1493,13 @@ pub fn generate_report(
   <div class="chart-container">
     <div id="eph-sep-chart" style="height:520px;"></div>
   </div>
+</div>
+
+<div class="section" id="s-speed" data-view="both">
+  <div class="section-title">Performance &mdash; Wall Clock</div>
+  <div class="basic-caption">Median wall clock per row, per tool — log scale. The chips explain the floors: in-process libraries sit at ms, subprocess tools pay spawn + ephemeris load, JAX pays per-call JIT.</div>
+  <div class="section-desc">Median wall clock per row for every tool with timing data, by axis (log-scaled bars). These are <b>single-particle replay</b> workloads — batch throughput is a different race — and each tool runs at its own accuracy target, so speed alone is not a ranking. Architecture chips mark the structural floors: <b>subprocess</b> tools (OpenOrb, layup, find_orb) pay process spawn + ephemeris load per invocation; <b>JAX</b> (jorbit) pays a per-call JIT/dispatch floor that would amortize in batched use; find_orb's OD bar is <b>per fit</b> (its marginal per-epoch propagation cost is ≈ 0 — the invocation toll includes the full astrometry pipeline). Empyrean shows both the bare-f64 path and the production uncertainty-first path (Jet1 + 6×6 covariance). Each median covers the rows that tool actually completed — object mixes can differ between tools until a full catalog run.</div>
+  <div id="speed-strip"></div>
 </div>
 
 <div class="section" id="s07">
@@ -4126,6 +4143,66 @@ if (!orbitComparisons.length) {{
         tr.onkeydown = (e) => {{ if (e.key === 'Enter' || e.key === ' ') {{ e.preventDefault(); toggleDetail(); }} }};
     }});
 }}
+
+// ─────────── Performance strip (Overview + Advanced) ───────────
+// Median wall clock per row per tool, per axis, as log-scaled bars. Absolute
+// per-tool numbers — independent of the selected pair, built once.
+function buildSpeedStrip() {{
+    const el = document.getElementById('speed-strip');
+    if (!el) return;
+    const fmtT = v => v == null ? '—' : v < 1 ? (v * 1000).toFixed(0) + ' µs' : v < 1000 ? (v < 10 ? v.toFixed(2) : v.toFixed(1)) + ' ms' : (v / 1000).toFixed(1) + ' s';
+    const medOf = rows => {{ const v = rows.filter(x => x != null && isFinite(x)); return v.length ? median(v) : null; }};
+    // Empyrean timing: rust channel (production wrapper) preferred, core fallback.
+    const empT = (tt, extra) => {{
+        for (const ch of ['rust', 'core']) {{
+            const v = medOf(results.filter(r => r.channel === ch && r.test_type === tt && (!extra || extra(r))).map(r => r.emp_time_ms));
+            if (v != null) return v;
+        }}
+        return null;
+    }};
+    const extT = (tt, field) => medOf(results.filter(r => r.test_type === tt).map(r => r[field]));
+    const CHIP_IN = 'in-process', CHIP_SUB = 'subprocess · spawn + ephem load', CHIP_JAX = 'JAX · per-call JIT floor';
+    const KCOL = '#5fb0a5', JCOL = '#9a8cc2';
+    const groups = [
+        {{ title: 'Propagation — per row', entries: [
+            {{ label: 'ASSIST', color: toolColor('assist'), chip: CHIP_IN, v: extT('propagation', 'assist_time_ms') }},
+            {{ label: 'kete', color: KCOL, chip: CHIP_IN, v: extT('propagation', 'kete_time_ms') }},
+            {{ label: 'Empyrean (f64)', color: toolColor('empyrean'), chip: CHIP_IN, v: empT('propagation', r => r.propagation_uncertainty === 'f64_no_cov') }},
+            {{ label: 'Empyrean (+6×6 cov)', color: toolColor('empyrean'), chip: 'in-process · production default', v: empT('propagation', r => r.propagation_uncertainty === 'first_order_with_cov') }},
+            {{ label: 'OpenOrb', color: toolColor('oorb'), chip: CHIP_SUB, v: extT('propagation', 'oorb_time_ms') }},
+            {{ label: 'jorbit', color: JCOL, chip: CHIP_JAX, v: extT('propagation', 'jorbit_time_ms') }},
+        ] }},
+        {{ title: 'Ephemeris — per row', entries: [
+            {{ label: 'kete', color: KCOL, chip: CHIP_IN, v: extT('ephemeris', 'kete_time_ms') }},
+            {{ label: 'Empyrean', color: toolColor('empyrean'), chip: CHIP_IN, v: empT('ephemeris', null) }},
+            {{ label: 'OpenOrb', color: toolColor('oorb'), chip: CHIP_SUB, v: extT('ephemeris', 'oorb_time_ms') }},
+            {{ label: 'jorbit', color: JCOL, chip: CHIP_JAX + ' · Horizons observer query', v: extT('ephemeris', 'jorbit_time_ms') }},
+        ] }},
+        {{ title: 'Orbit determination — per fit', entries: [
+            {{ label: 'Empyrean', color: toolColor('empyrean'), chip: 'in-process · full DC fit', v: empT('orbit_determination', null) }},
+            {{ label: 'layup', color: toolColor('layup'), chip: 'cold subprocess · startup-dominated', v: extT('orbit_determination', 'layup_time_ms') }},
+            {{ label: 'find_orb', color: toolColor('findorb'), chip: 'subprocess · full astrometry pipeline', v: extT('orbit_determination', 'findorb_time_ms') }},
+            {{ label: 'OrbFit', color: toolColor('orbfit'), chip: CHIP_SUB, v: extT('orbit_determination', 'orbfit_time_ms') }},
+        ] }},
+    ];
+    let html = '';
+    for (const g of groups) {{
+        const live = g.entries.filter(e => e.v != null).sort((a, b) => a.v - b.v);
+        if (!live.length) continue;
+        const lo = Math.log10(Math.max(live[0].v, 1e-3)) - 0.15;
+        const hi = Math.log10(live[live.length - 1].v) + 0.15;
+        html += `<div class="speed-group"><div class="speed-group-title">${{g.title}}</div>`;
+        for (const e of live) {{
+            const w = hi > lo ? Math.max(3, 100 * (Math.log10(Math.max(e.v, 1e-3)) - lo) / (hi - lo)) : 50;
+            html += `<div class="speed-row"><div class="speed-label">${{e.label}}</div>` +
+                `<div class="speed-track"><div class="speed-bar" style="width:${{w}}%; background:linear-gradient(90deg, ${{e.color}}cc, ${{e.color}}55)"></div></div>` +
+                `<div class="speed-val">${{fmtT(e.v)}}</div><div class="speed-chip">${{e.chip}}</div></div>`;
+        }}
+        html += '</div>';
+    }}
+    el.innerHTML = html || '<div class="section-desc" style="color:#8b9198">No timing data in this report.</div>';
+}}
+try {{ buildSpeedStrip(); }} catch (e) {{ console.error('buildSpeedStrip failed', e); }}
 
 // ─────────── Overview hero strip ───────────
 // The glanceable verdict for the selected pair: one number per axis, with
