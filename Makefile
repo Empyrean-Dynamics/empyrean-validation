@@ -169,7 +169,7 @@ all: build run report
 # when it will actually run — otherwise `make setup` pulls a Docker image
 # for a comparator that never executes (and fails the setup if Docker is
 # unavailable).
-setup: setup-assist setup-findorb setup-oorb $(if $(WITH_ORBFIT),setup-orbfit,) $(if $(WITH_LAYUP),setup-layup,)
+setup: setup-assist setup-findorb setup-oorb setup-kete setup-jorbit $(if $(WITH_ORBFIT),setup-orbfit,) $(if $(WITH_LAYUP),setup-layup,)
 	@echo
 	@echo "External dependencies installed."
 
@@ -273,6 +273,7 @@ WITH_ORBFIT ?=
 # OrbFit.
 WITH_LAYUP ?=
 run: run-rust run-python run-c run-cli run-assist run-findorb run-oorb \
+     run-kete run-jorbit \
      $(if $(WITH_ORBFIT),run-orbfit,) \
      $(if $(WITH_LAYUP),run-layup,) \
      $(if $(WITH_CORE),run-core,)
@@ -517,22 +518,26 @@ INCLUDE_OPTIONAL ?=
 # folding onto rust rows for backward compat.
 merge-external: $(if $(WITH_CORE),$(CORE_MERGED),$(RUST_MERGED))
 $(CORE_MERGED): $(CORE_OUT) $(ASSIST_OUT) $(FINDORB_OUT) $(FINDORB_RADAR_OUT) $(OORB_OUT) \
+                $(KETE_OUT) $(JORBIT_OUT) \
                 $(if $(WITH_ORBFIT),$(ORBFIT_OUT),) $(if $(WITH_LAYUP),$(LAYUP_OUT),) $(EMP_VAL_BIN)
-	@echo "──── Merge ASSIST + find_orb + OpenOrb$(if $(WITH_ORBFIT), + OrbFit,)$(if $(WITH_LAYUP), + layup,) into core ──"
+	@echo "──── Merge ASSIST + find_orb + OpenOrb + kete + jorbit$(if $(WITH_ORBFIT), + OrbFit,)$(if $(WITH_LAYUP), + layup,) into core ──"
 	@$(EMP_VAL_BIN) merge-external -i $(CORE_OUT) -o $(CORE_MERGED) \
 	    --assist $(ASSIST_OUT) --findorb $(FINDORB_OUT) \
 	    --findorb-radar $(FINDORB_RADAR_OUT) \
 	    --oorb $(OORB_OUT) \
+	    --kete $(KETE_OUT) --jorbit $(JORBIT_OUT) \
 	    --jpl-sbdb-cache $(CACHE_DIR)/sbdb \
 	    $(if $(WITH_ORBFIT),--orbfit $(ORBFIT_OUT),) \
 	    $(if $(WITH_LAYUP),--layup $(LAYUP_OUT),)
 $(RUST_MERGED): $(RUST) $(ASSIST_OUT) $(FINDORB_OUT) $(FINDORB_RADAR_OUT) $(OORB_OUT) \
+                $(KETE_OUT) $(JORBIT_OUT) \
                 $(if $(WITH_ORBFIT),$(ORBFIT_OUT),) $(if $(WITH_LAYUP),$(LAYUP_OUT),) $(EMP_VAL_BIN)
-	@echo "──── Merge ASSIST + find_orb + OpenOrb$(if $(WITH_ORBFIT), + OrbFit,)$(if $(WITH_LAYUP), + layup,) into rust (fallback) ──"
+	@echo "──── Merge ASSIST + find_orb + OpenOrb + kete + jorbit$(if $(WITH_ORBFIT), + OrbFit,)$(if $(WITH_LAYUP), + layup,) into rust (fallback) ──"
 	@$(EMP_VAL_BIN) merge-external -i $(RUST) -o $(RUST_MERGED) \
 	    --assist $(ASSIST_OUT) --findorb $(FINDORB_OUT) \
 	    --findorb-radar $(FINDORB_RADAR_OUT) \
 	    --oorb $(OORB_OUT) \
+	    --kete $(KETE_OUT) --jorbit $(JORBIT_OUT) \
 	    --jpl-sbdb-cache $(CACHE_DIR)/sbdb \
 	    $(if $(WITH_ORBFIT),--orbfit $(ORBFIT_OUT),) \
 	    $(if $(WITH_LAYUP),--layup $(LAYUP_OUT),)

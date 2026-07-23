@@ -287,6 +287,20 @@ jobs:
           path: empyrean-validation/runners/assist/.venv
           key: assist-venv-${{ hashFiles('empyrean-validation/runners/assist/setup.sh') }}
 
+      # kete + jorbit venvs — pure PyPI installs (jorbit pulls the CPU
+      # JAX wheel, ~1 minute cold); cache both resolved venvs.
+      - name: Cache kete venv
+        uses: actions/cache@v4
+        with:
+          path: empyrean-validation/runners/kete/.venv
+          key: kete-venv-${{ hashFiles('empyrean-validation/runners/kete/setup.sh') }}
+
+      - name: Cache jorbit venv
+        uses: actions/cache@v4
+        with:
+          path: empyrean-validation/runners/jorbit/.venv
+          key: jorbit-venv-${{ hashFiles('empyrean-validation/runners/jorbit/setup.sh') }}
+
       # find_orb is a from-source build of four C/C++ libraries (lunar,
       # jpl_eph, sat_code, find_orb). Cache the build tree + install
       # prefix, otherwise it's ~5 minutes of compile every run.
@@ -310,7 +324,7 @@ jobs:
       - name: Install system libraries (LAPACK/BLAS for OpenOrb)
         run: sudo apt-get update && sudo apt-get install -y --no-install-recommends liblapack-dev libblas-dev
 
-      - name: One-time external setup (ASSIST venv + find_orb + OpenOrb build)
+      - name: One-time external setup (ASSIST/kete/jorbit venvs + find_orb + OpenOrb build)
         working-directory: empyrean-validation
         env:
           DATA_DIR: ${{ env.EMPYREAN_DATA_DIR }}
