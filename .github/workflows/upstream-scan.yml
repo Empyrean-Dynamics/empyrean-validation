@@ -1,0 +1,316 @@
+name: Upstream Reference Scan
+
+# Weekly watch on the EXTERNAL reference tools the validation suite compares
+# against. It resolves each tool's latest upstream version and diffs it against
+# what this repo currently pins/records (in the per-tool runners/<tool>/setup.sh),
+# then REPORTS the result — a GITHUB_STEP_SUMMARY table plus a JSON + markdown
+# artifact. It is deliberately report-only: it never files issues and never
+# opens PRs. Bumping a pinned reference is a human decision (the pins carry
+# "update deliberately" comments precisely because changing a comparator moves
+# the validation-of-record baseline), so this job only surfaces the drift.
+#
+# What "current" means per tool (read from runners/<tool>/setup.sh):
+#   ASSIST    — PyPI `assist`, pinned `assist==1.2.3`            → compared
+#   find_orb  — git clone Bill-Gray/find_orb at HEAD (unpinned)  → HEAD reported
+#   OpenOrb   — git clone oorb/oorb at HEAD (unpinned)           → HEAD reported
+#   kete      — PyPI `kete`, floor `kete>=2.0` (unpinned)        → latest reported
+#   jorbit    — PyPI `jorbit`, floor `jorbit>=1.0` (unpinned)    → latest reported
+#   layup     — git Smithsonian/layup, pinned SHA 60b5b753…      → compared
+#   OrbFit    — docker minorplanetcenter/orbfit:latest (unpinned)→ digest reported
+#
+# Where the repo does not pin a version we say "unpinned (tracks …)" honestly
+# rather than faking a match/mismatch. Only pinned tools (ASSIST, layup) get a
+# real up-to-date verdict.
+#
+# Triggers:
+#   - cron     — Monday 07:00 UTC, one hour after the validation suite's
+#                06:00 UTC weekly refresh (see validation.yml), so the scan
+#                reflects the same week's state without contending with it.
+#   - dispatch — manual run.
+#
+# Secrets/permissions: none beyond the default GITHUB_TOKEN (public-repo reads
+# only). PyPI and the Docker registry are queried anonymously.
+
+on:
+  schedule:
+    - cron: "0 7 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  scan:
+    name: Scan external reference tools
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Resolve upstream versions and build report
+        env:
+          # gh reads GH_TOKEN; the default token suffices for public reads.
+          GH_TOKEN: ${{ github.token }}
+          OUT_DIR: upstream-scan-out
+        run: |
+          python3 - <<'PY'
+          import json
+          import os
+          import subprocess
+          import urllib.request
+          from datetime import datetime, timezone
+
+          UA = {"User-Agent": "empyrean-validation-upstream-scan"}
+
+
+          def gh_api(path, jq=None):
+              cmd = ["gh", "api", path]
+              if jq:
+                  cmd += ["--jq", jq]
+              p = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
+              if p.returncode != 0:
+                  msg = (p.stderr.strip() or f"gh api {path} failed").splitlines()[0]
+                  raise RuntimeError(msg)
+              return p.stdout.strip()
+
+
+          def gh_head_sha(repo):
+              return gh_api(f"repos/{repo}/commits/HEAD", ".sha")
+
+
+          def gh_latest_release(repo):
+              # Many of these repos publish no releases; treat that as "none".
+              try:
+                  tag = gh_api(f"repos/{repo}/releases/latest", ".tag_name")
+                  return tag or None
+              except Exception:
+                  return None
+
+
+          def pypi_version(pkg):
+              req = urllib.request.Request(
+                  f"https://pypi.org/pypi/{pkg}/json", headers=UA
+              )
+              with urllib.request.urlopen(req, timeout=30) as r:
+                  return json.load(r)["info"]["version"]
+
+
+          def docker_digest(image, tag):
+              # Docker Hub anonymous pull-token flow, then a manifest request whose
+              # Docker-Content-Digest response header is the immutable image id.
+              token_url = (
+                  "https://auth.docker.io/token?service=registry.docker.io"
+                  f"&scope=repository:{image}:pull"
+              )
+              req = urllib.request.Request(token_url, headers=UA)
+              with urllib.request.urlopen(req, timeout=30) as r:
+                  token = json.load(r)["token"]
+              accept = ", ".join([
+                  "application/vnd.docker.distribution.manifest.list.v2+json",
+                  "application/vnd.docker.distribution.manifest.v2+json",
+                  "application/vnd.oci.image.index.v1+json",
+                  "application/vnd.oci.image.manifest.v1+json",
+              ])
+              man_url = f"https://registry-1.docker.io/v2/{image}/manifests/{tag}"
+              req = urllib.request.Request(
+                  man_url,
+                  headers={**UA, "Authorization": f"Bearer {token}", "Accept": accept},
+              )
+              with urllib.request.urlopen(req, timeout=30) as r:
+                  dig = r.headers.get("Docker-Content-Digest")
+              if not dig:
+                  raise RuntimeError("registry returned no Docker-Content-Digest header")
+              return dig
+
+
+          def short(s, n=12):
+              return s[:n] if s and len(s) > n else s
+
+
+          # Each record's "current" mirrors runners/<tool>/setup.sh exactly.
+          TOOLS = [
+              {
+                  "name": "ASSIST", "kind": "pypi", "pkg": "assist",
+                  "current": "1.2.3", "current_desc": "1.2.3 (pinned)",
+                  "source_url": "https://pypi.org/project/assist/",
+                  "repo_url": "https://github.com/matthewholman/assist",
+              },
+              {
+                  "name": "find_orb", "kind": "github", "repo": "Bill-Gray/find_orb",
+                  "current": None, "current_desc": "unpinned (tracks HEAD)",
+                  "source_url": "https://github.com/Bill-Gray/find_orb",
+              },
+              {
+                  "name": "OpenOrb", "kind": "github", "repo": "oorb/oorb",
+                  "current": None, "current_desc": "unpinned (tracks HEAD)",
+                  "source_url": "https://github.com/oorb/oorb",
+              },
+              {
+                  "name": "kete", "kind": "pypi", "pkg": "kete",
+                  "current": None, "current_desc": "unpinned (floor >=2.0)",
+                  "source_url": "https://pypi.org/project/kete/",
+                  "repo_url": "https://github.com/dahlend/kete",
+              },
+              {
+                  "name": "jorbit", "kind": "pypi", "pkg": "jorbit",
+                  "current": None, "current_desc": "unpinned (floor >=1.0)",
+                  "source_url": "https://pypi.org/project/jorbit/",
+                  "repo_url": "https://github.com/ben-cassese/jorbit",
+              },
+              {
+                  "name": "layup", "kind": "github", "repo": "Smithsonian/layup",
+                  "current": "60b5b753fb74446fa5350fa12e5866de12fb1ba1",
+                  "current_desc": "60b5b75 (pinned SHA)",
+                  "source_url": "https://github.com/Smithsonian/layup",
+              },
+              {
+                  "name": "OrbFit", "kind": "docker",
+                  "image": "minorplanetcenter/orbfit", "tag": "latest",
+                  "current": None, "current_desc": "unpinned (tracks :latest tag)",
+                  "source_url": "https://hub.docker.com/r/minorplanetcenter/orbfit",
+              },
+          ]
+
+
+          def resolve(tool):
+              row = {
+                  "tool": tool["name"],
+                  "kind": tool["kind"],
+                  "current": tool["current_desc"],
+                  "current_raw": tool.get("current"),
+                  "latest": None,
+                  "up_to_date": None,
+                  "status": "ok",
+                  "source_url": tool["source_url"],
+                  "repo_url": tool.get("repo_url", tool["source_url"]),
+                  "error": None,
+              }
+              try:
+                  if tool["kind"] == "pypi":
+                      latest = pypi_version(tool["pkg"])
+                      row["latest"] = latest
+                      row["up_to_date"] = (
+                          "n/a (unpinned)" if tool["current"] is None
+                          else ("yes" if tool["current"] == latest else "UPDATE")
+                      )
+                  elif tool["kind"] == "github":
+                      head = gh_head_sha(tool["repo"])
+                      rel = gh_latest_release(tool["repo"])
+                      latest = short(head)
+                      if rel:
+                          latest = f"{latest} (release {rel})"
+                      row["latest"] = latest
+                      row["latest_sha"] = head
+                      row["latest_release"] = rel
+                      row["up_to_date"] = (
+                          "n/a (unpinned)" if tool["current"] is None
+                          else ("yes" if tool["current"] == head else "UPDATE")
+                      )
+                  elif tool["kind"] == "docker":
+                      dig = docker_digest(tool["image"], tool["tag"])
+                      row["latest"] = short(dig, 26)
+                      row["latest_digest"] = dig
+                      # :latest is a moving tag with nothing pinned to diff against.
+                      row["up_to_date"] = "n/a (unpinned)"
+                  else:
+                      raise RuntimeError(f"unknown kind {tool['kind']}")
+              except Exception as e:
+                  # One dead lookup (network, rate limit, registry auth) must not
+                  # sink the scan: mark it loudly and keep going. For OrbFit in
+                  # particular this is the "degrade loudly, never silently omit"
+                  # path the digest check is required to take.
+                  row["status"] = "check failed"
+                  row["error"] = f"{type(e).__name__}: {e}"
+                  row["latest"] = "check failed"
+                  row["up_to_date"] = "?"
+                  print(
+                      f"::warning title=upstream-scan::{tool['name']} lookup failed: "
+                      f"{row['error']}"
+                  )
+              return row
+
+
+          def badge(row):
+              return {
+                  "yes": "up-to-date",
+                  "UPDATE": "update available",
+                  "n/a (unpinned)": "n/a (unpinned)",
+                  "?": "check failed",
+              }.get(row["up_to_date"], str(row["up_to_date"]))
+
+
+          rows = [resolve(t) for t in TOOLS]
+          generated = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+
+          lines = [
+              "## Upstream reference-tool scan",
+              "",
+              f"_Generated {generated} — report-only; no issues or PRs are filed._",
+              "",
+              "| Tool | Current (this repo) | Latest upstream | Up-to-date? | Source |",
+              "|------|---------------------|-----------------|-------------|--------|",
+          ]
+          for r in rows:
+              label = r["source_url"].split("//")[-1]
+              lines.append(
+                  f"| {r['tool']} | {r['current']} | {r['latest']} | {badge(r)} "
+                  f"| [{label}]({r['source_url']}) |"
+              )
+
+          updates = [r for r in rows if r["up_to_date"] == "UPDATE"]
+          failed = [r for r in rows if r["status"] == "check failed"]
+          lines.append("")
+          if updates:
+              lines.append(
+                  f"**{len(updates)} pinned tool(s) behind upstream:** "
+                  + ", ".join(r["tool"] for r in updates) + "."
+              )
+          else:
+              lines.append("**All pinned tools are at their recorded upstream version.**")
+          if failed:
+              lines.append("")
+              lines.append(
+                  f"**{len(failed)} tool check(s) failed:** "
+                  + ", ".join(r["tool"] for r in failed)
+                  + " — see the run-log warnings above."
+              )
+          md = "\n".join(lines) + "\n"
+
+          payload = {
+              "generated_utc": datetime.now(timezone.utc).isoformat(),
+              "report_only": True,
+              "summary": {
+                  "tools_scanned": len(rows),
+                  "updates_available": [r["tool"] for r in updates],
+                  "checks_failed": [r["tool"] for r in failed],
+              },
+              "tools": rows,
+          }
+
+          out_dir = os.environ.get("OUT_DIR", "upstream-scan-out")
+          os.makedirs(out_dir, exist_ok=True)
+          with open(os.path.join(out_dir, "upstream-scan.md"), "w") as f:
+              f.write(md)
+          with open(os.path.join(out_dir, "upstream-scan.json"), "w") as f:
+              json.dump(payload, f, indent=2)
+
+          step_summary = os.environ.get("GITHUB_STEP_SUMMARY")
+          if step_summary:
+              with open(step_summary, "a") as f:
+                  f.write(md)
+
+          print(md)
+          PY
+
+      - name: Upload scan report artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: upstream-scan-report
+          path: upstream-scan-out/
+          retention-days: 90
+          if-no-files-found: warn
