@@ -363,7 +363,7 @@ run-findorb: $(ASSIST_PY)
 	    echo "──── find_orb: external OD reference ───────────────────"; \
 	    $(ASSIST_PY) $(EMP_VAL_RUNNERS)/findorb/run_findorb.py $(FIXTURES_PSV) \
 	        --output $(FINDORB_OUT) --fo-binary $(FO_BIN) \
-	        --data-dir $(DATA_DIR); \
+	        --data-dir $(DATA_DIR) --plan $(PLAN); \
 	    echo "──── find_orb: radar-augmented OD reference (psv-radar) ─"; \
 	    $(ASSIST_PY) $(EMP_VAL_RUNNERS)/findorb/run_findorb.py $(FIXTURES_PSV_RADAR) \
 	        --output $(FINDORB_RADAR_OUT) --fo-binary $(FO_BIN) \

@@ -39,7 +39,10 @@ from typing import Any, Dict, List, Optional, Tuple
 MJD_TO_JD = 2_400_000.5
 SCRIPT_DIR = pathlib.Path(__file__).parent
 FO_BINARY = SCRIPT_DIR / "install" / "bin" / "fo"
-FO_FILES_DIR = SCRIPT_DIR / "build" / "find_orb" / "find_orb"
+# find_orb's config/support files live directly in build/find_orb (the
+# previous build/find_orb/find_orb path never existed, so populate_fo_directory
+# silently copied nothing and fo fell back to ~/.find_orb).
+FO_FILES_DIR = SCRIPT_DIR / "build" / "find_orb"
 
 # Required find_orb support files
 REQUIRED_FILES = [
@@ -190,10 +193,83 @@ def populate_fo_directory(working_dir: str, data_dir: Optional[pathlib.Path] = N
         f.write('\n'.join(lines) + '\n')
 
 
+def sanitize_psv(psv: str) -> str:
+    """Normalize integer-valued ADES pos1-3 columns to carry a decimal point.
+
+    Space-based / roving observations (TESS C57, WISE C51, rover 247/250/270)
+    legally report integer observer positions (e.g. ``pos2=356814`` km), but
+    find_orb's ADES converter (``ades2mpc.cpp``) asserts on a position value
+    with no decimal point and aborts the whole fit. Appending ``.0`` is
+    numerically identical and keeps fo alive.
+    """
+    lines = psv.strip().split("\n")
+    if len(lines) < 2 or "pos1" not in lines[1]:
+        return psv
+    hdr = [h.strip() for h in lines[1].split("|")]
+    idx = [hdr.index(k) for k in ("pos1", "pos2", "pos3") if k in hdr]
+    out = lines[:2]
+    for ln in lines[2:]:
+        cols = ln.split("|")
+        for i in idx:
+            if i < len(cols):
+                v = cols[i].strip()
+                if v and "." not in v and "e" not in v.lower():
+                    cols[i] = cols[i].replace(v, v + ".0", 1)
+        out.append("|".join(cols))
+    return "\n".join(out) + "\n"
+
+
+def _parse_fo_vectors(path: str) -> list:
+    """Parse fo's computer-friendly state-vector ephemeris.
+
+    Line format: ``JD_TT  x y z vx vy vz`` — geocentric (code 500),
+    equatorial J2000, AU and AU/day, GEOMETRIC (fo applies light-time lag
+    only to observables, not state vectors). The first line is a header.
+    """
+    rows = []
+    for ln in open(path).read().strip().split("\n")[1:]:
+        parts = ln.split()
+        if len(parts) >= 7:
+            try:
+                rows.append({
+                    "jd_tt": float(parts[0]),
+                    "pos": [float(parts[1]), float(parts[2]), float(parts[3])],
+                    "vel": [float(parts[4]), float(parts[5]), float(parts[6])],
+                })
+            except ValueError:
+                continue
+    return rows
+
+
+def _parse_fo_observables(path: str) -> list:
+    """Parse fo's computer-friendly observables ephemeris.
+
+    Line format: ``JD  RA_deg  Dec_deg  delta_AU  r_AU  elong  mag`` with a
+    ``#(code) name`` header line. Astrometric (light-time-lagged) RA/Dec.
+    """
+    rows = []
+    for ln in open(path).read().strip().split("\n"):
+        if ln.startswith("#"):
+            continue
+        parts = ln.split()
+        if len(parts) >= 5:
+            try:
+                rows.append({
+                    "jd": float(parts[0]),
+                    "ra_deg": float(parts[1]),
+                    "dec_deg": float(parts[2]),
+                    "delta_au": float(parts[3]),
+                })
+            except ValueError:
+                continue
+    return rows
+
+
 def run_findorb(
     psv_string: str,
     data_dir: Optional[pathlib.Path] = None,
     fo_binary: Optional[pathlib.Path] = None,
+    ephem_spec: Optional[Dict[str, Any]] = None,
 ) -> Optional[Dict[str, Any]]:
     """Run find_orb on ADES PSV observations.
 
@@ -249,7 +325,60 @@ def run_findorb(
         elements = objects[obj_id].get("elements", {})
         residuals = objects[obj_id].get("observations", {}).get("residuals", [])
 
+        # ── Optional ephemeris stage: state vectors + per-site RA/Dec of the
+        # fitted orbit at the plan's exact epochs, in two more fo runs against
+        # the already-computed solution (same tmp dir). Note fo's time list is
+        # TT while plan epochs are TDB; |TT−TDB| ≤ 1.7 ms (≤ ~70 m at NEO
+        # speeds), far below fit-vs-reference differences.
+        vectors, observables = None, None
+        if ephem_spec:
+            # fo's EPHEM_STEPS value is sscanf'd with %79s — an absolute tmp
+            # path silently truncates. The fo subprocess runs with
+            # cwd=tmp_dir, so a bare relative filename is both short and
+            # unambiguous.
+            times_path = os.path.join(tmp_dir, "ephem_times.txt")
+            with open(times_path, "w") as f:
+                f.write("OPTION T\n")
+                for dt in ephem_spec["dt_days"]:
+                    f.write(f"JD {ephem_spec['epoch_mjd_tdb'] + dt + 2400000.5:.6f}\n")
+            with open(os.path.join(tmp_dir, "environ.dat"), "a") as f:
+                f.write("EPHEM_STEPS=1 tephem_times.txt\nTT_EPHEMERIS=1\n")
+            base = f"{fo_bin} {obs_file} -c -d 2 -D {tmp_dir}/environ.dat -O {tmp_dir}"
+            # State vectors (-E 0,17: type 1 = state vectors + computer
+            # friendly), geocentric (500) — geometric, equatorial J2000,
+            # AU / AU/day. The merge converts to SSB via Earth's state.
+            # fo's exit code after an ephemeris pass is unreliable (255 seen
+            # with a fully-written output file) — judge by the file contents.
+            vec_path = os.path.join(tmp_dir, "ephem_vec.txt")
+            rv = subprocess.run(
+                f"{base} -e {vec_path} -E 0,17 -C 500",
+                shell=True, cwd=tmp_dir, text=True, capture_output=True, timeout=300,
+            )
+            if os.path.exists(vec_path):
+                vectors = _parse_fo_vectors(vec_path)
+            if not vectors:
+                print(f"    find_orb vector ephemeris produced no rows (rc={rv.returncode})")
+            # Observables (-E 17: type 0 + computer friendly) per site.
+            codes = ",".join(ephem_spec["obs_codes"])
+            obs_tmpl = os.path.join(tmp_dir, "ephem_obs_%c.txt")
+            ro = subprocess.run(
+                f"{base} -e {obs_tmpl} -E 17 -C {codes}",
+                shell=True, cwd=tmp_dir, text=True, capture_output=True, timeout=300,
+            )
+            observables = {}
+            for code in ephem_spec["obs_codes"]:
+                p = os.path.join(tmp_dir, f"ephem_obs_{code}.txt")
+                if os.path.exists(p):
+                    parsed = _parse_fo_observables(p)
+                    if parsed:
+                        observables[code] = parsed
+            if not observables:
+                observables = None
+                print(f"    find_orb observables ephemeris produced no rows (rc={ro.returncode})")
+
         return {
+            "vectors": vectors,
+            "observables": observables,
             "elements": elements,
             "covariance_6x6": covar_json.get("covar"),
             "state_vector": covar_json.get("state_vect"),
@@ -337,7 +466,35 @@ def main():
              "'orbit_determination_radar' when fitting the optical+radar "
              "fixtures/psv-radar/ files (find_orb ingests the ADES <radar> table).",
     )
+    parser.add_argument(
+        "--plan", type=str, default=None,
+        help="Validation plan JSON. When given, each fitted orbit is also "
+             "propagated by find_orb to the plan's epochs: geocentric state "
+             "vectors (propagation axis) and per-site RA/Dec (ephemeris axis) "
+             "are emitted alongside the OD row.",
+    )
     args = parser.parse_args()
+
+    # Plan-driven ephemeris spec: per-object epoch + dt grid, plus the
+    # distinct observatory codes the plan's ephemeris rows use.
+    plan_epoch: Dict[str, float] = {}
+    plan_dts: Dict[str, list] = {}
+    plan_obs_codes: list = []
+    if args.plan:
+        with open(args.plan) as f:
+            plan_rows = json.load(f)
+        codes = set()
+        for r in plan_rows:
+            obj = r.get("object")
+            if r.get("test_type") == "propagation":
+                plan_epoch[obj] = r.get("epoch_mjd_tdb")
+                plan_dts.setdefault(obj, set()).add(r.get("dt_days"))
+            elif r.get("test_type") == "ephemeris" and r.get("observer"):
+                codes.add(r["observer"])
+                plan_dts.setdefault(obj, set()).add(r.get("dt_days"))
+        plan_obs_codes = sorted(codes)
+        plan_dts = {k: sorted(v) for k, v in plan_dts.items()}
+        print(f"  Plan: {len(plan_dts)} objects, observers: {plan_obs_codes}")
 
     data_dir = pathlib.Path(args.data_dir) if args.data_dir else pathlib.Path.home() / ".empyrean" / "data"
     fo_binary = pathlib.Path(args.fo_binary) if args.fo_binary else FO_BINARY
@@ -362,13 +519,23 @@ def main():
         name = psv_path.stem  # filename without .psv
         print(f"{name}")
 
-        psv = psv_path.read_text()
+        psv = sanitize_psv(psv_path.read_text())
         n_obs = len(psv.strip().split("\n")) - 2  # subtract header lines
         print(f"  {n_obs} observations")
 
+        # Plan-driven ephemeris spec for this object (optical pass only).
+        obj_name = name.replace("_", "/")
+        ephem_spec = None
+        if args.plan and obj_name in plan_epoch and args.test_type == "orbit_determination":
+            ephem_spec = {
+                "epoch_mjd_tdb": plan_epoch[obj_name],
+                "dt_days": plan_dts[obj_name],
+                "obs_codes": plan_obs_codes,
+            }
+
         # Run find_orb
         print("  Running find_orb...")
-        fo_result = run_findorb(psv, data_dir, fo_binary)
+        fo_result = run_findorb(psv, data_dir, fo_binary, ephem_spec)
 
         if fo_result is None:
             print("  SKIP: find_orb failed")
@@ -398,6 +565,43 @@ def main():
             "fo_residuals": fo_result["residuals"],
         }
         results.append(result)
+
+        # Ephemeris-stage rows: find_orb's fitted orbit propagated to the
+        # plan's epochs. NOTE the semantics — these are fit-then-propagate
+        # (find_orb's own fitted orbit), not a replay of the plan's initial
+        # conditions like the ASSIST / OpenOrb runners.
+        if ephem_spec and fo_result:
+            epoch = ephem_spec["epoch_mjd_tdb"]
+
+            def match_dt(jd):
+                dt = jd - 2400000.5 - epoch
+                best = min(ephem_spec["dt_days"], key=lambda d: abs(d - dt))
+                return best if abs(best - dt) < 5e-3 else None
+
+            n_vec = n_obs_rows = 0
+            for v in (fo_result.get("vectors") or []):
+                dt = match_dt(v["jd_tt"])
+                if dt is None:
+                    continue
+                results.append({
+                    "object": obj_name, "test_type": "propagation",
+                    "dt_days": dt, "timestamp": timestamp,
+                    "fo_geo_pos_au": v["pos"], "fo_geo_vel_au_d": v["vel"],
+                })
+                n_vec += 1
+            for code, obs_rows in (fo_result.get("observables") or {}).items():
+                for o in obs_rows:
+                    dt = match_dt(o["jd"])
+                    if dt is None:
+                        continue
+                    results.append({
+                        "object": obj_name, "test_type": "ephemeris",
+                        "dt_days": dt, "observer": code, "timestamp": timestamp,
+                        "fo_ra_deg": o["ra_deg"], "fo_dec_deg": o["dec_deg"],
+                        "fo_delta_au": o["delta_au"],
+                    })
+                    n_obs_rows += 1
+            print(f"  ephemerides: {n_vec} state vectors, {n_obs_rows} RA/Dec rows")
         print()
 
     # Save

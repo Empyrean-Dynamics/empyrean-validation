@@ -217,6 +217,16 @@ pub struct ValidationResult {
     /// Empyrean output Cartesian position (AU, ICRF, SSB-centered).
     /// Propagation + OD rows.
     pub emp_pos_au: Option<[f64; 3]>,
+    /// Propagated position 3×3 covariance (AU², ICRF, SSB-centered) — the
+    /// position block of Empyrean's STM-propagated 6×6. Lets the report show
+    /// the propagation offset as a Mahalanobis distance
+    /// \\(d = \sqrt{\Delta r^\top C^{-1} \Delta r}\\) instead of raw km.
+    /// Populated only on `first_order_with_cov` propagation rows (Empyrean is
+    /// the only tool that propagates a covariance). NOTE: the validation
+    /// attaches a synthetic typical-NEO input covariance, so `d` is measured
+    /// against that propagated envelope, not the object's real OD covariance.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub emp_pos_cov_au2: Option<[[f64; 3]; 3]>,
     /// Wall-clock per row (ms). Best-of `n_timing_runs`.
     pub emp_time_ms: Option<f64>,
     /// Angular separation vs Horizons (arcsec). Ephemeris rows.
@@ -225,6 +235,15 @@ pub struct ValidationResult {
     pub d_ra_arcsec: Option<f64>,
     /// dDec vs Horizons (arcsec). Ephemeris rows.
     pub d_dec_arcsec: Option<f64>,
+    /// Sky-plane 2×2 covariance in (RA·cosδ, Dec) arcsec² — the input
+    /// covariance mapped through the ephemeris Jacobian
+    /// \\(C_\text{radec} = J\,C_\text{in}\,J^\top\\) (RA row/col scaled by
+    /// cosδ to match `d_ra_arcsec`). Lets the report show the sky-plane offset
+    /// as a Mahalanobis distance instead of raw mas. Populated only on
+    /// `first_order_with_cov` ephemeris rows; same synthetic-input caveat as
+    /// [`emp_pos_cov_au2`](Self::emp_pos_cov_au2).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub emp_radec_cov_arcsec2: Option<[[f64; 2]; 2]>,
     /// Range diff vs Horizons (km). Ephemeris rows.
     pub d_rho_km: Option<f64>,
     /// Light-time diff vs Horizons (s). Ephemeris rows.
@@ -444,6 +463,30 @@ pub struct ValidationResult {
     pub findorb_n_obs_used: Option<u32>,
     /// find_orb observation count rejected.
     pub findorb_n_obs_rejected: Option<u32>,
+    // find_orb propagation + ephemeris reference: find_orb's own FITTED
+    // orbit propagated by find_orb to the plan's epochs (fit-then-propagate
+    // — NOT a replay of the plan's initial conditions like ASSIST/OpenOrb),
+    // via fo's state-vector and observables ephemerides.
+    /// |find_orb − Horizons| in km. Propagation rows. fo's geocentric
+    /// equatorial-J2000 geometric vector converted to SSB with Earth's
+    /// DE440 state at the merge step.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub findorb_vs_horizons_km: Option<f64>,
+    /// |empyrean − find_orb| in km. Propagation rows.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub emp_vs_findorb_km: Option<f64>,
+    /// find_orb angular separation vs Horizons (arcsec). Ephemeris rows.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub findorb_separation_arcsec: Option<f64>,
+    /// find_orb dRA·cos(δ) vs Horizons (arcsec). Ephemeris rows.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub findorb_d_ra_arcsec: Option<f64>,
+    /// find_orb dDec vs Horizons (arcsec). Ephemeris rows.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub findorb_d_dec_arcsec: Option<f64>,
+    /// find_orb range diff vs Horizons (km). Ephemeris rows.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub findorb_d_rho_km: Option<f64>,
 
     // ── OpenOrb (oorb) external reference ───────────────────────────
     // Propagation + ephemeris reference. Independent Fortran
@@ -556,10 +599,12 @@ impl ValidationResult {
             observer: None,
             emp_vs_horizons_km: None,
             emp_pos_au: None,
+            emp_pos_cov_au2: None,
             emp_time_ms: None,
             separation_arcsec: None,
             d_ra_arcsec: None,
             d_dec_arcsec: None,
+            emp_radec_cov_arcsec2: None,
             d_rho_km: None,
             d_light_time_s: None,
             ic_pos_au: None,
@@ -624,6 +669,12 @@ impl ValidationResult {
             findorb_rms_residual: None,
             findorb_n_obs_used: None,
             findorb_n_obs_rejected: None,
+            findorb_vs_horizons_km: None,
+            emp_vs_findorb_km: None,
+            findorb_separation_arcsec: None,
+            findorb_d_ra_arcsec: None,
+            findorb_d_dec_arcsec: None,
+            findorb_d_rho_km: None,
             oorb_vs_horizons_km: None,
             emp_vs_oorb_km: None,
             oorb_time_ms: None,

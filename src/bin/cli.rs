@@ -225,6 +225,10 @@ fn merge_external(args: MergeExternalArgs) -> Result<(), Box<dyn std::error::Err
     if let Some(path) = &args.findorb {
         let n = merge_findorb(&mut rows, path)?;
         eprintln!("Merged {n} find_orb rows");
+        let (np, ne) = merge_findorb_ephem(&mut rows, path)?;
+        if np + ne > 0 {
+            eprintln!("Merged {np} find_orb propagation + {ne} ephemeris reference rows");
+        }
     }
     if let Some(path) = &args.findorb_radar {
         let n = merge_findorb(&mut rows, path)?;
@@ -503,6 +507,161 @@ fn merge_layup(
         n += 1;
     }
     Ok(n)
+}
+
+/// Fold find_orb's ephemeris-stage rows (its own fitted orbit propagated by
+/// find_orb to the plan's epochs) onto matching propagation / ephemeris rows.
+///
+/// Propagation: fo emits GEOCENTRIC equatorial-J2000 geometric vectors
+/// (AU / AU/day); convert to SSB with Earth's DE440 state (the wrapper's
+/// geocentric "500" observer) and diff against the row's Horizons reference
+/// and Empyrean position. Ephemeris: fo emits astrometric RA/Dec + range per
+/// site; diff against the row's Horizons reference angles.
+///
+/// Semantics note: these are fit-then-propagate comparisons — find_orb
+/// propagates its own fit, NOT the plan's initial conditions, so the diffs
+/// include the fit-vs-JPL-orbit difference (unlike ASSIST / OpenOrb).
+fn merge_findorb_ephem(
+    rows: &mut [ValidationResult],
+    path: &std::path::Path,
+) -> Result<(usize, usize), Box<dyn std::error::Error>> {
+    let txt = std::fs::read_to_string(path).map_err(|e| format!("read {}: {e}", path.display()))?;
+    let fo: Vec<serde_json::Value> = serde_json::from_str(&txt)?;
+    let vec3 = |v: &serde_json::Value| -> Option<[f64; 3]> {
+        let a = v.as_array()?;
+        if a.len() != 3 {
+            return None;
+        }
+        Some([a[0].as_f64()?, a[1].as_f64()?, a[2].as_f64()?])
+    };
+    let mut prop_idx: std::collections::HashMap<(String, i64), [f64; 3]> = Default::default();
+    let mut eph_idx: std::collections::HashMap<(String, i64, String), (f64, f64, f64)> =
+        Default::default();
+    for o in &fo {
+        let (Some(name), Some(dt)) = (o["object"].as_str(), o["dt_days"].as_f64()) else {
+            continue;
+        };
+        match o["test_type"].as_str() {
+            Some("propagation") => {
+                if let Some(p) = vec3(&o["fo_geo_pos_au"]) {
+                    prop_idx.insert((name.to_string(), dt as i64), p);
+                }
+            }
+            Some("ephemeris") => {
+                if let (Some(obs), Some(ra), Some(dec), Some(delta)) = (
+                    o["observer"].as_str(),
+                    o["fo_ra_deg"].as_f64(),
+                    o["fo_dec_deg"].as_f64(),
+                    o["fo_delta_au"].as_f64(),
+                ) {
+                    eph_idx.insert(
+                        (name.to_string(), dt as i64, obs.to_string()),
+                        (ra, dec, delta),
+                    );
+                }
+            }
+            _ => {}
+        }
+    }
+    if prop_idx.is_empty() && eph_idx.is_empty() {
+        return Ok((0, 0));
+    }
+
+    // Earth's SSB position at every matched propagation epoch, batched
+    // through the wrapper's geocentric ("500") observer. A failure here is
+    // loud: silently skipping the conversion would fabricate a comparison.
+    let mut earth_at: std::collections::HashMap<u64, [f64; 3]> = Default::default();
+    if !prop_idx.is_empty() {
+        let mut epochs: Vec<f64> = rows
+            .iter()
+            .filter(|r| {
+                r.test_type == "propagation"
+                    && prop_idx.contains_key(&(r.object.clone(), r.dt_days as i64))
+            })
+            .map(|r| r.t_mjd_tdb)
+            .collect();
+        epochs.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        epochs.dedup();
+        if !epochs.is_empty() {
+            let ctx = empyrean::Context::from_data_dir(None)
+                .map_err(|e| format!("merge --findorb: engine context for Earth SSB state: {e}"))?;
+            let eps: Vec<empyrean::Epoch> = epochs
+                .iter()
+                .map(|&t| empyrean::Epoch::from_mjd_tdb(t))
+                .collect();
+            let observers = ctx
+                .get_observers(&["500"], &eps)
+                .map_err(|e| format!("merge --findorb: Earth (500) observer states: {e}"))?;
+            for o in &observers {
+                let t = o
+                    .epoch
+                    .mjd_tdb()
+                    .map_err(|e| format!("merge --findorb: observer epoch: {e}"))?;
+                earth_at.insert(t.to_bits(), o.position);
+            }
+        }
+    }
+
+    let (mut n_prop, mut n_eph) = (0, 0);
+    for r in rows.iter_mut() {
+        match r.test_type.as_str() {
+            "propagation" => {
+                let Some(geo) = prop_idx.get(&(r.object.clone(), r.dt_days as i64)) else {
+                    continue;
+                };
+                let Some(earth) = earth_at.get(&r.t_mjd_tdb.to_bits()) else {
+                    continue;
+                };
+                let fo_ssb = [geo[0] + earth[0], geo[1] + earth[1], geo[2] + earth[2]];
+                if let Some(rf) = &r.ref_pos_au {
+                    let d = ((fo_ssb[0] - rf[0]).powi(2)
+                        + (fo_ssb[1] - rf[1]).powi(2)
+                        + (fo_ssb[2] - rf[2]).powi(2))
+                    .sqrt();
+                    r.findorb_vs_horizons_km = Some(d * empyrean_validation::compare::AU_KM);
+                }
+                if let Some(emp) = &r.emp_pos_au {
+                    let d = ((fo_ssb[0] - emp[0]).powi(2)
+                        + (fo_ssb[1] - emp[1]).powi(2)
+                        + (fo_ssb[2] - emp[2]).powi(2))
+                    .sqrt();
+                    r.emp_vs_findorb_km = Some(d * empyrean_validation::compare::AU_KM);
+                }
+                n_prop += 1;
+            }
+            "ephemeris" => {
+                let Some(obs) = r.observer.as_deref() else {
+                    continue;
+                };
+                let key = (r.object.clone(), r.dt_days as i64, obs.to_string());
+                let Some(&(ra_deg, dec_deg, delta_au)) = eph_idx.get(&key) else {
+                    continue;
+                };
+                let (Some(ref_ra), Some(ref_dec)) = (r.ref_ra_rad, r.ref_dec_rad) else {
+                    continue;
+                };
+                let fo_ra = ra_deg.to_radians();
+                let fo_dec = dec_deg.to_radians();
+                let mut d_ra = (fo_ra - ref_ra).rem_euclid(std::f64::consts::TAU);
+                if d_ra > std::f64::consts::PI {
+                    d_ra -= std::f64::consts::TAU;
+                }
+                r.findorb_d_ra_arcsec = Some((d_ra * fo_dec.cos()).to_degrees() * 3600.0);
+                r.findorb_d_dec_arcsec = Some((fo_dec - ref_dec).to_degrees() * 3600.0);
+                r.findorb_separation_arcsec =
+                    Some(empyrean_validation::compare::angular_separation_arcsec(
+                        fo_ra, fo_dec, ref_ra, ref_dec,
+                    ));
+                if let Some(rho) = r.ref_rho_au {
+                    r.findorb_d_rho_km =
+                        Some((delta_au - rho) * empyrean_validation::compare::AU_KM);
+                }
+                n_eph += 1;
+            }
+            _ => {}
+        }
+    }
+    Ok((n_prop, n_eph))
 }
 
 /// JPL's own reported orbit-solution quality, parsed from a cached SBDB
@@ -821,6 +980,46 @@ mod tests {
         let n = merge_layup(&mut rows, f.path()).unwrap();
         assert_eq!(n, 0);
         assert_eq!(rows[0].layup_chi2, None);
+    }
+
+    #[test]
+    fn merge_findorb_ephem_folds_sky_plane_offsets() {
+        // An ephemeris entry folds signed RA/Dec offsets vs the row's own
+        // Horizons reference; a propagation entry with no matching row is
+        // ignored (and must NOT force an engine context in CI).
+        let mut r = ValidationResult::empty();
+        r.object = "Apophis".into();
+        r.test_type = "ephemeris".into();
+        r.dt_days = 30.0;
+        r.observer = Some("W84".into());
+        r.ref_ra_rad = Some(100.0_f64.to_radians());
+        r.ref_dec_rad = Some(10.0_f64.to_radians());
+        r.ref_rho_au = Some(1.5);
+        let mut rows = vec![r];
+
+        let mut f = tempfile::NamedTempFile::new().unwrap();
+        write!(
+            f,
+            r#"[{{"object":"Apophis","test_type":"ephemeris","dt_days":30.0,
+                 "observer":"W84","fo_ra_deg":100.001,"fo_dec_deg":10.0005,
+                 "fo_delta_au":1.5001}},
+                {{"object":"Nonexistent","test_type":"propagation","dt_days":0.0,
+                 "fo_geo_pos_au":[1.0,2.0,3.0],"fo_geo_vel_au_d":[0,0,0]}}]"#
+        )
+        .unwrap();
+        let (np, ne) = merge_findorb_ephem(&mut rows, f.path()).unwrap();
+        assert_eq!((np, ne), (0, 1));
+
+        let r = &rows[0];
+        // dRA·cosδ = 0.001° · cos(10.0005°) · 3600 ≈ 3.545″
+        let d_ra = r.findorb_d_ra_arcsec.unwrap();
+        assert!((d_ra - 0.001 * 10.0005_f64.to_radians().cos() * 3600.0).abs() < 1e-6);
+        let d_dec = r.findorb_d_dec_arcsec.unwrap();
+        assert!((d_dec - 0.0005 * 3600.0).abs() < 1e-6);
+        let sep = r.findorb_separation_arcsec.unwrap();
+        assert!((sep - (d_ra * d_ra + d_dec * d_dec).sqrt()).abs() < 1e-4);
+        let d_rho = r.findorb_d_rho_km.unwrap();
+        assert!((d_rho - 0.0001 * empyrean_validation::compare::AU_KM).abs() < 1e-3);
     }
 
     /// Write a mock SBDB cache file under `dir/{query}.json` for `merge_jpl`.

@@ -1004,6 +1004,19 @@ pub fn generate_report(
     }
 
     let rollups = rollup_channels(results);
+    // Hero-strip channel verdict: how many replay channels were compared
+    // against core, and how many are bit-identical on every row. Injected
+    // into the JS as HERO_CH so the Overview card is data-driven.
+    let hero_ch_n = rollups
+        .iter()
+        .filter(|r| r.channel != "core" && r.n_total_compared > 0)
+        .count();
+    let hero_ch_pass = rollups
+        .iter()
+        .filter(|r| {
+            r.channel != "core" && r.n_total_compared > 0 && r.n_passing == r.n_total_compared
+        })
+        .count();
     if let Some(path) = summary {
         write_summary(&rollups, path)?;
     }
@@ -1094,7 +1107,7 @@ pub fn generate_report(
     // ── §13 Reproducibility footer — every detail a referee needs to
     // reproduce a number from this report. Static content for now;
     // version + git-hash fields hard-coded against the current pins
-    // (empyrean 0.8.1 / empyrean-core v0.8.2 / hyperjet 1.9). Per-row
+    // (empyrean 0.9.0 / empyrean-core v0.9.2 / hyperjet 1.9). Per-row
     // run-time provenance (commit hash, kernel hash) is a follow-up.
     let provenance_footer_html = format!(
         r##"
@@ -1234,6 +1247,25 @@ pub fn generate_report(
   #tool-selector select:focus-visible, [role="button"]:focus-visible {{
     outline: 2px solid var(--ed-accent); outline-offset: 2px;
   }}
+  /* ── Overview (basic) view ─────────────────────────────────────── */
+  /* The Overview tab reuses the comparison page's DOM: prose, section
+     numbers, and per-section scorecards hide; one-line captions and the
+     hero verdict strip show. */
+  .basic-caption {{ display: none; color: var(--ed-text-secondary); font-size: 13px; margin: 2px 0 14px; }}
+  body.view-overview .section-desc, body.view-overview .section-num {{ display: none; }}
+  body.view-overview .basic-caption {{ display: block; }}
+  body.view-overview .header .meta, body.view-overview .prov-detail {{ display: none; }}
+  body.view-overview #prop-scorecard-pair, body.view-overview #eph-scorecard-pair {{ display: none; }}
+  .hero-cards {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(185px, 1fr)); gap: 12px; margin: 14px 0 6px; }}
+  .hero-card {{ background: var(--ed-surface); border: 1px solid var(--ed-border); border-radius: var(--ed-radius-sm); padding: 16px 18px; }}
+  .hero-card .hv {{ font-family: var(--ed-font-display); font-weight: 700; font-size: 30px; color: var(--ed-text-primary); line-height: 1.15; }}
+  .hero-card .hl {{ font-family: var(--ed-font-mono); font-size: 9px; color: var(--ed-text-secondary); letter-spacing: 1.5px; text-transform: uppercase; margin-bottom: 6px; }}
+  .hero-card .hs {{ font-size: 11px; color: var(--ed-text-muted); margin-top: 6px; }}
+  .hero-badge {{ font-size: 13px; font-weight: 700; margin-right: 6px; }}
+  .hero-badge.pass {{ color: #3d9a6d; }}
+  .hero-badge.warn {{ color: #e8a040; }}
+  #hero-title {{ display: flex; justify-content: space-between; align-items: baseline; flex-wrap: wrap; gap: 8px; }}
+  #overview-footer {{ color: var(--ed-text-muted); font-size: 12px; }}
   /* Narrow screens: shrink the 60px gutters so content isn't cramped */
   @media (max-width: 640px) {{
     .header {{ padding: 32px 20px 24px; }}
@@ -1250,15 +1282,20 @@ pub fn generate_report(
   <h2>DYNAMICS</h2>
   <div class="meta" style="font-size:12px; line-height:1.8;">{quality_summary_html}</div>
   <div class="meta" style="margin-top:6px; color:var(--ed-text-secondary);">{n_prop} propagation · {n_eph} ephemeris · {n_od} OD · {n_objects} objects · {n_channels} channel{channels_label}</div>
-  <div class="provenance">Test epoch: {test_epoch_label}<br/>Frame: ICRF (J2000) · Ephemeris: DE440 · Force model: empyrean::standard (1PN GR · 16-asteroid SB441-N16 perturbers · Marsden A1/A2/A3 + g(r) non-grav)<br/>Coverage: {coverage_line}<br/>Report run: {report_run_date} &nbsp;·&nbsp; <a href="#s13" style="color:#5b9bd5; text-decoration:none">▸ provenance &amp; references</a> &nbsp;·&nbsp; <a href="javascript:void(0)" onclick="downloadJSON()" style="color:#5b9bd5; text-decoration:none">↓ download embedded JSON</a></div>
+  <div class="provenance"><span class="prov-detail">Test epoch: {test_epoch_label}<br/>Frame: ICRF (J2000) · Ephemeris: DE440 · Force model: empyrean::standard (1PN GR · 16-asteroid SB441-N16 perturbers · Marsden A1/A2/A3 + g(r) non-grav)<br/>Coverage: {coverage_line}<br/></span>Report run: {report_run_date} &nbsp;·&nbsp; <a href="#s13" style="color:#5b9bd5; text-decoration:none">▸ provenance &amp; references</a> &nbsp;·&nbsp; <a href="javascript:void(0)" onclick="downloadJSON()" style="color:#5b9bd5; text-decoration:none">↓ download embedded JSON</a></div>
 </div>
 
 <div id="page-nav">
-  <button data-page="comparison" class="page-tab active">Tool Comparison</button>
+  <button data-page="overview" class="page-tab active">Overview</button>
+  <button data-page="comparison" class="page-tab">Advanced</button>
   <button data-page="empyrean" class="page-tab">Empyrean Internals</button>
 </div>
 
-<div class="section" id="tool-selector" style="padding-bottom:16px;">
+<div class="section" id="s00-hero" data-view="overview" style="padding-bottom:8px;">
+  <div id="hero-strip"></div>
+</div>
+
+<div class="section" id="tool-selector" data-view="both" style="padding-bottom:16px;">
   <div class="section-title" style="font-size:16px; margin-bottom:10px;">Comparison</div>
   <div style="display:flex; align-items:center; gap:10px; flex-wrap:wrap; font-family:'JetBrains Mono',monospace; font-size:13px;">
     <select id="tool1-select" aria-label="First tool to compare"></select>
@@ -1305,10 +1342,10 @@ pub fn generate_report(
     <thead><tr><th style="text-align:left">Component</th><th style="text-align:left">Purpose</th><th>Version</th></tr></thead>
     <tbody>
       <tr><td style="text-align:left">hyperjet</td><td style="text-align:left">Automatic differentiation &mdash; STMs / STTs</td><td>1.9.0</td></tr>
-      <tr><td style="text-align:left">empyrean-core</td><td style="text-align:left">Reference channel (<code>validate-core</code>)</td><td>0.8.2</td></tr>
-      <tr><td style="text-align:left">empyrean</td><td style="text-align:left">Distribution under test &mdash; Rust wrapper, C ABI, Python wheel, CLI</td><td>0.8.1</td></tr>
-      <tr><td style="text-align:left">empyrean-py</td><td style="text-align:left">Python wheel</td><td>0.8.1</td></tr>
-      <tr><td style="text-align:left">empyrean-cli</td><td style="text-align:left">Command-line interface</td><td>0.8.1</td></tr>
+      <tr><td style="text-align:left">empyrean-core</td><td style="text-align:left">Reference channel (<code>validate-core</code>)</td><td>0.9.2</td></tr>
+      <tr><td style="text-align:left">empyrean</td><td style="text-align:left">Distribution under test &mdash; Rust wrapper, C ABI, Python wheel, CLI</td><td>0.9.0</td></tr>
+      <tr><td style="text-align:left">empyrean-py</td><td style="text-align:left">Python wheel</td><td>0.9.0</td></tr>
+      <tr><td style="text-align:left">empyrean-cli</td><td style="text-align:left">Command-line interface</td><td>0.9.0</td></tr>
     </tbody>
   </table>
   </div>
@@ -1352,7 +1389,7 @@ pub fn generate_report(
       <tr>
         <td><b>find_orb</b></td>
         <td>Gray (Project Pluto) · MPC-grade OD</td>
-        <td>Orbit determination from ADES astrometry; reference for post-fit RMS</td>
+        <td>Orbit determination from ADES astrometry (post-fit RMS reference); its fitted orbit is then propagated by find_orb itself to the plan's epochs for propagation + sky-plane comparison (<b>fit-then-propagate</b> &mdash; unlike ASSIST / OpenOrb, which replay the plan's initial conditions, so these diffs include the fit-vs-JPL-orbit difference)</td>
         <td><a href="https://github.com/Empyrean-Dynamics/empyrean-validation/blob/main/runners/findorb/run_findorb.py" target="_blank" rel="noopener"><code>runners/findorb/run_findorb.py</code></a></td>
       </tr>
       <tr>
@@ -1369,17 +1406,23 @@ pub fn generate_report(
   </div>
 </div>
 
-<div class="section" id="s02">
+<div class="section" id="s02" data-view="both">
   <div class="section-num">03</div>
   <div class="section-title">Propagation &mdash; Position Agreement</div>
+  <div class="basic-caption">How closely the two tools' propagated positions agree, per object and time offset.</div>
   <div class="section-desc">How closely the two selected tools' propagated positions agree. The scorecard is the at-a-glance |&Delta;| between them; the heatmap breaks it out per object and propagation offset (color scale tagged to encounter-distance thresholds). Pick the pair at the top of the report.</div>
   <div id="prop-scorecard-pair"></div>
+  <div class="channel-toggle" id="prop-heat-toggle" style="display:none">
+    <button class="active" data-mode="physical">Physical (km)</button>
+    <button data-mode="sigma" title="Offset as a Mahalanobis distance in Empyrean's propagated covariance">Uncertainty (σ)</button>
+  </div>
   <div id="heatmap-horizons"></div>
 </div>
 
-<div class="section" id="s03">
+<div class="section" id="s03" data-view="both">
   <div class="section-num">04</div>
   <div class="section-title">Propagation &mdash; Error Growth</div>
+  <div class="basic-caption">Position difference between the two tools, growing with propagation time.</div>
   <div class="section-desc">Pairwise position difference between the two selected tools over time, log-y — median curve plus IQR band per population, with named outliers. The <b>Selected pair</b> view tracks the tool pair chosen above. The <b>Empyrean channels</b> overlay is an Empyrean-internal cross-check that every distribution channel (rust / python / c / cli / core) returns bit-identical numbers; the curves overlap at chart resolution.</div>
   <div class="channel-toggle" id="s03-toggle">
     <button class="active" data-mode="rust">Selected pair</button>
@@ -1419,12 +1462,17 @@ pub fn generate_report(
   </div>
 </div>
 
-<div class="section" id="s06">
+<div class="section" id="s06" data-view="both">
   <div class="section-num">06</div>
   <div class="section-title">Ephemeris &mdash; Sky-plane Agreement</div>
+  <div class="basic-caption">Predicted sky positions (RA/Dec) — separation vs the &sim;1 mas Gaia astrometric floor.</div>
   <div class="section-desc">Sky-plane (RA/Dec) agreement between the two selected tools' predicted positions, by population. Median and 95th-percentile separation, in milliarcseconds (1 mas &asymp; the Gaia astrometric noise floor). Each cell is the <b>mean over the observing sites</b> (W84, F51, X05, 500, I41) so it isn't hostage to any single site's parallax / light-time handling; hover shows the site count and spread. The chart below shows how that separation grows with propagation offset.</div>
   <div id="eph-scorecard-pair"></div>
   <div class="panel-title">Sky-plane separation per object</div>
+  <div class="channel-toggle" id="eph-heat-toggle" style="display:none">
+    <button class="active" data-mode="physical">Physical (mas)</button>
+    <button data-mode="sigma" title="Offset as a Mahalanobis distance in Empyrean's propagated RA/Dec covariance">Uncertainty (σ)</button>
+  </div>
   <div class="section-desc">The selected pair's RA/Dec separation per object and propagation offset (milliarcseconds); color scale anchored to the Gaia 1 mas floor.</div>
   <div id="eph-heatmap-pair"></div>
   <div class="panel-title">Separation vs propagation offset</div>
@@ -1506,6 +1554,10 @@ pub fn generate_report(
     </div>
     </div>
   </div>
+</div>
+
+<div class="section" id="overview-footer" data-view="overview" style="padding-top:24px; padding-bottom:32px;">
+  Methods, all six reference tools, per-axis detail and outliers &rarr; <b>Advanced</b> &middot; cross-channel fidelity, timing and covariance &rarr; <b>Empyrean Internals</b>.
 </div>
 
 <div class="section" id="s09b" data-page="empyrean">
@@ -1680,6 +1732,9 @@ const results = RESULTS_JSON;
 const popColors = POP_COLORS_JSON;
 const channelColors = CHANNEL_COLORS_JSON;
 const AU_KM = 149597870.700;
+// Channel-fidelity verdict computed by the Rust rollup (bit-identical
+// row counts vs core) — the JS can't cheaply recompute it.
+const HERO_CH = {{ pass: {hero_ch_pass}, n: {hero_ch_n} }};
 
 // ─────────── tool-pair registry (report generalization) ───────────
 // Single source of truth for the tool1-vs-tool2 comparator. Every row carries
@@ -1708,7 +1763,7 @@ const TOOLS_PRESENT = (() => {{
     const probe = {{
         assist:  r => r.assist_vs_horizons_km != null || r.emp_vs_assist_km != null,
         oorb:    r => r.oorb_vs_horizons_km != null || r.oorb_separation_arcsec != null,
-        findorb: r => r.findorb_rms_residual != null,
+        findorb: r => r.findorb_rms_residual != null || r.findorb_vs_horizons_km != null || r.findorb_d_ra_arcsec != null,
         orbfit:  r => r.orbfit_rms_arcsec != null,
         layup:   r => r.layup_reduced_chi2 != null || r.layup_converged != null,
     }};
@@ -1725,7 +1780,7 @@ const TOOL_AXES = {{
     jpl:      new Set(['prop_pos', 'eph', 'od_chi2', 'od_nobs']),
     assist:   new Set(['prop_pos', 'time']),
     oorb:     new Set(['prop_pos', 'eph', 'time']),
-    findorb:  new Set(['od_rms', 'od_nobs']),
+    findorb:  new Set(['prop_pos', 'eph', 'od_rms', 'od_nobs']),
     orbfit:   new Set(['od_rms', 'od_nobs']),
     layup:    new Set(['od_chi2', 'od_nobs']),
 }};
@@ -1752,6 +1807,9 @@ const TOOL_AXIS_DATA = (() => {{
         if (r.orbfit_rms_arcsec != null) {{ mark('orbfit', 'od_rms'); mark('orbfit', 'od_nobs'); }}
         if (r.layup_reduced_chi2 != null) mark('layup', 'od_chi2');
         if (r.layup_n_obs_used != null) mark('layup', 'od_nobs');
+        if (r.findorb_vs_horizons_km != null) {{ mark('findorb', 'prop_pos'); mark('jpl', 'prop_pos'); }}
+        if (r.emp_vs_findorb_km != null) {{ mark('findorb', 'prop_pos'); mark('empyrean', 'prop_pos'); }}
+        if (r.findorb_d_ra_arcsec != null) {{ mark('findorb', 'eph'); mark('jpl', 'eph'); }}
         if (r.ref_od_reduced_chi2 != null) mark('jpl', 'od_chi2');
         if (r.ref_od_n_obs_used != null) mark('jpl', 'od_nobs');
     }}
@@ -1771,6 +1829,8 @@ function propPosDiffKm(row, t1, t2) {{
         'empyrean|oorb': 'emp_vs_oorb_km',
         'assist|jpl': 'assist_vs_horizons_km',
         'jpl|oorb': 'oorb_vs_horizons_km',
+        'empyrean|findorb': 'emp_vs_findorb_km',
+        'findorb|jpl': 'findorb_vs_horizons_km',
     }};
     const f = F[[t1, t2].sort().join('|')];
     return (f && row[f] != null) ? row[f] : null;
@@ -1783,6 +1843,7 @@ function ephOffsets(row, tool) {{
     if (tool === 'jpl') return [0, 0];
     if (tool === 'empyrean') return (row.d_ra_arcsec != null && row.d_dec_arcsec != null) ? [row.d_ra_arcsec, row.d_dec_arcsec] : null;
     if (tool === 'oorb') return (row.oorb_d_ra_arcsec != null && row.oorb_d_dec_arcsec != null) ? [row.oorb_d_ra_arcsec, row.oorb_d_dec_arcsec] : null;
+    if (tool === 'findorb') return (row.findorb_d_ra_arcsec != null && row.findorb_d_dec_arcsec != null) ? [row.findorb_d_ra_arcsec, row.findorb_d_dec_arcsec] : null;
     return null;
 }}
 function ephSepArcsec(row, t1, t2) {{
@@ -1798,6 +1859,70 @@ function odRms(row, tool) {{ return ({{ empyrean: row.od_rms_combined_arcsec, fi
 function odReducedChi2(row, tool) {{ return ({{ empyrean: row.od_reduced_chi2, layup: row.layup_reduced_chi2, jpl: row.ref_od_reduced_chi2 }})[tool] ?? null; }}
 function odNobs(row, tool) {{ return ({{ empyrean: row.n_obs_used, findorb: row.findorb_n_obs_used, orbfit: row.orbfit_n_obs_used, layup: row.layup_n_obs_used, jpl: row.ref_od_n_obs_used }})[tool] ?? null; }}
 
+// ── Mahalanobis (uncertainty-unit) offsets ──────────────────────────────
+// Only Empyrean propagates a covariance, so these are defined only for the
+// Empyrean-vs-JPL pair: the offset vector normalized by Empyrean's propagated
+// covariance, d = sqrt(Δᵀ C⁻¹ Δ). d < 1 means the offset sits inside the 1σ
+// uncertainty ellipsoid. (The validation attaches a synthetic typical-NEO
+// input covariance, so d is measured against that propagated envelope.)
+function inv3(m) {{
+    const a=m[0][0],b=m[0][1],c=m[0][2],d=m[1][0],e=m[1][1],f=m[1][2],g=m[2][0],h=m[2][1],i=m[2][2];
+    const det = a*(e*i-f*h) - b*(d*i-f*g) + c*(d*h-e*g);
+    if (!isFinite(det) || Math.abs(det) < 1e-300) return null;
+    const s = 1/det;
+    return [[(e*i-f*h)*s,(c*h-b*i)*s,(b*f-c*e)*s],
+            [(f*g-d*i)*s,(a*i-c*g)*s,(c*d-a*f)*s],
+            [(d*h-e*g)*s,(b*g-a*h)*s,(a*e-b*d)*s]];
+}}
+function mahalanobisProp(row, t1, t2) {{
+    const pair = new Set([t1, t2]);
+    if (!(pair.has('empyrean') && pair.has('jpl'))) return null;
+    const p = row.emp_pos_au, r = row.ref_pos_au, C = row.emp_pos_cov_au2;
+    if (!p || !r || !C) return null;
+    const Ci = inv3(C);
+    if (!Ci) return null;
+    const dv = [p[0]-r[0], p[1]-r[1], p[2]-r[2]];
+    let d2 = 0;
+    for (let i=0;i<3;i++) for (let j=0;j<3;j++) d2 += dv[i]*Ci[i][j]*dv[j];
+    return d2 >= 0 ? Math.sqrt(d2) : null;
+}}
+function mahalanobisSky(row, t1, t2) {{
+    const pair = new Set([t1, t2]);
+    if (!(pair.has('empyrean') && pair.has('jpl'))) return null;
+    const dra = row.d_ra_arcsec, ddec = row.d_dec_arcsec, C = row.emp_radec_cov_arcsec2;
+    if (dra == null || ddec == null || !C) return null;
+    const det = C[0][0]*C[1][1] - C[0][1]*C[1][0];
+    if (!isFinite(det) || Math.abs(det) < 1e-300) return null;
+    const Ci = [[C[1][1]/det, -C[0][1]/det], [-C[1][0]/det, C[0][0]/det]];
+    const dd = [dra, ddec];
+    let d2 = 0;
+    for (let i=0;i<2;i++) for (let j=0;j<2;j++) d2 += dd[i]*Ci[i][j]*dd[j];
+    return d2 >= 0 ? Math.sqrt(d2) : null;
+}}
+// Does the current pair have Mahalanobis-σ data on this axis?
+function sigmaAvailable(axis) {{
+    if (!(new Set([TOOL1, TOOL2]).has('empyrean') && new Set([TOOL1, TOOL2]).has('jpl'))) return false;
+    const field = axis === 'prop' ? 'emp_pos_cov_au2' : 'emp_radec_cov_arcsec2';
+    return results.some(r => r[field] != null);
+}}
+function fmtSigma(s) {{
+    if (s == null || !isFinite(s)) return '—';
+    if (s < 100) return s.toFixed(s < 10 ? 2 : 1) + 'σ';
+    return s.toExponential(1) + 'σ';
+}}
+// Colour by statistical significance: <1σ blue/green (consistent), a few σ
+// amber, many σ red/magenta. Log-mapped over [0.1σ, 100σ].
+function sigmaColor(s) {{
+    if (s == null || !isFinite(s)) return '#161c25';
+    const t = Math.max(0, Math.min(1, (Math.log10(Math.max(s, 0.1)) + 1) / 3));
+    const stops = [[0.00,[13,30,60]],[0.33,[45,120,90]],[0.55,[200,175,70]],[0.72,[220,110,55]],[0.85,[200,60,60]],[1.00,[180,30,110]]];
+    let rgb = stops[0][1];
+    for (let k=0;k<stops.length-1;k++) {{ const at=stops[k][0],argb=stops[k][1],bt=stops[k+1][0],brgb=stops[k+1][1]; if (t>=at&&t<=bt) {{ const f=(t-at)/Math.max(bt-at,1e-9); rgb=[argb[0]+f*(brgb[0]-argb[0]),argb[1]+f*(brgb[1]-argb[1]),argb[2]+f*(brgb[2]-argb[2])]; break; }} }}
+    const hx = n => Math.max(0,Math.min(255,Math.floor(n))).toString(16).padStart(2,'0');
+    return '#'+hx(rgb[0])+hx(rgb[1])+hx(rgb[2]);
+}}
+let propHeatMode = 'physical', ephHeatMode = 'physical';
+
 // Is (t1, t2) a legal, on-disk-reconstructable comparison on this axis?
 function legalPair(t1, t2, axis) {{
     if (t1 === t2) return false;
@@ -1807,7 +1932,7 @@ function legalPair(t1, t2, axis) {{
         if (!anchored(t1) && !anchored(t2)) return false; // e.g. ASSIST vs OpenOrb
     }}
     if (axis === 'eph') {{
-        const ok = t => t === 'empyrean' || t === 'jpl' || t === 'oorb';
+        const ok = t => t === 'empyrean' || t === 'jpl' || t === 'oorb' || t === 'findorb';
         if (!ok(t1) || !ok(t2)) return false;
     }}
     return true;
@@ -1883,11 +2008,28 @@ function wireToolSelector() {{
 // (multichannel fidelity, Jet1-vs-f64 timing/uncertainty, non-grav, covariance)
 // live on their own page and are not gated by the tool-pair selection.
 function showPage(page) {{
+    // Three views over two DOM pages. 'overview' and 'comparison' (Advanced)
+    // share the comparison sections: data-view="overview" shows only on the
+    // Overview tab, data-view="both" on Overview AND Advanced, no data-view on
+    // Advanced only. body.view-overview swaps prose for one-line captions.
+    document.body.classList.toggle('view-overview', page === 'overview');
     document.querySelectorAll('.section').forEach(s => {{
         const dp = s.getAttribute('data-page') || 'comparison';
-        s.classList.toggle('page-hidden', !(dp === page || dp === 'both'));
+        const dv = s.getAttribute('data-view');
+        let show;
+        if (page === 'empyrean') {{
+            show = dp === 'empyrean' || dp === 'both';
+        }} else if (page === 'comparison') {{
+            show = (dp === 'comparison' || dp === 'both') && dv !== 'overview';
+        }} else {{
+            show = (dp === 'comparison' || dp === 'both') && (dv === 'overview' || dv === 'both');
+        }}
+        s.classList.toggle('page-hidden', !show);
     }});
     document.querySelectorAll('#page-nav .page-tab').forEach(b => {{ const on = b.dataset.page === page; b.classList.toggle('active', on); b.setAttribute('aria-current', on ? 'page' : 'false'); }});
+    // Deep link so a shared URL lands on the right tab.
+    const hash = page === 'comparison' ? '#advanced' : page === 'empyrean' ? '#internals' : '';
+    try {{ history.replaceState(null, '', hash || location.pathname.split('/').pop()); }} catch (e) {{}}
     // Plotly fixes a chart's width at newPlot time; a chart drawn while its
     // container was hidden (or on a since-resized window) is stale once
     // revealed — re-fit every now-visible chart on each page switch.
@@ -1900,7 +2042,10 @@ function showPage(page) {{
 }}
 function wirePageNav() {{
     document.querySelectorAll('#page-nav .page-tab').forEach(b => {{ b.onclick = () => showPage(b.dataset.page); }});
-    showPage('comparison');
+    const initial = location.hash === '#advanced' ? 'comparison'
+        : location.hash === '#internals' ? 'empyrean'
+        : 'overview';
+    showPage(initial);
 }}
 
 function downloadJSON() {{
@@ -2083,10 +2228,11 @@ function buildPropHeatmap() {{
         container.innerHTML = `<div class="section-desc" style="color:#8b9198"><b>${{toolLabel(TOOL1)}} vs ${{toolLabel(TOOL2)}}</b> has no propagation-position comparison stored (one side must be Empyrean or JPL Horizons).</div>`;
         return;
     }}
+    const sigma = propHeatMode === 'sigma' && sigmaAvailable('prop');
     const tiers = uniq(propBase.map(r => r.force_model)).sort();
     const dts = uniq(propBase.map(r => r.dt_days)).sort((a, b) => a - b);
     const lut = {{}};
-    for (const r of propBase) {{ const v = propPosDiffKm(r, TOOL1, TOOL2); if (v != null) lut[r.object + '|' + r.dt_days + '|' + r.force_model] = v; }}
+    for (const r of propBase) {{ const v = sigma ? mahalanobisProp(r, TOOL1, TOOL2) : propPosDiffKm(r, TOOL1, TOOL2); if (v != null) lut[r.object + '|' + r.dt_days + '|' + r.force_model] = v; }}
     const objs = [], seen = new Set();
     for (const r of propBase) {{ if (!seen.has(r.object)) {{ seen.add(r.object); objs.push([r.object, r.population]); }} }}
     let html = '';
@@ -2112,7 +2258,9 @@ function buildPropHeatmap() {{
                 for (const dt of dts) {{
                     const v = lut[name + '|' + dt + '|' + tier];
                     if (v != null) {{
-                        const bg = logColorKm(v), txt = fmtErrorKm(v), tc = v < 100 ? '#08080a' : '#e8e8ec';
+                        const bg = sigma ? sigmaColor(v) : logColorKm(v);
+                        const txt = sigma ? fmtSigma(v) : fmtErrorKm(v);
+                        const tc = (sigma ? v >= 3 : v >= 100) ? '#e8e8ec' : '#08080a';
                         html += `<td class="cell" style="background:${{bg}};color:${{tc}}" title="${{name}} dt=${{dt}}d: ${{txt}}">${{txt}}</td>`;
                     }} else {{
                         html += '<td class="cell missing" title="not tested / not compared">·</td>';
@@ -2123,7 +2271,17 @@ function buildPropHeatmap() {{
         }}
         html += '</table></div>';
     }}
-    html += `<div class="legend" style="margin-top:8px;">
+    if (sigma) {{
+        html += `<div class="legend" style="margin-top:8px;">
+      <div class="legend-item"><span class="pop-dot" style="background:${{sigmaColor(0.3)}}"></span>&lt; 1σ · inside the 1σ ellipsoid</div>
+      <div class="legend-item"><span class="pop-dot" style="background:${{sigmaColor(1)}}"></span>1σ</div>
+      <div class="legend-item"><span class="pop-dot" style="background:${{sigmaColor(3)}}"></span>3σ</div>
+      <div class="legend-item"><span class="pop-dot" style="background:${{sigmaColor(10)}}"></span>10σ</div>
+      <div class="legend-item"><span class="pop-dot" style="background:${{sigmaColor(100)}}"></span>≥ 100σ</div>
+      <div class="legend-item" style="color:#8b9198; flex-basis:100%">Mahalanobis distance of the Empyrean&minus;JPL position offset in Empyrean's STM-propagated covariance (synthetic typical-NEO input σ).</div>
+    </div>`;
+    }} else {{
+        html += `<div class="legend" style="margin-top:8px;">
       <div class="legend-item"><span class="pop-dot" style="background:#0d1e3c"></span>&lt; 1 km · sub-keyhole</div>
       <div class="legend-item"><span class="pop-dot" style="background:#5b9bd5"></span>1 km</div>
       <div class="legend-item"><span class="pop-dot" style="background:#c8af46"></span>100 km · lunar orbit</div>
@@ -2132,6 +2290,7 @@ function buildPropHeatmap() {{
       <div class="legend-item"><span class="pop-dot" style="background:#b41e6e"></span>≥ 10⁸ km · &gt;1 AU</div>
       <div class="legend-item"><span class="pop-dot" style="background:#161c25; border:1px dashed #778096"></span>not tested / not compared</div>
     </div>`;
+    }}
     container.innerHTML = html;
 }}
 function buildPropScorecard() {{
@@ -2150,7 +2309,28 @@ function buildPropScorecard() {{
 }}
 buildPropHeatmap();
 buildPropScorecard();
-onToolChange(() => {{ buildPropHeatmap(); buildPropScorecard(); }});
+// Physical / uncertainty-σ toggle — shown only when the pair is Empyrean-vs-JPL
+// and a propagated covariance is present (only Empyrean propagates one).
+function refreshPropHeatToggle() {{
+    const tog = document.getElementById('prop-heat-toggle');
+    if (!tog) return;
+    const avail = sigmaAvailable('prop');
+    tog.style.display = avail ? '' : 'none';
+    if (!avail && propHeatMode === 'sigma') {{
+        propHeatMode = 'physical';
+        tog.querySelectorAll('button').forEach(b => b.classList.toggle('active', b.dataset.mode === 'physical'));
+    }}
+}}
+document.querySelectorAll('#prop-heat-toggle button').forEach(btn => {{
+    btn.onclick = () => {{
+        document.querySelectorAll('#prop-heat-toggle button').forEach(b => b.classList.remove('active'));
+        btn.classList.add('active');
+        propHeatMode = btn.dataset.mode;
+        buildPropHeatmap();
+    }};
+}});
+refreshPropHeatToggle();
+onToolChange(() => {{ refreshPropHeatToggle(); buildPropHeatmap(); buildPropScorecard(); }});
 document.querySelectorAll('#s03-toggle button').forEach(btn => {{
     btn.onclick = () => {{
         document.querySelectorAll('#s03-toggle button').forEach(b => b.classList.remove('active'));
@@ -2383,7 +2563,8 @@ const ephBase = (() => {{
     const src = results.filter(r => r.channel === 'core' && r.test_type === 'ephemeris');
     const rows = src.length ? src : ephResults;
     const AVG = ['separation_arcsec', 'd_ra_arcsec', 'd_dec_arcsec',
-                 'oorb_separation_arcsec', 'oorb_d_ra_arcsec', 'oorb_d_dec_arcsec'];
+                 'oorb_separation_arcsec', 'oorb_d_ra_arcsec', 'oorb_d_dec_arcsec',
+                 'findorb_separation_arcsec', 'findorb_d_ra_arcsec', 'findorb_d_dec_arcsec'];
     // Key on the uncertainty mode too, so we average over observing SITES
     // only — not across the first_order_with_cov / f64_no_cov rows that eph
     // is doubled over (they carry the same RA/Dec but must stay distinct rows).
@@ -2405,6 +2586,13 @@ const ephBase = (() => {{
         base.sep_min = seps.length ? Math.min(...seps) : null;
         base.sep_max = seps.length ? Math.max(...seps) : null;
         base.observer = g.length > 1 ? (g.length + '-site mean') : g[0].observer;
+        // Element-wise mean of the 2×2 RA/Dec covariance over the sites, so the
+        // Mahalanobis-σ view uses the mean covariance against the mean offset.
+        const covs = g.map(r => r.emp_radec_cov_arcsec2).filter(c => c != null);
+        if (covs.length) {{
+            base.emp_radec_cov_arcsec2 = [[0, 0], [0, 0]];
+            for (const c of covs) for (let i = 0; i < 2; i++) for (let j = 0; j < 2; j++) base.emp_radec_cov_arcsec2[i][j] += c[i][j] / covs.length;
+        }}
         out.push(base);
     }}
     return out;
@@ -2506,11 +2694,17 @@ function buildEphHeatmap() {{
     }}
     const tiers = uniq(ephBase.map(r => r.force_model)).sort();
     const dts = uniq(ephBase.map(r => r.dt_days)).sort((a, b) => a - b);
+    const sigma = ephHeatMode === 'sigma' && sigmaAvailable('eph');
     const lut = {{}}, spread = {{}};
     for (const r of ephBase) {{
+        const k = r.object + '|' + r.dt_days + '|' + r.force_model;
+        if (sigma) {{
+            const d = mahalanobisSky(r, TOOL1, TOOL2);
+            if (d != null) lut[k] = d;
+            continue;
+        }}
         const s = ephSepArcsec(r, TOOL1, TOOL2);
         if (s == null) continue;
-        const k = r.object + '|' + r.dt_days + '|' + r.force_model;
         lut[k] = s * 1000;
         if (r.n_sites > 1) spread[k] = {{ n: r.n_sites, lo: r.sep_min != null ? r.sep_min * 1000 : null, hi: r.sep_max != null ? r.sep_max * 1000 : null }};
     }}
@@ -2539,8 +2733,10 @@ function buildEphHeatmap() {{
                 for (const dt of dts) {{
                     const v = lut[name + '|' + dt + '|' + tier];
                     if (v != null) {{
-                        const bg = sepColorMas(v), txt = fmtSepMas(v), tc = v < 1.0 ? '#08080a' : '#e8e8ec';
-                        const sp = spread[name + '|' + dt + '|' + tier];
+                        const bg = sigma ? sigmaColor(v) : sepColorMas(v);
+                        const txt = sigma ? fmtSigma(v) : fmtSepMas(v);
+                        const tc = (sigma ? v >= 3 : v >= 1.0) ? '#e8e8ec' : '#08080a';
+                        const sp = sigma ? null : spread[name + '|' + dt + '|' + tier];
                         const spTxt = sp ? ` · mean of ${{sp.n}} sites${{sp.lo != null ? ' (' + fmtSepMas(sp.lo) + '–' + fmtSepMas(sp.hi) + ')' : ''}}` : '';
                         html += `<td class="cell" style="background:${{bg}};color:${{tc}}" title="${{name}} dt=${{dt}}d: ${{txt}}${{spTxt}}">${{txt}}</td>`;
                     }} else {{
@@ -2552,7 +2748,17 @@ function buildEphHeatmap() {{
         }}
         html += '</table></div>';
     }}
-    html += `<div class="legend" style="margin-top:8px;">
+    if (sigma) {{
+        html += `<div class="legend" style="margin-top:8px;">
+      <div class="legend-item"><span class="pop-dot" style="background:${{sigmaColor(0.3)}}"></span>&lt; 1σ · inside the 1σ ellipse</div>
+      <div class="legend-item"><span class="pop-dot" style="background:${{sigmaColor(1)}}"></span>1σ</div>
+      <div class="legend-item"><span class="pop-dot" style="background:${{sigmaColor(3)}}"></span>3σ</div>
+      <div class="legend-item"><span class="pop-dot" style="background:${{sigmaColor(10)}}"></span>10σ</div>
+      <div class="legend-item"><span class="pop-dot" style="background:${{sigmaColor(100)}}"></span>≥ 100σ</div>
+      <div class="legend-item" style="color:#8b9198; flex-basis:100%">Mahalanobis distance of the Empyrean&minus;JPL RA/Dec offset in Empyrean's propagated sky-plane covariance (synthetic typical-NEO input σ, averaged over the sites).</div>
+    </div>`;
+    }} else {{
+        html += `<div class="legend" style="margin-top:8px;">
       <div class="legend-item"><span class="pop-dot" style="background:#0d1e3c"></span>&lt; 0.01 mas</div>
       <div class="legend-item"><span class="pop-dot" style="background:#5b9bd5"></span>0.1 mas</div>
       <div class="legend-item"><span class="pop-dot" style="background:#c8af46"></span>1 mas · Gaia floor</div>
@@ -2561,6 +2767,7 @@ function buildEphHeatmap() {{
       <div class="legend-item"><span class="pop-dot" style="background:#b41e6e"></span>&ge; 1&Prime; (1000 mas)</div>
       <div class="legend-item"><span class="pop-dot" style="background:#161c25; border:1px dashed #778096"></span>not tested / not compared</div>
     </div>`;
+    }}
     container.innerHTML = html;
 }}
 function buildEphScorecard() {{
@@ -2587,7 +2794,26 @@ if (ephResults.length > 0) {{
     }});
     buildEphHeatmap();
     buildEphScorecard();
-    onToolChange(() => {{ buildEphHeatmap(); buildEphScorecard(); }});
+    function refreshEphHeatToggle() {{
+        const tog = document.getElementById('eph-heat-toggle');
+        if (!tog) return;
+        const avail = sigmaAvailable('eph');
+        tog.style.display = avail ? '' : 'none';
+        if (!avail && ephHeatMode === 'sigma') {{
+            ephHeatMode = 'physical';
+            tog.querySelectorAll('button').forEach(b => b.classList.toggle('active', b.dataset.mode === 'physical'));
+        }}
+    }}
+    document.querySelectorAll('#eph-heat-toggle button').forEach(btn => {{
+        btn.onclick = () => {{
+            document.querySelectorAll('#eph-heat-toggle button').forEach(b => b.classList.remove('active'));
+            btn.classList.add('active');
+            ephHeatMode = btn.dataset.mode;
+            buildEphHeatmap();
+        }};
+    }});
+    refreshEphHeatToggle();
+    onToolChange(() => {{ refreshEphHeatToggle(); buildEphHeatmap(); buildEphScorecard(); }});
     document.querySelectorAll('#s06-toggle button').forEach(btn => {{
         btn.onclick = () => {{
             document.querySelectorAll('#s06-toggle button').forEach(b => b.classList.remove('active'));
@@ -3900,6 +4126,66 @@ if (!orbitComparisons.length) {{
         tr.onkeydown = (e) => {{ if (e.key === 'Enter' || e.key === ' ') {{ e.preventDefault(); toggleDetail(); }} }};
     }});
 }}
+
+// ─────────── Overview hero strip ───────────
+// The glanceable verdict for the selected pair: one number per axis, with
+// pass/warn badges ONLY for the truth-anchored Empyrean-vs-JPL pair (the
+// thresholds are printed on the cards so every badge is auditable).
+const HERO_THRESHOLDS = {{ prop_median_km: 1.0, eph_median_mas: 1.0, od_chi2_ratio: 2.0 }};
+function buildHero() {{
+    const el = document.getElementById('hero-strip');
+    if (!el) return;
+    const pair = new Set([TOOL1, TOOL2]);
+    const isJpl = pair.has('empyrean') && pair.has('jpl');
+    const badge = (ok, why) => `<span class="hero-badge ${{ok ? 'pass' : 'warn'}}" title="${{why}}">${{ok ? '✓' : '⚠'}}</span>`;
+    // Propagation: median pairwise |Δr| over the full grid.
+    const propMed = median(propBase.map(r => propPosDiffKm(r, TOOL1, TOOL2)).filter(v => v != null));
+    const propOk = propMed < HERO_THRESHOLDS.prop_median_km;
+    const propCard = isFinite(propMed)
+        ? `<div class="hero-card"><div class="hl">${{isJpl ? badge(propOk, 'pass: median < ' + HERO_THRESHOLDS.prop_median_km + ' km vs JPL Horizons truth') : ''}}Propagation</div><div class="hv">${{fmtErrorKm(propMed)}}</div><div class="hs">median |Δr| across the grid · threshold ${{HERO_THRESHOLDS.prop_median_km}} km</div></div>`
+        : `<div class="hero-card"><div class="hl">Propagation</div><div class="hv">—</div><div class="hs">no shared propagation axis for this pair</div></div>`;
+    // Sky-plane: median separation (mas), site-averaged.
+    const ephMed = median(ephBase.map(r => {{ const s = ephSepArcsec(r, TOOL1, TOOL2); return s == null ? null : s * 1000; }}).filter(v => v != null));
+    const ephOk = ephMed < HERO_THRESHOLDS.eph_median_mas;
+    const ephCard = isFinite(ephMed)
+        ? `<div class="hero-card"><div class="hl">${{isJpl ? badge(ephOk, 'pass: median < ' + HERO_THRESHOLDS.eph_median_mas + ' mas (≈ Gaia single-frame floor)') : ''}}Sky-plane</div><div class="hv">${{fmtSepMas(ephMed)}}</div><div class="hs">median RA/Dec separation · Gaia floor ≈ 1 mas</div></div>`
+        : `<div class="hero-card"><div class="hl">Sky-plane</div><div class="hv">—</div><div class="hs">no shared ephemeris axis for this pair</div></div>`;
+    // Orbit fit: reduced-χ² (or arcsec RMS) medians for whichever OD axis the pair shares.
+    const odCh = results.some(r => r.channel === 'core') ? 'core' : 'rust';
+    const odRows = results.filter(r => r.channel === odCh && r.test_type === 'orbit_determination');
+    let odCard = `<div class="hero-card"><div class="hl">Orbit fit</div><div class="hv">—</div><div class="hs">no shared OD axis for this pair</div></div>`;
+    if (legalPair(TOOL1, TOOL2, 'od_chi2')) {{
+        const a = median(odRows.map(r => odReducedChi2(r, TOOL1)).filter(v => v != null));
+        const b = median(odRows.map(r => odReducedChi2(r, TOOL2)).filter(v => v != null));
+        if (isFinite(a) && isFinite(b)) {{
+            const ratio = a > 0 && b > 0 ? Math.max(a / b, b / a) : Infinity;
+            const odOk = ratio <= HERO_THRESHOLDS.od_chi2_ratio;
+            odCard = `<div class="hero-card"><div class="hl">${{isJpl ? badge(odOk, 'pass: median χ²ᵣ within ×' + HERO_THRESHOLDS.od_chi2_ratio + ' of the JPL reported fit') : ''}}Orbit fit</div><div class="hv">${{a.toFixed(2)}}</div><div class="hs">median χ²ᵣ · ${{toolLabel(TOOL2)}}: ${{b.toFixed(2)}}</div></div>`;
+        }}
+    }} else if (legalPair(TOOL1, TOOL2, 'od_rms')) {{
+        const a = median(odRows.map(r => odRms(r, TOOL1)).filter(v => v != null));
+        const b = median(odRows.map(r => odRms(r, TOOL2)).filter(v => v != null));
+        if (isFinite(a) && isFinite(b)) {{
+            odCard = `<div class="hero-card"><div class="hl">Orbit fit</div><div class="hv">${{a.toFixed(2)}}″</div><div class="hs">median post-fit RMS · ${{toolLabel(TOOL2)}}: ${{b.toFixed(2)}}″</div></div>`;
+        }}
+    }}
+    // Channels: Rust-computed bit-identical verdict (HERO_CH).
+    const chCard = HERO_CH.n > 0
+        ? `<div class="hero-card"><div class="hl">${{badge(HERO_CH.pass === HERO_CH.n, 'pass: every replay channel bit-identical to core at ≤ 1e-10 km on every row')}}Channels</div><div class="hv">${{HERO_CH.pass}}/${{HERO_CH.n}}</div><div class="hs">replay channels bit-identical to core (≤ 10⁻¹⁰ km)</div></div>`
+        : `<div class="hero-card"><div class="hl">Channels</div><div class="hv">—</div><div class="hs">single channel in this report</div></div>`;
+    // Scope.
+    const nObj = uniq(results.map(r => r.object)).length;
+    const runDate = ((results[0] || {{}}).timestamp || '').slice(0, 10);
+    const scopeCard = `<div class="hero-card"><div class="hl">Scope</div><div class="hv">${{nObj}}</div><div class="hs">objects · ${{results.length.toLocaleString()}} rows${{runDate ? ' · run ' + runDate : ''}}</div></div>`;
+    el.innerHTML = `
+      <div id="hero-title">
+        <div style="font-family:var(--ed-font-display); font-weight:700; font-size:22px; color:var(--ed-text-primary)">${{toolLabel(TOOL1)}} <span style="color:var(--ed-text-muted); font-weight:400">vs</span> ${{toolLabel(TOOL2)}}</div>
+        <div style="font-family:var(--ed-font-mono); font-size:11px; color:var(--ed-text-muted)">${{isJpl ? 'flagship validation — pass thresholds on each card' : 'exploratory pair — verdicts apply to Empyrean vs JPL only'}}</div>
+      </div>
+      <div class="hero-cards">${{propCard}}${{ephCard}}${{odCard}}${{chCard}}${{scopeCard}}</div>`;
+}}
+try {{ buildHero(); }} catch (e) {{ console.error('buildHero failed', e); }}
+onToolChange(() => buildHero());
 
 // ─────────── tool-pair selector + page switch: wire + initial state ───────────
 // Runs last, after every panel has rendered and registered its renderer. Each

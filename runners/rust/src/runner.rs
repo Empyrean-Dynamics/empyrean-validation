@@ -379,6 +379,7 @@ pub fn run_propagation_validation(
                         };
 
                         let mut emp_times = Vec::new();
+                        let mut emp_pos_cov: Option<[[f64; 3]; 3]> = None;
                         let mut emp_state: Option<[f64; 3]> = None;
                         let mut failed = false;
 
@@ -390,6 +391,16 @@ pub fn run_propagation_validation(
                                     emp_times.push(ms);
                                     if !result.states.is_empty() {
                                         emp_state = Some(result.states[0].position);
+                                        // Propagated position 3×3 covariance (AU²) — present only
+                                        // when a covariance was propagated (first_order_with_cov).
+                                        emp_pos_cov = result.covariance_at_cartesian(0, 0).ok().map(|tc| {
+                                            let m = tc.matrix;
+                                            [
+                                                [m[0][0], m[0][1], m[0][2]],
+                                                [m[1][0], m[1][1], m[1][2]],
+                                                [m[2][0], m[2][1], m[2][2]],
+                                            ]
+                                        });
                                     } else {
                                         eprintln!(
                                             "  {} {tier_str} dt={dt:+.0}d {} empyrean Ok but states.len()=0 (likely AGM mixture-only return; skipping row)",
@@ -435,10 +446,12 @@ pub fn run_propagation_validation(
                             observer: None,
                             emp_vs_horizons_km: Some(emp_vs_hor),
                             emp_pos_au: Some(emp_pos),
+                            emp_pos_cov_au2: emp_pos_cov,
                             emp_time_ms: Some(emp_ms),
                             separation_arcsec: None,
                             d_ra_arcsec: None,
                             d_dec_arcsec: None,
+                            emp_radec_cov_arcsec2: None,
                             d_rho_km: None,
                             d_light_time_s: None,
                             ic_pos_au: Some(data.ic_pos),
@@ -503,6 +516,12 @@ pub fn run_propagation_validation(
                             findorb_rms_residual: None,
                             findorb_n_obs_used: None,
                             findorb_n_obs_rejected: None,
+                            findorb_vs_horizons_km: None,
+                            emp_vs_findorb_km: None,
+                            findorb_separation_arcsec: None,
+                            findorb_d_ra_arcsec: None,
+                            findorb_d_dec_arcsec: None,
+                            findorb_d_rho_km: None,
                             // External-reference fields populated by merge-external:
                             // OpenOrb (prop + ephemeris) and OrbFit (OD).
                             oorb_vs_horizons_km: None,
@@ -582,6 +601,44 @@ pub fn run_propagation_validation(
                             let d_ra_arcsec = d_ra.to_degrees() * 3600.0;
                             let d_dec_arcsec = d_dec.to_degrees() * 3600.0;
 
+                            // Sky-plane 2×2 covariance (arcsec², RA·cosδ) = the input
+                            // covariance mapped through the ephemeris Jacobian. Rows 0,1
+                            // of the [6][n_params] Jacobian are ∂RA,∂Dec (deg per input
+                            // unit); project only the 6 state columns (C_in is the 6×6
+                            // state covariance), scale RA by cosδ, convert deg→arcsec.
+                            let emp_radec_cov: Option<[[f64; 2]; 2]> =
+                                match (&covariance, eph.sensitivity.first()) {
+                                    (Some(cin), Some(sens))
+                                        if sens.jacobian.len() >= 2 * (sens.n_params as usize) =>
+                                    {
+                                        let np = sens.n_params as usize;
+                                        let hra = &sens.jacobian[0..np];
+                                        let hdec = &sens.jacobian[np..2 * np];
+                                        let quad = |ha: &[f64], hb: &[f64]| {
+                                            let mut s = 0.0;
+                                            for i in 0..6 {
+                                                for j in 0..6 {
+                                                    s += ha[i] * cin[i][j] * hb[j];
+                                                }
+                                            }
+                                            s
+                                        };
+                                        let cosd = emp_dec_rad.cos();
+                                        let a2 = 3600.0_f64 * 3600.0;
+                                        Some([
+                                            [
+                                                quad(hra, hra) * cosd * cosd * a2,
+                                                quad(hra, hdec) * cosd * a2,
+                                            ],
+                                            [
+                                                quad(hra, hdec) * cosd * a2,
+                                                quad(hdec, hdec) * a2,
+                                            ],
+                                        ])
+                                    }
+                                    _ => None,
+                                };
+
                             let d_rho_km = Some((entry.rho_au - hor.rho_au) * compare::AU_KM);
                             let d_lt_s = if entry.light_time_days.is_finite() {
                                 hor_light_time_d
@@ -607,10 +664,12 @@ pub fn run_propagation_validation(
                                 observer: Some(obs_code.to_string()),
                                 emp_vs_horizons_km: None,
                                 emp_pos_au: None,
+                                emp_pos_cov_au2: None,
                                 emp_time_ms: None,
                                 separation_arcsec: Some(sep),
                                 d_ra_arcsec: Some(d_ra_arcsec),
                                 d_dec_arcsec: Some(d_dec_arcsec),
+                                emp_radec_cov_arcsec2: emp_radec_cov,
                                 d_rho_km,
                                 d_light_time_s: d_lt_s,
                                 ic_pos_au: Some(data.ic_pos),
@@ -675,6 +734,12 @@ pub fn run_propagation_validation(
                                 findorb_rms_residual: None,
                                 findorb_n_obs_used: None,
                                 findorb_n_obs_rejected: None,
+                                findorb_vs_horizons_km: None,
+                                emp_vs_findorb_km: None,
+                                findorb_separation_arcsec: None,
+                                findorb_d_ra_arcsec: None,
+                                findorb_d_dec_arcsec: None,
+                                findorb_d_rho_km: None,
                                 oorb_vs_horizons_km: None,
                                 emp_vs_oorb_km: None,
                                 oorb_time_ms: None,
@@ -1061,10 +1126,12 @@ pub fn run_od_validation(
             observer: None,
             emp_vs_horizons_km: None,
             emp_pos_au: Some(orbit.position),
+            emp_pos_cov_au2: None,
             emp_time_ms: Some(ms),
             separation_arcsec: None,
             d_ra_arcsec: None,
             d_dec_arcsec: None,
+            emp_radec_cov_arcsec2: None,
             d_rho_km: None,
             d_light_time_s: None,
             ic_pos_au: None,
@@ -1129,6 +1196,12 @@ pub fn run_od_validation(
             findorb_rms_residual: None,
             findorb_n_obs_used: None,
             findorb_n_obs_rejected: None,
+            findorb_vs_horizons_km: None,
+            emp_vs_findorb_km: None,
+            findorb_separation_arcsec: None,
+            findorb_d_ra_arcsec: None,
+            findorb_d_dec_arcsec: None,
+            findorb_d_rho_km: None,
             oorb_vs_horizons_km: None,
             emp_vs_oorb_km: None,
             oorb_time_ms: None,
@@ -1210,10 +1283,12 @@ pub fn run_od_validation(
                                 observer: None,
                                 emp_vs_horizons_km: None,
                                 emp_pos_au: Some(orbit_r.position),
+                                emp_pos_cov_au2: None,
                                 emp_time_ms: Some(ms_r),
                                 separation_arcsec: None,
                                 d_ra_arcsec: None,
                                 d_dec_arcsec: None,
+                                emp_radec_cov_arcsec2: None,
                                 d_rho_km: None,
                                 d_light_time_s: None,
                                 ic_pos_au: None,
@@ -1278,6 +1353,12 @@ pub fn run_od_validation(
                                 findorb_rms_residual: None,
                                 findorb_n_obs_used: None,
                                 findorb_n_obs_rejected: None,
+                                findorb_vs_horizons_km: None,
+                                emp_vs_findorb_km: None,
+                                findorb_separation_arcsec: None,
+                                findorb_d_ra_arcsec: None,
+                                findorb_d_dec_arcsec: None,
+                                findorb_d_rho_km: None,
                                 oorb_vs_horizons_km: None,
                                 emp_vs_oorb_km: None,
                                 oorb_time_ms: None,
@@ -1387,10 +1468,12 @@ pub fn run_od_validation(
                             observer: None,
                             emp_vs_horizons_km: None,
                             emp_pos_au: Some(orbit_n.position),
+                            emp_pos_cov_au2: None,
                             emp_time_ms: Some(ms_n),
                             separation_arcsec: None,
                             d_ra_arcsec: None,
                             d_dec_arcsec: None,
+                            emp_radec_cov_arcsec2: None,
                             d_rho_km: None,
                             d_light_time_s: None,
                             ic_pos_au: None,
@@ -1455,6 +1538,12 @@ pub fn run_od_validation(
                             findorb_rms_residual: None,
                             findorb_n_obs_used: None,
                             findorb_n_obs_rejected: None,
+                            findorb_vs_horizons_km: None,
+                            emp_vs_findorb_km: None,
+                            findorb_separation_arcsec: None,
+                            findorb_d_ra_arcsec: None,
+                            findorb_d_dec_arcsec: None,
+                            findorb_d_rho_km: None,
                             oorb_vs_horizons_km: None,
                             emp_vs_oorb_km: None,
                             oorb_time_ms: None,
