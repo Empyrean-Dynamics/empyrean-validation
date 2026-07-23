@@ -1395,7 +1395,7 @@ pub fn generate_report(
       <tr>
         <td><b>OpenOrb</b></td>
         <td>Granvik et al. · University of Helsinki (Fortran)</td>
-        <td>N-body propagation &amp; ephemeris; an independent Fortran implementation</td>
+        <td>N-body propagation &amp; ephemeris (Bulirsch&ndash;Stoer, planets + Moon + Pluto, relativity on; no asteroid perturbers &mdash; BC430 not installed, so km-scale asteroid-perturbation signal remains in its residual). The plan's SSB states are converted to OpenOrb's heliocentric convention on the way in and back on the way out.</td>
         <td><a href="https://github.com/Empyrean-Dynamics/empyrean-validation/blob/main/runners/oorb/run_oorb.py" target="_blank" rel="noopener"><code>runners/oorb/run_oorb.py</code></a></td>
       </tr>
       <tr style="opacity:0.55">

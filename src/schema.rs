@@ -291,6 +291,18 @@ pub struct ValidationResult {
     pub ref_rho_au: Option<f64>,
     /// Horizons truth one-way light time (days).
     pub ref_light_time_d: Option<f64>,
+    /// Sun's SSB position at the target epoch (AU, ICRF). Propagation rows.
+    /// Lets observer-/Sun-centered external tools (OpenOrb's heliocentric
+    /// orbit convention) convert to and from the plan's SSB frame without
+    /// their own planetary-ephemeris query.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ref_sun_pos_au: Option<[f64; 3]>,
+    /// Sun's SSB velocity at the target epoch (AU/day, ICRF). Propagation
+    /// rows. The velocity matters as much as the position: feeding an SSB
+    /// velocity to a heliocentric integrator is a ~12 m/s error → a
+    /// semi-major-axis bias → ~10⁶ km/yr of along-track drift.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ref_sun_vel_au_d: Option<[f64; 3]>,
 
     // ── JPL SBDB OD-fit reference ───────────────────────────────────
     // JPL's own reported orbit-solution quality for this object, read
@@ -624,6 +636,8 @@ impl ValidationResult {
             ref_dec_rad: None,
             ref_rho_au: None,
             ref_light_time_d: None,
+            ref_sun_pos_au: None,
+            ref_sun_vel_au_d: None,
             ref_od_rms_normalized: None,
             ref_od_reduced_chi2: None,
             ref_od_n_obs_used: None,

@@ -165,6 +165,11 @@ pub fn build_plan(
         // 3. Per-dt Horizons fetches.
         let dt_list = obj.dt_days.unwrap_or(DEFAULT_DT_DAYS);
         let mut horizons_vectors: HashMap<i64, ([f64; 3], [f64; 3])> = HashMap::new();
+        // Sun's SSB state at each target epoch (Horizons command "10").
+        // Carried on propagation rows so Sun-centered external tools
+        // (OpenOrb's heliocentric orbit convention) can convert to/from the
+        // plan's SSB frame without their own planetary ephemeris.
+        let mut sun_vectors: HashMap<i64, ([f64; 3], [f64; 3])> = HashMap::new();
         for &dt in dt_list {
             let target = epoch + dt;
             match empyrean::query_horizons_vectors(
@@ -177,6 +182,14 @@ pub fn build_plan(
                 }
                 Err(e) => {
                     eprintln!("  {}: dt={dt:+.0}d Horizons SKIP ({e})", obj.name);
+                }
+            }
+            match empyrean::query_horizons_vectors("10", target, Some(horizons_cache_dir)) {
+                Ok(h) => {
+                    sun_vectors.insert(dt as i64, h);
+                }
+                Err(e) => {
+                    eprintln!("  {}: dt={dt:+.0}d Sun-vector SKIP ({e})", obj.name);
                 }
             }
         }
@@ -229,6 +242,7 @@ pub fn build_plan(
                         (a1, a2, a3, g_alpha, g_r0, g_m, g_n, g_k, ng_dt),
                         ref_pos,
                         ref_vel,
+                        sun_vectors.get(&(dt as i64)).copied(),
                         uncertainty,
                         &timestamp,
                     ));
@@ -301,6 +315,7 @@ fn propagation_plan_row(
     nongrav: (f64, f64, f64, f64, f64, f64, f64, f64, Option<f64>),
     ref_pos: [f64; 3],
     ref_vel: [f64; 3],
+    sun: Option<([f64; 3], [f64; 3])>,
     uncertainty: Option<&str>,
     timestamp: &str,
 ) -> ValidationResult {
@@ -327,6 +342,8 @@ fn propagation_plan_row(
     r.ic_non_grav_dt = ng_dt;
     r.ref_pos_au = Some(ref_pos);
     r.ref_vel_au_d = Some(ref_vel);
+    r.ref_sun_pos_au = sun.map(|(p, _)| p);
+    r.ref_sun_vel_au_d = sun.map(|(_, v)| v);
     r.propagation_uncertainty = uncertainty.map(|s| s.to_string());
     r.timestamp = timestamp.to_string();
     r.notes = obj.notes.to_string();
@@ -461,9 +478,12 @@ mod tests {
             (5e-13, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, None),
             [1.0, 0.0, 0.0],
             [0.0, 0.017, 0.0],
+            Some(([-0.004, 0.0, 0.0], [0.0, 1e-6, 0.0])),
             Some(uncertainty_modes::F64_NO_COV),
             "2026-04-29T00:00:00Z",
         );
+        assert_eq!(r.ref_sun_pos_au, Some([-0.004, 0.0, 0.0]));
+        assert_eq!(r.ref_sun_vel_au_d, Some([0.0, 1e-6, 0.0]));
         assert_eq!(r.object, "Apophis");
         assert_eq!(r.population, "NEO");
         assert_eq!(r.test_type, "propagation");

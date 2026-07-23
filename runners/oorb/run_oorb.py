@@ -30,6 +30,7 @@ import argparse
 import json
 import math
 import os
+import re
 import statistics
 import subprocess
 import sys
@@ -53,6 +54,21 @@ def _ecl_to_eq(v: tuple[float, float, float]) -> list[float]:
     """Rotate a 3-vector from ecliptic-J2000 to equatorial-J2000 (≈ICRF)."""
     x, y, z = v
     return [x, _COS_OBL * y - _SIN_OBL * z, _SIN_OBL * y + _COS_OBL * z]
+
+
+# TAI−UTC (leap seconds) at the MJD thresholds covering the validation
+# epoch range (2011–2041). TT−UTC = (TAI−UTC) + 32.184 s. No leap second
+# has been announced since 2017; future epochs assume 37 s — if one is
+# ever added, far-future rows pick up a ~1 s timing offset (≈ tens of km
+# for fast NEOs) until this table is extended.
+_LEAP_TABLE = [(57754, 37.0), (57204, 36.0), (56109, 35.0), (54832, 34.0)]
+
+
+def _tt_minus_utc_s(mjd: float) -> float:
+    for thresh, tai_utc in _LEAP_TABLE:
+        if mjd >= thresh:
+            return tai_utc + 32.184
+    return _LEAP_TABLE[-1][1] + 32.184
 
 
 def _angular_sep_arcsec(ra1: float, dec1: float, ra2: float, dec2: float) -> float:
@@ -162,24 +178,19 @@ def _parse_eph_basic(text: str) -> dict:
         parts = raw.split()
         if len(parts) < 6:
             continue
+        # Fixed layout per the task's own header:
+        #   #Designation Code MJD_UTC/UT1 Delta RA Dec dDelta/dt ...
+        # (Delta in AU BEFORE RA/Dec in degrees — a positional read; the
+        # previous plausibility-probe heuristic silently locked onto Delta
+        # as RA.)
         try:
-            # Find first plausible (ra, dec, rho) triple in the row.
-            for i in range(2, len(parts) - 2):
-                ra_deg = float(parts[i])
-                dec_deg = float(parts[i + 1])
-                rho_au = float(parts[i + 2])
-                if (
-                    0.0 <= ra_deg <= 360.0
-                    and -90.0 <= dec_deg <= 90.0
-                    and 0.0 < rho_au < 1000.0
-                ):
-                    return {
-                        "ra_deg": ra_deg,
-                        "dec_deg": dec_deg,
-                        "rho_au": rho_au,
-                    }
+            rho_au = float(parts[3])
+            ra_deg = float(parts[4])
+            dec_deg = float(parts[5])
         except ValueError:
             continue
+        if 0.0 <= ra_deg <= 360.0 and -90.0 <= dec_deg <= 90.0 and rho_au > 0.0:
+            return {"ra_deg": ra_deg, "dec_deg": dec_deg, "rho_au": rho_au}
     raise ValueError("no ephemeris row recognized")
 
 
@@ -197,10 +208,46 @@ def _run_oorb(
     return proc.stdout, proc.stderr, proc.returncode
 
 
-def _propagate(row: dict, oorb_bin: Path, env: dict[str, str]) -> dict | None:
+def _heliocentric_ic(row: dict, sun_epoch: dict) -> tuple | None:
+    """Convert the plan's SSB-centered IC to heliocentric for oorb.
+
+    OpenOrb's Cartesian orbit convention is HELIOCENTRIC (center 11 — the
+    CAREQ .des variant carries no center override), while the plan's
+    `ic_pos_au`/`ic_vel_au_d` are SSB-centered. Feeding SSB coordinates in
+    unconverted biases the initial state by the Sun's barycentric offset
+    (~1e6 km) and — worse — its ~12 m/s barycentric velocity, a
+    semi-major-axis error worth ~1e6 km/yr of along-track drift.
+    """
+    sun = sun_epoch.get(row.get("object"))
     ic_pos = row.get("ic_pos_au")
     ic_vel = row.get("ic_vel_au_d")
     if ic_pos is None or ic_vel is None:
+        return None
+    if sun is None:
+        print(
+            f"  {row.get('object')}: SKIP — plan carries no Sun SSB state "
+            "(ref_sun_pos_au/ref_sun_vel_au_d); regenerate the plan",
+            file=sys.stderr,
+        )
+        return None
+    sun_pos, sun_vel = sun
+    helio_pos = [ic_pos[i] - sun_pos[i] for i in range(3)]
+    helio_vel = [ic_vel[i] - sun_vel[i] for i in range(3)]
+    return helio_pos, helio_vel
+
+
+def _propagate(row: dict, oorb_bin: Path, env: dict[str, str], sun_epoch: dict) -> dict | None:
+    helio = _heliocentric_ic(row, sun_epoch)
+    if helio is None:
+        return None
+    ic_pos, ic_vel = helio
+    sun_t = row.get("ref_sun_pos_au")
+    if sun_t is None:
+        print(
+            f"  {row.get('object')} dt={row.get('dt_days', 0):+.0f}: SKIP — "
+            "row carries no ref_sun_pos_au; regenerate the plan",
+            file=sys.stderr,
+        )
         return None
 
     with tempfile.TemporaryDirectory(prefix="oorb_run_") as td:
@@ -236,8 +283,11 @@ def _propagate(row: dict, oorb_bin: Path, env: dict[str, str]) -> dict | None:
             )
             return None
 
-    # Rotate ecliptic-J2000 → equatorial-J2000 to match empyrean's frame.
-    pos = _ecl_to_eq((x_e, y_e, z_e))
+    # Rotate ecliptic-J2000 → equatorial-J2000 to match empyrean's frame,
+    # then recenter heliocentric → SSB with the Sun's state at the target
+    # epoch (carried on the plan row).
+    helio_eq = _ecl_to_eq((x_e, y_e, z_e))
+    pos = [helio_eq[i] + sun_t[i] for i in range(3)]
     res: dict = {"oorb_pos_au": pos, "oorb_time_ms": ms}
     ref = row.get("ref_pos_au")
     if ref is not None:
@@ -246,16 +296,26 @@ def _propagate(row: dict, oorb_bin: Path, env: dict[str, str]) -> dict | None:
     return res
 
 
-def _ephemeris(row: dict, oorb_bin: Path, env: dict[str, str]) -> dict | None:
-    ic_pos = row.get("ic_pos_au")
-    ic_vel = row.get("ic_vel_au_d")
+def _ephemeris(row: dict, oorb_bin: Path, env: dict[str, str], sun_epoch: dict) -> dict | None:
     obs_code = row.get("observer")
-    if ic_pos is None or ic_vel is None or not obs_code:
+    if not obs_code:
         return None
+    helio = _heliocentric_ic(row, sun_epoch)
+    if helio is None:
+        return None
+    ic_pos, ic_vel = helio
 
     with tempfile.TemporaryDirectory(prefix="oorb_eph_") as td:
-        in_path = Path(td) / "in.orb"
+        # The .des extension matters: oorb picks its input parser from the
+        # file extension, and a ".orb" name routes to the fixed-width
+        # OpenOrb-format reader, which silently parses zero orbits out of a
+        # DES-format file. The ephemeris task takes --start-mjd-utc (its
+        # only epoch option — unknown flags like --epoch-mjd-tdb are
+        # silently ignored, yielding an empty ephemeris), so convert the
+        # plan's TDB epoch with the leap-second table (TDB≈TT to <2 ms).
+        in_path = Path(td) / "in.des"
         _write_des_file(in_path, row["object"], row["epoch_mjd_tdb"], ic_pos, ic_vel)
+        t_utc = row["t_mjd_tdb"] - _tt_minus_utc_s(row["t_mjd_tdb"]) / 86400.0
         t0 = time.perf_counter()
         out, err, rc = _run_oorb(
             oorb_bin,
@@ -263,8 +323,8 @@ def _ephemeris(row: dict, oorb_bin: Path, env: dict[str, str]) -> dict | None:
                 "--task=ephemeris",
                 f"--orb-in={in_path}",
                 f"--code={obs_code}",
-                f"--epoch-mjd-tdb={row['t_mjd_tdb']:.10f}",
-                "--separately",
+                f"--start-mjd-utc={t_utc:.10f}",
+                "--timespan=0",
             ],
             env,
         )
@@ -397,7 +457,32 @@ def main() -> int:
     if oorb_data.exists():
         env["OORB_DATA"] = str(oorb_data)
     if oorb_conf.exists():
-        env["OORB_CONF"] = str(oorb_conf)
+        # The stock oorb.conf ships `dynamical_model: 2-body` — no planetary
+        # perturbations at all, which is catastrophically wrong over the
+        # ±15 yr grid (~10⁴ km/month of missing perturbation signal; 10⁷ km
+        # over 15 yr). Force full n-body (the conf's perturber list is
+        # already all-planets + Moon + Pluto, relativity on). Asteroid
+        # perturbers stay off (BC430 not installed) — OpenOrb's residual vs
+        # Horizons therefore retains the km-scale asteroid-perturbation
+        # signal, which is honest and documented, not a bug.
+        conf_text = oorb_conf.read_text()
+        patched, n_sub = re.subn(
+            r"(?m)^dynamical_model:\s+2-body\s*$",
+            "dynamical_model:      n-body",
+            conf_text,
+        )
+        if n_sub != 1 and not re.search(r"(?m)^dynamical_model:\s+n-body\s*$", conf_text):
+            print(
+                f"ERROR: could not force n-body dynamics in {oorb_conf} "
+                f"(matched {n_sub} 'dynamical_model: 2-body' lines)",
+                file=sys.stderr,
+            )
+            return 1
+        conf_dir = Path(tempfile.mkdtemp(prefix="oorb_conf_"))
+        nbody_conf = conf_dir / "oorb_nbody.conf"
+        nbody_conf.write_text(patched)
+        env["OORB_CONF"] = str(nbody_conf)
+        print("oorb dynamics: n-body (planets + Moon + Pluto, relativity on; asteroid perturbers off)")
 
     plan = json.loads(args.input.read_text())
     if not plan:
@@ -405,6 +490,16 @@ def main() -> int:
         return 1
 
     print(f"Loaded {len(plan)} plan rows; running through oorb...", file=sys.stderr)
+
+    # Sun SSB state at each object's IC epoch (the dt=0 propagation row).
+    sun_epoch: dict = {}
+    for r in plan:
+        if (
+            r.get("test_type") == "propagation"
+            and r.get("dt_days") == 0.0
+            and r.get("ref_sun_pos_au") is not None
+        ):
+            sun_epoch[r["object"]] = (r["ref_sun_pos_au"], r["ref_sun_vel_au_d"])
 
     timestamp = datetime.now(timezone.utc).isoformat()
     out_rows: list[dict] = []
@@ -423,9 +518,9 @@ def main() -> int:
         new["timestamp"] = timestamp
         tt = r.get("test_type")
         if tt == "propagation":
-            update = _propagate(r, oorb_bin, env)
+            update = _propagate(r, oorb_bin, env, sun_epoch)
         elif tt == "ephemeris":
-            update = _ephemeris(r, oorb_bin, env)
+            update = _ephemeris(r, oorb_bin, env, sun_epoch)
         else:
             update = None
         if update is None:
