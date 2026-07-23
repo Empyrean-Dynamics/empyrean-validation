@@ -1242,6 +1242,14 @@ pub fn generate_report(
   #tool-selector select:focus {{ outline: none; border-color: var(--ed-accent); box-shadow: 0 0 0 2px var(--ed-focus-ring); }}
   #tool-swap {{ background: var(--ed-input-bg); color: var(--ed-text-secondary); border: 1px solid var(--ed-input-border); border-radius: var(--ed-radius-sm); padding: 5px 9px; cursor: pointer; font-family: var(--ed-font-mono); }}
   #tool-swap:hover {{ color: var(--ed-accent); border-color: var(--ed-accent); }}
+  /* Capability pillar band (Overview) */
+  .pillar-band {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(250px, 1fr)); gap: 12px; margin-top: 14px; }}
+  .pillar {{ background: var(--ed-surface); border: 1px solid var(--ed-border); border-left-width: 3px; border-radius: var(--ed-radius-sm); padding: 14px 16px; display: flex; flex-direction: column; gap: 7px; }}
+  .pillar .pt {{ font-family: var(--ed-font-mono); font-size: 10px; letter-spacing: 2px; text-transform: uppercase; color: var(--ed-text-secondary); }}
+  .pillar .pc {{ font-family: var(--ed-font-display); font-weight: 700; font-size: 15px; color: var(--ed-text-primary); line-height: 1.35; }}
+  .pillar .pp {{ font-family: var(--ed-font-mono); font-size: 10px; color: var(--ed-text-muted); line-height: 1.9; }}
+  .pillar .pl {{ font-family: var(--ed-font-mono); font-size: 10px; margin-top: auto; }}
+  .pillar .pl a {{ color: var(--ed-accent); text-decoration: none; cursor: pointer; }}
   /* Performance strip */
   .speed-group {{ margin: 18px 0 6px; }}
   .speed-group-title {{ font-family: var(--ed-font-mono); font-size: 10px; letter-spacing: 2px; text-transform: uppercase; color: var(--ed-text-secondary); margin-bottom: 8px; }}
@@ -1303,6 +1311,7 @@ pub fn generate_report(
 
 <div class="section" id="s00-hero" data-view="overview" style="padding-bottom:8px;">
   <div id="hero-strip"></div>
+  <div id="pillar-band" class="pillar-band"></div>
 </div>
 
 <div class="section" id="tool-selector" data-view="both" style="padding-bottom:16px;">
@@ -4275,6 +4284,106 @@ function buildHero() {{
 }}
 try {{ buildHero(); }} catch (e) {{ console.error('buildHero failed', e); }}
 onToolChange(() => buildHero());
+
+// ─────────── Capability pillars (Overview) ───────────
+// The four claims the report exists to prove — accuracy, OD robustness,
+// uncertainty, complex orbits — each with proof chips computed from THIS
+// run's data, pinned to the Empyrean-vs-JPL comparison (selector-independent).
+function pillarGo(page, id) {{
+    showPage(page);
+    const el = document.getElementById(id);
+    if (el) el.scrollIntoView({{ block: 'start' }});
+}}
+function buildPillars() {{
+    const el = document.getElementById('pillar-band');
+    if (!el) return;
+    const odCh = results.some(r => r.channel === 'core') ? 'core' : 'rust';
+    const fmt2 = v => v == null || !isFinite(v) ? '—' : v.toFixed(2);
+
+    // Accuracy.
+    const propMed = median(propBase.map(r => propPosDiffKm(r, 'empyrean', 'jpl')).filter(v => v != null));
+    const ephMed = median(ephBase.map(r => {{ const x = ephSepArcsec(r, 'empyrean', 'jpl'); return x == null ? null : x * 1000; }}).filter(v => v != null));
+    const nObj = uniq(results.map(r => r.object)).length;
+    const maxDt = Math.max(...results.filter(r => r.test_type === 'propagation').map(r => Math.abs(r.dt_days)));
+
+    // OD robustness.
+    const od = results.filter(r => r.channel === odCh && r.test_type === 'orbit_determination');
+    const conv = od.filter(r => r.od_converged).length;
+    const chiE = median(od.map(r => r.od_reduced_chi2).filter(v => v != null));
+    const chiJ = median(od.map(r => r.ref_od_reduced_chi2).filter(v => v != null));
+    const radarObjs = uniq(results.filter(r => r.channel === odCh && r.test_type === 'orbit_determination_radar').map(r => r.object)).length;
+    const ngRows = results.filter(r => r.channel === odCh && r.test_type === 'non_grav_recovery');
+    let ngPass = 0;
+    for (const r of ngRows) {{
+        let ok = true, any = false;
+        for (const k of [1, 2, 3]) {{
+            const ic = r['ic_a' + k];
+            if (!ic) continue;
+            any = true;
+            const fit = r['od_a' + k], sg = r['od_a' + k + '_sigma'];
+            if (fit == null || sg == null || !isFinite(fit) || !isFinite(sg) || sg <= 0 || Math.abs(fit - ic) / sg > 3) ok = false;
+        }}
+        if (any && ok) ngPass++;
+    }}
+    const fitters = [['findorb_rms_residual', 'find_orb'], ['layup_reduced_chi2', 'layup'], ['orbfit_rms_arcsec', 'OrbFit']]
+        .filter(([f]) => results.some(r => r[f] != null)).map(([, n]) => n);
+
+    // Uncertainty ladder (rust-channel timing medians).
+    const modeT = m => {{ const v = results.filter(r => r.channel === 'rust' && r.test_type === 'propagation' && r.propagation_uncertainty === m).map(r => r.emp_time_ms).filter(x => x != null); return v.length ? median(v) : null; }};
+    const tF64 = modeT('f64_no_cov'), tJ1 = modeT('first_order_with_cov'), tAuto = modeT('auto');
+    const covRatio = tF64 && tJ1 ? (tJ1 / tF64) : null;
+    const autoRatio = tJ1 && tAuto ? (tAuto / tJ1) : null;
+    const ladder = [['second_order_with_cov', 'Jet2 STT'], ['sigma_point_with_cov', 'σ-point 120'], ['monte_carlo_100_with_cov', 'MC-100']]
+        .filter(([m]) => modeT(m) != null).map(([, n]) => n);
+    const covPairs = typeof orbitComparisons !== 'undefined' ? orbitComparisons.length : 0;
+    const covOk = covPairs ? orbitComparisons.filter(c => c.sigma_equiv_combined != null && isFinite(c.sigma_equiv_combined) && c.sigma_equiv_combined < 1).length : 0;
+
+    // Complex orbits (population zoo + physics flags).
+    const byPop = {{}};
+    for (const r of results) {{ (byPop[r.population] = byPop[r.population] || new Set()).add(r.object); }}
+    const n = p => (byPop[p] ? byPop[p].size : 0);
+    const dtObjs = uniq(results.filter(r => r.ic_non_grav_dt != null).map(r => r.object)).length;
+    const zoo = [];
+    if (n('Comet')) zoo.push(`${{n('Comet')}} comets — Marsden g(r)${{dtObjs ? ' + ΔT lag' : ''}}`);
+    if (n('ISO')) zoo.push(`${{n('ISO')}} interstellar`);
+    if (n('TCO')) zoo.push(`${{n('TCO')}} mini-moons`);
+    if (n('Impactor')) zoo.push(`${{n('Impactor')}} impactors — fitted pre-impact`);
+    if (n('Short-arc NEO')) zoo.push(`${{n('Short-arc NEO')}} short-arc`);
+    if (n('Self-Perturber')) zoo.push(`${{n('Self-Perturber')}} SB441 self-perturbers`);
+    const rest = ['Jupiter Trojan', 'Neptune Trojan', 'Earth Trojan', 'Centaur', 'TNO', 'MBA', 'NEO'].filter(p => n(p) > 0);
+    if (rest.length) zoo.push('+ ' + rest.map(p => p.replace(' Trojan', '-Trojan')).join(', '));
+
+    const pillars = [
+        {{ color: '#5b9bd5', title: 'Accuracy', claim: `${{fmtErrorKm(propMed)}} median vs JPL over ±${{Math.round(maxDt / 365.25)}}-year arcs`,
+           chips: [`${{fmtSepMas(ephMed)}} median sky-plane`, `${{nObj}} objects · every axis vs Horizons truth`],
+           link: ['overview', 's02', 'position agreement ↓'] }},
+        {{ color: '#3d9a6d', title: 'OD robustness', claim: `${{conv}}/${{od.length}} fits converge · χ²ᵣ ${{fmt2(chiE)}}${{chiJ != null ? ' vs JPL ' + fmt2(chiJ) : ''}}`,
+           chips: [
+               radarObjs ? `${{radarObjs}} radar-augmented fits` : null,
+               ngRows.length ? `non-grav recovery ${{ngPass}}/${{ngRows.length}} within 3σ of JPL` : null,
+               fitters.length ? `cross-checked vs ${{fitters.join(' · ')}}` : null,
+           ].filter(Boolean),
+           link: ['comparison', 's09', 'Advanced → Orbit Determination'] }},
+        {{ color: '#8064a2', title: 'Uncertainty', claim: covRatio ? `Full 6×6 covariance for ${{covRatio.toFixed(1)}}× the cost of f64` : 'Uncertainty-first by design',
+           chips: [
+               autoRatio ? `adaptive Auto at ${{autoRatio.toFixed(1)}}× first-order — escalates only when needed` : null,
+               ladder.length ? ladder.join(' · ') + ' — one propagate() call' : null,
+               covPairs ? `${{covOk}}/${{covPairs}} fitted covariances consistent with JPL (σ_equiv < 1)` : null,
+           ].filter(Boolean),
+           link: ['empyrean', 's11', 'Internals → Uncertainty Cost'] }},
+        {{ color: '#e8a040', title: 'Complex orbits', claim: 'One force model across the solar-system zoo',
+           chips: zoo,
+           link: ['overview', 's03', 'error growth by population ↓'] }},
+    ];
+    el.innerHTML = pillars.map(p => `
+      <div class="pillar" style="border-left-color:${{p.color}}">
+        <div class="pt" style="color:${{p.color}}">${{p.title}}</div>
+        <div class="pc">${{p.claim}}</div>
+        <div class="pp">${{p.chips.join('<br/>')}}</div>
+        <div class="pl"><a onclick="pillarGo('${{p.link[0]}}','${{p.link[1]}}')">${{p.link[2]}}</a></div>
+      </div>`).join('');
+}}
+try {{ buildPillars(); }} catch (e) {{ console.error('buildPillars failed', e); }}
 
 // ─────────── tool-pair selector + page switch: wire + initial state ───────────
 // Runs last, after every panel has rendered and registered its renderer. Each
