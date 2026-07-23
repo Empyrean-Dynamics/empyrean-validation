@@ -1498,7 +1498,7 @@ pub fn generate_report(
 <div class="section" id="s-speed" data-view="both">
   <div class="section-title">Performance &mdash; Wall Clock</div>
   <div class="basic-caption">Median wall clock per row, per tool — log scale. The chips explain the floors: in-process libraries sit at ms, subprocess tools pay spawn + ephemeris load, JAX pays per-call JIT.</div>
-  <div class="section-desc">Median wall clock per row for every tool with timing data, by axis (log-scaled bars). These are <b>single-particle replay</b> workloads — batch throughput is a different race — and each tool runs at its own accuracy target, so speed alone is not a ranking. Architecture chips mark the structural floors: <b>subprocess</b> tools (OpenOrb, layup, find_orb) pay process spawn + ephemeris load per invocation; <b>JAX</b> (jorbit) pays a per-call JIT/dispatch floor that would amortize in batched use; find_orb's OD bar is <b>per fit</b> (its marginal per-epoch propagation cost is ≈ 0 — the invocation toll includes the full astrometry pipeline). Empyrean shows both the bare-f64 path and the production uncertainty-first path (Jet1 + 6×6 covariance). Each median covers the rows that tool actually completed — object mixes can differ between tools until a full catalog run.</div>
+  <div class="section-desc">Median wall clock per row for every tool with timing data, by axis (log-scaled bars). These are <b>single-particle replay</b> workloads — batch throughput is a different race — and each tool runs at its own accuracy target, so speed alone is not a ranking. Architecture chips mark the structural floors: <b>subprocess</b> tools (OpenOrb, layup, find_orb) pay process spawn + ephemeris load per invocation; <b>JAX</b> (jorbit) pays a per-call JIT/dispatch floor that would amortize in batched use; find_orb's OD bar is <b>per fit</b> (its marginal per-epoch propagation cost is ≈ 0 — the invocation toll includes the full astrometry pipeline). Empyrean shows its full uncertainty ladder — bare f64, the production Jet1 + 6×6 covariance path, adaptive Auto, Jet2 STM+STT, the 120-sample sigma-point transform, and seeded 100-sample Monte Carlo — all through the same <code>propagate()</code> call. Each median covers the rows that tool actually completed — object mixes can differ between tools until a full catalog run.</div>
   <div id="speed-strip"></div>
 </div>
 
@@ -2563,6 +2563,14 @@ if (assistResults.length > 0) {{
         {{ tag: 'auto', label: 'Auto',
            empColor: '#8064a2', assistColor: '#8064a2',
            empSymbol: 'triangle-up', assistSymbol: 'cross-open',
+           showAssist: false }},
+        {{ tag: 'sigma_point_with_cov', label: 'Sigma-point (120 samples)',
+           empColor: '#3d9a6d',
+           empSymbol: 'diamond',
+           showAssist: false }},
+        {{ tag: 'monte_carlo_100_with_cov', label: 'Monte Carlo (100 samples, seeded)',
+           empColor: '#e8a040',
+           empSymbol: 'x',
            showAssist: false }},
     ]);
 }}
@@ -4169,6 +4177,10 @@ function buildSpeedStrip() {{
             {{ label: 'kete', color: KCOL, chip: CHIP_IN, v: extT('propagation', 'kete_time_ms') }},
             {{ label: 'Empyrean (f64)', color: toolColor('empyrean'), chip: CHIP_IN, v: empT('propagation', r => r.propagation_uncertainty === 'f64_no_cov') }},
             {{ label: 'Empyrean (+6×6 cov)', color: toolColor('empyrean'), chip: 'in-process · production default', v: empT('propagation', r => r.propagation_uncertainty === 'first_order_with_cov') }},
+            {{ label: 'Empyrean (Auto)', color: toolColor('empyrean'), chip: 'in-process · adaptive escalation', v: empT('propagation', r => r.propagation_uncertainty === 'auto') }},
+            {{ label: 'Empyrean (Jet2 STT)', color: toolColor('empyrean'), chip: 'in-process · STM + STT, 6+21 partials', v: empT('propagation', r => r.propagation_uncertainty === 'second_order_with_cov') }},
+            {{ label: 'Empyrean (σ-point)', color: toolColor('empyrean'), chip: 'in-process · 120 sigma samples', v: empT('propagation', r => r.propagation_uncertainty === 'sigma_point_with_cov') }},
+            {{ label: 'Empyrean (MC-100)', color: toolColor('empyrean'), chip: 'in-process · 100 seeded samples', v: empT('propagation', r => r.propagation_uncertainty === 'monte_carlo_100_with_cov') }},
             {{ label: 'OpenOrb', color: toolColor('oorb'), chip: CHIP_SUB, v: extT('propagation', 'oorb_time_ms') }},
             {{ label: 'jorbit', color: JCOL, chip: CHIP_JAX, v: extT('propagation', 'jorbit_time_ms') }},
         ] }},

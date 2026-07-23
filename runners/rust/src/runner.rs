@@ -270,6 +270,9 @@ pub fn run_propagation_validation(
         tag: &'static str,
         attach: bool,
         method: UncertaintyMethod,
+        /// Timing repetitions (best-of-N). The sampling methods cost
+        /// ~100-120 propagations per call, so they measure once.
+        timing_runs: usize,
     }
     let modes: Vec<UncertaintyAxis> = if config.attach_covariance {
         vec![
@@ -277,21 +280,41 @@ pub fn run_propagation_validation(
                 tag: "first_order_with_cov",
                 attach: true,
                 method: UncertaintyMethod::FirstOrder,
+                timing_runs: 0,
             },
             UncertaintyAxis {
                 tag: "f64_no_cov",
                 attach: false,
                 method: UncertaintyMethod::FirstOrder,
+                timing_runs: 0,
             },
             UncertaintyAxis {
                 tag: "second_order_with_cov",
                 attach: true,
                 method: UncertaintyMethod::SecondOrder,
+                timing_runs: 0,
             },
             UncertaintyAxis {
                 tag: "auto",
                 attach: true,
                 method: UncertaintyMethod::auto(),
+                timing_runs: 0,
+            },
+            // The full uncertainty ladder, for the report's performance
+            // strip: sigma-point (120 samples at the wrapper defaults) and
+            // seeded Monte Carlo with 100 samples. Sampling methods cost
+            // ~100-120 propagations per call — timing_runs = 1.
+            UncertaintyAxis {
+                tag: "sigma_point_with_cov",
+                attach: true,
+                method: UncertaintyMethod::sigma_point(),
+                timing_runs: 1,
+            },
+            UncertaintyAxis {
+                tag: "monte_carlo_100_with_cov",
+                attach: true,
+                method: UncertaintyMethod::monte_carlo(100),
+                timing_runs: 1,
             },
         ]
     } else {
@@ -299,6 +322,7 @@ pub fn run_propagation_validation(
             tag: "f64_no_cov",
             attach: false,
             method: UncertaintyMethod::FirstOrder,
+            timing_runs: 0,
         }]
     };
 
@@ -383,7 +407,12 @@ pub fn run_propagation_validation(
                         let mut emp_state: Option<[f64; 3]> = None;
                         let mut failed = false;
 
-                        for _ in 0..config.n_timing_runs {
+                        let runs = if axis.timing_runs > 0 {
+                            axis.timing_runs
+                        } else {
+                            config.n_timing_runs
+                        };
+                        for _ in 0..runs {
                             let t0 = Instant::now();
                             match ctx.propagate(&[orbit.clone()], &[target], &prop_config) {
                                 Ok(result) => {
@@ -552,6 +581,13 @@ pub fn run_propagation_validation(
                 }
 
                 // Ephemeris tests (Standard tier) — one row per observing site.
+                // Only for the two plan modes (first_order / f64): the
+                // timing-ladder modes (Jet2 / auto / sigma-point / MC) have no
+                // ephemeris plan rows to compare against, and the sampling
+                // methods would pay ~100 propagations per site for nothing.
+                if !matches!(axis.tag, "first_order_with_cov" | "f64_no_cov") {
+                    continue;
+                }
                 for &obs_code in obs_codes {
                 for &dt in data.dt_list {
                     let Some(hor) = data.horizons_ephemeris.get(&(obs_code, dt as i64)) else {
