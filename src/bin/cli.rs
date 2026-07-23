@@ -487,6 +487,7 @@ fn merge_orbfit(
         r.orbfit_n_obs_used = f["orbfit_n_obs_used"].as_u64().map(|v| v as u32);
         r.orbfit_n_obs_rejected = f["orbfit_n_obs_rejected"].as_u64().map(|v| v as u32);
         r.orbfit_time_ms = f["orbfit_time_ms"].as_f64();
+        r.orbfit_error = f["orbfit_error"].as_str().map(String::from);
         n += 1;
     }
     Ok(n)

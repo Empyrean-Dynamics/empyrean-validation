@@ -557,6 +557,13 @@ pub struct ValidationResult {
     /// OrbFit wall-clock per row (ms).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub orbfit_time_ms: Option<f64>,
+    /// OrbFit per-object failure message (e.g. neofit2.x encounter-
+    /// propagation overflow on an impact-terminated arc). Distinguishes
+    /// "attempted and failed" from "never attempted" (both leave the
+    /// numeric fields `None`); a failed fit must stay visible in the
+    /// merged report, never collapse into a blank.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub orbfit_error: Option<String>,
 
     // ── layup external reference ────────────────────────────────────
     // OD reference. Independent orbit fitter (Smithsonian / CfA; Matthew
@@ -716,6 +723,7 @@ impl ValidationResult {
             orbfit_n_obs_used: None,
             orbfit_n_obs_rejected: None,
             orbfit_time_ms: None,
+            orbfit_error: None,
             layup_chi2: None,
             layup_reduced_chi2: None,
             layup_n_obs_used: None,

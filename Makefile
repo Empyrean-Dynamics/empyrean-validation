@@ -261,12 +261,15 @@ build-empyrean-validation:
 # Default external set: ASSIST + OpenOrb + find_orb + kete + jorbit +
 # layup all run as part of `make run` and fold into the merged report.
 #
-# OrbFit ships its runner via Docker but is not yet end-to-end — the
-# neofit2.x Cartesian-seed workflow is in progress (see
-# runners/orbfit/TODO.md). It stays gated behind `WITH_ORBFIT=1` until
-# the runner produces real fits; the gate flips to default-on in the
-# same change that lands the working runner.
-WITH_ORBFIT ?=
+# OrbFit runs its runner via the MPC's Docker container (neofit2.x): it
+# refits each OD object from empyrean's IC as a heliocentric Cartesian
+# seed and folds the post-fit RMS + observation counts onto the OD rows.
+# Default-on. On Apple Silicon the amd64-only image runs under qemu
+# (5-10x slower per fit — patience, not a hang); native amd64 CI is fast.
+# Set WITH_ORBFIT= (empty) to skip on hosts without Docker. Deep-encounter
+# impactors (e.g. 2008 TC3, 2024 BX1) can overflow neofit2.x's encounter
+# propagation and are surfaced as per-object errors, never silently.
+WITH_ORBFIT ?= 1
 # layup: OD reference from ADES PSV astrometry (Smithsonian, ASSIST-backed).
 # Default-on; set WITH_LAYUP= (empty) to skip on hosts where its heavy
 # C-extension venv is unavailable.
@@ -412,9 +415,9 @@ setup-orbfit:
 
 run-orbfit: $(ORBFIT_OUT)
 $(ORBFIT_OUT): $(PLAN)
-	@echo "──── OrbFit: external OD reference (via docker) ────────"
+	@echo "──── OrbFit: external OD reference (neofit2.x via docker) ──"
 	@$(EMP_VAL_RUNNERS)/orbfit/run_orbfit.py \
-	    --plan $(PLAN) --output $(ORBFIT_OUT)
+	    --plan $(PLAN) --output $(ORBFIT_OUT) --psv-dir $(FIXTURES_PSV)
 
 # Optional: empyrean-core direct (no FFI). Replays the plan in-process so
 # the report's Section 09 can show binding-translation drift (rust wrapper

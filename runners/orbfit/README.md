@@ -29,51 +29,67 @@ OrbFit is particularly valuable as a comparison point because:
 | Maintainer | Federica Spoto et al., IAU Minor Planet Center |
 | License | GPL (OrbFit is free software; never linked into empyrean) |
 
-## Status
+## How it works
 
-🚧 **Investigation complete; implementation deferred.** See
-[`TODO.md`](TODO.md) for the full investigation summary and the
-`neofit2.x` + Cartesian-seed plan that the next session should
-pick up.
+OrbFit's production workflow (the one the MPC uses to maintain its NEO
+catalog) never does blind IOD on a long arc — it always **refines a
+prior orbit** against the astrometry. `neofit2.x` is that refit step.
+This runner drives it exactly as the MPC does, but seeds the prior orbit
+from **empyrean's initial condition** instead of a previous MPC solution
+(a Cartesian-seeded refit, not an independent initial-orbit
+determination):
 
-Short version: OrbFit's binaries (`neocp_prelim.x`, `fitobs.x` Gauss
-IOD, `neofit2.x`) all assume a prior orbit exists somewhere — the
-MPC workflow chains discovery IOD with subsequent refits. None of
-them do blind IOD on a 13-year arc cleanly. The right path is to
-write a Cartesian seed at `epoch/<desig>.eq0` from empyrean's plan
-row IC (ICRF→ECLM rotation) and drive `neofit2.x` with it.
+1. **Seed.** Each OD object's IC (Cartesian state at `epoch_mjd_tdb`,
+   from the plan's propagation/ephemeris rows — ICRF, SSB-centered) is
+   converted to OrbFit's heliocentric ecliptic-J2000 (`ECLM J2000`)
+   frame — subtract the Sun's SSB state (`ref_sun_pos_au`), rotate ICRF
+   → ecliptic — and written as an OEF2.0 `CAR` record at
+   `epoch/<desig>.eq0`. The SSB→heliocentric shift matters: for
+   deep-Earth-approaching NEOs (Apophis's 0.029 AU 2020 encounter) the
+   ~0.007 AU Sun–SSB offset is a large fraction of the encounter
+   distance and, left in, corrupts neofit2.x's two-body encounter
+   segments (`ever_pitkin` overflow). Objects with no deep encounter
+   tolerate a raw SSB seed, so when the plan carries no Sun state the
+   runner falls back to SSB, records `orbfit_seed_origin="ssb"`, and
+   warns — the fallback only ever fails *loudly*.
+2. **Fit.** `neofit2.x < input` with the MPC's production option file
+   (`neofit.nop.std`, or `neofit.nop.ngr` when the plan row carries a
+   non-gravitational signal — `ic_a1`/`ic_a2`/`ic_a3` — as for Apophis,
+   Phaethon, 2024 YR4). Observations come from the ADES PSV fixtures
+   (`mpcobs/<desig>.psv`, ingested directly), fit with the `gaiaDR2_mix`
+   error model + CMC2003 outlier rejection.
+3. **Parse.** The fitted Cartesian state + covariance from the `CAR`
+   record of `epoch/<desig>.eq0_postfit`; the weighted RMS + per-obs
+   SEL flags (used/rejected) from `mpcobs/<desig>.rwo`. The state is
+   rotated ecliptic → ICRF so emitted rows carry ICRF (heliocentric).
 
-What's in place (won't break anything in `make all`):
+Reproduces the container's own bundled unit tests (`2021UA12`, `3200` —
+`rms_ast < 2″`) and fits empyrean's catalog from its ICs (Eros 0.59″,
+Apophis with non-gravs 0.50″). Deep-encounter impactors whose arcs run
+into Earth (2008 TC3, 2024 BX1, …) can overflow neofit2.x's encounter
+propagation; those surface as per-object `orbfit_error`, never a silent
+skip.
 
-- [x] `setup.sh` — pulls + smoke-tests the container
-- [x] `run_orbfit.py` — docker plumbing, scratch-dir setup, `.fel` /
-      `.rwo` parsers; **`process_od_row` short-circuits with an
-      `orbfit_error` until the seed-writer path is wired**
-- [x] Schema extension: `orbfit_*` fields on `ValidationResult`
-- [x] CLI extension: `--orbfit` flag on `merge-external`
-- [x] Makefile wiring: gated behind `WITH_ORBFIT=1` so the runner
-      does not execute as part of `make all`
+The runner is **default-on** in `make all` (`WITH_ORBFIT=1`). On Apple
+Silicon the amd64-only image runs under qemu, ~5–10× slower per fit
+(tens of seconds each) — slow is expected, not a hang; native amd64 CI
+is fast.
 
-What's pending (see [`TODO.md`](TODO.md) for the worked-out plan):
-
-- [ ] Cartesian-seed `.eq0` writer (ICRF→ECLM rotation; obliquity
-      constants already imported in `run_orbfit.py`)
-- [ ] Swap `process_od_row_real` back to `process_od_row` and update
-      the docker exec to invoke `neofit2.x < input`
-- [ ] Sanity-check against the container's bundled `2021UA12` /
-      `3200` NEA test cases before pointing at empyrean's catalog
-- [ ] Report integration alongside ASSIST + OpenOrb + find_orb
-
-## Usage (once setup is filled in)
+## Usage
 
 ```bash
-# One-time: pull the MPC container
+# One-time: pull the MPC container (~3.85 GB).
 ./setup.sh
 
-# Per-run: replay every OD row from the canonical plan through OrbFit
-python3 run_orbfit.py \
+# Per-run: refit every OD row from the canonical plan through neofit2.x.
+./run_orbfit.py \
     --plan ../../results/validation_plan.json \
-    --output ../../results/validation_orbfit.json
+    --output ../../results/validation_orbfit.json \
+    --psv-dir ../../fixtures/psv
+
+# Test subset (a few objects, e.g. a plain NEO + a non-grav one):
+./run_orbfit.py --plan ../../results/validation_plan.json \
+    --output /tmp/orbfit_test.json --only Eros,Apophis
 ```
 
 The output JSON is consumed by `empyrean-validation merge-external
