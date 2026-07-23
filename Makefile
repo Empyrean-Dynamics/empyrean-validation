@@ -258,20 +258,19 @@ build-empyrean-validation:
 # channel consumes), then the four replay channels (python / c / cli / core),
 # then the externals. Each non-rust channel reads exactly one file and writes
 # exactly one file.
-# Public-report channel set: ASSIST + OrbFit + OpenOrb + find_orb are
-# the four canonical externals surfaced in the headline report. kete +
-# jorbit stay as opt-in runners — invoke `make run-kete` / `make run-jorbit`
-# explicitly to produce their JSONs, and pass `INCLUDE_OPTIONAL=1` to
-# the `report` target to surface them in the rendered HTML.
+# Default external set: ASSIST + OpenOrb + find_orb + kete + jorbit +
+# layup all run as part of `make run` and fold into the merged report.
 #
-# OrbFit ships its runner via Docker but is not yet end-to-end
-# (Cartesian seed orbit + equinoctial→Cartesian conversion pending).
-# Set `WITH_ORBFIT=1` to opt in once those are in place.
+# OrbFit ships its runner via Docker but is not yet end-to-end — the
+# neofit2.x Cartesian-seed workflow is in progress (see
+# runners/orbfit/TODO.md). It stays gated behind `WITH_ORBFIT=1` until
+# the runner produces real fits; the gate flips to default-on in the
+# same change that lands the working runner.
 WITH_ORBFIT ?=
-# layup is opt-in too (WITH_LAYUP=1) — brand-new upstream (v0.0.1) with a heavy
-# C-extension build, so it stays out of the default `make all` path, same as
-# OrbFit.
-WITH_LAYUP ?=
+# layup: OD reference from ADES PSV astrometry (Smithsonian, ASSIST-backed).
+# Default-on; set WITH_LAYUP= (empty) to skip on hosts where its heavy
+# C-extension venv is unavailable.
+WITH_LAYUP ?= 1
 run: run-rust run-python run-c run-cli run-assist run-findorb run-oorb \
      run-kete run-jorbit \
      $(if $(WITH_ORBFIT),run-orbfit,) \

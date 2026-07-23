@@ -77,7 +77,10 @@ env:
   # version would add cost with no signal. Per-version *Python* coverage lives in
   # the empyrean repo's own CI (lint + mypy + tests across the support range).
   PYTHON_VERSION: "3.12"
-  OBJECTS: ${{ inputs.objects || 'Apophis,Bennu,Eros,Vesta,2018 LA' }}
+  # Empty OBJECTS = the full 50-object catalog. Every trigger (push, cron,
+  # sibling dispatch) validates the complete catalog; pass a comma-separated
+  # subset via workflow_dispatch `objects` for a quick targeted run.
+  OBJECTS: ${{ inputs.objects || '' }}
   TIER: ${{ inputs.tier || 'standard' }}
 
 jobs:
@@ -111,7 +114,10 @@ jobs:
     needs: precheck
     if: needs.precheck.outputs.empyrean-available == 'true'
     runs-on: ubuntu-latest
-    timeout-minutes: 90
+    # Full 50-object catalog across every channel. 360 is the
+    # GitHub-hosted runner ceiling; if the suite grows past it the
+    # options are sharding by population or a larger runner.
+    timeout-minutes: 360
     steps:
       # ── Trace what fired this run ──────────────────────────────
       # Surfaces the sender repo + sha/tag in the GitHub UI's Annotations
@@ -301,6 +307,15 @@ jobs:
           path: empyrean-validation/runners/jorbit/.venv
           key: jorbit-venv-${{ hashFiles('empyrean-validation/runners/jorbit/setup.sh') }}
 
+      # layup venv — heavy C-extension + sorcha/jax dep graph, several
+      # minutes to resolve cold. Default-on channel since the Makefile
+      # flipped WITH_LAYUP to 1.
+      - name: Cache layup venv
+        uses: actions/cache@v4
+        with:
+          path: empyrean-validation/runners/layup/.venv
+          key: layup-venv-${{ hashFiles('empyrean-validation/runners/layup/setup.sh') }}
+
       # find_orb is a from-source build of four C/C++ libraries (lunar,
       # jpl_eph, sat_code, find_orb). Cache the build tree + install
       # prefix, otherwise it's ~5 minutes of compile every run.
@@ -324,7 +339,7 @@ jobs:
       - name: Install system libraries (LAPACK/BLAS for OpenOrb)
         run: sudo apt-get update && sudo apt-get install -y --no-install-recommends liblapack-dev libblas-dev
 
-      - name: One-time external setup (ASSIST/kete/jorbit venvs + find_orb + OpenOrb build)
+      - name: One-time external setup (ASSIST/kete/jorbit/layup venvs + find_orb + OpenOrb build)
         working-directory: empyrean-validation
         env:
           DATA_DIR: ${{ env.EMPYREAN_DATA_DIR }}
