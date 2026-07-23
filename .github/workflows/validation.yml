@@ -88,9 +88,13 @@ on:
   repository_dispatch:
     types: [sibling-main-push, sibling-tag-push]
 
+# Default to read-only for EVERY job. id-token:write (which mints the GCP
+# OIDC token) is granted ONLY to the reduce job that publishes to GCS — never
+# workflow-wide, because the external matrix legs build and run untrusted
+# upstream tool code and must not be able to exchange an OIDC token for the
+# empyrean-ci service account.
 permissions:
   contents: read
-  id-token: write  # Workload Identity Federation for GCS upload
 
 env:
   CARGO_TERM_COLOR: always
@@ -133,12 +137,29 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GH_PAT }}
         run: |
-          if gh api repos/Empyrean-Dynamics/empyrean --silent 2>/dev/null; then
-            echo "available=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "available=false" >> "$GITHUB_OUTPUT"
-            echo "::notice title=Validation suite skipped::Empyrean-Dynamics/empyrean is not published yet; the full-channel suite resumes automatically once the wrapper repo exists."
-          fi
+          # Split the axes on the HTTP status: a 404 genuinely means the
+          # wrapper repo is not published yet (skip the suite cleanly); a
+          # 401/403/5xx/000 means an expired-PAT or network failure and MUST
+          # fail loudly, never silently disable the release gate by mapping
+          # every non-200 to "unavailable".
+          code=$(curl -sS -o /dev/null -w '%{http_code}' \
+            -H "Authorization: Bearer $GH_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            https://api.github.com/repos/Empyrean-Dynamics/empyrean || echo 000)
+          echo "Probe HTTP status: $code"
+          case "$code" in
+            200)
+              echo "available=true" >> "$GITHUB_OUTPUT"
+              ;;
+            404)
+              echo "available=false" >> "$GITHUB_OUTPUT"
+              echo "::notice title=Validation suite skipped::Empyrean-Dynamics/empyrean is not published yet; the full-channel suite resumes automatically once the wrapper repo exists."
+              ;;
+            *)
+              echo "::error title=Validation precheck failed::Probing Empyrean-Dynamics/empyrean returned HTTP $code (not 200/404) — likely an expired GH_PAT or a GitHub API outage. Failing loudly rather than silently disabling the suite."
+              exit 1
+              ;;
+          esac
 
   # ── prep ───────────────────────────────────────────────────────────
   # Download + cache all shared data ONCE, build the rust reference, and
@@ -459,12 +480,15 @@ jobs:
           path: ~/.empyrean/cache
           key: ${{ env.JPL_CACHE_KEY }}
 
-      # One cache per tool build tree, keyed on the tool's setup.sh. The
-      # path list is a superset (venv / install / build + find_orb's
-      # ~/include ~/lib); absent members are simply not cached. OrbFit is
-      # a Docker pull with no on-disk tree here — its container is not
-      # cached (native amd64 on the runner makes the fit itself fast; the
-      # ~3 GB pull is the cost, a candidate for docker-layer caching later).
+      # One cache per tool build tree. The path list is a superset (venv /
+      # install / build + find_orb's ~/include ~/lib); absent members are
+      # simply not cached. It ALSO caches runners/assist/.venv because the
+      # find_orb and OpenOrb runners execute under the ASSIST interpreter
+      # ($(ASSIST_PY) is a prerequisite of run-findorb / run-oorb), so those
+      # two legs build the assist venv too — the key hashes both the tool's
+      # and assist's setup.sh so either changing invalidates it. OrbFit is a
+      # Docker pull with no on-disk tree here — not cached (native amd64 makes
+      # the fit fast; the ~3 GB pull is a candidate for docker-layer caching).
       - name: Cache tool build
         if: matrix.tool != 'orbfit'
         uses: actions/cache@v4
@@ -473,9 +497,10 @@ jobs:
             empyrean-validation/runners/${{ matrix.tool }}/.venv
             empyrean-validation/runners/${{ matrix.tool }}/install
             empyrean-validation/runners/${{ matrix.tool }}/build
+            empyrean-validation/runners/assist/.venv
             ~/include
             ~/lib
-          key: ${{ matrix.tool }}-${{ hashFiles(format('empyrean-validation/runners/{0}/setup.sh', matrix.tool)) }}
+          key: ${{ matrix.tool }}-${{ hashFiles(format('empyrean-validation/runners/{0}/setup.sh', matrix.tool), 'empyrean-validation/runners/assist/setup.sh') }}
 
       # OpenOrb's Fortran build links LAPACK/BLAS, not present by default.
       - name: Install LAPACK/BLAS (OpenOrb only)
@@ -488,11 +513,19 @@ jobs:
           name: prep-plan-and-rust
           path: empyrean-validation/results
 
+      # find_orb and OpenOrb run under the ASSIST venv interpreter, so their
+      # legs must build it explicitly (their `make run-*` would otherwise
+      # trigger an uncached assist pip build mid-run, coupling all three
+      # comparators to assist-setup health). Other tools are self-contained.
       - name: Setup ${{ matrix.tool }}
         working-directory: empyrean-validation
         env:
           DATA_DIR: ${{ env.EMPYREAN_DATA_DIR }}
-        run: make setup-${{ matrix.tool }}
+        run: |
+          case "${{ matrix.tool }}" in
+            findorb|oorb) make setup-assist setup-${{ matrix.tool }} ;;
+            *)            make setup-${{ matrix.tool }} ;;
+          esac
 
       - name: Run ${{ matrix.tool }}
         working-directory: empyrean-validation
@@ -526,6 +559,12 @@ jobs:
     if: always() && needs.prep.result == 'success' && needs.empyrean.result == 'success'
     runs-on: ubuntu-latest
     timeout-minutes: 45
+    # The only job that publishes to GCS, so the only one that may mint the
+    # OIDC token. Kept off the workflow-level grant so the untrusted external
+    # legs never inherit it.
+    permissions:
+      contents: read
+      id-token: write
     steps:
       - name: Checkout empyrean-validation (default)
         uses: actions/checkout@v4
@@ -584,14 +623,18 @@ jobs:
             --strict-channels python,core
 
       # ── GCS upload ─────────────────────────────────────────────
+      # Publish on every real trigger INCLUDING repository_dispatch — a
+      # sibling-tag-push is exactly the moment the published dashboard must
+      # reflect the new engine tag's validation. (Omitting it left the bucket
+      # stale while the summary still claimed a publish.)
       - name: Authenticate to Google Cloud
-        if: github.event_name == 'schedule' || github.event_name == 'push' || github.event_name == 'workflow_dispatch'
+        if: github.event_name == 'schedule' || github.event_name == 'push' || github.event_name == 'workflow_dispatch' || github.event_name == 'repository_dispatch'
         uses: google-github-actions/auth@v2
         with:
           workload_identity_provider: "projects/786706985139/locations/global/workloadIdentityPools/github-pool/providers/github-provider"
           service_account: "empyrean-ci@empyrean-dynamics.iam.gserviceaccount.com"
       - name: Upload to GCS
-        if: github.event_name == 'schedule' || github.event_name == 'push' || github.event_name == 'workflow_dispatch'
+        if: github.event_name == 'schedule' || github.event_name == 'push' || github.event_name == 'workflow_dispatch' || github.event_name == 'repository_dispatch'
         working-directory: empyrean-validation
         run: |
           TIMESTAMP=$(date -u +%Y%m%d_%H%M%S)
@@ -608,7 +651,7 @@ jobs:
           gcloud storage cp results/od_validation.json         ${{ env.GCS_BUCKET }}/latest/od_validation.json
           gcloud storage cp results/validation_report.html     ${{ env.GCS_BUCKET }}/latest/validation_report.html
           gcloud storage cp results/validation_summary.json    ${{ env.GCS_BUCKET }}/latest/validation_summary.json
-          for ch in rust python core assist findorb oorb kete jorbit layup orbfit; do
+          for ch in rust python c cli core assist findorb oorb kete jorbit layup orbfit; do
             f="results/validation_${ch}.json"
             [ -f "$f" ] && gcloud storage cp "$f" "${{ env.GCS_BUCKET }}/latest/channels/${ch}.json"
           done
@@ -617,7 +660,7 @@ jobs:
           gcloud storage cp results/od_validation.json         ${{ env.GCS_BUCKET }}/archive/${TIMESTAMP}/od_validation.json
           gcloud storage cp results/validation_report.html     ${{ env.GCS_BUCKET }}/archive/${TIMESTAMP}/validation_report.html
           gcloud storage cp results/validation_summary.json    ${{ env.GCS_BUCKET }}/archive/${TIMESTAMP}/validation_summary.json
-          for ch in rust python core assist findorb oorb kete jorbit layup orbfit; do
+          for ch in rust python c cli core assist findorb oorb kete jorbit layup orbfit; do
             f="results/validation_${ch}.json"
             [ -f "$f" ] && gcloud storage cp "$f" "${{ env.GCS_BUCKET }}/archive/${TIMESTAMP}/channels/${ch}.json"
           done
@@ -651,4 +694,11 @@ jobs:
               print(f\"| {ch['channel']} | {ch['n_rows']} | {pass_str} | {dpos:.2e} | {p50:.1f} | {ratio:.2f}x |\")
           " >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
-          echo "Report uploaded to \`${{ env.GCS_BUCKET }}/latest/validation_report.html\`" >> $GITHUB_STEP_SUMMARY
+          # Only claim a GCS publish when one actually happened — otherwise
+          # point at the CI artifact so nobody trusts a stale dashboard.
+          case "${{ github.event_name }}" in
+            schedule|push|workflow_dispatch|repository_dispatch)
+              echo "Report published to \`${{ env.GCS_BUCKET }}/latest/validation_report.html\`" >> $GITHUB_STEP_SUMMARY ;;
+            *)
+              echo "Report NOT published to GCS for event \`${{ github.event_name }}\` — see the \`validation-report\` CI artifact on this run." >> $GITHUB_STEP_SUMMARY ;;
+          esac
