@@ -43,6 +43,12 @@ EMPYREAN_VALIDATION_ROOT := $(ROOT)
 
 OBJECTS ?=
 TIERS ?= standard
+# Matrix-CI plumbing. When PLAN_PREBUILT=1 the plan is assumed to have been
+# produced by an upstream `prep` job and dropped into $(RESULTS_DIR) as an
+# artifact, so the plan target only asserts its presence instead of rebuilding
+# it from the rust channel. This lets the replay + external channels run in
+# isolated matrix legs that never build or run the rust reference themselves.
+PLAN_PREBUILT ?=
 DATA_DIR ?= $(HOME)/.empyrean/data
 CACHE_DIR ?= $(HOME)/.empyrean/cache
 RESULTS_DIR := $(ROOT)/results
@@ -144,7 +150,7 @@ REPORT_INPUTS := $(if $(WITH_CORE),$(RUST)$(comma)$(PYTHON)$(comma)$(C_OUT)$(com
         build-empyrean-c build-rust build-c build-cli build-wheel build-core build-empyrean-validation \
         run-rust run-python run-c run-cli run-assist run-findorb run-oorb run-orbfit \
         run-core run-kete run-jorbit run-layup \
-        merge-external plan
+        merge-external plan reduce
 
 help:
 	@echo "Targets:"
@@ -316,6 +322,15 @@ print(f'Wrote {len(a)+len(b)} unified rust rows ({len(a)} prop+eph, {len(b)} OD)
 # the plan instead of validation_rust.json so they don't depend on rust's
 # results.
 plan: $(PLAN)
+ifeq ($(PLAN_PREBUILT),1)
+# Matrix-CI replay/external leg: the plan was produced by the prep job and
+# staged here as an artifact. Assert its presence loudly rather than silently
+# rebuilding it (which would need the rust reference this leg deliberately
+# does not carry).
+$(PLAN):
+	@test -f $(PLAN) || { echo "ERROR: PLAN_PREBUILT=1 but $(PLAN) is missing — the prep job's plan artifact was not staged into $(RESULTS_DIR)."; exit 1; }
+	@echo "──── Plan: using prebuilt artifact $(PLAN) ─────────────"
+else
 $(PLAN): $(RUST)
 	@echo "──── Plan: strip channel-specific fields from rust unified ─"
 	@$(WHEEL_PY) -c "import json; \
@@ -326,6 +341,7 @@ rows=[r for r in rows if r.get('propagation_uncertainty') not in ('auto', 'secon
 [r.update(channel='plan') for r in rows]; \
 json.dump(rows, open('$(PLAN)','w'), indent=2, default=str); \
 print(f'Wrote {len(rows)} plan rows to $(PLAN) (auto + second-order excluded — rust-only axes)')"
+endif
 
 run-python: $(PLAN)
 	@echo "──── Python channel: replay plan ───────────────────────"
@@ -554,6 +570,44 @@ report: $(RUST) $(PYTHON) $(C_OUT) $(CLI_OUT) $(if $(WITH_CORE),$(CORE_MERGED),$
 	@echo "Report: $(REPORT)"
 	@echo "Summary: $(SUMMARY)"
 	@echo "Channels: rust, python, c, cli$(if $(WITH_CORE), + core,)"
+
+# ── Matrix-CI reduce ───────────────────────────────────────
+# Merge external references + render the report from channel JSONs that
+# upstream matrix legs produced and staged into $(RESULTS_DIR). Unlike the
+# `report` target this does NOT go through the per-channel file-target rules
+# (those would try to rebuild missing binaries), so it never rebuilds a
+# channel — the legs own that. It builds only the validation harness itself,
+# then folds in whatever external channels are actually present: a leg that
+# failed under the matrix's fail-fast:false leaves its JSON absent, and reduce
+# skips it *loudly* (printed to the log and, by its absence, to the report)
+# rather than faking or defaulting it. The empyrean replay channels
+# (rust/python/c/cli/core) come from a single upstream job that succeeds or
+# fails atomically, so REPORT_INPUTS still lists them directly.
+reduce: build-empyrean-validation
+	@echo "──── Reduce: merge external references + render report ─"
+	@ref=""; merged=""; \
+	if [ -f "$(CORE_OUT)" ]; then ref="$(CORE_OUT)"; merged="$(CORE_MERGED)"; \
+	elif [ -f "$(RUST)" ]; then ref="$(RUST)"; merged="$(RUST_MERGED)"; \
+	else echo "ERROR: reduce found neither $(CORE_OUT) nor $(RUST) — no reference channel was staged."; exit 1; fi; \
+	echo "Reference channel: $$ref  →  $$merged"; \
+	flags=""; \
+	add() { if [ -f "$$2" ]; then flags="$$flags $$1 $$2"; else echo "  skip $$1 — $$2 not staged (leg failed or was disabled)"; fi; }; \
+	add --assist        "$(ASSIST_OUT)"; \
+	add --findorb       "$(FINDORB_OUT)"; \
+	add --findorb-radar "$(FINDORB_RADAR_OUT)"; \
+	add --oorb          "$(OORB_OUT)"; \
+	add --kete          "$(KETE_OUT)"; \
+	add --jorbit        "$(JORBIT_OUT)"; \
+	add --orbfit        "$(ORBFIT_OUT)"; \
+	add --layup         "$(LAYUP_OUT)"; \
+	if [ -d "$(CACHE_DIR)/sbdb" ]; then flags="$$flags --jpl-sbdb-cache $(CACHE_DIR)/sbdb"; fi; \
+	$(EMP_VAL_BIN) merge-external -i "$$ref" -o "$$merged" $$flags
+	@$(EMP_VAL_BIN) report \
+	    --results $(REPORT_INPUTS) \
+	    --output $(REPORT) \
+	    --summary $(SUMMARY)
+	@echo "Report: $(REPORT)"
+	@echo "Summary: $(SUMMARY)"
 
 # ── Cleanup ────────────────────────────────────────────────
 clean:

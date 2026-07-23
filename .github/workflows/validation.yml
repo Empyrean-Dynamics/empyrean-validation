@@ -6,6 +6,32 @@ name: Validation Suite
 # live in the repos whose surface they exercise — empyrean and
 # empyrean-core — and are checked out here as siblings.
 #
+# ── Pipeline shape (matrix fan-out) ────────────────────────────────
+#
+#   precheck ─► prep ─┬─► empyrean (rust/python/c/cli/core) ─┐
+#                     │                                       ├─► reduce
+#                     └─► external ×N (assist, findorb, …) ───┘
+#
+#   • prep   — download + cache all shared data ONCE, build the rust
+#              reference, and emit the canonical validation_plan.json.
+#              The only job that touches the network (JPL/NAIF/SBDB) or
+#              carries the private-engine checkout for the reference.
+#   • empyrean — the five distribution channels that need the private
+#              empyrean + empyrean-core source built; they share one
+#              build so they run together in a single job.
+#   • external — one matrix leg per independent reference implementation
+#              (ASSIST, find_orb, OpenOrb, kete, jorbit, layup, OrbFit).
+#              Each replays the *prebuilt* plan; needs no secrets and no
+#              private checkout. fail-fast:false so one dead comparator
+#              never sinks the others — its channel just goes missing
+#              from the report, loudly, never faked.
+#   • reduce — merge every staged channel JSON + render the report +
+#              gate (ci-check) + publish to GCS.
+#
+# Every leg restores the same keyed caches (data kernels, JPL API
+# responses, cargo, per-tool build trees) that `prep` populates, so the
+# expensive downloads/builds happen once and fan out warm.
+#
 # Triggers:
 #   - cron                — Monday 06:00 UTC weekly refresh
 #   - dispatch            — manual run with optional OBJECTS / TIER inputs
@@ -82,6 +108,11 @@ env:
   # subset via workflow_dispatch `objects` for a quick targeted run.
   OBJECTS: ${{ inputs.objects || '' }}
   TIER: ${{ inputs.tier || 'standard' }}
+  # Shared cache keys — every job restores by these exact keys so the
+  # downloads/builds `prep` populates fan out warm. Bump a version suffix
+  # when the underlying artifact set changes.
+  DATA_CACHE_KEY: empyrean-data-v2
+  JPL_CACHE_KEY: empyrean-api-cache-v1
 
 jobs:
   # The full suite needs the empyrean wrapper repo for the rust /
@@ -109,20 +140,19 @@ jobs:
             echo "::notice title=Validation suite skipped::Empyrean-Dynamics/empyrean is not published yet; the full-channel suite resumes automatically once the wrapper repo exists."
           fi
 
-  validate:
-    name: Build + run + report
+  # ── prep ───────────────────────────────────────────────────────────
+  # Download + cache all shared data ONCE, build the rust reference, and
+  # emit the canonical plan. This is the only job that hits the network
+  # (NAIF/JPL/SBDB) and the only one besides `empyrean` that carries the
+  # private-engine checkout. Everything downstream restores the caches it
+  # populates and consumes the plan artifact it uploads.
+  prep:
+    name: Prep — data + rust reference + plan
     needs: precheck
     if: needs.precheck.outputs.empyrean-available == 'true'
     runs-on: ubuntu-latest
-    # Full 50-object catalog across every channel. 360 is the
-    # GitHub-hosted runner ceiling; if the suite grows past it the
-    # options are sharding by population or a larger runner.
-    timeout-minutes: 360
+    timeout-minutes: 180
     steps:
-      # ── Trace what fired this run ──────────────────────────────
-      # Surfaces the sender repo + sha/tag in the GitHub UI's Annotations
-      # tab so triaging "who broke validation" is one click instead of
-      # a hunt through the run summary JSON.
       - name: Log trigger source
         run: |
           echo "Event: ${{ github.event_name }}"
@@ -140,98 +170,69 @@ jobs:
       #   <workspace>/empyrean-validation/      (this repo: framework + Makefile + externals)
       #   <workspace>/<engine siblings>/ (empyrean-core's private deps for [patch])
       # All paths in the Makefile resolve from `..` of the empyrean-validation
-      # checkout, which means each repo MUST sit alongside it. We do that by
-      # checking the default repo out under `path: empyrean-validation/`
-      # rather than the workspace root.
+      # checkout, which means each repo MUST sit alongside it.
       - name: Checkout empyrean-validation (default)
         uses: actions/checkout@v4
         with:
           path: empyrean-validation
-
       - name: Checkout empyrean (sibling)
         uses: actions/checkout@v4
         with:
           repository: Empyrean-Dynamics/empyrean
           path: empyrean
           token: ${{ secrets.GH_PAT }}
-
       - name: Checkout empyrean-core (sibling)
         uses: actions/checkout@v4
         with:
           repository: Empyrean-Dynamics/empyrean-core
           path: empyrean-core
           token: ${{ secrets.GH_PAT }}
-
-      # Transitive deps — needed by the [patch] sections in
-      # empyrean / empyrean-core / empyrean-validation Cargo.toml so
-      # cargo resolves empyrean-core's private deps to local sibling
-      # checkouts instead of the tagged git URLs (which would
-      # otherwise duplicate the dep tree and produce incompatible
-      # `Orbits<AU>` types across the workspace).
       - name: Checkout core dep (transitive)
         uses: actions/checkout@v4
         with:
           repository: Empyrean-Dynamics/scott
           path: scott
           token: ${{ secrets.GH_PAT }}
-
       - name: Checkout core dep 2 (transitive)
         uses: actions/checkout@v4
         with:
           repository: Empyrean-Dynamics/villeneuve
           path: villeneuve
           token: ${{ secrets.GH_PAT }}
-
       - name: Checkout nolan (transitive)
         uses: actions/checkout@v4
         with:
           repository: Empyrean-Dynamics/nolan
           path: nolan
           token: ${{ secrets.GH_PAT }}
-
       - name: Configure git for any non-patched private deps
         run: git config --global url."https://x-access-token:${{ secrets.GH_PAT }}@github.com/".insteadOf "ssh://git@github.com/"
 
-      # ── Toolchains ─────────────────────────────────────────────
       - uses: actions-rust-lang/setup-rust-toolchain@v1
         with:
           rustflags: ""
-          # The repo checks out under empyrean-validation/ (sibling
-          # layout), so the embedded rust-cache must be pointed at the
-          # actual crate roots — with no config it runs cargo metadata
-          # at the workspace root, finds no Cargo.toml, and errors.
           cache-workspaces: |
             empyrean-validation
             empyrean-validation/runners/rust
             empyrean-validation/runners/cli
-
       - uses: actions/setup-python@v5
         with:
           python-version: ${{ env.PYTHON_VERSION }}
-
       - name: Install uv (used by empyrean-py wheel build)
         run: pip install uv
 
-      # ── Caches ─────────────────────────────────────────────────
-      # SPICE kernels + DE440 + bias.dat — large (~2 GB). Restore by key,
-      # but SAVE only after a complete, successful download (the explicit
-      # save step below) so a transient NAIF/JPL outage mid-download can
-      # never poison the cache with a partial kernel set that later runs
-      # would silently trust. Bump the suffix when adding a kernel.
+      # ── Data kernels (SPICE + DE440 + bias.dat, ~2 GB) ─────────
+      # Restore by key, but SAVE only after a complete, successful
+      # download so a transient NAIF/JPL outage mid-download can never
+      # poison the cache with a partial kernel set later runs would trust.
       - name: Restore empyrean data kernels
         id: cache-data
         uses: actions/cache/restore@v4
         with:
           path: data
-          key: empyrean-data-v2
-
+          key: ${{ env.DATA_CACHE_KEY }}
       - name: Download empyrean data kernels
         if: steps.cache-data.outputs.cache-hit != 'true'
-        # Retry transient network failures instead of failing the whole
-        # suite: --retry-all-errors covers connection timeouts (curl exit
-        # 28, seen when naif.jpl.nasa.gov is briefly unreachable), and
-        # --connect-timeout caps a single hung attempt so it fails fast
-        # into the next retry rather than stalling for minutes.
         run: |
           mkdir -p data
           cd data
@@ -244,35 +245,24 @@ jobs:
           get -o moon_pa_de440_200625.bpc https://naif.jpl.nasa.gov/pub/naif/generic_kernels/pck/moon_pa_de440_200625.bpc
           get -o sb441-n16.bsp https://ssd.jpl.nasa.gov/ftp/eph/small_bodies/asteroids_de441/sb441-n16.bsp
           get -o linux_p1550p2650.440 https://ssd.jpl.nasa.gov/ftp/eph/planets/Linux/de440/linux_p1550p2650.440
-          # Observatory codes: vendored in-repo rather than fetched. MPC
-          # (minorplanetcenter.net) throttles GitHub Actions IP ranges, so
-          # a live fetch reliably times out in CI even with retries; the
-          # file is ~77 KB and the observatories used never move, so
-          # pinning it also makes the validation inputs reproducible.
-          # Refresh by re-downloading into assets/ (see assets/README.md).
+          # Observatory codes: vendored in-repo (MPC throttles Actions IPs).
           gunzip -c "$GITHUB_WORKSPACE/empyrean-validation/assets/obscodes_extended.json.gz" > obscodes_extended.json
-
-      # Runs only on a fresh, successful download (a bare `if:` implies
-      # success()), so the cache is populated exactly once per key with a
-      # complete kernel set — never a partial one from a failed run.
       - name: Save empyrean data kernels
         if: steps.cache-data.outputs.cache-hit != 'true'
         uses: actions/cache/save@v4
         with:
           path: data
-          key: empyrean-data-v2
+          key: ${{ env.DATA_CACHE_KEY }}
 
-      # JPL Horizons + SBDB API responses — the rust runner caches every
-      # IC and reference vector the first time it fetches them, so warm
-      # CI runs avoid hammering JPL's servers.
+      # JPL Horizons + SBDB API responses. prep is the writer: the rust
+      # plan build fetches every IC + reference vector once and caches it,
+      # so the fan-out legs restore a warm cache and never hammer JPL.
       - name: Cache JPL API responses
         uses: actions/cache@v4
         with:
           path: ~/.empyrean/cache
-          key: empyrean-api-cache-v1
+          key: ${{ env.JPL_CACHE_KEY }}
 
-      # Cargo registry + workspace targets across all sibling repos. Key
-      # on every Cargo.toml / Cargo.lock so any dep bump invalidates.
       - name: Cache cargo state
         uses: actions/cache@v4
         with:
@@ -285,83 +275,307 @@ jobs:
           key: cargo-${{ hashFiles('**/Cargo.lock', '**/Cargo.toml') }}
           restore-keys: cargo-
 
-      # ASSIST venv — assist + rebound take ~30 seconds to install
-      # cleanly from PyPI; cache the resolved venv across runs.
-      - name: Cache ASSIST venv
-        uses: actions/cache@v4
-        with:
-          path: empyrean-validation/runners/assist/.venv
-          key: assist-venv-${{ hashFiles('empyrean-validation/runners/assist/setup.sh') }}
+      # ── Build the rust reference + the plan ────────────────────
+      # `make plan` builds the rust runner, runs prop+eph + OD, and
+      # strips the result into the canonical plan every other channel
+      # replays. This is the reference channel: everything compares to it.
+      # `make build` compiles the binaries (the rust runner's file target
+      # is produced by the phony `build-rust`, so `plan` alone can't build
+      # it); `make plan` then runs prop+eph + OD and strips the canonical
+      # plan. The wheel venv is built too because the plan-strip script
+      # runs under it.
+      - name: Build rust reference + generate plan
+        working-directory: empyrean-validation
+        env:
+          DATA_DIR: ${{ env.EMPYREAN_DATA_DIR }}
+        run: make build plan OBJECTS="${OBJECTS}" TIERS="${TIER}"
 
-      # kete + jorbit venvs — pure PyPI installs (jorbit pulls the CPU
-      # JAX wheel, ~1 minute cold); cache both resolved venvs.
-      - name: Cache kete venv
-        uses: actions/cache@v4
+      # Stage the plan + the rust channel outputs for the downstream jobs.
+      - name: Upload plan + rust reference
+        uses: actions/upload-artifact@v4
         with:
-          path: empyrean-validation/runners/kete/.venv
-          key: kete-venv-${{ hashFiles('empyrean-validation/runners/kete/setup.sh') }}
+          name: prep-plan-and-rust
+          path: |
+            empyrean-validation/results/validation_plan.json
+            empyrean-validation/results/validation_rust_propeph.json
+            empyrean-validation/results/validation_rust_od.json
+            empyrean-validation/results/validation_rust.json
+          retention-days: 30
+          if-no-files-found: error
 
-      - name: Cache jorbit venv
-        uses: actions/cache@v4
+  # ── empyrean ───────────────────────────────────────────────────────
+  # The four remaining distribution channels (python / c / cli / core)
+  # that need the private empyrean + empyrean-core build. rust already ran
+  # in prep (it seeds the plan), so this job replays the prebuilt plan
+  # through the wheel, the C ABI, the CLI, and empyrean-core direct.
+  empyrean:
+    name: Empyrean channels — python/c/cli/core
+    needs: prep
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - name: Checkout empyrean-validation (default)
+        uses: actions/checkout@v4
         with:
-          path: empyrean-validation/runners/jorbit/.venv
-          key: jorbit-venv-${{ hashFiles('empyrean-validation/runners/jorbit/setup.sh') }}
-
-      # layup venv — heavy C-extension + sorcha/jax dep graph, several
-      # minutes to resolve cold. Default-on channel since the Makefile
-      # flipped WITH_LAYUP to 1.
-      - name: Cache layup venv
-        uses: actions/cache@v4
+          path: empyrean-validation
+      - name: Checkout empyrean (sibling)
+        uses: actions/checkout@v4
         with:
-          path: empyrean-validation/runners/layup/.venv
-          key: layup-venv-${{ hashFiles('empyrean-validation/runners/layup/setup.sh') }}
+          repository: Empyrean-Dynamics/empyrean
+          path: empyrean
+          token: ${{ secrets.GH_PAT }}
+      - name: Checkout empyrean-core (sibling)
+        uses: actions/checkout@v4
+        with:
+          repository: Empyrean-Dynamics/empyrean-core
+          path: empyrean-core
+          token: ${{ secrets.GH_PAT }}
+      - name: Checkout core dep (transitive)
+        uses: actions/checkout@v4
+        with:
+          repository: Empyrean-Dynamics/scott
+          path: scott
+          token: ${{ secrets.GH_PAT }}
+      - name: Checkout core dep 2 (transitive)
+        uses: actions/checkout@v4
+        with:
+          repository: Empyrean-Dynamics/villeneuve
+          path: villeneuve
+          token: ${{ secrets.GH_PAT }}
+      - name: Checkout nolan (transitive)
+        uses: actions/checkout@v4
+        with:
+          repository: Empyrean-Dynamics/nolan
+          path: nolan
+          token: ${{ secrets.GH_PAT }}
+      - name: Configure git for any non-patched private deps
+        run: git config --global url."https://x-access-token:${{ secrets.GH_PAT }}@github.com/".insteadOf "ssh://git@github.com/"
 
-      # find_orb is a from-source build of four C/C++ libraries (lunar,
-      # jpl_eph, sat_code, find_orb). Cache the build tree + install
-      # prefix, otherwise it's ~5 minutes of compile every run.
-      - name: Cache find_orb build
-        id: cache-findorb
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          rustflags: ""
+          cache-workspaces: |
+            empyrean-validation
+            empyrean-validation/runners/rust
+            empyrean-validation/runners/cli
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+      - name: Install uv (used by empyrean-py wheel build)
+        run: pip install uv
+
+      - name: Restore empyrean data kernels
+        uses: actions/cache/restore@v4
+        with:
+          path: data
+          key: ${{ env.DATA_CACHE_KEY }}
+      - name: Restore JPL API responses
+        uses: actions/cache/restore@v4
+        with:
+          path: ~/.empyrean/cache
+          key: ${{ env.JPL_CACHE_KEY }}
+      - name: Cache cargo state
         uses: actions/cache@v4
         with:
           path: |
-            empyrean-validation/runners/findorb/build
-            empyrean-validation/runners/findorb/install
+            ~/.cargo/registry
+            ~/.cargo/git
+            empyrean/target
+            empyrean-core/target
+            empyrean-validation/target
+          key: cargo-${{ hashFiles('**/Cargo.lock', '**/Cargo.toml') }}
+          restore-keys: cargo-
+
+      - name: Download plan + rust reference
+        uses: actions/download-artifact@v4
+        with:
+          name: prep-plan-and-rust
+          path: empyrean-validation/results
+
+      # Build the wheel / C ABI / CLI / core binaries, then replay the
+      # prebuilt plan through each. PLAN_PREBUILT=1 stops the Makefile
+      # from trying to rebuild the rust reference (it lives in prep).
+      # Build only what the four replay channels need: the native lib
+      # (C/CLI/core link it via DYLD), the C ABI runner, the CLI runner,
+      # the wheel, and empyrean-core direct. The rust runner is not built
+      # here — it ran in prep and its output is staged.
+      - name: Build empyrean distribution artifacts
+        working-directory: empyrean-validation
+        env:
+          DATA_DIR: ${{ env.EMPYREAN_DATA_DIR }}
+        run: make build-empyrean-c build-c build-cli build-wheel build-core
+      - name: Replay plan — python / c / cli / core
+        working-directory: empyrean-validation
+        env:
+          DATA_DIR: ${{ env.EMPYREAN_DATA_DIR }}
+        run: make run-python run-c run-cli run-core PLAN_PREBUILT=1 OBJECTS="${OBJECTS}" TIERS="${TIER}"
+
+      - name: Upload empyrean channel outputs
+        uses: actions/upload-artifact@v4
+        with:
+          name: channels-empyrean
+          path: |
+            empyrean-validation/results/validation_python.json
+            empyrean-validation/results/validation_c.json
+            empyrean-validation/results/validation_cli.json
+            empyrean-validation/results/validation_core.json
+          retention-days: 30
+          if-no-files-found: error
+
+  # ── external ───────────────────────────────────────────────────────
+  # One matrix leg per independent reference implementation. Each replays
+  # the prebuilt plan through an upstream tool. NO private checkout, NO
+  # secrets — these run untrusted-ish upstream code isolated from the PAT
+  # and the GCP identity. fail-fast:false so a single dead comparator
+  # leaves its channel missing from the report (loudly) without sinking
+  # the rest of the matrix.
+  external:
+    name: External — ${{ matrix.tool }}
+    needs: prep
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    strategy:
+      fail-fast: false
+      matrix:
+        tool: [assist, findorb, oorb, kete, jorbit, layup, orbfit]
+    steps:
+      - name: Checkout empyrean-validation (default)
+        uses: actions/checkout@v4
+        with:
+          path: empyrean-validation
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Restore empyrean data kernels
+        uses: actions/cache/restore@v4
+        with:
+          path: data
+          key: ${{ env.DATA_CACHE_KEY }}
+      - name: Restore JPL API responses
+        uses: actions/cache/restore@v4
+        with:
+          path: ~/.empyrean/cache
+          key: ${{ env.JPL_CACHE_KEY }}
+
+      # One cache per tool build tree, keyed on the tool's setup.sh. The
+      # path list is a superset (venv / install / build + find_orb's
+      # ~/include ~/lib); absent members are simply not cached. OrbFit is
+      # a Docker pull with no on-disk tree here — its container is not
+      # cached (native amd64 on the runner makes the fit itself fast; the
+      # ~3 GB pull is the cost, a candidate for docker-layer caching later).
+      - name: Cache tool build
+        if: matrix.tool != 'orbfit'
+        uses: actions/cache@v4
+        with:
+          path: |
+            empyrean-validation/runners/${{ matrix.tool }}/.venv
+            empyrean-validation/runners/${{ matrix.tool }}/install
+            empyrean-validation/runners/${{ matrix.tool }}/build
             ~/include
             ~/lib
-          key: findorb-build-v5
+          key: ${{ matrix.tool }}-${{ hashFiles(format('empyrean-validation/runners/{0}/setup.sh', matrix.tool)) }}
 
-      # ── Pipeline ───────────────────────────────────────────────
-      # `make setup` only runs the per-runner setup scripts that produce
-      # things the cache might not have (or that are cheap to re-check).
-      # OpenOrb links against LAPACK/BLAS, which aren't on the runner by
-      # default (its Fortran build otherwise fails at `ld: cannot find
-      # -llapack`). gfortran is already present.
-      - name: Install system libraries (LAPACK/BLAS for OpenOrb)
+      # OpenOrb's Fortran build links LAPACK/BLAS, not present by default.
+      - name: Install LAPACK/BLAS (OpenOrb only)
+        if: matrix.tool == 'oorb'
         run: sudo apt-get update && sudo apt-get install -y --no-install-recommends liblapack-dev libblas-dev
 
-      - name: One-time external setup (ASSIST/kete/jorbit/layup venvs + find_orb + OpenOrb build)
+      - name: Download plan
+        uses: actions/download-artifact@v4
+        with:
+          name: prep-plan-and-rust
+          path: empyrean-validation/results
+
+      - name: Setup ${{ matrix.tool }}
         working-directory: empyrean-validation
         env:
           DATA_DIR: ${{ env.EMPYREAN_DATA_DIR }}
-        run: make setup
+        run: make setup-${{ matrix.tool }}
 
-      # `make all` = build + run + report. The Makefile owns every detail
-      # of the pipeline — channel order, perturber exclusion, plan
-      # derivation, merge-external, report renderer invocation. CI just
-      # passes through OBJECTS / TIERS as overrides.
-      - name: make all
+      - name: Run ${{ matrix.tool }}
         working-directory: empyrean-validation
         env:
           DATA_DIR: ${{ env.EMPYREAN_DATA_DIR }}
-        run: make all OBJECTS="${OBJECTS}" TIERS="${TIER}"
+        run: make run-${{ matrix.tool }} PLAN_PREBUILT=1 OBJECTS="${OBJECTS}" TIERS="${TIER}"
 
-      # ── Hard gate ──────────────────────────────────────────────
-      # python and core are both expected to be bit-exact to the rust
-      # reference at 1e-10 fidelity. python tests that the PyO3 bridge
-      # round-trips without precision loss; core tests that the FFI
-      # surface (rust) and the direct engine surface (core) don't drift apart
-      # on the v0.7.0 ODConfig defaults. A failure here usually means a
-      # config-default regression in either the wrapper or the engine.
+      # Upload whatever this leg produced. find_orb emits two files
+      # (optical + radar); the glob covers per-tool naming without a
+      # per-tool branch. if-no-files-found:error so a leg that ran but
+      # produced nothing fails visibly rather than uploading an empty
+      # artifact the reduce step would silently treat as "channel absent".
+      - name: Upload ${{ matrix.tool }} channel output
+        uses: actions/upload-artifact@v4
+        with:
+          name: channel-${{ matrix.tool }}
+          path: |
+            empyrean-validation/results/validation_${{ matrix.tool }}.json
+            empyrean-validation/results/validation_${{ matrix.tool }}_radar.json
+          retention-days: 30
+          if-no-files-found: error
+
+  # ── reduce ─────────────────────────────────────────────────────────
+  # Merge every staged channel JSON + render the report + gate + publish.
+  # Runs whenever prep and the empyrean channels succeeded, EVEN IF some
+  # external legs failed (always() + explicit result checks): the report
+  # then simply omits the dead comparators, which is the honest outcome.
+  reduce:
+    name: Reduce — merge + report + publish
+    needs: [prep, empyrean, external]
+    if: always() && needs.prep.result == 'success' && needs.empyrean.result == 'success'
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: Checkout empyrean-validation (default)
+        uses: actions/checkout@v4
+        with:
+          path: empyrean-validation
+
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          rustflags: ""
+          cache-workspaces: empyrean-validation
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      # merge-external reads the SBDB cache for JPL reference elements.
+      - name: Restore JPL API responses
+        uses: actions/cache/restore@v4
+        with:
+          path: ~/.empyrean/cache
+          key: ${{ env.JPL_CACHE_KEY }}
+      - name: Cache cargo state
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            empyrean-validation/target
+          key: cargo-${{ hashFiles('empyrean-validation/**/Cargo.lock', 'empyrean-validation/**/Cargo.toml') }}
+          restore-keys: cargo-
+
+      # Pull every channel artifact flat into results/. merge-multiple
+      # flattens each single-file artifact into the one results dir.
+      - name: Download all channel artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: empyrean-validation/results
+          merge-multiple: true
+
+      - name: List staged channels
+        working-directory: empyrean-validation
+        run: ls -la results/
+
+      # reduce builds only the harness, then folds in whichever external
+      # channels are present (skipping any that a failed leg left absent).
+      # WITH_CORE=1 so REPORT_INPUTS is core-keyed (the empyrean job always
+      # produces core under a precheck-gated run).
+      - name: Merge + report
+        working-directory: empyrean-validation
+        run: make reduce PLAN_PREBUILT=1 WITH_CORE=1
+
       - name: ci-check (gate on python + core parity)
         working-directory: empyrean-validation
         run: |
@@ -376,29 +590,12 @@ jobs:
         with:
           workload_identity_provider: "projects/786706985139/locations/global/workloadIdentityPools/github-pool/providers/github-provider"
           service_account: "empyrean-ci@empyrean-dynamics.iam.gserviceaccount.com"
-
       - name: Upload to GCS
         if: github.event_name == 'schedule' || github.event_name == 'push' || github.event_name == 'workflow_dispatch'
         working-directory: empyrean-validation
         run: |
           TIMESTAMP=$(date -u +%Y%m%d_%H%M%S)
-
-          # GCS layout consumed by the app's validation page
-          # (https://validation.empyrean-dynamics.com/latest/...):
-          #
-          #   latest/validation.json         ← merged rust prop+eph (canonical, backwards-compat)
-          #   latest/od_validation.json      ← rust OD (canonical, backwards-compat)
-          #   latest/channels/{rust,python,core,assist,findorb}.json
-          #   latest/validation_report.html
-          #   latest/validation_summary.json
-          #
-          # archive/{TIMESTAMP}/ mirrors the same structure for history.
-
           alias_canonical() { cp "$1" "$2"; }
-          # The merged-with-externals result is core-keyed when the core
-          # channel ran (WITH_CORE) and rust-keyed otherwise. `make all`
-          # only produces one of the two, so alias whichever exists —
-          # cp under `set -e` would abort the upload on the missing name.
           if [ -f results/validation_core_merged.json ]; then
             alias_canonical results/validation_core_merged.json results/validation.json
           else
@@ -406,23 +603,21 @@ jobs:
           fi
           alias_canonical results/validation_rust_od.json      results/od_validation.json
 
-          # latest/ — overwrite each upload
           gcloud storage rm -r ${{ env.GCS_BUCKET }}/latest/ 2>/dev/null || true
           gcloud storage cp results/validation.json            ${{ env.GCS_BUCKET }}/latest/validation.json
           gcloud storage cp results/od_validation.json         ${{ env.GCS_BUCKET }}/latest/od_validation.json
           gcloud storage cp results/validation_report.html     ${{ env.GCS_BUCKET }}/latest/validation_report.html
           gcloud storage cp results/validation_summary.json    ${{ env.GCS_BUCKET }}/latest/validation_summary.json
-          for ch in rust python core assist findorb; do
+          for ch in rust python core assist findorb oorb kete jorbit layup orbfit; do
             f="results/validation_${ch}.json"
             [ -f "$f" ] && gcloud storage cp "$f" "${{ env.GCS_BUCKET }}/latest/channels/${ch}.json"
           done
 
-          # archive/ — historical
           gcloud storage cp results/validation.json            ${{ env.GCS_BUCKET }}/archive/${TIMESTAMP}/validation.json
           gcloud storage cp results/od_validation.json         ${{ env.GCS_BUCKET }}/archive/${TIMESTAMP}/od_validation.json
           gcloud storage cp results/validation_report.html     ${{ env.GCS_BUCKET }}/archive/${TIMESTAMP}/validation_report.html
           gcloud storage cp results/validation_summary.json    ${{ env.GCS_BUCKET }}/archive/${TIMESTAMP}/validation_summary.json
-          for ch in rust python core assist findorb; do
+          for ch in rust python core assist findorb oorb kete jorbit layup orbfit; do
             f="results/validation_${ch}.json"
             [ -f "$f" ] && gcloud storage cp "$f" "${{ env.GCS_BUCKET }}/archive/${TIMESTAMP}/channels/${ch}.json"
           done
