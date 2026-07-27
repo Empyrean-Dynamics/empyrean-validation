@@ -28,6 +28,7 @@ import pathlib
 import re
 import shutil
 import subprocess
+import sys
 import tempfile
 import time
 import urllib.parse
@@ -473,7 +474,7 @@ def fetch_sbdb_elements(designation: str) -> Optional[Dict[str, Any]]:
 # ── Main ────────────────────────────────────────────────
 
 
-def main():
+def main() -> int:
     parser = argparse.ArgumentParser(
         description="Run find_orb OD on PSV observation files"
     )
@@ -536,8 +537,19 @@ def main():
     # Find all PSV files in the directory
     psv_files = sorted(psv_dir.glob("*.psv"))
     if not psv_files:
-        print(f"No PSV files found in {psv_dir}")
-        return
+        # This used to print and `return` — exit status 0, no output file
+        # written. reduce then reported "skip --findorb — not staged (leg
+        # failed or was disabled)", which was false on both counts: the leg
+        # ran, succeeded, and was enabled. A comparator with nothing to
+        # compare is a failure with a cause, and the cause is named here.
+        print(
+            f"ERROR: no PSV files found in {psv_dir}\n"
+            "       find_orb had nothing to fit. The fixtures are tracked in-repo "
+            "(fixtures/psv/README.md);\n"
+            "       `make check-fixtures` asserts they are present.",
+            file=sys.stderr,
+        )
+        return 1
 
     print(f"find_orb OD Validation")
     print(f"  Binary: {fo_binary}")
@@ -548,6 +560,7 @@ def main():
     timestamp = datetime.now(timezone.utc).isoformat()
     source_version = resolve_source_version()
     results = []
+    n_failed = 0
 
     for psv_path in psv_files:
         name = psv_path.stem  # filename without .psv
@@ -572,8 +585,23 @@ def main():
         fo_result = run_findorb(psv, data_dir, fo_binary, ephem_spec)
 
         if fo_result is None:
-            print("  SKIP: find_orb failed")
+            # Failure ROW, following the OrbFit runner's pattern: the reason
+            # travels in a dedicated error field alongside the object's
+            # identity, so the merge sees an object that find_orb could not
+            # fit rather than an object find_orb was never asked about. The
+            # merge reads fo_* with `.as_f64()`, so a row without them folds
+            # as all-None — no fabricated numbers.
+            print("  FAIL: find_orb produced no solution — emitting failure row")
             print()
+            n_failed += 1
+            results.append({
+                "object": name.replace("_", "/"),
+                "test_type": args.test_type,
+                "timestamp": timestamp,
+                "source_version": source_version,
+                "fo_error": "find_orb produced no solution (see log above)",
+                "fo_n_obs_total": n_obs,
+            })
             continue
 
         elements = fo_result["elements"]
@@ -648,11 +676,26 @@ def main():
     with open(output_path, "w") as f:
         json.dump(results, f, indent=2, default=str)
 
+    n_fits = len(psv_files) - n_failed
     print(f"{'=' * 80}")
     print(f"  Results: {output_path}")
-    print(f"  {len(results)} objects processed")
+    print(f"  {len(results)} rows from {len(psv_files)} fixtures "
+          f"({n_fits} fits, {n_failed} failures)")
     print(f"{'=' * 80}")
+
+    # Non-zero only when EVERY object failed — a partial failure set is still
+    # useful output and is surfaced per-row via fo_error. Same rule the OrbFit
+    # runner applies.
+    if psv_files and n_fits == 0:
+        print(
+            f"ERROR: find_orb fitted NONE of the {len(psv_files)} fixtures. "
+            "The channel computed nothing;\n"
+            "       every row carries fo_error. See the per-object output above.",
+            file=sys.stderr,
+        )
+        return 1
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

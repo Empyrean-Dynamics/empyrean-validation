@@ -446,25 +446,27 @@ run-assist: $(PLAN) check-plan $(ASSIST_PY)
 	    --horizons-cache $(CACHE_DIR)/horizons \
 	    --data-dir $(DATA_DIR)
 
-# find_orb's binary is an optional, non-fatal build (see findorb/setup.sh).
-# When it's absent, skip the comparison and emit empty result files so the
-# merge step still has valid (empty) inputs — the missing comparator is
-# surfaced here and by its absence from the report, never silently faked.
+# find_orb's binary is an optional, non-fatal BUILD (see findorb/setup.sh) —
+# but a missing binary at RUN time is a failure, not a skip. This used to
+# `echo '[]' > $(FINDORB_OUT)` and succeed, which handed the merge a
+# syntactically valid file asserting "find_orb compared zero objects" and
+# produced a green leg that ran no comparator at all. Fail with the fix
+# instead; the matrix's fail-fast:false keeps the other comparators alive and
+# reduce then omits find_orb honestly.
 run-findorb: $(ASSIST_PY) check-plan check-fixtures
-	@if [ -x "$(FO_BIN)" ]; then \
-	    echo "──── find_orb: external OD reference ───────────────────"; \
-	    $(ASSIST_PY) $(EMP_VAL_RUNNERS)/findorb/run_findorb.py $(FIXTURES_PSV) \
-	        --output $(FINDORB_OUT) --fo-binary $(FO_BIN) \
-	        --data-dir $(DATA_DIR) --plan $(PLAN); \
-	    echo "──── find_orb: radar-augmented OD reference (psv-radar) ─"; \
-	    $(ASSIST_PY) $(EMP_VAL_RUNNERS)/findorb/run_findorb.py $(FIXTURES_PSV_RADAR) \
-	        --output $(FINDORB_RADAR_OUT) --fo-binary $(FO_BIN) \
-	        --data-dir $(DATA_DIR) --test-type orbit_determination_radar; \
-	else \
-	    echo "──── find_orb: SKIPPED (binary not built — see setup warning) ──"; \
-	    echo '[]' > $(FINDORB_OUT); \
-	    echo '[]' > $(FINDORB_RADAR_OUT); \
-	fi
+	@test -x "$(FO_BIN)" || { \
+	    echo "ERROR: find_orb binary not built: $(FO_BIN)"; \
+	    echo "       Build it with: make setup-findorb"; \
+	    echo "       (An empty result file would report 'find_orb compared nothing' as a pass.)"; \
+	    exit 1; }
+	@echo "──── find_orb: external OD reference ───────────────────"
+	@$(ASSIST_PY) $(EMP_VAL_RUNNERS)/findorb/run_findorb.py $(FIXTURES_PSV) \
+	    --output $(FINDORB_OUT) --fo-binary $(FO_BIN) \
+	    --data-dir $(DATA_DIR) --plan $(PLAN)
+	@echo "──── find_orb: radar-augmented OD reference (psv-radar) ─"
+	@$(ASSIST_PY) $(EMP_VAL_RUNNERS)/findorb/run_findorb.py $(FIXTURES_PSV_RADAR) \
+	    --output $(FINDORB_RADAR_OUT) --fo-binary $(FO_BIN) \
+	    --data-dir $(DATA_DIR) --test-type orbit_determination_radar
 
 # ── OpenOrb (oorb) external comparison — propagation + ephemeris ─
 # Independent Fortran implementation (Granvik et al., University of
@@ -479,20 +481,18 @@ $(OORB_BIN):
 	@cd $(EMP_VAL_RUNNERS)/oorb && ./setup.sh
 
 run-oorb: $(OORB_OUT)
-# oorb's binary is an optional, non-fatal build (see oorb/setup.sh). When
-# it's absent, skip the comparison and emit an empty result file so the
-# merge step still has a valid input — the missing comparator is surfaced
-# here and by its absence from the report, never silently faked.
+# Same rule as find_orb: an optional BUILD, but a missing binary at RUN time
+# is a failure. The `echo '[]'` fallback made a leg that compared nothing
+# indistinguishable from a leg that compared everything and agreed.
 $(OORB_OUT): $(PLAN) $(ASSIST_PY) | check-plan
-	@if [ -x "$(OORB_BIN)" ]; then \
-	    echo "──── OpenOrb: external prop + ephemeris reference ──────"; \
-	    $(ASSIST_PY) $(EMP_VAL_RUNNERS)/oorb/run_oorb.py \
-	        --input $(PLAN) --output $(OORB_OUT) \
-	        --prefix $(EMP_VAL_RUNNERS)/oorb/install; \
-	else \
-	    echo "──── OpenOrb: SKIPPED (binary not built — see setup warning) ──"; \
-	    echo '[]' > $(OORB_OUT); \
-	fi
+	@test -x "$(OORB_BIN)" || { \
+	    echo "ERROR: OpenOrb binary not built: $(OORB_BIN)"; \
+	    echo "       Build it with: make setup-oorb"; \
+	    exit 1; }
+	@echo "──── OpenOrb: external prop + ephemeris reference ──────"
+	@$(ASSIST_PY) $(EMP_VAL_RUNNERS)/oorb/run_oorb.py \
+	    --input $(PLAN) --output $(OORB_OUT) \
+	    --prefix $(EMP_VAL_RUNNERS)/oorb/install
 
 # ── OrbFit external comparison — orbit determination ─────────────
 # OrbFit Consortium (University of Pisa) / IAU Minor Planet Center.
@@ -575,20 +575,20 @@ $(LAYUP_PY):
 	@cd $(EMP_VAL_RUNNERS)/layup && ./setup.sh
 
 run-layup: $(LAYUP_OUT)
-# layup's venv is an optional, heavy build (see layup/setup.sh). When it's
-# absent, skip the fit and emit an empty result file so the merge step still
-# has a valid input — the missing comparator is surfaced here and by its
-# absence from the report, never silently faked.
+# layup's venv is an optional, heavy BUILD (see layup/setup.sh), but it is
+# only ever *run* when WITH_LAYUP is set — so at this point the caller has
+# asked for layup and a missing venv is a failure. The `echo '[]'` fallback
+# reported a comparator that never executed as a successful empty comparison.
+# Opt out with WITH_LAYUP= rather than by silently producing nothing.
 $(LAYUP_OUT): | check-fixtures
-	@if [ -x "$(LAYUP_PY)" ]; then \
-	    echo "──── layup: external OD reference (ADES PSV) ───────────"; \
-	    $(LAYUP_PY) $(EMP_VAL_RUNNERS)/layup/run_layup.py $(FIXTURES_PSV) \
-	        --output $(LAYUP_OUT); \
-	else \
-	    echo "──── layup: SKIPPED (venv not built — run 'make setup-layup') ──"; \
-	    mkdir -p $(RESULTS_DIR); \
-	    echo '[]' > $(LAYUP_OUT); \
-	fi
+	@test -x "$(LAYUP_PY)" || { \
+	    echo "ERROR: layup venv not built: $(LAYUP_PY)"; \
+	    echo "       Build it with: make setup-layup, or opt out with WITH_LAYUP="; \
+	    exit 1; }
+	@echo "──── layup: external OD reference (ADES PSV) ───────────"
+	@mkdir -p $(RESULTS_DIR)
+	@$(LAYUP_PY) $(EMP_VAL_RUNNERS)/layup/run_layup.py $(FIXTURES_PSV) \
+	    --output $(LAYUP_OUT)
 
 # ── Merge external + report ────────────────────────────────
 # Channel-agnostic meta operations live in this repo's CLI binary. It

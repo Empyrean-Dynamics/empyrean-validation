@@ -543,6 +543,12 @@ def main() -> int:
     source_version = _oorb_source_version(oorb_bin)
     out_rows: list[dict] = []
     n_skipped = 0
+    # Rows oorb actually computed something for. Counted explicitly rather
+    # than derived from len(out_rows) - n_skipped: the Jet1-axis skip
+    # `continue`s WITHOUT appending a row while the compute-failure skip
+    # appends a pass-through, so the two are not a single arithmetic
+    # relationship.
+    n_computed = 0
 
     for r in plan:
         # Uncertainty axis: skip Jet1 rows. oorb supports propagating a
@@ -567,6 +573,7 @@ def main() -> int:
             n_skipped += 1
         else:
             new.update(update)
+            n_computed += 1
         out_rows.append(new)
 
     args.output.parent.mkdir(parents=True, exist_ok=True)
@@ -576,6 +583,33 @@ def main() -> int:
         file=sys.stderr,
     )
     print(_executive_summary(out_rows), file=sys.stderr)
+
+    # A run in which EVERY row skipped computed nothing. Until now that exited
+    # 0 after writing a full pass-through of untouched plan rows — a file that
+    # looks exactly like a successful oorb channel, tagged channel="oorb", with
+    # not one oorb-computed number in it. The merge then folded zero fields and
+    # the report showed OpenOrb as present-and-agreeing.
+    #
+    # The live cause is a genuine gap, and this is how it becomes visible: the
+    # plan is derived from the rust runner's output, and the rust runner never
+    # populates ref_sun_pos_au / ref_sun_vel_au_d (only `empyrean-validation
+    # plan` does). Both _propagate and _ephemeris need the Sun's SSB state to
+    # convert OpenOrb's heliocentric convention, so every row skips. Failing
+    # here is the honest report of that, not a new defect.
+    if n_computed == 0:
+        print(
+            f"ERROR: oorb computed ZERO rows — all {n_skipped} candidate rows "
+            "were skipped.\n"
+            "       The output is a pass-through of untouched plan rows; nothing "
+            "in it came from OpenOrb.\n"
+            "       If the skips are 'plan carries no Sun SSB state', the plan is "
+            "missing ref_sun_pos_au /\n"
+            "       ref_sun_vel_au_d — the rust runner does not populate them, so a "
+            "rust-derived plan never\n"
+            "       carries them. See the per-row SKIP lines above for the reason.",
+            file=sys.stderr,
+        )
+        return 1
     return 0
 
 

@@ -472,6 +472,7 @@ def main() -> int:
 
     out_rows = []
     n_skipped = 0
+    n_missing_fixture = 0
     for r in rust_rows:
         ic_pos = r.get("ic_pos_au")
         ic_vel = r.get("ic_vel_au_d")
@@ -544,6 +545,17 @@ def main() -> int:
             # fixture with the slash rewritten to "_".
             psv_path = args.fixtures_dir / f"{r['object'].replace('/', '_')}.psv"
             if not psv_path.exists():
+                # Loudly, and fatally at the end — same seam as the C and CLI
+                # drivers. A silent `continue` deleted the OD row from this
+                # channel's output while the run still exited 0, so a channel
+                # that fitted nothing looked like one that fitted everything.
+                # The fixtures are tracked in-repo now; a missing one is a
+                # broken checkout, never a normal condition.
+                print(
+                    f"  {r['object']} OD FAIL: no PSV fixture at {psv_path}",
+                    file=sys.stderr,
+                )
+                n_missing_fixture += 1
                 n_skipped += 1
                 continue
             psv_text = psv_path.read_text()
@@ -688,6 +700,17 @@ def main() -> int:
         f"Wrote {len(out_rows)} python rows to {args.output} (skipped {n_skipped})",
         file=sys.stderr,
     )
+    if n_missing_fixture:
+        print(
+            f"ERROR: {n_missing_fixture} OD row(s) had no PSV fixture under "
+            f"{args.fixtures_dir}.\n"
+            "       The fixtures are tracked in-repo (fixtures/psv/README.md); "
+            "`make check-fixtures` asserts\n"
+            "       they are present. Those OD rows are missing from this "
+            "channel's output entirely.",
+            file=sys.stderr,
+        )
+        return 1
     return 0
 
 

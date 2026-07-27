@@ -179,6 +179,7 @@ def main() -> int:
     source_version = _driver_source_version()
     out_rows = []
     n_skipped = 0
+    n_missing_fixture = 0
 
     for r in rust_rows:
         tt = r.get("test_type")
@@ -282,6 +283,17 @@ def main() -> int:
             # path separator.
             psv = args.fixtures_dir / f"{r['object'].replace('/', '_')}.psv"
             if not psv.exists():
+                # Loudly, and fatally at the end. This used to skip with no
+                # message at all: the OD row vanished from the C channel's
+                # output and the run still exited 0, so a channel that fitted
+                # nothing was indistinguishable from one that fitted
+                # everything. The fixtures are tracked in-repo now, so a
+                # missing one is a broken checkout, never a normal condition.
+                print(
+                    f"  {r['object']} OD FAIL: no PSV fixture at {psv}",
+                    file=sys.stderr,
+                )
+                n_missing_fixture += 1
                 n_skipped += 1
                 continue
             tier = _TIER_TO_INT.get(r["force_model"])
@@ -388,6 +400,17 @@ def main() -> int:
         f"Wrote {len(out_rows)} c rows to {args.output} (skipped {n_skipped})",
         file=sys.stderr,
     )
+    if n_missing_fixture:
+        print(
+            f"ERROR: {n_missing_fixture} OD row(s) had no PSV fixture under "
+            f"{args.fixtures_dir}.\n"
+            "       The fixtures are tracked in-repo (fixtures/psv/README.md); "
+            "`make check-fixtures` asserts\n"
+            "       they are present. Those OD rows are missing from this "
+            "channel's output entirely.",
+            file=sys.stderr,
+        )
+        return 1
     return 0
 
 
