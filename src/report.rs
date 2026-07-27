@@ -10,7 +10,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::Path;
 
 use crate::catalog::population_color;
-use crate::schema::ValidationResult;
+use crate::schema::{ValidationResult, test_types};
 
 /// Numerical-fidelity threshold: any metric whose absolute difference
 /// against the Rust reference exceeds this is flagged as a failure.
@@ -97,6 +97,22 @@ fn approx_bit_identical_threshold(test_type: &str) -> f64 {
         _ => 1e-3,           // 1 mm in km
     }
 }
+
+/// Test types rolled up per channel — in the summary JSON, the §10 matrix,
+/// and the fidelity descriptor chips.
+///
+/// The OD family (`orbit_determination_radar`, `non_grav_recovery`) used to be
+/// missing from this list, so those axes had no `by_test_type` entry anywhere:
+/// not in the report, and — the load-bearing consequence — not in
+/// `validation_summary.json`, which is what `ci-check` gates on. An axis the
+/// gate cannot see is an axis the gate cannot enforce a floor for.
+pub const SUMMARY_TEST_TYPES: [&str; 5] = [
+    test_types::PROPAGATION,
+    test_types::EPHEMERIS,
+    test_types::ORBIT_DETERMINATION,
+    test_types::ORBIT_DETERMINATION_RADAR,
+    test_types::NON_GRAV_RECOVERY,
+];
 
 /// Format a numerical diff value in a friendly units string.
 fn fmt_diff(v: f64) -> String {
@@ -386,7 +402,7 @@ fn rollup_channels(results: &[ValidationResult]) -> Vec<ChannelRollup> {
         // whatever native unit dominated the row), so ephemeris rows —
         // which don't carry `emp_pos_au` — still report real agreement.
         let mut by_test_type: BTreeMap<String, TestTypeRollup> = BTreeMap::new();
-        for tt in ["propagation", "ephemeris", "orbit_determination"] {
+        for tt in SUMMARY_TEST_TYPES {
             let n_compared_tt = by_tt_compared.get(tt).copied().unwrap_or(0);
             let drs = by_tt_row_max_diff.remove(tt).unwrap_or_default();
             let n_bit_identical = by_tt_bit_identical.get(tt).copied().unwrap_or(0);
@@ -734,7 +750,7 @@ fn build_per_test_type_matrix_html(rollups: &[ChannelRollup]) -> String {
     }
     html.push_str("</tr></thead><tbody>");
 
-    for tt in ["propagation", "ephemeris", "orbit_determination"] {
+    for tt in SUMMARY_TEST_TYPES {
         html.push_str(&format!(r#"<tr><td class="obj-name">{tt}</td>"#));
         for r in rollups {
             let is_ref = r.channel == "core";
@@ -783,7 +799,7 @@ fn build_per_test_type_matrix_html(rollups: &[ChannelRollup]) -> String {
 fn fidelity_summary_per_tt(rollups: &[ChannelRollup]) -> String {
     let mut bits: Vec<String> = Vec::new();
     for r in rollups.iter().filter(|r| r.channel != "core") {
-        for tt in ["propagation", "ephemeris", "orbit_determination"] {
+        for tt in SUMMARY_TEST_TYPES {
             if let Some(x) = r.by_test_type.get(tt) {
                 if x.n_compared == 0 {
                     continue;

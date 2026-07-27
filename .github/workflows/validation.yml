@@ -626,12 +626,30 @@ jobs:
         working-directory: empyrean-validation
         run: make reduce PLAN_PREBUILT=1 WITH_CORE=1
 
-      - name: ci-check (gate on python + core parity)
+      # Per-axis row floors, not just aggregate parity. The full catalog is
+      # 50 objects, each contributing one orbit_determination row, and the
+      # five objects with radar fixtures each contributing one
+      # orbit_determination_radar row. Without these floors the gate passes
+      # on "orbit_determination: 0 compared", which is how a dead OD channel
+      # stayed green for the life of this repo.
+      #
+      # Floors are only applied on a full-catalog run: a workflow_dispatch
+      # with an OBJECTS subset legitimately produces fewer rows, and a floor
+      # that fires on a deliberate subset would train everyone to ignore it.
+      - name: ci-check (gate on python + core parity and OD row floors)
         working-directory: empyrean-validation
         run: |
+          if [ -z "${OBJECTS}" ]; then
+            MIN_ROWS="--min-rows orbit_determination=50,orbit_determination_radar=5"
+            echo "Full catalog run — enforcing per-axis floors: ${MIN_ROWS}"
+          else
+            MIN_ROWS=""
+            echo "::warning title=OD row floors not enforced::OBJECTS='${OBJECTS}' is a subset, so the per-axis ci-check floors are skipped for this run."
+          fi
           ./target/release/empyrean-validation ci-check \
             --summary results/validation_summary.json \
-            --strict-channels python,core
+            --strict-channels python,core \
+            ${MIN_ROWS}
 
       # ── GCS upload ─────────────────────────────────────────────
       # Publish on every real trigger INCLUDING repository_dispatch — a

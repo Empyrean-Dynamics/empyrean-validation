@@ -14,7 +14,8 @@
 //!   channel) via [`crate::report::generate_report`].
 //! - [`ci-check`](CiCheckArgs) — read the CI summary JSON written by
 //!   `report --summary` and exit non-zero if any channel in
-//!   `--strict-channels` failed binding fidelity at 1e-10.
+//!   `--strict-channels` is absent from the summary, failed binding
+//!   fidelity at 1e-10, or fell below a `--min-rows` per-axis floor.
 //!
 //! Per-channel runners (the binaries that actually execute
 //! propagation / ephemeris / OD against a specific empyrean
@@ -157,8 +158,27 @@ struct CiCheckArgs {
     /// Channels that must pass binding fidelity (1e-10) on every row.
     /// Comma-separated. Channels not in this list are surfaced in the
     /// report but don't fail CI.
+    ///
+    /// A strict channel that is ABSENT from the summary is a failure, not
+    /// a skip — a channel that produced no output at all is the most
+    /// severe outcome available, and the gate must not read it as silence.
     #[arg(long, value_delimiter = ',', default_values_t = ["c".to_string(), "cli".to_string(), "python".to_string()])]
     strict_channels: Vec<String>,
+    /// Minimum compared-row count per test type, as `<test_type>=<count>`.
+    /// Repeatable and/or comma-separated, e.g.
+    /// `--min-rows orbit_determination=50,orbit_determination_radar=5`.
+    ///
+    /// Enforced against every strict channel. Aggregate row counts cannot
+    /// catch a single dead axis: a run with the full propagation and
+    /// ephemeris grid and ZERO orbit-determination rows has tens of
+    /// thousands of compared rows and passes an aggregate check without
+    /// having tested orbit determination at all. That is precisely the
+    /// state this suite shipped in. Floors are per-axis for that reason.
+    ///
+    /// Scale these when running an object subset; the wired defaults in the
+    /// workflow correspond to the full catalog.
+    #[arg(long, value_delimiter = ',')]
+    min_rows: Vec<String>,
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -925,6 +945,95 @@ fn compare_sidecar_candidates(main_path: &std::path::Path) -> Vec<PathBuf> {
     out
 }
 
+/// Parse `--min-rows test_type=count` entries into (test_type, floor) pairs.
+///
+/// A malformed entry is an error, never a skipped floor: a typo'd test type
+/// that silently enforced nothing would reproduce the exact class of defect
+/// these floors exist to catch.
+fn parse_min_rows(specs: &[String]) -> Result<Vec<(String, u64)>, String> {
+    specs
+        .iter()
+        .map(|spec| {
+            let (tt, n) = spec
+                .split_once('=')
+                .ok_or_else(|| format!("--min-rows expects <test_type>=<count>, got {spec:?}"))?;
+            let tt = tt.trim();
+            if tt.is_empty() {
+                return Err(format!("--min-rows entry {spec:?} has an empty test type"));
+            }
+            let n: u64 = n
+                .trim()
+                .parse()
+                .map_err(|e| format!("--min-rows entry {spec:?}: bad count: {e}"))?;
+            Ok((tt.to_string(), n))
+        })
+        .collect()
+}
+
+/// Every reason this summary fails the gate, as human-readable lines.
+///
+/// Split out from [`ci_check`] so the gate's logic is testable without a
+/// process exit — a gate nobody can write a test against is a gate nobody
+/// notices has stopped checking anything.
+fn ci_check_failures(
+    channels: &[serde_json::Value],
+    strict_channels: &[String],
+    min_rows: &[(String, u64)],
+    summary_path: &std::path::Path,
+) -> Vec<String> {
+    let mut failures = Vec::new();
+    for want in strict_channels {
+        // Absence check FIRST. The previous gate iterated the summary and
+        // `continue`d past any channel not in --strict-channels, which meant
+        // a strict channel missing from the summary entirely was never
+        // examined — the gate passed on a channel that had produced nothing.
+        let Some(ch) = channels
+            .iter()
+            .find(|c| c["channel"].as_str() == Some(want.as_str()))
+        else {
+            let present: Vec<&str> = channels
+                .iter()
+                .filter_map(|c| c["channel"].as_str())
+                .collect();
+            failures.push(format!(
+                "{want}: ABSENT from {} — the channel produced no rows at all \
+                 (present: [{}])",
+                summary_path.display(),
+                present.join(", ")
+            ));
+            continue;
+        };
+
+        let passing = ch["n_passing"].as_u64().unwrap_or(0);
+        let total = ch["n_total_compared"].as_u64().unwrap_or(0);
+        if total == 0 {
+            failures.push(format!("{want}: no rows compared"));
+        } else if passing < total {
+            failures.push(format!(
+                "{want}: {passing}/{total} rows passed at 1e-10 (expected 100%)"
+            ));
+        }
+
+        // Per-axis floors. `by_test_type` is keyed by test type; a missing
+        // key and a zero count are the same failure — the axis was not
+        // exercised — and are reported as such rather than skipped.
+        for (tt, floor) in min_rows {
+            let n = ch["by_test_type"][tt]["n_compared"].as_u64();
+            match n {
+                Some(n) if n >= *floor => {}
+                Some(n) => {
+                    failures.push(format!("{want}: {tt} compared {n} rows, floor is {floor}"))
+                }
+                None => failures.push(format!(
+                    "{want}: {tt} is absent from the summary (floor is {floor}) — \
+                     that axis was never exercised"
+                )),
+            }
+        }
+    }
+    failures
+}
+
 fn ci_check(args: CiCheckArgs) -> Result<(), Box<dyn std::error::Error>> {
     let raw = std::fs::read_to_string(&args.summary)
         .map_err(|e| format!("read {}: {e}", args.summary.display()))?;
@@ -932,29 +1041,26 @@ fn ci_check(args: CiCheckArgs) -> Result<(), Box<dyn std::error::Error>> {
     let channels = summary["channels"]
         .as_array()
         .ok_or("summary missing channels array")?;
-
-    let mut failures = Vec::new();
-    for ch in channels {
-        let name = ch["channel"].as_str().unwrap_or("?");
-        if !args.strict_channels.iter().any(|s| s == name) {
-            continue;
-        }
-        let passing = ch["n_passing"].as_u64().unwrap_or(0);
-        let total = ch["n_total_compared"].as_u64().unwrap_or(0);
-        if total == 0 {
-            failures.push(format!("{name}: no rows compared"));
-        } else if passing < total {
-            failures.push(format!(
-                "{name}: {passing}/{total} rows passed at 1e-10 (expected 100%)"
-            ));
-        }
-    }
+    let min_rows = parse_min_rows(&args.min_rows)?;
+    let failures = ci_check_failures(channels, &args.strict_channels, &min_rows, &args.summary);
 
     if failures.is_empty() {
         eprintln!(
             "ci-check: all strict channels [{}] passed binding fidelity at 1e-10",
             args.strict_channels.join(", ")
         );
+        if min_rows.is_empty() {
+            eprintln!("ci-check: no per-axis row floors were requested (--min-rows)");
+        } else {
+            eprintln!(
+                "ci-check: per-axis row floors met [{}]",
+                min_rows
+                    .iter()
+                    .map(|(tt, n)| format!("{tt}>={n}"))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            );
+        }
         Ok(())
     } else {
         for f in &failures {
@@ -992,6 +1098,116 @@ mod tests {
         r.object = object.into();
         r.test_type = "orbit_determination".into();
         r
+    }
+
+    // ── ci-check gate ────────────────────────────────────────────────
+    //
+    // The gate that shipped had two holes, both of which let a channel that
+    // computed nothing report success. These tests pin both shut.
+
+    /// A summary channel entry with the given per-axis compared counts.
+    fn summary_channel(name: &str, by_tt: &[(&str, u64)]) -> serde_json::Value {
+        let total: u64 = by_tt.iter().map(|(_, n)| *n).sum();
+        let by_test_type: serde_json::Map<String, serde_json::Value> = by_tt
+            .iter()
+            .map(|(tt, n)| ((*tt).to_string(), serde_json::json!({ "n_compared": n })))
+            .collect();
+        serde_json::json!({
+            "channel": name,
+            "n_rows": total,
+            "n_passing": total,
+            "n_total_compared": total,
+            "by_test_type": by_test_type,
+        })
+    }
+
+    fn strict(names: &[&str]) -> Vec<String> {
+        names.iter().map(|s| (*s).to_string()).collect()
+    }
+
+    fn check(channels: &[serde_json::Value], names: &[&str], floors: &[&str]) -> Vec<String> {
+        let min_rows = parse_min_rows(&strict(floors)).expect("floors parse");
+        ci_check_failures(
+            channels,
+            &strict(names),
+            &min_rows,
+            std::path::Path::new("results/validation_summary.json"),
+        )
+    }
+
+    #[test]
+    fn ci_check_fails_when_a_strict_channel_is_absent() {
+        // Hole 1: the gate iterated the summary's channels and skipped any
+        // that were not strict, so a strict channel MISSING from the summary
+        // was never examined at all — the most severe outcome available read
+        // as silence.
+        let channels = vec![summary_channel("python", &[("propagation", 100)])];
+        let failures = check(&channels, &["python", "core"], &[]);
+        assert_eq!(failures.len(), 1, "{failures:?}");
+        assert!(failures[0].starts_with("core: ABSENT"), "{failures:?}");
+        assert!(failures[0].contains("python"), "lists what was present");
+
+        // Present channels are still checked normally.
+        assert!(check(&channels, &["python"], &[]).is_empty());
+    }
+
+    #[test]
+    fn ci_check_fails_on_a_zero_row_od_axis_that_aggregates_green() {
+        // Hole 2: the gate asserted aggregate row counts only. This is the
+        // exact shape that shipped — a full propagation + ephemeris grid and
+        // ZERO orbit-determination rows. 12,194 rows compared, 100% passing,
+        // and the OD axis never ran.
+        let channels = vec![summary_channel(
+            "core",
+            &[("propagation", 4854), ("ephemeris", 7340)],
+        )];
+
+        // Aggregate-only: green, exactly as before.
+        assert!(check(&channels, &["core"], &[]).is_empty());
+
+        // With floors: caught, and the message names the axis.
+        let failures = check(
+            &channels,
+            &["core"],
+            &["orbit_determination=50", "orbit_determination_radar=5"],
+        );
+        assert_eq!(failures.len(), 2, "{failures:?}");
+        assert!(
+            failures[0].contains("orbit_determination is absent"),
+            "{failures:?}"
+        );
+        assert!(
+            failures[1].contains("orbit_determination_radar is absent"),
+            "{failures:?}"
+        );
+    }
+
+    #[test]
+    fn ci_check_floor_is_a_floor_not_an_equality() {
+        let at_floor = vec![summary_channel("core", &[("orbit_determination", 50)])];
+        assert!(check(&at_floor, &["core"], &["orbit_determination=50"]).is_empty());
+
+        let above = vec![summary_channel("core", &[("orbit_determination", 55)])];
+        assert!(check(&above, &["core"], &["orbit_determination=50"]).is_empty());
+
+        // One short — a partially-run catalog is a failure, not a pass.
+        let below = vec![summary_channel("core", &[("orbit_determination", 49)])];
+        let failures = check(&below, &["core"], &["orbit_determination=50"]);
+        assert_eq!(failures.len(), 1, "{failures:?}");
+        assert!(
+            failures[0].contains("compared 49 rows, floor is 50"),
+            "{failures:?}"
+        );
+    }
+
+    #[test]
+    fn min_rows_rejects_malformed_specs() {
+        // A typo'd floor that silently enforced nothing would reproduce the
+        // very defect the floors exist to catch, so parsing is strict.
+        assert!(parse_min_rows(&strict(["orbit_determination=50"].as_ref())).is_ok());
+        assert!(parse_min_rows(&strict(["orbit_determination"].as_ref())).is_err());
+        assert!(parse_min_rows(&strict(["=50"].as_ref())).is_err());
+        assert!(parse_min_rows(&strict(["orbit_determination=lots"].as_ref())).is_err());
     }
 
     #[test]
