@@ -295,6 +295,13 @@ build-empyrean-validation:
 	@echo "──── Building empyrean-validation CLI ──────────────────"
 	@cd $(EMPYREAN_VALIDATION_ROOT) && cargo build --release --bin empyrean-validation
 
+# File target so rules that need the binary (plan strip, merge, report) can
+# depend on it directly instead of failing with "No rule to make target"
+# when it hasn't been built yet. Delegates to the phony recipe above so
+# cargo's fingerprinting still decides whether to rebuild.
+$(EMP_VAL_BIN):
+	@$(MAKE) --no-print-directory build-empyrean-validation
+
 # ── Run pipeline ───────────────────────────────────────────
 # Channel order: rust first (produces the unified $(RUST) input every other
 # channel consumes), then the four replay channels (python / c / cli / core),
@@ -396,16 +403,9 @@ $(PLAN):
 	@test -f $(PLAN) || { echo "ERROR: PLAN_PREBUILT=1 but $(PLAN) is missing — the prep job's plan artifact was not staged into $(RESULTS_DIR)."; exit 1; }
 	@echo "──── Plan: using prebuilt artifact $(PLAN) ─────────────"
 else
-$(PLAN): $(RUST)
-	@echo "──── Plan: strip channel-specific fields from rust unified ─"
-	@$(WHEEL_PY) -c "import json; \
-rows=json.load(open('$(RUST)')); \
-clear_fields=['emp_pos_au','emp_time_ms','emp_vs_horizons_km','separation_arcsec','d_ra_arcsec','d_dec_arcsec','d_rho_km','d_light_time_s','od_iterations','od_converged','od_rms_ra_arcsec','od_rms_dec_arcsec','od_rms_combined_arcsec','od_chi2','od_reduced_chi2','od_a1','od_a2','od_a3','od_a1_sigma','od_a2_sigma','od_a3_sigma','assist_vs_horizons_km','emp_vs_assist_km','assist_time_ms','speed_ratio','findorb_rms_residual','findorb_n_obs_used','findorb_n_obs_rejected']; \
-rows=[r for r in rows if r.get('propagation_uncertainty') not in ('auto', 'second_order_with_cov')]; \
-[r.update({f: None for f in clear_fields}) for r in rows]; \
-[r.update(channel='plan') for r in rows]; \
-json.dump(rows, open('$(PLAN)','w'), indent=2, default=str); \
-print(f'Wrote {len(rows)} plan rows to $(PLAN) (auto + second-order excluded — rust-only axes)')"
+$(PLAN): $(RUST) $(EMP_VAL_BIN)
+	@echo "──── Plan: strip rust unified down to the plan contract ────"
+	@$(EMP_VAL_BIN) strip-plan --input $(RUST) --output $(PLAN)
 endif
 
 # Phony so the assertion runs on EVERY invocation, not just the one that

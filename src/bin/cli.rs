@@ -5,6 +5,9 @@
 //! - [`plan`](PlanArgs) — generate a [`ValidationPlan`] JSON using the
 //!   shared [`crate::catalog`] and [`crate::plan::build_plan`]. Output
 //!   is the canonical fixture every per-channel runner consumes.
+//! - [`strip-plan`](StripPlanArgs) — reduce a channel-result JSON (the
+//!   rust reference's) to the canonical plan, keeping only the
+//!   plan-contract keys and popping everything else.
 //! - [`merge-external`](MergeExternalArgs) — fold ASSIST and find_orb
 //!   per-channel JSONs into a base channel JSON (typically the rust
 //!   runner's), populating the `assist_*` / `findorb_*` fields on each
@@ -49,6 +52,8 @@ struct Cli {
 enum Command {
     /// Generate a validation plan JSON (test grid + IC + Horizons references).
     Plan(PlanArgs),
+    /// Strip a channel-result JSON down to the canonical plan contract.
+    StripPlan(StripPlanArgs),
     /// Merge ASSIST / find_orb per-channel JSONs into a rust-channel JSON.
     MergeExternal(MergeExternalArgs),
     /// Render an HTML report from one or more channel JSONs.
@@ -79,6 +84,17 @@ struct PlanArgs {
     /// Disk-cache directory for SBDB / Horizons queries.
     #[arg(long, default_value = "~/.empyrean/cache")]
     cache_dir: PathBuf,
+}
+
+#[derive(Parser, Debug)]
+struct StripPlanArgs {
+    /// Channel-result JSON to derive the plan from (the rust reference's
+    /// unified `validation_rust.json`).
+    #[arg(short, long)]
+    input: PathBuf,
+    /// Output plan JSON path.
+    #[arg(short, long, default_value = "results/validation_plan.json")]
+    output: PathBuf,
 }
 
 #[derive(Parser, Debug)]
@@ -185,6 +201,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cli = Cli::parse();
     match cli.command {
         Command::Plan(args) => plan(args),
+        Command::StripPlan(args) => strip_plan(args),
         Command::MergeExternal(args) => merge_external(args),
         Command::Report(args) => report(args),
         Command::CiCheck(args) => ci_check(args),
@@ -238,6 +255,59 @@ fn plan(args: PlanArgs) -> Result<(), Box<dyn std::error::Error>> {
         "Wrote {} plan rows to {}",
         plan.len(),
         args.output.display()
+    );
+    Ok(())
+}
+
+/// Reduce a channel-result JSON to the canonical plan.
+///
+/// The transformation itself lives in [`empyrean_validation::plan`] — the
+/// crate that owns the schema owns the plan contract, so a schema change and
+/// a plan change land together instead of drifting apart in a shell one-liner.
+/// This replaces an inline Python strip in the Makefile that ran under the
+/// empyrean wheel's interpreter, which also means plan generation no longer
+/// depends on the wheel venv existing.
+fn strip_plan(args: StripPlanArgs) -> Result<(), Box<dyn std::error::Error>> {
+    let raw = std::fs::read_to_string(&args.input)
+        .map_err(|e| format!("read {}: {e}", args.input.display()))?;
+    let rows: Vec<serde_json::Value> =
+        serde_json::from_str(&raw).map_err(|e| format!("parse {}: {e}", args.input.display()))?;
+    let (plan, dropped) = empyrean_validation::plan::strip_to_plan(&rows)?;
+
+    // Same assertion the Makefile makes on the finished plan, made here at
+    // the point the rows are actually discarded, so the message can name the
+    // input file that came up empty.
+    let n_od = plan
+        .iter()
+        .filter(|r| {
+            !matches!(
+                r["test_type"].as_str(),
+                Some("propagation") | Some("ephemeris")
+            )
+        })
+        .count();
+    if n_od == 0 {
+        return Err(format!(
+            "{} carries ZERO orbit-determination rows ({} rows in, {} plan rows out). \
+             The plan would delete the OD axis from every downstream channel while \
+             each one reported success.",
+            args.input.display(),
+            rows.len(),
+            plan.len()
+        )
+        .into());
+    }
+
+    if let Some(parent) = args.output.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::write(&args.output, serde_json::to_string_pretty(&plan)?)?;
+    eprintln!(
+        "Wrote {} plan rows to {} ({} OD; {} rust-only uncertainty-axis rows dropped)",
+        plan.len(),
+        args.output.display(),
+        n_od,
+        dropped
     );
     Ok(())
 }

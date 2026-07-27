@@ -430,6 +430,172 @@ fn self_perturber_naif_ids(obj: &ValidationObject) -> Vec<i32> {
         .unwrap_or_default()
 }
 
+// ── Plan contract (the strip) ───────────────────────────────────────────
+//
+// `make plan` derives the canonical plan from the rust channel's own output
+// rather than re-querying JPL, so the plan inherits whatever field set the
+// rust runner happened to emit. That coupling broke the `core` reference
+// channel: empyrean-core pins the v0.7.0 schema, whose `ValidationResult` is
+// `#[serde(deny_unknown_fields)]`, and the rust runner had since gained
+// `emp_pos_cov_au2`, `emp_radec_cov_arcsec2`, and `source_version`. The core
+// channel aborted on the unknown keys, which failed the empyrean matrix job,
+// which skipped reduce / gate / publish entirely.
+//
+// The subtlety that makes a blacklist unfixable: the old strip NULLED the
+// fields it wanted to remove. `deny_unknown_fields` rejects on key PRESENCE,
+// not on value — `"emp_pos_cov_au2": null` fails exactly as hard as a
+// populated one. Adding fields to a clear list could never have fixed it.
+//
+// So the contract is inverted: an explicit whitelist of keys the plan may
+// carry, with everything else POPPED. A field added to the rust runner
+// tomorrow cannot reach a pinned consumer, because reaching the plan now
+// requires being named here.
+
+/// Plan-contract keys whose **values are carried through**: test identity,
+/// initial conditions, and the Horizons reference values every replay channel
+/// compares against.
+pub const PLAN_CARRIED_KEYS: [&str; 30] = [
+    // Test identity
+    "object",
+    "population",
+    "epoch_mjd_tdb",
+    "dt_days",
+    "t_mjd_tdb",
+    "force_model",
+    "test_type",
+    "channel",
+    "observer",
+    "propagation_uncertainty",
+    "excluded_perturbers_naif",
+    "timestamp",
+    "notes",
+    // Initial conditions
+    "ic_pos_au",
+    "ic_vel_au_d",
+    "ic_a1",
+    "ic_a2",
+    "ic_a3",
+    "ic_g_alpha",
+    "ic_g_r0",
+    "ic_g_m",
+    "ic_g_n",
+    "ic_g_k",
+    "ic_non_grav_dt",
+    // Horizons reference values
+    "ref_pos_au",
+    "ref_vel_au_d",
+    "ref_ra_rad",
+    "ref_dec_rad",
+    "ref_rho_au",
+    "ref_light_time_d",
+];
+
+/// Plan-contract keys that are **present but null**.
+///
+/// These carry no plan data — they are result slots a channel fills in. They
+/// cannot simply be popped: the schema does not mark them `#[serde(default)]`,
+/// on the pinned v0.7.0 shape or the current one, so a channel output derived
+/// from a plan missing them would fail to deserialize on a *missing* key
+/// instead of an unknown one. Present-and-null is the only value that
+/// satisfies both halves of the contract.
+pub const PLAN_CLEARED_KEYS: [&str; 23] = [
+    "emp_vs_horizons_km",
+    "emp_pos_au",
+    "emp_time_ms",
+    "separation_arcsec",
+    "d_ra_arcsec",
+    "d_dec_arcsec",
+    "d_rho_km",
+    "d_light_time_s",
+    "n_obs_used",
+    "od_iterations",
+    "od_converged",
+    "od_rms_ra_arcsec",
+    "od_rms_dec_arcsec",
+    "od_rms_combined_arcsec",
+    "od_chi2",
+    "od_reduced_chi2",
+    "assist_vs_horizons_km",
+    "emp_vs_assist_km",
+    "assist_time_ms",
+    "speed_ratio",
+    "findorb_rms_residual",
+    "findorb_n_obs_used",
+    "findorb_n_obs_rejected",
+];
+
+/// Uncertainty axes a replay channel can actually reproduce.
+///
+/// The rust reference also sweeps `second_order_with_cov`, `auto`,
+/// `sigma_point_with_cov`, and `monte_carlo_100_with_cov`. Those are
+/// rust-only axes; a plan row asking another channel to replay one is a row
+/// that channel will never match. The old strip blacklisted the first two and
+/// let the sigma-point and Monte-Carlo rows through, so they rode into the
+/// "plan" as unreplayable work. Whitelisted for the same reason the key set
+/// is: a new rust-only axis must not silently become everyone's problem.
+///
+/// `None` (OD rows carry no uncertainty tag) is always in the plan.
+pub const PLAN_UNCERTAINTY_AXES: [&str; 2] = [
+    uncertainty_modes::FIRST_ORDER_WITH_COV,
+    uncertainty_modes::F64_NO_COV,
+];
+
+/// Is this row on an axis the plan should carry?
+fn is_plan_axis(row: &serde_json::Map<String, serde_json::Value>) -> bool {
+    match row.get("propagation_uncertainty") {
+        None | Some(serde_json::Value::Null) => true,
+        Some(serde_json::Value::String(s)) => PLAN_UNCERTAINTY_AXES.contains(&s.as_str()),
+        Some(_) => false,
+    }
+}
+
+/// Reduce one channel-result row to the plan contract: carried keys keep their
+/// values, cleared keys become `null`, everything else is popped.
+fn strip_row_to_plan_contract(
+    row: &serde_json::Map<String, serde_json::Value>,
+) -> serde_json::Value {
+    let mut out = serde_json::Map::new();
+    for key in PLAN_CARRIED_KEYS {
+        // A carried key absent from the input stays absent rather than
+        // materialising as null — the input row is the authority on what it
+        // measured, and a fabricated key is the failure mode this whole
+        // function exists to prevent.
+        if let Some(v) = row.get(key) {
+            out.insert(key.to_string(), v.clone());
+        }
+    }
+    for key in PLAN_CLEARED_KEYS {
+        out.insert(key.to_string(), serde_json::Value::Null);
+    }
+    out.insert(
+        "channel".to_string(),
+        serde_json::Value::String(channels::PLAN.to_string()),
+    );
+    serde_json::Value::Object(out)
+}
+
+/// Strip a channel-result JSON array down to the canonical plan.
+///
+/// Returns the plan rows, and the count of input rows dropped as rust-only
+/// uncertainty axes.
+pub fn strip_to_plan(
+    rows: &[serde_json::Value],
+) -> Result<(Vec<serde_json::Value>, usize), String> {
+    let mut out = Vec::with_capacity(rows.len());
+    let mut dropped_axis = 0usize;
+    for (i, row) in rows.iter().enumerate() {
+        let obj = row
+            .as_object()
+            .ok_or_else(|| format!("row {i} is not a JSON object"))?;
+        if !is_plan_axis(obj) {
+            dropped_axis += 1;
+            continue;
+        }
+        out.push(strip_row_to_plan_contract(obj));
+    }
+    Ok((out, dropped_axis))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -499,5 +665,245 @@ mod tests {
         let r = od_plan_row(pallas, "standard", "ts");
         assert_eq!(r.test_type, "orbit_determination");
         assert_eq!(r.excluded_perturbers_naif, vec![2_000_002]);
+    }
+
+    // ── Plan contract ───────────────────────────────────────────────
+    //
+    // The pinned consumer's schema, reconstructed as a deserialization
+    // target. `empyrean-core` depends on `empyrean-validation` at tag v0.7.0,
+    // whose `ValidationResult` is `#[serde(deny_unknown_fields)]` over
+    // exactly these 70 keys — so this struct accepts precisely what that
+    // consumer accepts and rejects precisely what it rejects. Verified
+    // against `git show v0.7.0:src/schema.rs`.
+    //
+    // Every field is `Option<Value>` + `#[serde(default)]` on purpose: this
+    // models the KEY contract, which is the axis `deny_unknown_fields`
+    // enforces. Value shapes are the live schema's business.
+    macro_rules! pinned_schema {
+        ($name:ident { $($field:ident),* $(,)? }) => {
+            #[derive(serde::Deserialize)]
+            #[serde(deny_unknown_fields)]
+            #[allow(dead_code)]
+            struct $name {
+                $( #[serde(default)] $field: Option<serde_json::Value>, )*
+            }
+        };
+    }
+
+    pinned_schema!(PinnedV070Result {
+        object,
+        population,
+        epoch_mjd_tdb,
+        dt_days,
+        t_mjd_tdb,
+        force_model,
+        test_type,
+        channel,
+        observer,
+        emp_vs_horizons_km,
+        emp_pos_au,
+        emp_time_ms,
+        separation_arcsec,
+        d_ra_arcsec,
+        d_dec_arcsec,
+        d_rho_km,
+        d_light_time_s,
+        ic_pos_au,
+        ic_vel_au_d,
+        ic_a1,
+        ic_a2,
+        ic_a3,
+        ic_g_alpha,
+        ic_g_r0,
+        ic_g_m,
+        ic_g_n,
+        ic_g_k,
+        ic_non_grav_dt,
+        ref_pos_au,
+        ref_vel_au_d,
+        ref_ra_rad,
+        ref_dec_rad,
+        ref_rho_au,
+        ref_light_time_d,
+        n_obs_used,
+        od_iterations,
+        od_converged,
+        od_rms_ra_arcsec,
+        od_rms_dec_arcsec,
+        od_rms_combined_arcsec,
+        od_chi2,
+        od_reduced_chi2,
+        od_a1,
+        od_a2,
+        od_a3,
+        od_a1_sigma,
+        od_a2_sigma,
+        od_a3_sigma,
+        excluded_perturbers_naif,
+        propagation_uncertainty,
+        assist_vs_horizons_km,
+        emp_vs_assist_km,
+        assist_time_ms,
+        speed_ratio,
+        findorb_rms_residual,
+        findorb_n_obs_used,
+        findorb_n_obs_rejected,
+        oorb_vs_horizons_km,
+        emp_vs_oorb_km,
+        oorb_time_ms,
+        oorb_separation_arcsec,
+        oorb_d_ra_arcsec,
+        oorb_d_dec_arcsec,
+        oorb_d_rho_km,
+        orbfit_rms_arcsec,
+        orbfit_n_obs_used,
+        orbfit_n_obs_rejected,
+        orbfit_time_ms,
+        timestamp,
+        notes,
+    });
+
+    /// A rust-channel result row carrying every current-schema field plus
+    /// fields no schema has ever heard of.
+    fn rust_row_with_unknown_fields(uncertainty: Option<&str>) -> serde_json::Value {
+        let mut row = serde_json::to_value(ValidationResult {
+            propagation_uncertainty: uncertainty.map(str::to_string),
+            // Fields that exist today but NOT at v0.7.0 — the ones that
+            // actually broke the core channel.
+            emp_pos_cov_au2: Some([[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]]),
+            emp_radec_cov_arcsec2: Some([[1.0, 0.0], [0.0, 1.0]]),
+            source_version: Some("empyrean-core 0.9.2".into()),
+            ref_sun_pos_au: Some([1.0, 2.0, 3.0]),
+            layup_chi2: Some(1.0),
+            orbfit_error: Some("boom".into()),
+            object: "Apophis".into(),
+            population: "NEO".into(),
+            test_type: test_types::PROPAGATION.into(),
+            channel: channels::RUST.into(),
+            force_model: "standard".into(),
+            ic_pos_au: Some([1.0, 2.0, 3.0]),
+            ref_pos_au: Some([1.0, 2.0, 3.0]),
+            emp_pos_au: Some([9.0, 9.0, 9.0]),
+            emp_time_ms: Some(42.0),
+            ..ValidationResult::empty()
+        })
+        .unwrap();
+        // …and fields from a hypothetical future runner, which is the case
+        // the whitelist is really insuring against.
+        let obj = row.as_object_mut().unwrap();
+        obj.insert("emp_delta_v_budget_m_s".into(), serde_json::json!(7.0));
+        obj.insert("some_future_field".into(), serde_json::json!({"a": 1}));
+        row
+    }
+
+    #[test]
+    fn plan_from_rows_with_unknown_fields_deserializes_against_the_pinned_schema() {
+        let rows = vec![rust_row_with_unknown_fields(Some(
+            uncertainty_modes::F64_NO_COV,
+        ))];
+        let (plan, dropped) = strip_to_plan(&rows).expect("strip");
+        assert_eq!(dropped, 0);
+        assert_eq!(plan.len(), 1);
+
+        // The whole point: a v0.7.0 consumer can read this.
+        let json = serde_json::to_string(&plan[0]).unwrap();
+        serde_json::from_str::<PinnedV070Result>(&json).unwrap_or_else(|e| {
+            panic!("plan row rejected by the pinned v0.7.0 schema: {e}\n{json}")
+        });
+
+        // …and so can the current one, which is stricter about value shapes.
+        serde_json::from_str::<ValidationResult>(&json)
+            .unwrap_or_else(|e| panic!("plan row rejected by the current schema: {e}\n{json}"));
+    }
+
+    #[test]
+    fn strip_pops_unknown_keys_rather_than_nulling_them() {
+        // The defect this replaces: the old strip set `field: None`, and
+        // `deny_unknown_fields` rejects on key PRESENCE, so nulling could
+        // never have fixed deserialization. Presence is the assertion.
+        let rows = vec![rust_row_with_unknown_fields(None)];
+        let (plan, _) = strip_to_plan(&rows).unwrap();
+        let obj = plan[0].as_object().unwrap();
+        for leaked in [
+            "emp_pos_cov_au2",
+            "emp_radec_cov_arcsec2",
+            "source_version",
+            "layup_chi2",
+            "orbfit_error",
+            "some_future_field",
+            "emp_delta_v_budget_m_s",
+        ] {
+            assert!(
+                !obj.contains_key(leaked),
+                "{leaked} must be POPPED, not present-and-null"
+            );
+        }
+        // Cleared keys are the exception — present, and null.
+        for cleared in PLAN_CLEARED_KEYS {
+            assert_eq!(
+                obj.get(cleared),
+                Some(&serde_json::Value::Null),
+                "{cleared} must be present and null"
+            );
+        }
+        // Carried keys keep their values; the channel tag is rewritten.
+        assert_eq!(obj["object"], serde_json::json!("Apophis"));
+        assert_eq!(obj["ic_pos_au"], serde_json::json!([1.0, 2.0, 3.0]));
+        assert_eq!(obj["channel"], serde_json::json!(channels::PLAN));
+    }
+
+    #[test]
+    fn cleared_keys_cover_every_key_the_schema_demands_be_present() {
+        // Both the current schema and the pinned v0.7.0 one leave 50 fields
+        // without `#[serde(default)]`, so a plan that popped one would make
+        // every derived channel output fail to deserialize on a MISSING key.
+        // Carried ∪ cleared must therefore cover them. This is what stops a
+        // future tidy-up of the cleared list from breaking the other
+        // direction.
+        let (plan, _) = strip_to_plan(&[rust_row_with_unknown_fields(None)]).unwrap();
+        let json = serde_json::to_string(&plan[0]).unwrap();
+        serde_json::from_str::<ValidationResult>(&json).expect("no required key was popped");
+    }
+
+    #[test]
+    fn rust_only_uncertainty_axes_never_reach_the_plan() {
+        // sigma_point and monte_carlo rode into the "plan" under the old
+        // blacklist, which named only `auto` and `second_order_with_cov`.
+        for axis in [
+            "auto",
+            "second_order_with_cov",
+            "sigma_point_with_cov",
+            "monte_carlo_100_with_cov",
+        ] {
+            let (plan, dropped) =
+                strip_to_plan(&[rust_row_with_unknown_fields(Some(axis))]).unwrap();
+            assert!(plan.is_empty(), "{axis} leaked into the plan");
+            assert_eq!(dropped, 1);
+        }
+        for axis in PLAN_UNCERTAINTY_AXES {
+            let (plan, dropped) =
+                strip_to_plan(&[rust_row_with_unknown_fields(Some(axis))]).unwrap();
+            assert_eq!(plan.len(), 1, "{axis} should be replayable");
+            assert_eq!(dropped, 0);
+        }
+        // OD rows carry no uncertainty tag and are always in the plan.
+        let (plan, dropped) = strip_to_plan(&[rust_row_with_unknown_fields(None)]).unwrap();
+        assert_eq!((plan.len(), dropped), (1, 0));
+    }
+
+    #[test]
+    fn plan_contract_is_a_subset_of_the_pinned_schema() {
+        // Belt and braces on the whitelist itself: a key added to
+        // PLAN_CARRIED_KEYS that the pinned consumer does not know about
+        // would reintroduce the original bug, and would only show up in the
+        // deserialization test if some row happened to populate it.
+        let mut row = serde_json::Map::new();
+        for k in PLAN_CARRIED_KEYS.iter().chain(PLAN_CLEARED_KEYS.iter()) {
+            row.insert((*k).to_string(), serde_json::Value::Null);
+        }
+        let json = serde_json::to_string(&serde_json::Value::Object(row)).unwrap();
+        serde_json::from_str::<PinnedV070Result>(&json).unwrap_or_else(|e| {
+            panic!("a plan-contract key is unknown to the pinned v0.7.0 schema: {e}")
+        });
     }
 }
