@@ -848,6 +848,51 @@ pub struct OdValidationOutput {
     pub orbit_comparisons: Vec<OrbitComparison>,
 }
 
+/// Build an OD **failure row**: a `ValidationResult` that records *why* no fit
+/// was produced, in the same row stream a successful fit would have joined.
+///
+/// The `determine()` error path already emitted one of these (empyrean-8l28);
+/// this lifts that pattern out so every way an OD can fail to produce a number
+/// goes through it. A fixture that is missing, unreadable, unparseable, or
+/// empty is a validation *failure*, not an absence — the project rule is "no
+/// hidden fallbacks in scientific code: never silently substitute defaults,
+/// drop observations, or degrade quality; every mismatch must surface loudly."
+///
+/// The distinction is not cosmetic. A row carrying `od_converged: false` and
+/// the reason in `notes` reaches the report and the row counts; a row that was
+/// never emitted is indistinguishable downstream from "this object was never
+/// part of the run". That is precisely how the OD channel stayed dead in CI
+/// for the life of this repo: fifty missing fixtures produced fifty `eprintln`
+/// lines nobody reads and an empty JSON array that every consumer treated as
+/// "nothing to do". Fifty failure rows in the report would have said it out
+/// loud on the first run.
+///
+/// Callers fill in whatever they know (`n_obs_used`, `emp_time_ms`,
+/// `od_iterations`); everything else stays `None`, which reads as "not
+/// measured" rather than a fabricated zero.
+fn od_failure_row(
+    obj: &ValidationObject,
+    test_type: &str,
+    channel: &str,
+    tier_str: &str,
+    excluded_naif: &[i32],
+    engine_version: Option<String>,
+    note: String,
+) -> ValidationResult {
+    let mut row = ValidationResult::empty();
+    row.object = obj.name.to_string();
+    row.population = obj.population.to_string();
+    row.test_type = test_type.to_string();
+    row.channel = channel.to_string();
+    row.force_model = tier_str.to_string();
+    row.od_converged = Some(false);
+    row.excluded_perturbers_naif = excluded_naif.to_vec();
+    row.source_version = engine_version;
+    row.timestamp = chrono::Utc::now().to_rfc3339();
+    row.notes = note;
+    row
+}
+
 /// Run orbit-determination validation: load PSV from
 /// `validation/fixtures/psv/{name}.psv`, run `ctx.determine`, emit one
 /// `ValidationResult` row per object with `test_type =
@@ -905,53 +950,16 @@ pub fn run_od_validation(
             let mut results: Vec<ValidationResult> = Vec::new();
             let mut captured_orbits: Vec<CapturedOrbit> = Vec::new();
             let mut orbit_comparisons: Vec<OrbitComparison> = Vec::new();
-        // Try common PSV filename variants. Object names with a "/"
-        // (the comets — "2P/Encke", "103P/Hartley 2", the interstellars)
-        // are stored with the slash rewritten to "_" so the name is not
-        // read as a path separator; try that sanitized form too.
-        let candidates = [
-            fixtures_dir.join(format!("{}.psv", obj.name)),
-            fixtures_dir.join(format!("{}.psv", obj.name.replace('/', "_"))),
-            fixtures_dir.join(format!("{}.psv", obj.mpc_designation)),
-        ];
-        let path = candidates.iter().find(|p| p.exists());
-        let Some(path) = path else {
-            eprintln!(
-                "  {}: SKIP (no PSV at {})",
-                obj.name,
-                candidates[0].display()
-            );
-            return (results, captured_orbits, orbit_comparisons);
-        };
-
-        let psv = match std::fs::read_to_string(path) {
-            Ok(s) => s,
-            Err(e) => {
-                eprintln!("  {}: SKIP (read PSV: {e})", obj.name);
-                return (results, captured_orbits, orbit_comparisons);
-            }
-        };
-
-        let observations = match ctx.read_ades(&psv) {
-            Ok(o) => o,
-            Err(e) => {
-                eprintln!("  {}: SKIP (parse PSV: {e})", obj.name);
-                return (results, captured_orbits, orbit_comparisons);
-            }
-        };
-
-        if observations.is_empty() {
-            eprintln!("  {}: SKIP (zero observations)", obj.name);
-            return (results, captured_orbits, orbit_comparisons);
-        }
-
-        let n_obs = observations.len();
         // SB441-N16 self-perturbers: exclude the body's own gravity from
         // the perturber set during fitting. Without this the integrator
         // self-pulls and converges to junk fixed points (Pallas RMS 8000″,
         // Iris RMS 149″, etc.). The validation catalog tags these with
         // population = "Self-Perturber"; mpc_designation carries the
         // asteroid number for Origin::Asteroid construction.
+        //
+        // Derived from the catalog entry alone, so it is hoisted above the
+        // fixture load: a failure row for a fixture that never loaded still
+        // records which perturber set the fit *would* have used.
         let excluded_origins: Vec<Origin> = if obj.population == "Self-Perturber" {
             match obj.mpc_designation.parse::<i32>() {
                 Ok(n) => vec![Origin::Asteroid(n)],
@@ -965,6 +973,87 @@ pub fn run_od_validation(
             .copied()
             .map(Origin::naif_id)
             .collect();
+        // Emit a failure row for any way the optical fixture fails to become
+        // observations. See `od_failure_row` for why these are rows and not
+        // log lines.
+        let fixture_failure = |note: String| -> ValidationResult {
+            od_failure_row(
+                obj,
+                empyrean_validation::schema::test_types::ORBIT_DETERMINATION,
+                &channel,
+                &tier_str,
+                &excluded_naif,
+                engine_version.clone(),
+                note,
+            )
+        };
+
+        // Try common PSV filename variants. Object names with a "/"
+        // (the comets — "2P/Encke", "103P/Hartley 2", the interstellars)
+        // are stored with the slash rewritten to "_" so the name is not
+        // read as a path separator; try that sanitized form too.
+        let candidates = [
+            fixtures_dir.join(format!("{}.psv", obj.name)),
+            fixtures_dir.join(format!("{}.psv", obj.name.replace('/', "_"))),
+            fixtures_dir.join(format!("{}.psv", obj.mpc_designation)),
+        ];
+        let path = candidates.iter().find(|p| p.exists());
+        let Some(path) = path else {
+            eprintln!(
+                "  {}: FAIL (no PSV at {}) — emitting failure row",
+                obj.name,
+                candidates[0].display()
+            );
+            results.push(fixture_failure(format!(
+                "no PSV fixture: none of {} exist",
+                candidates
+                    .iter()
+                    .map(|p| p.display().to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )));
+            return (results, captured_orbits, orbit_comparisons);
+        };
+
+        let psv = match std::fs::read_to_string(path) {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("  {}: FAIL (read PSV: {e}) — emitting failure row", obj.name);
+                results.push(fixture_failure(format!(
+                    "read PSV {}: {e}",
+                    path.display()
+                )));
+                return (results, captured_orbits, orbit_comparisons);
+            }
+        };
+
+        let observations = match ctx.read_ades(&psv) {
+            Ok(o) => o,
+            Err(e) => {
+                eprintln!(
+                    "  {}: FAIL (parse PSV: {e}) — emitting failure row",
+                    obj.name
+                );
+                results.push(fixture_failure(format!(
+                    "parse PSV {}: {e}",
+                    path.display()
+                )));
+                return (results, captured_orbits, orbit_comparisons);
+            }
+        };
+
+        if observations.is_empty() {
+            eprintln!(
+                "  {}: FAIL (zero observations) — emitting failure row",
+                obj.name
+            );
+            let mut row = fixture_failure(format!("PSV {} parsed to zero observations", path.display()));
+            row.n_obs_used = Some(0);
+            results.push(row);
+            return (results, captured_orbits, orbit_comparisons);
+        }
+
+        let n_obs = observations.len();
         eprintln!(
             "  {}: {} observations, running determine{}...",
             obj.name,
@@ -996,21 +1085,10 @@ pub fn run_od_validation(
                     "  {}: determine FAIL ({e}) — emitting failure row",
                     obj.name
                 );
-                let mut row = empyrean_validation::schema::ValidationResult::empty();
-                row.object = obj.name.to_string();
-                row.population = obj.population.to_string();
-                row.test_type =
-                    empyrean_validation::schema::test_types::ORBIT_DETERMINATION.to_string();
-                row.channel = channel.clone();
-                row.force_model = tier_str.clone();
+                let mut row = fixture_failure(format!("determine FAIL: {e}"));
                 row.n_obs_used = Some(n_obs as u32);
-                row.od_converged = Some(false);
                 row.od_iterations = Some(max_iterations);
                 row.emp_time_ms = Some(ms_fail);
-                row.excluded_perturbers_naif = excluded_naif.clone();
-                row.source_version = engine_version.clone();
-                row.timestamp = chrono::Utc::now().to_rfc3339();
-                row.notes = format!("determine FAIL: {e}");
                 results.push(row);
                 return (results, captured_orbits, orbit_comparisons);
             }

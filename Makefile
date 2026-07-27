@@ -150,7 +150,7 @@ REPORT_INPUTS := $(if $(WITH_CORE),$(RUST)$(comma)$(PYTHON)$(comma)$(C_OUT)$(com
         build-empyrean-c build-rust build-c build-cli build-wheel build-core build-empyrean-validation \
         run-rust run-python run-c run-cli run-assist run-findorb run-oorb run-orbfit \
         run-core run-kete run-jorbit run-layup \
-        merge-external plan reduce
+        merge-external plan check-plan reduce
 
 help:
 	@echo "Targets:"
@@ -345,9 +345,10 @@ $(RUST_OD): $(RUST_BIN) | check-fixtures
 
 $(RUST): $(RUST_PROPEPH) $(RUST_OD)
 	@echo "──── Rust channel: merge prop+eph + OD into unified ────"
-	@$(WHEEL_PY) -c "import json; \
+	@$(WHEEL_PY) -c "import json,sys; \
 a=json.load(open('$(RUST_PROPEPH)')); \
 b=json.load(open('$(RUST_OD)')); \
+sys.exit('ERROR: $(RUST_OD) carries zero OD rows. The rust OD pass produced nothing — a runner that emits no rows at all is a dead channel, not a passing one. Check the fixture guard (make check-fixtures) and the runner log above.') if not b else None; \
 json.dump(a+b, open('$(RUST)','w'), indent=2, default=str); \
 print(f'Wrote {len(a)+len(b)} unified rust rows ({len(a)} prop+eph, {len(b)} OD) to $(RUST)')"
 
@@ -357,7 +358,35 @@ print(f'Wrote {len(a)+len(b)} unified rust rows ({len(a)} prop+eph, {len(b)} OD)
 # separation_arcsec, channel set to "plan"). Every replay channel reads
 # the plan instead of validation_rust.json so they don't depend on rust's
 # results.
-plan: $(PLAN)
+#
+# A plan with zero OD rows is not a smaller plan — it is a plan that
+# silently deletes an entire test axis from every downstream channel.
+# That is exactly what shipped: the plan carried 0 orbit_determination
+# rows, so python / c / cli / core / find_orb / OrbFit / layup each
+# replayed nothing on the OD axis and reported success. Assert the count
+# on BOTH plan paths — the one that generates it and the one that
+# receives it as a prep artifact — so no leg can replay a gutted plan.
+define ASSERT_PLAN_HAS_OD
+import json, sys
+rows = json.load(open(sys.argv[1]))
+od = [r for r in rows if r.get("test_type") not in ("propagation", "ephemeris")]
+if not od:
+    sys.exit(
+        f"ERROR: {sys.argv[1]} carries ZERO orbit-determination rows "
+        f"({len(rows)} rows total, all propagation/ephemeris).\n"
+        "       Every OD consumer downstream (python / c / cli / core replay, "
+        "find_orb, OrbFit, layup,\n"
+        "       SBDB merge, the report's OD section) would no-op and report "
+        "success on an untested axis.\n"
+        "       Run `make check-fixtures` and re-read the rust OD runner log."
+    )
+from collections import Counter
+c = Counter(r["test_type"] for r in od)
+print("  plan OD rows: " + ", ".join(f"{n} {t}" for t, n in sorted(c.items())))
+endef
+export ASSERT_PLAN_HAS_OD
+
+plan: $(PLAN) check-plan
 ifeq ($(PLAN_PREBUILT),1)
 # Matrix-CI replay/external leg: the plan was produced by the prep job and
 # staged here as an artifact. Assert its presence loudly rather than silently
@@ -379,14 +408,22 @@ json.dump(rows, open('$(PLAN)','w'), indent=2, default=str); \
 print(f'Wrote {len(rows)} plan rows to $(PLAN) (auto + second-order excluded — rust-only axes)')"
 endif
 
-run-python: $(PLAN) check-fixtures
+# Phony so the assertion runs on EVERY invocation, not just the one that
+# built the plan file. `plan` and every plan-consuming target depend on
+# this, so a leg handed a gutted prep artifact refuses to replay it —
+# python3 rather than $(WHEEL_PY) because the external legs carry no
+# wheel venv.
+check-plan: $(PLAN)
+	@python3 -c "$$ASSERT_PLAN_HAS_OD" $(PLAN)
+
+run-python: $(PLAN) check-plan check-fixtures
 	@echo "──── Python channel: replay plan ───────────────────────"
 	@$(WHEEL_PY) $(EMPYREAN_RUNNERS)/python/run.py \
 	    --input $(PLAN) --output $(PYTHON) \
 	    --fixtures-dir $(FIXTURES_PSV) \
 	    --data-dir $(DATA_DIR)
 
-run-c: $(PLAN) $(C_BIN) check-fixtures
+run-c: $(PLAN) $(C_BIN) check-plan check-fixtures
 	@echo "──── C channel: replay plan (prop / eph / OD) ──────────"
 	@$(WHEEL_PY) $(EMPYREAN_RUNNERS)/c/drive.py \
 	    --input $(PLAN) \
@@ -394,7 +431,7 @@ run-c: $(PLAN) $(C_BIN) check-fixtures
 	    --fixtures-dir $(FIXTURES_PSV) \
 	    $(if $(filter-out $(HOME)/.empyrean/data,$(DATA_DIR)),--data-dir $(DATA_DIR),)
 
-run-cli: $(PLAN) $(CLI_BIN) check-fixtures
+run-cli: $(PLAN) $(CLI_BIN) check-plan check-fixtures
 	@echo "──── CLI channel: fork-exec one binary per plan row ────"
 	@$(DYLD) $(WHEEL_PY) $(EMPYREAN_RUNNERS)/cli/drive.py \
 	    --input $(PLAN) \
@@ -402,7 +439,7 @@ run-cli: $(PLAN) $(CLI_BIN) check-fixtures
 	    --fixtures-dir $(FIXTURES_PSV) \
 	    $(if $(filter-out $(HOME)/.empyrean/data,$(DATA_DIR)),--data-dir $(DATA_DIR),)
 
-run-assist: $(PLAN) $(ASSIST_PY)
+run-assist: $(PLAN) check-plan $(ASSIST_PY)
 	@echo "──── ASSIST: external propagator reference ─────────────"
 	@$(ASSIST_PY) $(EMP_VAL_RUNNERS)/assist/run_assist.py $(PLAN) \
 	    --output $(ASSIST_OUT) \
@@ -413,7 +450,7 @@ run-assist: $(PLAN) $(ASSIST_PY)
 # When it's absent, skip the comparison and emit empty result files so the
 # merge step still has valid (empty) inputs — the missing comparator is
 # surfaced here and by its absence from the report, never silently faked.
-run-findorb: $(ASSIST_PY) check-fixtures
+run-findorb: $(ASSIST_PY) check-plan check-fixtures
 	@if [ -x "$(FO_BIN)" ]; then \
 	    echo "──── find_orb: external OD reference ───────────────────"; \
 	    $(ASSIST_PY) $(EMP_VAL_RUNNERS)/findorb/run_findorb.py $(FIXTURES_PSV) \
@@ -446,7 +483,7 @@ run-oorb: $(OORB_OUT)
 # it's absent, skip the comparison and emit an empty result file so the
 # merge step still has a valid input — the missing comparator is surfaced
 # here and by its absence from the report, never silently faked.
-$(OORB_OUT): $(PLAN) $(ASSIST_PY)
+$(OORB_OUT): $(PLAN) $(ASSIST_PY) | check-plan
 	@if [ -x "$(OORB_BIN)" ]; then \
 	    echo "──── OpenOrb: external prop + ephemeris reference ──────"; \
 	    $(ASSIST_PY) $(EMP_VAL_RUNNERS)/oorb/run_oorb.py \
@@ -466,7 +503,7 @@ setup-orbfit:
 	@cd $(EMP_VAL_RUNNERS)/orbfit && ./setup.sh
 
 run-orbfit: $(ORBFIT_OUT)
-$(ORBFIT_OUT): $(PLAN) | check-fixtures
+$(ORBFIT_OUT): $(PLAN) | check-plan check-fixtures
 	@echo "──── OrbFit: external OD reference (neofit2.x via docker) ──"
 	@$(EMP_VAL_RUNNERS)/orbfit/run_orbfit.py \
 	    --plan $(PLAN) --output $(ORBFIT_OUT) --psv-dir $(FIXTURES_PSV)
@@ -479,7 +516,7 @@ ifneq ($(WITH_CORE),1)
 	@echo "──── Core channel skipped (empyrean-core not found) ────"
 endif
 
-$(CORE_OUT): $(PLAN) $(CORE_BIN) | check-fixtures
+$(CORE_OUT): $(PLAN) $(CORE_BIN) | check-plan check-fixtures
 	@echo "──── Core channel: replay plan via empyrean-core ───────"
 	@$(DYLD) $(CORE_BIN) --input $(PLAN) --output $(CORE_OUT) \
 	    --fixtures-dir $(FIXTURES_PSV)
@@ -500,7 +537,7 @@ $(KETE_PY):
 	@cd $(EMP_VAL_RUNNERS)/kete && ./setup.sh
 
 run-kete: $(KETE_OUT)
-$(KETE_OUT): $(PLAN) $(KETE_PY) | check-fixtures
+$(KETE_OUT): $(PLAN) $(KETE_PY) | check-plan check-fixtures
 	@echo "──── Kete: external all-test-types reference ──────────"
 	@$(KETE_PY) $(EMP_VAL_RUNNERS)/kete/run_kete.py \
 	    --input $(PLAN) --output $(KETE_OUT) \
@@ -519,7 +556,7 @@ $(JORBIT_PY):
 	@cd $(EMP_VAL_RUNNERS)/jorbit && ./setup.sh
 
 run-jorbit: $(JORBIT_OUT)
-$(JORBIT_OUT): $(PLAN) $(JORBIT_PY)
+$(JORBIT_OUT): $(PLAN) $(JORBIT_PY) | check-plan
 	@echo "──── jorbit: external (opt-in) reference ───────────────"
 	@$(JORBIT_PY) $(EMP_VAL_RUNNERS)/jorbit/run_jorbit.py \
 	    --input $(PLAN) --output $(JORBIT_OUT)
