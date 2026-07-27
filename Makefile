@@ -145,7 +145,7 @@ comma := ,
 REPORT_INPUTS := $(if $(WITH_CORE),$(RUST)$(comma)$(PYTHON)$(comma)$(C_OUT)$(comma)$(CLI_OUT)$(comma)$(CORE_MERGED),$(RUST_MERGED)$(comma)$(PYTHON)$(comma)$(C_OUT)$(comma)$(CLI_OUT))
 
 # ── Targets ────────────────────────────────────────────────
-.PHONY: all setup build run report clean help \
+.PHONY: all setup build run report clean help check-fixtures \
         setup-assist setup-findorb setup-oorb setup-orbfit setup-kete setup-jorbit setup-layup \
         build-empyrean-c build-rust build-c build-cli build-wheel build-core build-empyrean-validation \
         run-rust run-python run-c run-cli run-assist run-findorb run-oorb run-orbfit \
@@ -169,6 +169,42 @@ help:
 	@echo "        empyrean-validation=$(EMPYREAN_VALIDATION_ROOT)"
 
 all: build run report
+
+# ── Fixture guard ──────────────────────────────────────────
+# Every OD channel reads $(FIXTURES_PSV); the find_orb radar pass reads
+# $(FIXTURES_PSV_RADAR). Both are tracked in-repo (see
+# fixtures/psv/README.md), so a plain checkout carries them. If they are
+# absent anyway — a sparse checkout, an out-of-band deletion, a stale
+# worktree — say so here, with the reason and the fix.
+#
+# Before this guard existed, `fixtures/psv` was a bare directory
+# prerequisite of the layup output, so an absent fixture set aborted the
+# whole build with GNU make's "No rule to make target
+# '.../fixtures/psv'" — which names a path but not a problem. Every other
+# OD target had no prerequisite at all and simply produced zero rows.
+#
+# Order-only (`| check-fixtures`) on the file targets: the guard must run
+# before them, but a phony prerequisite must never mark a completed
+# multi-hour channel output as out of date.
+check-fixtures:
+	@test -d "$(FIXTURES_PSV)" || { \
+	    echo "ERROR: optical OD fixtures are missing: $(FIXTURES_PSV)"; \
+	    echo "       They are tracked in this repo — see fixtures/psv/README.md."; \
+	    echo "       Restore them with: git checkout -- fixtures/psv"; \
+	    exit 1; }
+	@n_opt=`ls -1 "$(FIXTURES_PSV)"/*.psv 2>/dev/null | wc -l | tr -d ' '`; \
+	 test "$$n_opt" -gt 0 || { \
+	    echo "ERROR: $(FIXTURES_PSV) exists but holds no .psv files."; \
+	    echo "       Every OD channel would emit zero rows. Restore them with:"; \
+	    echo "       git checkout -- fixtures/psv"; \
+	    exit 1; }; \
+	 n_rad=`ls -1 "$(FIXTURES_PSV_RADAR)"/*.psv 2>/dev/null | wc -l | tr -d ' '`; \
+	 test "$$n_rad" -gt 0 || { \
+	    echo "ERROR: $(FIXTURES_PSV_RADAR) holds no .psv files."; \
+	    echo "       The radar OD pass would emit zero rows. Restore them with:"; \
+	    echo "       git checkout -- fixtures/psv-radar"; \
+	    exit 1; }; \
+	 echo "Fixtures: $$n_opt optical + $$n_rad radar PSV files"
 
 # ── Setup (one-time) ───────────────────────────────────────
 # OrbFit's runner is gated on WITH_ORBFIT (see `run`), so only set it up
@@ -300,7 +336,7 @@ $(RUST_PROPEPH): $(RUST_BIN)
 	    --data-dir $(DATA_DIR) --cache-dir $(CACHE_DIR) \
 	    --output $(RUST_PROPEPH)
 
-$(RUST_OD): $(RUST_BIN)
+$(RUST_OD): $(RUST_BIN) | check-fixtures
 	@echo "──── Rust channel: orbit determination ─────────────────"
 	@$(DYLD) $(RUST_BIN) od $(ONLY_FLAG) --tier $(TIERS) \
 	    --data-dir $(DATA_DIR) \
@@ -343,14 +379,14 @@ json.dump(rows, open('$(PLAN)','w'), indent=2, default=str); \
 print(f'Wrote {len(rows)} plan rows to $(PLAN) (auto + second-order excluded — rust-only axes)')"
 endif
 
-run-python: $(PLAN)
+run-python: $(PLAN) check-fixtures
 	@echo "──── Python channel: replay plan ───────────────────────"
 	@$(WHEEL_PY) $(EMPYREAN_RUNNERS)/python/run.py \
 	    --input $(PLAN) --output $(PYTHON) \
 	    --fixtures-dir $(FIXTURES_PSV) \
 	    --data-dir $(DATA_DIR)
 
-run-c: $(PLAN) $(C_BIN)
+run-c: $(PLAN) $(C_BIN) check-fixtures
 	@echo "──── C channel: replay plan (prop / eph / OD) ──────────"
 	@$(WHEEL_PY) $(EMPYREAN_RUNNERS)/c/drive.py \
 	    --input $(PLAN) \
@@ -358,7 +394,7 @@ run-c: $(PLAN) $(C_BIN)
 	    --fixtures-dir $(FIXTURES_PSV) \
 	    $(if $(filter-out $(HOME)/.empyrean/data,$(DATA_DIR)),--data-dir $(DATA_DIR),)
 
-run-cli: $(PLAN) $(CLI_BIN)
+run-cli: $(PLAN) $(CLI_BIN) check-fixtures
 	@echo "──── CLI channel: fork-exec one binary per plan row ────"
 	@$(DYLD) $(WHEEL_PY) $(EMPYREAN_RUNNERS)/cli/drive.py \
 	    --input $(PLAN) \
@@ -377,7 +413,7 @@ run-assist: $(PLAN) $(ASSIST_PY)
 # When it's absent, skip the comparison and emit empty result files so the
 # merge step still has valid (empty) inputs — the missing comparator is
 # surfaced here and by its absence from the report, never silently faked.
-run-findorb: $(ASSIST_PY)
+run-findorb: $(ASSIST_PY) check-fixtures
 	@if [ -x "$(FO_BIN)" ]; then \
 	    echo "──── find_orb: external OD reference ───────────────────"; \
 	    $(ASSIST_PY) $(EMP_VAL_RUNNERS)/findorb/run_findorb.py $(FIXTURES_PSV) \
@@ -430,7 +466,7 @@ setup-orbfit:
 	@cd $(EMP_VAL_RUNNERS)/orbfit && ./setup.sh
 
 run-orbfit: $(ORBFIT_OUT)
-$(ORBFIT_OUT): $(PLAN)
+$(ORBFIT_OUT): $(PLAN) | check-fixtures
 	@echo "──── OrbFit: external OD reference (neofit2.x via docker) ──"
 	@$(EMP_VAL_RUNNERS)/orbfit/run_orbfit.py \
 	    --plan $(PLAN) --output $(ORBFIT_OUT) --psv-dir $(FIXTURES_PSV)
@@ -443,7 +479,7 @@ ifneq ($(WITH_CORE),1)
 	@echo "──── Core channel skipped (empyrean-core not found) ────"
 endif
 
-$(CORE_OUT): $(PLAN) $(CORE_BIN)
+$(CORE_OUT): $(PLAN) $(CORE_BIN) | check-fixtures
 	@echo "──── Core channel: replay plan via empyrean-core ───────"
 	@$(DYLD) $(CORE_BIN) --input $(PLAN) --output $(CORE_OUT) \
 	    --fixtures-dir $(FIXTURES_PSV)
@@ -464,7 +500,7 @@ $(KETE_PY):
 	@cd $(EMP_VAL_RUNNERS)/kete && ./setup.sh
 
 run-kete: $(KETE_OUT)
-$(KETE_OUT): $(PLAN) $(KETE_PY)
+$(KETE_OUT): $(PLAN) $(KETE_PY) | check-fixtures
 	@echo "──── Kete: external all-test-types reference ──────────"
 	@$(KETE_PY) $(EMP_VAL_RUNNERS)/kete/run_kete.py \
 	    --input $(PLAN) --output $(KETE_OUT) \
@@ -506,7 +542,7 @@ run-layup: $(LAYUP_OUT)
 # absent, skip the fit and emit an empty result file so the merge step still
 # has a valid input — the missing comparator is surfaced here and by its
 # absence from the report, never silently faked.
-$(LAYUP_OUT): $(FIXTURES_PSV)
+$(LAYUP_OUT): | check-fixtures
 	@if [ -x "$(LAYUP_PY)" ]; then \
 	    echo "──── layup: external OD reference (ADES PSV) ───────────"; \
 	    $(LAYUP_PY) $(EMP_VAL_RUNNERS)/layup/run_layup.py $(FIXTURES_PSV) \

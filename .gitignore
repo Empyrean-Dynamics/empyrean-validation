@@ -5,10 +5,9 @@ Cargo.lock
 # own isolated workspaces under runners/).
 **/target/
 
-# ADES observation fixtures for the validation catalog — the per-object
-# `.psv` files churn over time as observations are added / debiased /
-# re-fetched. Carried out-of-band, not tracked.
-fixtures/psv/
+# NOTE: `fixtures/psv/` is TRACKED (it used to be ignored). The OD channel
+# is only alive in CI if the fixtures ride the checkout — see
+# fixtures/psv/README.md for the rationale and the refresh procedure.
 
 # Compiled C-channel runner binary — `make -C runners/c` output.
 runners/c/runner
