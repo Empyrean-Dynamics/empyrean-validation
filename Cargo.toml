@@ -7,7 +7,14 @@ rust-version = "1.90.0"
 authors = ["Joachim Moeyens <joachim@empyrean-dynamics.com>", "Empyrean Dynamics"]
 description = "Cross-channel validation framework for the empyrean astrodynamics stack — schema, test catalog, plan generator, report renderer, and external-reference runners (ASSIST, find_orb, kete) shared by every empyrean repo's CI."
 repository = "https://github.com/Empyrean-Dynamics/empyrean-validation"
-include = ["src/**/*", "catalog.json", "Cargo.toml", "docs/katex-header.html"]
+include = [
+    "src/**/*",
+    "catalog.json",
+    "Cargo.toml",
+    "docs/katex-header.html",
+    # include_str!-ed into every generated report; the build fails without it.
+    "assets/empyrean-tokens.css",
+]
 
 [lib]
 name = "empyrean_validation"

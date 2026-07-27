@@ -675,7 +675,14 @@ jobs:
           fi
           alias_canonical results/validation_rust_od.json      results/od_validation.json
 
-          gcloud storage rm -r ${{ env.GCS_BUCKET }}/latest/ 2>/dev/null || true
+          # No `gcloud storage rm -r latest/` before the copies. Every object
+          # below is overwritten by name, so the delete removed nothing the
+          # copy would not have replaced — it only opened a window in which
+          # the published dashboard was a 404. A per-channel file for a
+          # comparator that stopped running does go stale rather than
+          # vanishing, which is the one thing the delete bought; the report
+          # states which channels ran, and a stale sibling object is a far
+          # smaller problem than an empty bucket mid-publish.
           gcloud storage cp results/validation.json            ${{ env.GCS_BUCKET }}/latest/validation.json
           gcloud storage cp results/od_validation.json         ${{ env.GCS_BUCKET }}/latest/od_validation.json
           gcloud storage cp results/validation_report.html     ${{ env.GCS_BUCKET }}/latest/validation_report.html

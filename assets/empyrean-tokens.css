@@ -1,0 +1,25 @@
+/* Empyrean Dynamics design tokens — Arctic Blue (dark).
+ *
+ * Vendored asset. This file is the validation report's own copy of the brand
+ * tokens: `src/report.rs` inlines it verbatim into every generated report's
+ * <style> block via include_str!, so the report is self-contained and carries
+ * no reference to any internal repository. Published artifacts must not point
+ * at internal docs.
+ *
+ * Muted / chart values follow the WCAG-AA brand update (muted #778096, chart
+ * grid alpha 0.15, chart axis #778096).
+ */
+  :root {
+    --ed-bg: #0d1117; --ed-surface: #151b23; --ed-surface-raised: #1a2332;
+    --ed-border: #1a2332; --ed-border-subtle: #14181f;
+    --ed-text-primary: #e8e8ec; --ed-text-secondary: #8b9198; --ed-text-muted: #778096;
+    --ed-accent: #5b9bd5; --ed-accent-hover: #7bb8e8; --ed-accent-pressed: #3d7ab8;
+    --ed-accent-subtle: rgba(91, 155, 213, 0.12);
+    --ed-success: #3d9a6d; --ed-warning: #c8a040; --ed-warning-text: #c8a040;
+    --ed-error: #d05040; --ed-error-text: #e06252; --ed-event: #e8a040;
+    --ed-font-display: 'Syne', sans-serif; --ed-font-mono: 'JetBrains Mono', monospace; --ed-font-body: 'DM Sans', sans-serif;
+    --ed-radius-sm: 4px; --ed-radius-md: 6px;
+    --ed-chart-grid: rgba(91, 155, 213, 0.15); --ed-chart-axis: #778096; --ed-chart-label: #8b9198;
+    --ed-scrollbar-thumb: #2d3440; --ed-scrollbar-hover: #4a5060;
+    --ed-input-bg: #151b23; --ed-input-border: #1a2332; --ed-focus-ring: rgba(91, 155, 213, 0.5);
+  }

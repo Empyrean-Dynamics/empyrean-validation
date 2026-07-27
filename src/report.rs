@@ -98,6 +98,19 @@ fn approx_bit_identical_threshold(test_type: &str) -> f64 {
     }
 }
 
+/// Empyrean Dynamics design tokens, inlined verbatim into every generated
+/// report's `<style>` block.
+///
+/// Vendored as this repo's own asset. The report is a PUBLISHED artifact — it
+/// is uploaded to the public GCS bucket — and a published artifact must not
+/// carry a pointer to an internal repository. The previous version shipped a
+/// CSS comment naming an internal docs path in the `<style>` block of every
+/// report the bucket has ever served.
+///
+/// `include_str!` rather than a duplicated literal, so the values and their
+/// provenance note live in exactly one place in this tree.
+const BRAND_TOKENS_CSS: &str = include_str!("../assets/empyrean-tokens.css");
+
 /// Test types rolled up per channel — in the summary JSON, the §10 matrix,
 /// and the fidelity descriptor chips.
 ///
@@ -1180,23 +1193,7 @@ pub fn generate_report(
 <link href="https://fonts.googleapis.com/css2?family=Syne:wght@400;500;600;700;800&family=JetBrains+Mono:wght@300;400;500&family=DM+Sans:wght@300;400;500&display=swap" rel="stylesheet">
 <script src="https://cdn.plot.ly/plotly-2.35.0.min.js"></script>
 <style>
-  /* Empyrean Dynamics design tokens — Arctic Blue (dark). Mirrors
-     lang/brand/empyrean-tokens.css; muted/chart values follow the WCAG-AA
-     brand update (muted #778096, chart grid 0.15, chart axis #778096). */
-  :root {{
-    --ed-bg: #0d1117; --ed-surface: #151b23; --ed-surface-raised: #1a2332;
-    --ed-border: #1a2332; --ed-border-subtle: #14181f;
-    --ed-text-primary: #e8e8ec; --ed-text-secondary: #8b9198; --ed-text-muted: #778096;
-    --ed-accent: #5b9bd5; --ed-accent-hover: #7bb8e8; --ed-accent-pressed: #3d7ab8;
-    --ed-accent-subtle: rgba(91, 155, 213, 0.12);
-    --ed-success: #3d9a6d; --ed-warning: #c8a040; --ed-warning-text: #c8a040;
-    --ed-error: #d05040; --ed-error-text: #e06252; --ed-event: #e8a040;
-    --ed-font-display: 'Syne', sans-serif; --ed-font-mono: 'JetBrains Mono', monospace; --ed-font-body: 'DM Sans', sans-serif;
-    --ed-radius-sm: 4px; --ed-radius-md: 6px;
-    --ed-chart-grid: rgba(91, 155, 213, 0.15); --ed-chart-axis: #778096; --ed-chart-label: #8b9198;
-    --ed-scrollbar-thumb: #2d3440; --ed-scrollbar-hover: #4a5060;
-    --ed-input-bg: #151b23; --ed-input-border: #1a2332; --ed-focus-ring: rgba(91, 155, 213, 0.5);
-  }}
+{brand_tokens_css}
   * {{ margin: 0; padding: 0; box-sizing: border-box; }}
   body {{ background: var(--ed-bg); color: var(--ed-text-primary); font-family: var(--ed-font-body); font-weight: 300; min-height: 100vh; }}
   .header {{ padding: 60px 60px 40px; max-width: 1400px; margin: 0 auto; border-bottom: 1px solid var(--ed-border); }}
@@ -4410,6 +4407,7 @@ try {{ wirePageNav(); }} catch (e) {{ console.error('wirePageNav failed', e); }}
 </script>
 </body>
 </html>"##,
+        brand_tokens_css = BRAND_TOKENS_CSS,
         n_prop = n_prop,
         n_eph = n_eph,
         n_od = n_od,

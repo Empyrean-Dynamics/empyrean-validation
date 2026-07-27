@@ -21,7 +21,9 @@
 #   make run       # run all channels (rust / python / c / cli / core / assist / findorb)
 #   make report    # merge + generate HTML report + ci-summary JSON
 #   make all       # build + run + report
-#   make clean     # remove generated JSONs and HTML; keep external installs
+#   make clean     # remove derived report/summary/plan; KEEP channel results
+#   make archive   # snapshot a completed run to results/archive/<timestamp>/
+#   make clean-results  # delete channel results (requires an archive first)
 #
 # Override defaults:
 #   make all OBJECTS="Apophis,Bennu" TIERS="standard"
@@ -145,7 +147,7 @@ comma := ,
 REPORT_INPUTS := $(if $(WITH_CORE),$(RUST)$(comma)$(PYTHON)$(comma)$(C_OUT)$(comma)$(CLI_OUT)$(comma)$(CORE_MERGED),$(RUST_MERGED)$(comma)$(PYTHON)$(comma)$(C_OUT)$(comma)$(CLI_OUT))
 
 # ── Targets ────────────────────────────────────────────────
-.PHONY: all setup build run report clean help check-fixtures \
+.PHONY: all setup build run report clean clean-results clean-all archive help check-fixtures \
         setup-assist setup-findorb setup-oorb setup-orbfit setup-kete setup-jorbit setup-layup \
         build-empyrean-c build-rust build-c build-cli build-wheel build-core build-empyrean-validation \
         run-rust run-python run-c run-cli run-assist run-findorb run-oorb run-orbfit \
@@ -159,7 +161,9 @@ help:
 	@echo "  make run       # all channels$(if $(WITH_CORE), (incl. core),)"
 	@echo "  make report    # merged HTML + summary"
 	@echo "  make all       # build + run + report"
-	@echo "  make clean     # remove generated JSONs + HTML"
+	@echo "  make clean     # remove derived report/summary/plan (results kept)"
+	@echo "  make archive   # snapshot a completed run to results/archive/<ts>/"
+	@echo "  make clean-results  # delete channel results (archive required)"
 	@echo
 	@echo "Channels: rust, python, c, cli$(if $(WITH_CORE), + core,)"
 	@echo "Variables:  OBJECTS='A,B' TIERS=standard DATA_DIR=$(DATA_DIR)"
@@ -683,11 +687,52 @@ reduce: build-empyrean-validation
 	@echo "Summary: $(SUMMARY)"
 
 # ── Cleanup ────────────────────────────────────────────────
-clean:
-	rm -rf $(RESULTS_DIR)
-	@echo "Removed $(RESULTS_DIR). External deps preserved."
+# Completed runs archive here, one timestamped directory per `make archive`.
+ARCHIVE_DIR := $(RESULTS_DIR)/archive
 
-clean-all: clean
+# `clean` no longer removes results/. It used to be `rm -rf $(RESULTS_DIR)`,
+# which on 2026-07-23 destroyed a seven-hour local validation run — the
+# obvious, muscle-memory command silently deleting the single most expensive
+# artifact in the repo. Results are not build output: a full run costs hours of
+# CPU and cannot be regenerated from source alone (it depends on the JPL
+# responses cached at the time). Removing them is now something you have to ask
+# for by name.
+clean:
+	@rm -f $(REPORT) $(SUMMARY) $(RUST_MERGED) $(CORE_MERGED) $(PLAN)
+	@echo "Removed the derived report / summary / merge / plan from $(RESULTS_DIR)."
+	@echo "Per-channel results are PRESERVED — 'make clean-results' removes those,"
+	@echo "'make archive' snapshots them to $(ARCHIVE_DIR)/<timestamp>/ first."
+
+# The explicit one. Named so it cannot be typed by accident, and it refuses to
+# run without an archived copy — the whole point is that hours of compute are
+# never one keystroke from gone.
+clean-results:
+	@test -d "$(ARCHIVE_DIR)" && [ -n "`ls -1 $(ARCHIVE_DIR) 2>/dev/null`" ] || { \
+	    echo "ERROR: refusing to delete $(RESULTS_DIR) with nothing in $(ARCHIVE_DIR)."; \
+	    echo "       A full run is hours of CPU and is not reproducible from source"; \
+	    echo "       alone (it depends on the JPL responses cached at the time)."; \
+	    echo "       Run 'make archive' first, or 'rm -rf $(RESULTS_DIR)' if you"; \
+	    echo "       really mean it."; \
+	    exit 1; }
+	@find $(RESULTS_DIR) -mindepth 1 -maxdepth 1 ! -name archive -exec rm -rf {} +
+	@echo "Removed the channel outputs in $(RESULTS_DIR). $(ARCHIVE_DIR) preserved."
+
+# Snapshot a completed run. Timestamped so consecutive runs accumulate instead
+# of overwriting, which is what makes a run comparable to the one before it.
+archive:
+	@test -d "$(RESULTS_DIR)" || { echo "Nothing to archive: $(RESULTS_DIR) does not exist."; exit 1; }
+	@stamp=`date -u +%Y%m%d_%H%M%S`; dest="$(ARCHIVE_DIR)/$$stamp"; \
+	 mkdir -p "$$dest"; \
+	 n=0; \
+	 for f in $(RESULTS_DIR)/*; do \
+	     [ -e "$$f" ] || continue; \
+	     case "$$f" in $(ARCHIVE_DIR)) continue ;; esac; \
+	     cp -R "$$f" "$$dest"/ && n=$$((n+1)); \
+	 done; \
+	 test "$$n" -gt 0 || { echo "Nothing to archive: $(RESULTS_DIR) is empty."; rmdir "$$dest"; exit 1; }; \
+	 echo "Archived $$n result artifact(s) to $$dest"
+
+clean-all: clean clean-results
 	rm -rf $(ASSIST_VENV) $(KETE_VENV)
 	rm -rf $(EMP_VAL_RUNNERS)/findorb/build $(EMP_VAL_RUNNERS)/findorb/install
 	rm -f $(C_BIN)
