@@ -88,6 +88,38 @@ FO_BIN := $(EMP_VAL_RUNNERS)/findorb/install/bin/fo
 CORE_BIN := $(EMPYREAN_CORE_ROOT)/target/release/validate-core
 WITH_CORE := $(if $(wildcard $(EMPYREAN_CORE_ROOT)/Cargo.toml),1,)
 
+# OpenOrb: DEFAULT-OFF, and that is a decision, not an oversight.
+#
+# run_oorb.py needs ref_sun_pos_au / ref_sun_vel_au_d on each row to convert
+# OpenOrb's heliocentric convention into the plan's SSB frame. Only
+# `empyrean-validation plan` populates those; the plan CI and this Makefile
+# actually use is stripped from the rust runner's output, which never does.
+# Measured: 0 of 652 rust rows and 0 of 448 plan rows carry the key, so 100%
+# of oorb's rows skip. The runner now exits nonzero on that instead of writing
+# a pass-through of untouched plan rows and calling it a green channel — which
+# means running it today is a guaranteed, permanent failure, not a flaky one.
+#
+# It cannot simply be plumbed: ref_sun_* are not among the 70 keys of the
+# v0.7.0 schema empyrean-core pins, so adding them to PLAN_CARRIED_KEYS
+# reintroduces the deny_unknown_fields break the whitelist strip exists to
+# kill. Sequencing (empyrean-jg3o): tag the validation schema -> re-pin
+# empyrean-core -> populate ref_sun_* -> set WITH_OORB=1 here and restore the
+# `oorb` matrix leg in .github/workflows/validation.yml.
+#
+# Turning it off rather than leaving it red is the point: a leg that is always
+# red teaches people to ignore red, and a leg that skips in silence is the
+# defect this whole branch exists to eliminate. Set WITH_OORB=1 to run it
+# anyway — the runner's honest nonzero exit is deliberately intact, so a
+# premature re-enable fails immediately and says why.
+#
+# Defined here, above every target that references it: GNU make expands a
+# prerequisite list when the rule is READ, so a flag defined below `setup`
+# reads as empty there no matter what it is later assigned.
+WITH_OORB ?=
+# Why the OpenOrb channel is absent, in one line, for the reduce log. Empty
+# when WITH_OORB is set, so a re-enabled leg stops claiming to be disabled.
+OORB_DISABLED_REASON := $(if $(WITH_OORB),,the plan carries no ref_sun_pos_au/ref_sun_vel_au_d and cannot until the validation schema is tagged and empyrean-core re-pinned (empyrean-jg3o); leg turned off in .github/workflows/validation.yml and behind WITH_OORB here)
+
 # DYLD path for runtime linking against libempyrean.dylib (built by
 # empyrean-c into the empyrean repo's target/release).
 DYLD := DYLD_LIBRARY_PATH="$(EMPYREAN_ROOT)/target/release"
@@ -215,7 +247,7 @@ check-fixtures:
 # when it will actually run — otherwise `make setup` pulls a Docker image
 # for a comparator that never executes (and fails the setup if Docker is
 # unavailable).
-setup: setup-assist setup-findorb setup-oorb setup-kete setup-jorbit $(if $(WITH_ORBFIT),setup-orbfit,) $(if $(WITH_LAYUP),setup-layup,)
+setup: setup-assist setup-findorb setup-kete setup-jorbit $(if $(WITH_OORB),setup-oorb,) $(if $(WITH_ORBFIT),setup-orbfit,) $(if $(WITH_LAYUP),setup-layup,)
 	@echo
 	@echo "External dependencies installed."
 
@@ -327,8 +359,10 @@ WITH_ORBFIT ?= 1
 # Default-on; set WITH_LAYUP= (empty) to skip on hosts where its heavy
 # C-extension venv is unavailable.
 WITH_LAYUP ?= 1
-run: run-rust run-python run-c run-cli run-assist run-findorb run-oorb \
+# OpenOrb is gated on WITH_OORB, defined above with the reason it is off.
+run: run-rust run-python run-c run-cli run-assist run-findorb \
      run-kete run-jorbit \
+     $(if $(WITH_OORB),run-oorb,) \
      $(if $(WITH_ORBFIT),run-orbfit,) \
      $(if $(WITH_LAYUP),run-layup,) \
      $(if $(WITH_CORE),run-core,)
@@ -632,26 +666,26 @@ INCLUDE_OPTIONAL ?=
 # choice. If `core` isn't present (WITH_CORE not set), fall back to
 # folding onto rust rows for backward compat.
 merge-external: $(if $(WITH_CORE),$(CORE_MERGED),$(RUST_MERGED))
-$(CORE_MERGED): $(CORE_OUT) $(ASSIST_OUT) $(FINDORB_OUT) $(FINDORB_RADAR_OUT) $(OORB_OUT) \
+$(CORE_MERGED): $(CORE_OUT) $(ASSIST_OUT) $(FINDORB_OUT) $(FINDORB_RADAR_OUT) $(if $(WITH_OORB),$(OORB_OUT),) \
                 $(KETE_OUT) $(JORBIT_OUT) \
                 $(if $(WITH_ORBFIT),$(ORBFIT_OUT),) $(if $(WITH_LAYUP),$(LAYUP_OUT),) $(EMP_VAL_BIN)
-	@echo "──── Merge ASSIST + find_orb + OpenOrb + kete + jorbit$(if $(WITH_ORBFIT), + OrbFit,)$(if $(WITH_LAYUP), + layup,) into core ──"
+	@echo "──── Merge ASSIST + find_orb$(if $(WITH_OORB), + OpenOrb,) + kete + jorbit$(if $(WITH_ORBFIT), + OrbFit,)$(if $(WITH_LAYUP), + layup,) into core ──"
 	@$(EMP_VAL_BIN) merge-external -i $(CORE_OUT) -o $(CORE_MERGED) \
 	    --assist $(ASSIST_OUT) --findorb $(FINDORB_OUT) \
 	    --findorb-radar $(FINDORB_RADAR_OUT) \
-	    --oorb $(OORB_OUT) \
+	    $(if $(WITH_OORB),--oorb $(OORB_OUT),) \
 	    --kete $(KETE_OUT) --jorbit $(JORBIT_OUT) \
 	    --jpl-sbdb-cache $(CACHE_DIR)/sbdb \
 	    $(if $(WITH_ORBFIT),--orbfit $(ORBFIT_OUT),) \
 	    $(if $(WITH_LAYUP),--layup $(LAYUP_OUT),)
-$(RUST_MERGED): $(RUST) $(ASSIST_OUT) $(FINDORB_OUT) $(FINDORB_RADAR_OUT) $(OORB_OUT) \
+$(RUST_MERGED): $(RUST) $(ASSIST_OUT) $(FINDORB_OUT) $(FINDORB_RADAR_OUT) $(if $(WITH_OORB),$(OORB_OUT),) \
                 $(KETE_OUT) $(JORBIT_OUT) \
                 $(if $(WITH_ORBFIT),$(ORBFIT_OUT),) $(if $(WITH_LAYUP),$(LAYUP_OUT),) $(EMP_VAL_BIN)
-	@echo "──── Merge ASSIST + find_orb + OpenOrb + kete + jorbit$(if $(WITH_ORBFIT), + OrbFit,)$(if $(WITH_LAYUP), + layup,) into rust (fallback) ──"
+	@echo "──── Merge ASSIST + find_orb$(if $(WITH_OORB), + OpenOrb,) + kete + jorbit$(if $(WITH_ORBFIT), + OrbFit,)$(if $(WITH_LAYUP), + layup,) into rust (fallback) ──"
 	@$(EMP_VAL_BIN) merge-external -i $(RUST) -o $(RUST_MERGED) \
 	    --assist $(ASSIST_OUT) --findorb $(FINDORB_OUT) \
 	    --findorb-radar $(FINDORB_RADAR_OUT) \
-	    --oorb $(OORB_OUT) \
+	    $(if $(WITH_OORB),--oorb $(OORB_OUT),) \
 	    --kete $(KETE_OUT) --jorbit $(JORBIT_OUT) \
 	    --jpl-sbdb-cache $(CACHE_DIR)/sbdb \
 	    $(if $(WITH_ORBFIT),--orbfit $(ORBFIT_OUT),) \
@@ -680,6 +714,13 @@ report: $(RUST) $(PYTHON) $(C_OUT) $(CLI_OUT) $(if $(WITH_CORE),$(CORE_MERGED),$
 # rather than faking or defaulting it. The empyrean replay channels
 # (rust/python/c/cli/core) come from a single upstream job that succeeds or
 # fails atomically, so REPORT_INPUTS still lists them directly.
+#
+# `add` takes a third argument: the reason the channel is deliberately off, or
+# empty when it should have been there. The message used to read "leg failed
+# or was disabled" for both cases, which is unreadable — the next person
+# cannot tell a policy decision from a breakage, and both look like the
+# channel merely went missing. A DISABLED line names the decision and the
+# bead; a MISSING line says the leg was expected and did not deliver.
 reduce: build-empyrean-validation
 	@echo "──── Reduce: merge external references + render report ─"
 	@ref=""; merged=""; \
@@ -688,15 +729,25 @@ reduce: build-empyrean-validation
 	else echo "ERROR: reduce found neither $(CORE_OUT) nor $(RUST) — no reference channel was staged."; exit 1; fi; \
 	echo "Reference channel: $$ref  →  $$merged"; \
 	flags=""; \
-	add() { if [ -f "$$2" ]; then flags="$$flags $$1 $$2"; else echo "  skip $$1 — $$2 not staged (leg failed or was disabled)"; fi; }; \
-	add --assist        "$(ASSIST_OUT)"; \
-	add --findorb       "$(FINDORB_OUT)"; \
-	add --findorb-radar "$(FINDORB_RADAR_OUT)"; \
-	add --oorb          "$(OORB_OUT)"; \
-	add --kete          "$(KETE_OUT)"; \
-	add --jorbit        "$(JORBIT_OUT)"; \
-	add --orbfit        "$(ORBFIT_OUT)"; \
-	add --layup         "$(LAYUP_OUT)"; \
+	add() { \
+	    if [ -f "$$2" ]; then \
+	        if [ -n "$$3" ]; then \
+	            echo "  NOTE $$1 — marked DISABLED ($$3) yet $$2 IS staged; folding it in anyway. Someone re-enabled the leg without clearing the note."; \
+	        fi; \
+	        flags="$$flags $$1 $$2"; \
+	    elif [ -n "$$3" ]; then \
+	        echo "  skip $$1 — DISABLED by decision: $$3"; \
+	    else \
+	        echo "  skip $$1 — MISSING: $$2 was not staged. Its matrix leg was expected to run and did not deliver (fail-fast:false keeps the rest alive); the report omits this comparator."; \
+	    fi; }; \
+	add --assist        "$(ASSIST_OUT)"          ""; \
+	add --findorb       "$(FINDORB_OUT)"         ""; \
+	add --findorb-radar "$(FINDORB_RADAR_OUT)"   ""; \
+	add --oorb          "$(OORB_OUT)"            "$(OORB_DISABLED_REASON)"; \
+	add --kete          "$(KETE_OUT)"            ""; \
+	add --jorbit        "$(JORBIT_OUT)"          ""; \
+	add --orbfit        "$(ORBFIT_OUT)"          ""; \
+	add --layup         "$(LAYUP_OUT)"           ""; \
 	if [ -d "$(CACHE_DIR)/sbdb" ]; then flags="$$flags --jpl-sbdb-cache $(CACHE_DIR)/sbdb"; fi; \
 	$(EMP_VAL_BIN) merge-external -i "$$ref" -o "$$merged" $$flags
 	@$(EMP_VAL_BIN) report \

@@ -486,7 +486,34 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        tool: [assist, findorb, oorb, kete, jorbit, layup, orbfit]
+        # `oorb` is DISABLED, deliberately — it is not missing from this list
+        # by accident, and the oorb-specific steps below are kept in place as
+        # the re-enable path.
+        #
+        # BLOCKER: run_oorb.py needs `ref_sun_pos_au` / `ref_sun_vel_au_d` on
+        # each row to convert OpenOrb's heliocentric convention into the
+        # plan's SSB frame. Only `empyrean-validation plan` populates those;
+        # the plan this workflow uses is stripped from the rust runner's
+        # output, which never does. Measured: 0 of 652 rust rows and 0 of 448
+        # plan rows carry the key, so 100% of oorb's rows skip. The keys
+        # cannot simply be added to the plan whitelist — they are not in the
+        # v0.7.0 schema empyrean-core pins, so carrying them reintroduces the
+        # deny_unknown_fields break the whitelist strip exists to kill.
+        #
+        # The leg was previously green while computing nothing (a pass-through
+        # of untouched plan rows, exit 0). run_oorb.py now exits nonzero on a
+        # 100% skip, which is honest and is deliberately LEFT IN PLACE — but
+        # it makes this leg permanently red, and a permanently-red leg trains
+        # people to ignore red. So the leg is off, by decision, with the
+        # blocker named: neither faking a pass nor crying wolf.
+        #
+        # RE-ENABLE (empyrean-jg3o): tag the validation schema -> re-pin
+        # empyrean-core -> populate ref_sun_* in the rust runner or the strip
+        # -> add `oorb` back to this list and set WITH_OORB=1 in the Makefile.
+        # Until then reduce prints a DISABLED line naming this reason, so the
+        # channel's absence from the report is explained rather than guessed
+        # at.
+        tool: [assist, findorb, kete, jorbit, layup, orbfit]
     steps:
       - name: Checkout empyrean-validation (default)
         uses: actions/checkout@v4
@@ -531,6 +558,9 @@ jobs:
           key: ${{ matrix.tool }}-${{ hashFiles(format('empyrean-validation/runners/{0}/setup.sh', matrix.tool), 'empyrean-validation/runners/assist/setup.sh') }}
 
       # OpenOrb's Fortran build links LAPACK/BLAS, not present by default.
+      # Inert while `oorb` is off the matrix (see the DISABLED note there);
+      # kept so re-enabling is one list edit rather than an archaeology
+      # exercise.
       - name: Install LAPACK/BLAS (OpenOrb only)
         if: matrix.tool == 'oorb'
         run: sudo apt-get update && sudo apt-get install -y --no-install-recommends liblapack-dev libblas-dev
@@ -545,6 +575,8 @@ jobs:
       # legs must build it explicitly (their `make run-*` would otherwise
       # trigger an uncached assist pip build mid-run, coupling all three
       # comparators to assist-setup health). Other tools are self-contained.
+      # The `oorb` half of the case is inert while that leg is off the matrix
+      # and, like the LAPACK step, is kept as the re-enable path.
       - name: Setup ${{ matrix.tool }}
         working-directory: empyrean-validation
         env:
@@ -711,6 +743,18 @@ jobs:
           # vanishing, which is the one thing the delete bought; the report
           # states which channels ran, and a stale sibling object is a far
           # smaller problem than an empty bucket mid-publish.
+          #
+          # ONE OUTSTANDING CONSEQUENCE of that trade, now that `oorb` is a
+          # deliberately disabled leg: `latest/channels/oorb.json` in the
+          # bucket is whatever the last green-but-computed-nothing run put
+          # there — a pass-through of untouched plan rows tagged
+          # channel="oorb". It is not overwritten because the file is no
+          # longer produced. Nothing in this workflow deletes published
+          # objects, and adding a delete here is a production-data action that
+          # wants a human, so this is recorded rather than automated: the
+          # stale object should be removed out of band as part of
+          # empyrean-jg3o. The loop below is left listing `oorb` so the
+          # re-enable path needs no edit; `[ -f ]` skips it meanwhile.
           gcloud storage cp results/validation.json            ${{ env.GCS_BUCKET }}/latest/validation.json
           gcloud storage cp results/od_validation.json         ${{ env.GCS_BUCKET }}/latest/od_validation.json
           gcloud storage cp results/validation_report.html     ${{ env.GCS_BUCKET }}/latest/validation_report.html
