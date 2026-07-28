@@ -675,23 +675,29 @@ jobs:
         working-directory: empyrean-validation
         run: make reduce PLAN_PREBUILT=1 WITH_CORE=1
 
-      # Per-axis row floors, not just aggregate parity. The full catalog is
-      # 50 objects, each contributing one orbit_determination row, and the
-      # five objects with radar fixtures each contributing one
-      # orbit_determination_radar row. Without these floors the gate passes
-      # on "orbit_determination: 0 compared", which is how a dead OD channel
-      # stayed green for the life of this repo.
+      # Per-axis row floors, not just aggregate parity. Without them the gate
+      # passes on "orbit_determination: 0 compared", which is how a dead OD
+      # channel stayed green for the life of this repo.
       #
-      # The radar floor is scoped to `rust:` — DELIBERATE and TEMPORARY, see
+      # `--catalog-floors` derives the numbers instead of restating them: one
+      # orbit_determination row per catalog object, one
+      # orbit_determination_radar row per tracked radar fixture. They used to
+      # be spelled here as 50 and 5, coupled to the catalog by nothing at all,
+      # so adding a catalog object silently under-strictened the gate — the
+      # floor stayed at the old count and the new object's absence from the OD
+      # axis would have passed. `ci-check` reads
+      # empyrean_validation::catalog for both, and unit tests pin the catalog
+      # length and the radar-fixture list to the tree.
+      #
+      # The radar floor lands on `rust` alone — DELIBERATE and TEMPORARY, see
       # empyrean-s1ab. Nothing but the rust runner can replay a radar OD row
       # (the python driver skips rows without an ic state, and empyrean-core's
       # validate-core has no radar arm), so the plan strips those rows
       # entirely (plan::PLAN_RUST_ONLY_TEST_TYPES) and the strict channels
-      # never see them. Gating them on `rust`, where they are actually
-      # produced, keeps the radar work under a floor instead of quietly
-      # un-gating it — an unscoped floor here would fail python and core
-      # forever for work they cannot do. When the replay drivers grow a radar
-      # arm, the rows return to the plan and this scope prefix comes off.
+      # never see them. Gating them where they are actually produced keeps the
+      # radar work under a floor instead of quietly un-gating it — an unscoped
+      # floor would fail python and core forever for work they cannot do. When
+      # the replay drivers grow a radar arm, the floor moves back on its own.
       #
       # Floors are only applied on a full-catalog run: a workflow_dispatch
       # with an OBJECTS subset legitimately produces fewer rows, and a floor
@@ -700,16 +706,16 @@ jobs:
         working-directory: empyrean-validation
         run: |
           if [ -z "${OBJECTS}" ]; then
-            MIN_ROWS="--min-rows orbit_determination=50,rust:orbit_determination_radar=5"
-            echo "Full catalog run — enforcing per-axis floors: ${MIN_ROWS}"
+            FLOORS="--catalog-floors"
+            echo "Full catalog run — enforcing the catalog-derived per-axis floors."
           else
-            MIN_ROWS=""
+            FLOORS=""
             echo "::warning title=OD row floors not enforced::OBJECTS='${OBJECTS}' is a subset, so the per-axis ci-check floors are skipped for this run."
           fi
           ./target/release/empyrean-validation ci-check \
             --summary results/validation_summary.json \
             --strict-channels python,core \
-            ${MIN_ROWS}
+            ${FLOORS}
 
       # ── GCS upload ─────────────────────────────────────────────
       # Publish on every real trigger INCLUDING repository_dispatch — a

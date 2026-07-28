@@ -31,9 +31,11 @@ use std::path::PathBuf;
 
 use clap::{Parser, Subcommand};
 use empyrean_validation::{
-    catalog::{ValidationObject, all_objects, filter_by_name, filter_by_population},
+    catalog::{
+        RADAR_FIXTURE_OBJECTS, ValidationObject, all_objects, filter_by_name, filter_by_population,
+    },
     plan::{PlanConfig, build_plan},
-    report::generate_report,
+    report::{SUMMARY_TEST_TYPES, generate_report},
     schema::{OrbitComparison, ValidationResult, channels, test_types},
 };
 
@@ -200,10 +202,23 @@ struct CiCheckArgs {
     /// channel missing from the summary is a failure, exactly like a strict
     /// channel that produced nothing.
     ///
-    /// Scale these when running an object subset; the wired defaults in the
-    /// workflow correspond to the full catalog.
+    /// Scale these when running an object subset; prefer `--catalog-floors`
+    /// for a full-catalog run so the numbers cannot drift from the catalog.
     #[arg(long, value_delimiter = ',')]
     min_rows: Vec<String>,
+    /// Enforce the per-axis floors implied by the catalog, on top of any
+    /// `--min-rows` given. Only valid for a FULL-catalog run.
+    ///
+    /// The floors are not free-standing numbers, they are facts about the
+    /// catalog: one `orbit_determination` row per catalog object, and one
+    /// `orbit_determination_radar` row per object with a tracked radar
+    /// fixture. Spelling them as literals in the workflow meant adding a
+    /// catalog object silently under-strictened the gate — the floor stayed
+    /// at the old count and the new object's absence from the OD axis would
+    /// have passed. Derived here instead, from
+    /// [`empyrean_validation::catalog`], so the two cannot drift.
+    #[arg(long)]
+    catalog_floors: bool,
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -286,15 +301,38 @@ fn strip_plan(args: StripPlanArgs) -> Result<(), Box<dyn std::error::Error>> {
     // Same assertion the Makefile makes on the finished plan, made here at
     // the point the rows are actually discarded, so the message can name the
     // input file that came up empty.
+    //
+    // Counted by NAME against the OD family, not as "anything that is not
+    // propagation or ephemeris". The complement counts a typo'd test type as
+    // OD, and it counts any of the narrower recovery axes as if they were the
+    // OD axis — a plan of nothing but `non_grav_recovery` rows satisfied the
+    // old form while carrying not one differential-correction row of the axis
+    // this assertion exists to protect. Both halves are checked: the family
+    // must be non-empty, and `orbit_determination` itself must be present.
     let n_od = plan
         .iter()
         .filter(|r| {
-            !matches!(
-                r["test_type"].as_str(),
-                Some("propagation") | Some("ephemeris")
-            )
+            r["test_type"]
+                .as_str()
+                .is_some_and(test_types::is_orbit_determination)
         })
         .count();
+    let n_optical = plan
+        .iter()
+        .filter(|r| r["test_type"].as_str() == Some(test_types::ORBIT_DETERMINATION))
+        .count();
+    if n_od > 0 && n_optical == 0 {
+        return Err(format!(
+            "{} carries {n_od} orbit-determination-family row(s) but ZERO \
+             `{}` rows. The recovery axes ({}) are checks layered on top of the \
+             optical fit, not substitutes for it — a plan with only those \
+             deletes the OD axis proper while still looking non-empty.",
+            args.input.display(),
+            test_types::ORBIT_DETERMINATION,
+            test_types::ORBIT_DETERMINATION_FAMILY[1..].join(", "),
+        )
+        .into());
+    }
     if n_od == 0 {
         return Err(format!(
             "{} carries ZERO orbit-determination rows ({} rows in, {} plan rows out). \
@@ -1064,10 +1102,7 @@ fn report(args: ReportArgs) -> Result<(), Box<dyn std::error::Error>> {
 /// Is this an orbit-determination row — i.e. a row produced by a
 /// differential-correction fit rather than a propagate / ephemeris call?
 fn is_od_row(r: &ValidationResult) -> bool {
-    !matches!(
-        r.test_type.as_str(),
-        test_types::PROPAGATION | test_types::EPHEMERIS
-    )
+    test_types::is_orbit_determination(&r.test_type)
 }
 
 /// Candidate sidecar paths for the orbit-comparison data associated
@@ -1153,6 +1188,24 @@ fn parse_min_rows(specs: &[String]) -> Result<Vec<RowFloor>, String> {
             if tt.is_empty() {
                 return Err(format!("--min-rows entry {spec:?} has an empty test type"));
             }
+            if !test_types::ALL.contains(&tt) {
+                return Err(format!(
+                    "--min-rows entry {spec:?}: {tt:?} is not a known test type (known: {}). \
+                     A floor on a name no channel emits enforces nothing while reading as \
+                     'that axis was never exercised' — the exact confusion these floors \
+                     exist to remove.",
+                    test_types::ALL.join(", ")
+                ));
+            }
+            if !SUMMARY_TEST_TYPES.contains(&tt) {
+                return Err(format!(
+                    "--min-rows entry {spec:?}: {tt:?} is a real test type but is not rolled \
+                     up into validation_summary.json (rolled up: {}), so the gate cannot see \
+                     it and the floor could never be satisfied. Add it to \
+                     empyrean_validation::report::SUMMARY_TEST_TYPES first.",
+                    SUMMARY_TEST_TYPES.join(", ")
+                ));
+            }
             let channel = match channel {
                 None => None,
                 Some("") => {
@@ -1180,6 +1233,32 @@ fn parse_min_rows(specs: &[String]) -> Result<Vec<RowFloor>, String> {
             })
         })
         .collect()
+}
+
+/// The per-axis row floors a full-catalog run must clear, derived from the
+/// catalog rather than written out as numbers.
+///
+/// - `orbit_determination` — one row per catalog object. The rust OD pass
+///   emits exactly one, success or failure row, for every object it is given,
+///   and every replay channel replays what the plan carries. Unscoped, so it
+///   applies to every strict channel.
+/// - `orbit_determination_radar` — one row per object with a tracked radar
+///   fixture, scoped to `rust`: those rows are stripped from the plan while
+///   radar OD is rust-only (`plan::PLAN_RUST_ONLY_TEST_TYPES`,
+///   `empyrean-s1ab`), so `rust` is the only channel that has them.
+fn catalog_row_floors() -> Vec<RowFloor> {
+    vec![
+        RowFloor {
+            channel: None,
+            test_type: test_types::ORBIT_DETERMINATION.to_string(),
+            floor: all_objects().len() as u64,
+        },
+        RowFloor {
+            channel: Some(channels::RUST.to_string()),
+            test_type: test_types::ORBIT_DETERMINATION_RADAR.to_string(),
+            floor: RADAR_FIXTURE_OBJECTS.len() as u64,
+        },
+    ]
 }
 
 /// Channel names a `--min-rows` floor (or `--strict-channels`) may name.
@@ -1348,7 +1427,10 @@ fn ci_check(args: CiCheckArgs) -> Result<(), Box<dyn std::error::Error>> {
     let channels = summary["channels"]
         .as_array()
         .ok_or("summary missing channels array")?;
-    let min_rows = parse_min_rows(&args.min_rows)?;
+    let mut min_rows = parse_min_rows(&args.min_rows)?;
+    if args.catalog_floors {
+        min_rows.extend(catalog_row_floors());
+    }
     let failures = ci_check_failures(channels, &args.strict_channels, &min_rows, &args.summary);
 
     if failures.is_empty() {
@@ -1357,7 +1439,10 @@ fn ci_check(args: CiCheckArgs) -> Result<(), Box<dyn std::error::Error>> {
             args.strict_channels.join(", ")
         );
         if min_rows.is_empty() {
-            eprintln!("ci-check: no per-axis row floors were requested (--min-rows)");
+            eprintln!(
+                "ci-check: no per-axis row floors were requested \
+                 (--min-rows / --catalog-floors)"
+            );
         } else {
             eprintln!(
                 "ci-check: per-axis row floors met [{}]",
@@ -1551,6 +1636,106 @@ mod tests {
         // A channel name nobody emits must read as "you typed it wrong", not
         // as "that channel produced nothing".
         assert!(parse_min_rows(&strict(["rst:orbit_determination=5"].as_ref())).is_err());
+    }
+
+    #[test]
+    fn min_rows_rejects_unknown_test_types() {
+        // Syntax alone is not enough. A typo parsed cleanly and then reported
+        // "that axis was never exercised" — indistinguishable from a genuinely
+        // dead axis, which is the confusion the floors exist to remove.
+        let err = parse_min_rows(&strict(["orbit_determinaton=50"].as_ref()))
+            .expect_err("typo must be rejected");
+        assert!(err.contains("not a known test type"), "{err}");
+        assert!(
+            err.contains("orbit_determination"),
+            "lists the known set: {err}"
+        );
+
+        // A real test type that the summary does not roll up is a different
+        // error, because it is a different fix.
+        let err = parse_min_rows(&strict(["dt_recovery=1"].as_ref()))
+            .expect_err("un-rolled-up axis must be rejected");
+        assert!(err.contains("SUMMARY_TEST_TYPES"), "{err}");
+
+        // Everything the summary does roll up parses, scoped or not.
+        for tt in SUMMARY_TEST_TYPES {
+            parse_min_rows(&strict([format!("{tt}=1").as_str()].as_ref()))
+                .unwrap_or_else(|e| panic!("{tt}: {e}"));
+            parse_min_rows(&strict([format!("rust:{tt}=1").as_str()].as_ref()))
+                .unwrap_or_else(|e| panic!("rust:{tt}: {e}"));
+        }
+    }
+
+    #[test]
+    fn catalog_floors_track_the_catalog() {
+        // The 50 and the 5 used to be literals in the workflow, coupled to the
+        // catalog by nothing. Derived now, so adding a catalog object raises
+        // the floor with it instead of silently under-strictening the gate.
+        let floors = catalog_row_floors();
+        assert_eq!(
+            floors,
+            vec![
+                RowFloor {
+                    channel: None,
+                    test_type: "orbit_determination".into(),
+                    floor: all_objects().len() as u64,
+                },
+                RowFloor {
+                    channel: Some("rust".into()),
+                    test_type: "orbit_determination_radar".into(),
+                    floor: RADAR_FIXTURE_OBJECTS.len() as u64,
+                },
+            ]
+        );
+        // And they are the numbers the workflow used to spell out, so this is
+        // a re-derivation of the same gate rather than a quiet loosening.
+        assert_eq!(floors[0].floor, 50);
+        assert_eq!(floors[1].floor, 5);
+    }
+
+    #[test]
+    fn catalog_floors_pass_a_full_catalog_run_and_fail_a_short_one() {
+        let n = all_objects().len() as u64;
+        let radar = RADAR_FIXTURE_OBJECTS.len() as u64;
+        let full = vec![
+            summary_channel("core", &[("orbit_determination", n)]),
+            summary_channel_split(
+                "rust",
+                &[
+                    ("orbit_determination", n, n),
+                    ("orbit_determination_radar", radar, 0),
+                ],
+            ),
+        ];
+        let floors = catalog_row_floors();
+        assert!(
+            ci_check_failures(
+                &full,
+                &strict(&["core"]),
+                &floors,
+                std::path::Path::new("results/validation_summary.json"),
+            )
+            .is_empty()
+        );
+
+        // One catalog object missing from the OD axis.
+        let short = vec![
+            summary_channel("core", &[("orbit_determination", n - 1)]),
+            summary_channel_split(
+                "rust",
+                &[
+                    ("orbit_determination", n, n),
+                    ("orbit_determination_radar", radar, 0),
+                ],
+            ),
+        ];
+        let failures = ci_check_failures(
+            &short,
+            &strict(&["core"]),
+            &floors,
+            std::path::Path::new("results/validation_summary.json"),
+        );
+        assert!(!failures.is_empty(), "a short catalog must fail the gate");
     }
 
     #[test]

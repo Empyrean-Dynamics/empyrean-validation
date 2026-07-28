@@ -818,6 +818,17 @@ const SHORT_ARC_NEOS: &[ValidationObject] = &[
     },
 ];
 
+/// Catalog objects that have a radar-augmented fixture in
+/// `fixtures/psv-radar/` and therefore produce an
+/// `orbit_determination_radar` row.
+///
+/// Named here rather than counted from the directory listing at gate time,
+/// because a floor derived from the very files it is meant to protect is
+/// self-fulfilling: delete a fixture and the floor obligingly drops to match.
+/// The list is the claim; [`radar_fixture_objects_match_the_tracked_files`]
+/// is what stops it drifting from the tree.
+pub const RADAR_FIXTURE_OBJECTS: [&str; 5] = ["Apophis", "Bennu", "Didymos", "Eros", "Toutatis"];
+
 /// Returns the full validation object catalog (44 objects across 13
 /// populations). Order matches the populations enumerated in the module
 /// docstring.
@@ -868,6 +879,41 @@ mod tests {
     #[test]
     fn catalog_has_50_objects() {
         assert_eq!(all_objects().len(), 50);
+    }
+
+    #[test]
+    fn radar_fixture_objects_match_the_tracked_files() {
+        // The CI row floor for the radar OD axis is
+        // RADAR_FIXTURE_OBJECTS.len(); if the list and the tracked fixtures
+        // drift, the floor silently stops describing the work. Adding a radar
+        // fixture without adding it here under-strictens the gate; naming an
+        // object here without the fixture makes the gate unsatisfiable. Both
+        // fail right here instead.
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("fixtures/psv-radar");
+        let mut on_disk: Vec<String> = std::fs::read_dir(&dir)
+            .unwrap_or_else(|e| panic!("read {}: {e}", dir.display()))
+            .filter_map(|e| {
+                let p = e.ok()?.path();
+                (p.extension()? == "psv").then(|| p.file_stem()?.to_str().map(str::to_string))?
+            })
+            .collect();
+        on_disk.sort();
+        let mut named: Vec<String> = RADAR_FIXTURE_OBJECTS
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        named.sort();
+        assert_eq!(on_disk, named);
+
+        // …and each one is a real catalog entry, so a floor derived from this
+        // list counts rows the runner can actually produce.
+        for name in RADAR_FIXTURE_OBJECTS {
+            assert_eq!(
+                filter_by_name(&[name]).len(),
+                1,
+                "{name} has a radar fixture but is not in the catalog"
+            );
+        }
     }
 
     #[test]

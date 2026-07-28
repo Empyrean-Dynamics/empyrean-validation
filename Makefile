@@ -431,21 +431,50 @@ print(f'Wrote {len(a)+len(b)} unified rust rows ({len(a)} prop+eph, {len(b)} OD)
 # replayed nothing on the OD axis and reported success. Assert the count
 # on BOTH plan paths — the one that generates it and the one that
 # receives it as a prep artifact — so no leg can replay a gutted plan.
+#
+# OD_TEST_TYPES mirrors empyrean_validation::schema::test_types::
+# ORBIT_DETERMINATION_FAMILY, which cannot be imported here: the external
+# matrix legs run this assertion under a bare python3 with no cargo toolchain
+# and no built harness. The unit test
+# `makefile_od_test_type_list_matches_the_schema` reads this very line and
+# fails if the two ever disagree, so the duplication is checked rather than
+# trusted.
+#
+# Counted by NAME rather than as "not propagation and not ephemeris". The
+# complement counts a typo'd test type as OD, and it counts the narrower
+# recovery axes as if they were the OD axis — a plan of nothing but
+# `non_grav_recovery` rows satisfied the old form while carrying not one row
+# of the axis this assertion protects. So both halves are asserted: some OD
+# row must exist, and `orbit_determination` itself must be among them.
+OD_TEST_TYPES := orbit_determination,orbit_determination_radar,non_grav_recovery,dt_recovery,photometry_recovery,thrust_recovery
 define ASSERT_PLAN_HAS_OD
 import json, sys
-rows = json.load(open(sys.argv[1]))
-od = [r for r in rows if r.get("test_type") not in ("propagation", "ephemeris")]
+from collections import Counter
+
+path, od_types = sys.argv[1], sys.argv[2].split(",")
+rows = json.load(open(path))
+od = [r for r in rows if r.get("test_type") in od_types]
 if not od:
+    seen = ", ".join(f"{n} {t}" for t, n in sorted(Counter(r.get("test_type") for r in rows).items()))
     sys.exit(
-        f"ERROR: {sys.argv[1]} carries ZERO orbit-determination rows "
-        f"({len(rows)} rows total, all propagation/ephemeris).\n"
+        f"ERROR: {path} carries ZERO orbit-determination rows "
+        f"({len(rows)} rows total; test types present: {seen}).\n"
         "       Every OD consumer downstream (python / c / cli / core replay, "
         "find_orb, OrbFit, layup,\n"
         "       SBDB merge, the report's OD section) would no-op and report "
         "success on an untested axis.\n"
         "       Run `make check-fixtures` and re-read the rust OD runner log."
     )
-from collections import Counter
+if not any(r.get("test_type") == "orbit_determination" for r in od):
+    sys.exit(
+        f"ERROR: {path} carries {len(od)} orbit-determination-family rows but ZERO "
+        "`orbit_determination` rows.\n"
+        "       The recovery axes (non_grav / dt / photometry / thrust) are checks "
+        "layered on top of the\n"
+        "       optical fit, not substitutes for it — a plan with only those deletes "
+        "the OD axis proper\n"
+        "       while still looking non-empty."
+    )
 c = Counter(r["test_type"] for r in od)
 print("  plan OD rows: " + ", ".join(f"{n} {t}" for t, n in sorted(c.items())))
 endef
@@ -472,7 +501,7 @@ endif
 # python3 rather than $(WHEEL_PY) because the external legs carry no
 # wheel venv.
 check-plan: $(PLAN)
-	@python3 -c "$$ASSERT_PLAN_HAS_OD" $(PLAN)
+	@python3 -c "$$ASSERT_PLAN_HAS_OD" $(PLAN) $(OD_TEST_TYPES)
 
 run-python: $(PLAN) check-plan check-fixtures
 	@echo "──── Python channel: replay plan ───────────────────────"

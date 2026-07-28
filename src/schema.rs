@@ -160,6 +160,47 @@ pub mod test_types {
     /// and core-reference replay exist, but there is no maneuvering-object
     /// fixture yet, so no channel emits these rows today.
     pub const THRUST_RECOVERY: &str = "thrust_recovery";
+
+    /// Every canonical test type, in declaration order.
+    ///
+    /// The membership set for anything that accepts a test-type name from
+    /// outside this crate — a `--min-rows` floor, a runner's `--test-type`
+    /// flag. A name checked for syntax but never for membership turns a typo
+    /// into "that axis was never exercised", which reads as a dead channel
+    /// when the truth is a misspelling.
+    pub const ALL: [&str; 8] = [
+        PROPAGATION,
+        EPHEMERIS,
+        ORBIT_DETERMINATION,
+        ORBIT_DETERMINATION_RADAR,
+        NON_GRAV_RECOVERY,
+        DT_RECOVERY,
+        PHOTOMETRY_RECOVERY,
+        THRUST_RECOVERY,
+    ];
+
+    /// The orbit-determination family: every test type whose row comes from a
+    /// differential-correction fit rather than a propagate / ephemeris call.
+    ///
+    /// Named as a set because "is this an OD row?" was being answered by
+    /// `test_type not in (propagation, ephemeris)` in three places. That
+    /// complement is a trap: it counts every future test type as OD, and it
+    /// counts a *typo* as OD, so an assertion built on it can be satisfied by
+    /// rows that are not orbit determination at all. Enumerate instead — a new
+    /// test type then has to declare which side it is on.
+    pub const ORBIT_DETERMINATION_FAMILY: [&str; 6] = [
+        ORBIT_DETERMINATION,
+        ORBIT_DETERMINATION_RADAR,
+        NON_GRAV_RECOVERY,
+        DT_RECOVERY,
+        PHOTOMETRY_RECOVERY,
+        THRUST_RECOVERY,
+    ];
+
+    /// Is this the name of an orbit-determination test type?
+    pub fn is_orbit_determination(test_type: &str) -> bool {
+        ORBIT_DETERMINATION_FAMILY.contains(&test_type)
+    }
 }
 
 /// Canonical [`ValidationResult::propagation_uncertainty`] values.
@@ -938,6 +979,52 @@ pub struct OrbitComparison {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn every_test_type_is_classified_exactly_once() {
+        // ALL and the propagation/ephemeris + OD-family split must stay in
+        // lockstep. A new test type added to the module but not to ALL is
+        // invisible to every membership check; one added to ALL but to
+        // neither side of the split is a row nothing knows how to count.
+        for tt in test_types::ALL {
+            let od = test_types::ORBIT_DETERMINATION_FAMILY.contains(&tt);
+            let prop_eph = matches!(tt, test_types::PROPAGATION | test_types::EPHEMERIS);
+            assert!(
+                od ^ prop_eph,
+                "{tt} is in neither or both of (propagation/ephemeris) and \
+                 ORBIT_DETERMINATION_FAMILY"
+            );
+        }
+        assert_eq!(
+            test_types::ALL.len(),
+            test_types::ORBIT_DETERMINATION_FAMILY.len() + 2,
+            "a test type is missing from ALL"
+        );
+    }
+
+    #[test]
+    fn makefile_od_test_type_list_matches_the_schema() {
+        // The Makefile's plan assertion runs under a bare python3 on the
+        // external matrix legs — no cargo, no built harness — so it cannot
+        // import ORBIT_DETERMINATION_FAMILY and carries its own copy. Check
+        // the copy instead of trusting it: a test type added here and not
+        // there silently drops out of the assertion that guards the OD axis.
+        let makefile =
+            std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/Makefile")).unwrap();
+        let line = makefile
+            .lines()
+            .find(|l| l.starts_with("OD_TEST_TYPES :="))
+            .expect("Makefile defines OD_TEST_TYPES");
+        let listed: Vec<&str> = line
+            .split_once(":=")
+            .unwrap()
+            .1
+            .trim()
+            .split(',')
+            .map(str::trim)
+            .collect();
+        assert_eq!(listed, test_types::ORBIT_DETERMINATION_FAMILY.to_vec());
+    }
 
     #[test]
     fn empty_round_trips_through_json() {

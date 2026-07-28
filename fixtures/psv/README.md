@@ -30,9 +30,26 @@ location would have to hand each of those legs a credential, dissolving the
 security boundary the matrix was built around. Tracking is the only option that
 delivers the fixtures to a secretless leg via the checkout it already does.
 
-Cost, measured: 50 files, 42 MB in the working tree, ~4.5 MB compressed — the
-repo's entire pack was 6 MB before this. Two orders of magnitude below any
-GitHub limit, and one refresh per quarter keeps it there for years.
+Cost, measured: 50 files, 42 MB in the working tree; **6.02 MiB of git objects
+on disk** as written, deltaing down to **4.51 MiB** when packed. Everything else
+in the repo packs to 1.72 MiB, so these fixtures are now the bulk of it — still
+two orders of magnitude below any GitHub limit, and one refresh per quarter
+keeps it there for years. `../psv-radar/` adds nothing on top: its optical
+tables are byte-identical to these, so packing both together is still 4.51 MiB.
+
+> **Correction.** The commit that staged these files (`23479ea`) reported
+> "~4.5 MB compressed against a 6 MB pack". The first number is the packed
+> figure and is right, but it is not what the commit put on disk — loose
+> objects are zlib-only, with no delta compression, so the tree gained 6.02 MiB
+> until something repacked it. The second number was simply wrong: the repo
+> without these fixtures packs to 1.72 MiB, not 6 MB, so this is not a 75%
+> addition to the repo, it is a tripling of it. The decision above stands on
+> either figure; the record should not.
+>
+> Reproduce: `git ls-tree -r HEAD -- fixtures/psv | awk '{print $3}'`, then
+> `git cat-file --batch-check='%(objectsize:disk)'` summed for the on-disk
+> figure, or `git pack-objects --stdout > /dev/null` piped through `wc -c` for
+> the packed one.
 
 Redistribution is not in question: the astrometry is MPC-published optical
 observation records (freely available for scientific use) and, in the radar
