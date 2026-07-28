@@ -34,7 +34,7 @@ use empyrean_validation::{
     catalog::{ValidationObject, all_objects, filter_by_name, filter_by_population},
     plan::{PlanConfig, build_plan},
     report::generate_report,
-    schema::{OrbitComparison, ValidationResult, channels},
+    schema::{OrbitComparison, ValidationResult, channels, test_types},
 };
 
 #[derive(Parser, Debug)]
@@ -949,6 +949,10 @@ fn merge_jpl(
 fn report(args: ReportArgs) -> Result<(), Box<dyn std::error::Error>> {
     let mut all: Vec<ValidationResult> = Vec::new();
     let mut orbit_comparisons: Vec<OrbitComparison> = Vec::new();
+    // Every sidecar path that was looked for and not found, so an absence can
+    // be reported with the names that were actually tried.
+    let mut sidecars_tried: Vec<PathBuf> = Vec::new();
+    let mut sidecar_found: Option<PathBuf> = None;
     for path in &args.results {
         let raw =
             std::fs::read_to_string(path).map_err(|e| format!("read {}: {e}", path.display()))?;
@@ -970,6 +974,7 @@ fn report(args: ReportArgs) -> Result<(), Box<dyn std::error::Error>> {
         // it forward in the file name).
         for cmp_path in compare_sidecar_candidates(path) {
             if !cmp_path.exists() {
+                sidecars_tried.push(cmp_path);
                 continue;
             }
             let raw = std::fs::read_to_string(&cmp_path)
@@ -986,9 +991,55 @@ fn report(args: ReportArgs) -> Result<(), Box<dyn std::error::Error>> {
                 n += 1;
             }
             eprintln!("Loaded {n} orbit comparisons from {}", cmp_path.display(),);
+            if n == 0 {
+                eprintln!(
+                    "  WARNING: {} is present but empty. §12 of the report will render \
+                     nothing. The OD pass ran and wrote a sidecar with no comparisons in \
+                     it — check the `validate od` log for fits that produced no orbit.",
+                    cmp_path.display()
+                );
+            }
+            sidecar_found = Some(cmp_path);
             // First sidecar wins — don't double-load if both candidates exist.
             break;
         }
+    }
+    // An OD run with no sidecar anywhere is an error, not a skip.
+    //
+    // `validate od` always writes `{stem}_compare.jsonl` next to its output,
+    // so if the OD channel produced rows the sidecar existed at some point;
+    // its absence here means it was not carried across a job boundary. That
+    // is what happened in CI: prep's upload step listed only the four channel
+    // JSONs, the file stayed in prep's workspace, and the reader below
+    // `continue`d past the absence and exited 0 — so §12 was empty in every
+    // published report, silently, for reasons no log line ever mentioned.
+    // Same silent-empty family as the dead OD channel itself, so it fails the
+    // same way: loudly, naming what it looked for.
+    if sidecar_found.is_none() && all.iter().any(is_od_row) {
+        let od_channels: Vec<String> = {
+            let mut c: Vec<String> = all
+                .iter()
+                .filter(|r| is_od_row(r))
+                .map(|r| r.channel.clone())
+                .collect();
+            c.sort();
+            c.dedup();
+            c
+        };
+        return Err(format!(
+            "orbit-determination rows are present (channels: {}) but no orbit-comparison \
+             sidecar was found. §12 of the report would render empty with no explanation. \
+             Looked for: {}. `validate od` writes `<output>_compare.jsonl` beside its \
+             output — stage it alongside the channel JSONs (it is part of the \
+             prep-plan-and-rust artifact).",
+            od_channels.join(", "),
+            sidecars_tried
+                .iter()
+                .map(|p| p.display().to_string())
+                .collect::<Vec<_>>()
+                .join(", ")
+        )
+        .into());
     }
     if !all.iter().any(|r| r.channel == "rust") {
         return Err(
@@ -1008,6 +1059,15 @@ fn report(args: ReportArgs) -> Result<(), Box<dyn std::error::Error>> {
         eprintln!("Wrote CI summary to {}", p.display());
     }
     Ok(())
+}
+
+/// Is this an orbit-determination row — i.e. a row produced by a
+/// differential-correction fit rather than a propagate / ephemeris call?
+fn is_od_row(r: &ValidationResult) -> bool {
+    !matches!(
+        r.test_type.as_str(),
+        test_types::PROPAGATION | test_types::EPHEMERIS
+    )
 }
 
 /// Candidate sidecar paths for the orbit-comparison data associated
@@ -1586,6 +1646,80 @@ mod tests {
             failures[0].contains("rust:orbit_determination_radar>=5"),
             "names the floor that could not be evaluated: {failures:?}"
         );
+    }
+
+    // ── orbit-comparison sidecar ─────────────────────────────────────
+
+    /// Write a one-channel results JSON and return its path.
+    fn write_results(dir: &std::path::Path, name: &str, rows: &[ValidationResult]) -> PathBuf {
+        let p = dir.join(name);
+        std::fs::write(&p, serde_json::to_string(rows).unwrap()).unwrap();
+        p
+    }
+
+    fn rust_od_rows() -> Vec<ValidationResult> {
+        let mut od = od_row("Eros");
+        od.channel = "rust".into();
+        let mut prop = ValidationResult::empty();
+        prop.object = "Eros".into();
+        prop.channel = "rust".into();
+        prop.test_type = "propagation".into();
+        vec![od, prop]
+    }
+
+    #[test]
+    fn report_fails_loudly_when_the_od_sidecar_is_absent() {
+        // The reader used to `continue` past a missing sidecar and exit 0, so
+        // §12 was empty in every published report and nothing said why. If OD
+        // rows are present the sidecar existed upstream; its absence here
+        // means it was never carried across the job boundary.
+        let dir = tempfile::tempdir().unwrap();
+        let results = write_results(dir.path(), "validation_rust.json", &rust_od_rows());
+        let err = report(ReportArgs {
+            results: vec![results],
+            output: dir.path().join("report.html"),
+            summary: None,
+        })
+        .expect_err("absent sidecar must fail");
+        let msg = err.to_string();
+        assert!(msg.contains("no orbit-comparison sidecar"), "{msg}");
+        // Names both candidates it looked for, so the fix is obvious.
+        assert!(msg.contains("validation_rust_compare.jsonl"), "{msg}");
+        assert!(msg.contains("validation_rust_od_compare.jsonl"), "{msg}");
+    }
+
+    #[test]
+    fn report_accepts_an_od_run_whose_sidecar_is_staged() {
+        let dir = tempfile::tempdir().unwrap();
+        let results = write_results(dir.path(), "validation_rust.json", &rust_od_rows());
+        // Present but empty is a warning, not a failure: `validate od` writes
+        // the file unconditionally, and a fit that produced no comparison is a
+        // different problem from a file that never travelled.
+        std::fs::write(dir.path().join("validation_rust_od_compare.jsonl"), "").unwrap();
+        report(ReportArgs {
+            results: vec![results],
+            output: dir.path().join("report.html"),
+            summary: None,
+        })
+        .expect("staged sidecar");
+    }
+
+    #[test]
+    fn report_does_not_demand_a_sidecar_without_od_rows() {
+        // A propagation/ephemeris-only run never invokes `validate od`, so
+        // there is no sidecar to miss and no §12 to fill.
+        let dir = tempfile::tempdir().unwrap();
+        let mut prop = ValidationResult::empty();
+        prop.object = "Eros".into();
+        prop.channel = "rust".into();
+        prop.test_type = "propagation".into();
+        let results = write_results(dir.path(), "validation_rust.json", &[prop]);
+        report(ReportArgs {
+            results: vec![results],
+            output: dir.path().join("report.html"),
+            summary: None,
+        })
+        .expect("prop-only run needs no sidecar");
     }
 
     #[test]

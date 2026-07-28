@@ -323,6 +323,21 @@ jobs:
         run: make build plan OBJECTS="${OBJECTS}" TIERS="${TIER}"
 
       # Stage the plan + the rust channel outputs for the downstream jobs.
+      #
+      # Including the two JSONL sidecars `validate od` writes next to
+      # validation_rust_od.json. They are not channel results, they are the
+      # per-object fitted/propagated orbits and the fitted-vs-reference
+      # Keplerian Mahalanobis comparisons, and the reduce job's `report` step
+      # is the only consumer. Listing only the four JSON files left them in
+      # prep's workspace and nowhere else, so §12 of every published report —
+      # "fitted orbit + covariance vs references" — was empty, not because
+      # there was nothing to show but because the data never crossed the job
+      # boundary. Same silent-empty family as the OD channel itself.
+      #
+      # Every downstream job pulls this artifact whole (`download-artifact` by
+      # name, or reduce's merge-multiple), so the sidecars arrive wherever
+      # validation_rust_od.json does; there is no per-file download list to
+      # extend.
       - name: Upload plan + rust reference
         uses: actions/upload-artifact@v4
         with:
@@ -332,6 +347,8 @@ jobs:
             empyrean-validation/results/validation_rust_propeph.json
             empyrean-validation/results/validation_rust_od.json
             empyrean-validation/results/validation_rust.json
+            empyrean-validation/results/validation_rust_od_orbits.jsonl
+            empyrean-validation/results/validation_rust_od_compare.jsonl
           retention-days: 30
           if-no-files-found: error
 
@@ -720,6 +737,7 @@ jobs:
             empyrean-validation/results/validation_report.html
             empyrean-validation/results/validation_summary.json
             empyrean-validation/results/*.json
+            empyrean-validation/results/*.jsonl
           retention-days: 30
 
       - name: Step summary

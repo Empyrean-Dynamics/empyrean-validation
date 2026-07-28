@@ -347,12 +347,32 @@ $(RUST_PROPEPH): $(RUST_BIN)
 	    --data-dir $(DATA_DIR) --cache-dir $(CACHE_DIR) \
 	    --output $(RUST_PROPEPH)
 
+# `validate od` writes TWO JSONL sidecars beside $(RUST_OD), named from its
+# stem: $(RUST_OD_ORBITS) (per-object fitted + propagated orbit + covariance)
+# and $(RUST_OD_COMPARE) (fitted-vs-reference Keplerian Mahalanobis
+# comparisons, the sole input to the report's §12). They are not channel
+# results and no make rule names them as outputs, which is how CI came to
+# stage the four channel JSONs and leave both sidecars behind in the prep
+# job's workspace — §12 was empty in every published report. Declared here so
+# the coupling is visible: the prep upload in .github/workflows/validation.yml
+# lists both by name, and `report` now fails rather than rendering an
+# unexplained empty §12 when OD rows arrive without them.
+RUST_OD_ORBITS := $(RESULTS_DIR)/validation_rust_od_orbits.jsonl
+RUST_OD_COMPARE := $(RESULTS_DIR)/validation_rust_od_compare.jsonl
+
 $(RUST_OD): $(RUST_BIN) | check-fixtures
 	@echo "──── Rust channel: orbit determination ─────────────────"
 	@$(DYLD) $(RUST_BIN) od $(ONLY_FLAG) --tier $(TIERS) \
 	    --data-dir $(DATA_DIR) \
 	    --fixtures-dir $(FIXTURES_PSV) \
 	    --output $(RUST_OD)
+	@for f in $(RUST_OD_ORBITS) $(RUST_OD_COMPARE); do \
+	    test -f "$$f" || { \
+	        echo "ERROR: $(RUST_BIN) od did not write its sidecar $$f."; \
+	        echo "       The report's §12 (fitted orbit + covariance vs references)"; \
+	        echo "       has no other input and would render empty."; \
+	        exit 1; }; \
+	 done
 
 $(RUST): $(RUST_PROPEPH) $(RUST_OD)
 	@echo "──── Rust channel: merge prop+eph + OD into unified ────"
