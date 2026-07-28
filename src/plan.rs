@@ -540,13 +540,107 @@ pub const PLAN_UNCERTAINTY_AXES: [&str; 2] = [
     uncertainty_modes::F64_NO_COV,
 ];
 
-/// Is this row on an axis the plan should carry?
-fn is_plan_axis(row: &serde_json::Map<String, serde_json::Value>) -> bool {
-    match row.get("propagation_uncertainty") {
+/// Test types no replay channel can reproduce, and so must never reach the
+/// plan.
+///
+/// **Deliberate and temporary — tracked as `empyrean-s1ab`.** Un-nesting the
+/// radar OD pass made the rust runner emit `orbit_determination_radar` rows for
+/// the first time, and nothing but the rust runner can replay them:
+///
+/// - `runners/python/run.py` skips any non-`orbit_determination` row that
+///   carries no `ic_pos_au` / `ic_vel_au_d`, and the radar rows carry
+///   `ic_pos_au: null` by construction (the fit seeds itself from the fixture,
+///   not from the plan), so python replays zero of them — a python-side floor
+///   on that axis can never be met.
+/// - `empyrean-core`'s `validate-core` has no radar arm; it falls through to
+///   `_ => {}` and pushes the row anyway with a null position. The report
+///   counts such a row as *compared* but never as *passing*, so the core
+///   channel fails its `passing == total` strict check on exactly those rows
+///   (measured: 448 rows, 446 passing, the 2 missing being the radar pair).
+///
+/// So a plan carrying these rows does not describe a cross-channel radar
+/// comparison — it describes work no channel can do, and makes the gate
+/// unsatisfiable for a reason unrelated to any real regression. Stripping them
+/// is the honest state: the suite stops implying a comparison that does not
+/// exist. The radar axis stays gated by a row floor on the **rust** channel,
+/// where the rows are actually produced and visible (see the `--min-rows`
+/// handling in `src/bin/cli.rs` and the ci-check step in
+/// `.github/workflows/validation.yml`).
+///
+/// Removing an entry here is the *goal*, not a regression: once the replay
+/// drivers grow a real radar arm (`empyrean-s1ab`), the row comes back into the
+/// plan and its floor moves back onto the strict channels.
+///
+/// # Why a blacklist when [`PLAN_UNCERTAINTY_AXES`] is a whitelist
+///
+/// The polarity is opposite on purpose, because the dangerous direction is
+/// opposite. A new *uncertainty axis* is rust-only by default — whitelisting
+/// means it cannot silently become every channel's problem. A new *test type*
+/// is meant to be replayed by everyone — blacklisting means a new one reaches
+/// the plan and fails loudly in the channels that cannot yet run it, instead of
+/// silently vanishing from the plan and taking a whole test axis with it. That
+/// silent-axis-deletion is the exact defect this branch exists to kill.
+pub const PLAN_RUST_ONLY_TEST_TYPES: [&str; 1] = [test_types::ORBIT_DETERMINATION_RADAR];
+
+/// Why a channel-result row was excluded from the plan.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PlanExclusion {
+    /// Row sits on a rust-only uncertainty axis ([`PLAN_UNCERTAINTY_AXES`]).
+    UncertaintyAxis,
+    /// Row is a rust-only test type ([`PLAN_RUST_ONLY_TEST_TYPES`]).
+    RustOnlyTestType,
+}
+
+/// Rows [`strip_to_plan`] dropped, counted by reason.
+///
+/// Counted rather than merely discarded so the caller can print *what* it
+/// removed and *why* — a strip that silently shrinks the plan is
+/// indistinguishable from a strip that ate a live axis.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct PlanDrops {
+    /// Rows dropped by [`PLAN_UNCERTAINTY_AXES`].
+    pub uncertainty_axis: usize,
+    /// Rows dropped by [`PLAN_RUST_ONLY_TEST_TYPES`].
+    pub rust_only_test_type: usize,
+}
+
+impl PlanDrops {
+    /// Total rows dropped, across every reason.
+    pub fn total(&self) -> usize {
+        self.uncertainty_axis + self.rust_only_test_type
+    }
+}
+
+impl std::fmt::Display for PlanDrops {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{} rust-only uncertainty-axis + {} rust-only test-type rows dropped",
+            self.uncertainty_axis, self.rust_only_test_type
+        )
+    }
+}
+
+/// Why the plan must not carry this row, or `None` if it belongs in the plan.
+///
+/// One predicate for both exclusion rules so the strip has a single decision
+/// point: a new rule is a new arm here plus a new [`PlanDrops`] counter, never a
+/// second filtering pass somewhere else in the pipeline.
+fn plan_exclusion(row: &serde_json::Map<String, serde_json::Value>) -> Option<PlanExclusion> {
+    let on_plan_axis = match row.get("propagation_uncertainty") {
         None | Some(serde_json::Value::Null) => true,
         Some(serde_json::Value::String(s)) => PLAN_UNCERTAINTY_AXES.contains(&s.as_str()),
         Some(_) => false,
+    };
+    if !on_plan_axis {
+        return Some(PlanExclusion::UncertaintyAxis);
     }
+    if let Some(serde_json::Value::String(tt)) = row.get("test_type")
+        && PLAN_RUST_ONLY_TEST_TYPES.contains(&tt.as_str())
+    {
+        return Some(PlanExclusion::RustOnlyTestType);
+    }
+    None
 }
 
 /// Reduce one channel-result row to the plan contract: carried keys keep their
@@ -576,24 +670,31 @@ fn strip_row_to_plan_contract(
 
 /// Strip a channel-result JSON array down to the canonical plan.
 ///
-/// Returns the plan rows, and the count of input rows dropped as rust-only
-/// uncertainty axes.
+/// Returns the plan rows and a [`PlanDrops`] breakdown of everything the strip
+/// removed, by reason.
 pub fn strip_to_plan(
     rows: &[serde_json::Value],
-) -> Result<(Vec<serde_json::Value>, usize), String> {
+) -> Result<(Vec<serde_json::Value>, PlanDrops), String> {
     let mut out = Vec::with_capacity(rows.len());
-    let mut dropped_axis = 0usize;
+    let mut drops = PlanDrops::default();
     for (i, row) in rows.iter().enumerate() {
         let obj = row
             .as_object()
             .ok_or_else(|| format!("row {i} is not a JSON object"))?;
-        if !is_plan_axis(obj) {
-            dropped_axis += 1;
-            continue;
+        match plan_exclusion(obj) {
+            Some(PlanExclusion::UncertaintyAxis) => {
+                drops.uncertainty_axis += 1;
+                continue;
+            }
+            Some(PlanExclusion::RustOnlyTestType) => {
+                drops.rust_only_test_type += 1;
+                continue;
+            }
+            None => {}
         }
         out.push(strip_row_to_plan_contract(obj));
     }
-    Ok((out, dropped_axis))
+    Ok((out, drops))
 }
 
 #[cfg(test)]
@@ -796,13 +897,23 @@ mod tests {
         row
     }
 
+    /// The same row, retagged to a given test type and off the uncertainty
+    /// axis entirely, so the test-type rule is exercised in isolation.
+    fn rust_row_with_test_type(test_type: &str) -> serde_json::Value {
+        let mut row = rust_row_with_unknown_fields(None);
+        row.as_object_mut()
+            .unwrap()
+            .insert("test_type".into(), serde_json::json!(test_type));
+        row
+    }
+
     #[test]
     fn plan_from_rows_with_unknown_fields_deserializes_against_the_pinned_schema() {
         let rows = vec![rust_row_with_unknown_fields(Some(
             uncertainty_modes::F64_NO_COV,
         ))];
-        let (plan, dropped) = strip_to_plan(&rows).expect("strip");
-        assert_eq!(dropped, 0);
+        let (plan, drops) = strip_to_plan(&rows).expect("strip");
+        assert_eq!(drops.total(), 0);
         assert_eq!(plan.len(), 1);
 
         // The whole point: a v0.7.0 consumer can read this.
@@ -875,20 +986,64 @@ mod tests {
             "sigma_point_with_cov",
             "monte_carlo_100_with_cov",
         ] {
-            let (plan, dropped) =
-                strip_to_plan(&[rust_row_with_unknown_fields(Some(axis))]).unwrap();
+            let (plan, drops) = strip_to_plan(&[rust_row_with_unknown_fields(Some(axis))]).unwrap();
             assert!(plan.is_empty(), "{axis} leaked into the plan");
-            assert_eq!(dropped, 1);
+            assert_eq!(drops.uncertainty_axis, 1);
+            assert_eq!(drops.rust_only_test_type, 0);
         }
         for axis in PLAN_UNCERTAINTY_AXES {
-            let (plan, dropped) =
-                strip_to_plan(&[rust_row_with_unknown_fields(Some(axis))]).unwrap();
+            let (plan, drops) = strip_to_plan(&[rust_row_with_unknown_fields(Some(axis))]).unwrap();
             assert_eq!(plan.len(), 1, "{axis} should be replayable");
-            assert_eq!(dropped, 0);
+            assert_eq!(drops.total(), 0);
         }
         // OD rows carry no uncertainty tag and are always in the plan.
-        let (plan, dropped) = strip_to_plan(&[rust_row_with_unknown_fields(None)]).unwrap();
-        assert_eq!((plan.len(), dropped), (1, 0));
+        let (plan, drops) = strip_to_plan(&[rust_row_with_unknown_fields(None)]).unwrap();
+        assert_eq!((plan.len(), drops.total()), (1, 0));
+    }
+
+    #[test]
+    fn rust_only_test_types_never_reach_the_plan() {
+        // The radar OD rows the rust runner emits are unreplayable by every
+        // other channel (empyrean-s1ab); a plan carrying them makes the gate
+        // unsatisfiable. They must be dropped, and dropped under their OWN
+        // counter so the strip's log says which rule removed them.
+        for tt in PLAN_RUST_ONLY_TEST_TYPES {
+            let (plan, drops) = strip_to_plan(&[rust_row_with_test_type(tt)]).unwrap();
+            assert!(plan.is_empty(), "{tt} leaked into the plan");
+            assert_eq!(drops.rust_only_test_type, 1);
+            assert_eq!(drops.uncertainty_axis, 0);
+        }
+        // Every other test type still rides through. Pinned by name so adding
+        // a test type to the blacklist is a deliberate, visible act — the
+        // whole hazard of a plan strip is that it deletes an axis quietly.
+        for tt in [
+            test_types::PROPAGATION,
+            test_types::EPHEMERIS,
+            test_types::ORBIT_DETERMINATION,
+            test_types::NON_GRAV_RECOVERY,
+            test_types::DT_RECOVERY,
+            test_types::PHOTOMETRY_RECOVERY,
+            test_types::THRUST_RECOVERY,
+        ] {
+            let (plan, drops) = strip_to_plan(&[rust_row_with_test_type(tt)]).unwrap();
+            assert_eq!(plan.len(), 1, "{tt} should reach the plan");
+            assert_eq!(drops.total(), 0, "{tt} was dropped");
+        }
+    }
+
+    #[test]
+    fn strip_counts_each_drop_reason_separately() {
+        let rows = vec![
+            rust_row_with_unknown_fields(Some("monte_carlo_100_with_cov")),
+            rust_row_with_unknown_fields(Some("auto")),
+            rust_row_with_test_type(test_types::ORBIT_DETERMINATION_RADAR),
+            rust_row_with_test_type(test_types::ORBIT_DETERMINATION),
+        ];
+        let (plan, drops) = strip_to_plan(&rows).unwrap();
+        assert_eq!(plan.len(), 1);
+        assert_eq!(drops.uncertainty_axis, 2);
+        assert_eq!(drops.rust_only_test_type, 1);
+        assert_eq!(drops.total(), 3);
     }
 
     #[test]

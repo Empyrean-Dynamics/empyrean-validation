@@ -34,7 +34,7 @@ use empyrean_validation::{
     catalog::{ValidationObject, all_objects, filter_by_name, filter_by_population},
     plan::{PlanConfig, build_plan},
     report::generate_report,
-    schema::{OrbitComparison, ValidationResult},
+    schema::{OrbitComparison, ValidationResult, channels},
 };
 
 #[derive(Parser, Debug)]
@@ -180,16 +180,25 @@ struct CiCheckArgs {
     /// severe outcome available, and the gate must not read it as silence.
     #[arg(long, value_delimiter = ',', default_values_t = ["c".to_string(), "cli".to_string(), "python".to_string()])]
     strict_channels: Vec<String>,
-    /// Minimum compared-row count per test type, as `<test_type>=<count>`.
-    /// Repeatable and/or comma-separated, e.g.
-    /// `--min-rows orbit_determination=50,orbit_determination_radar=5`.
+    /// Minimum compared-row count per test type, as `<test_type>=<count>`
+    /// or `<channel>:<test_type>=<count>`. Repeatable and/or comma-separated,
+    /// e.g. `--min-rows orbit_determination=50,rust:orbit_determination_radar=5`.
     ///
-    /// Enforced against every strict channel. Aggregate row counts cannot
-    /// catch a single dead axis: a run with the full propagation and
-    /// ephemeris grid and ZERO orbit-determination rows has tens of
-    /// thousands of compared rows and passes an aggregate check without
-    /// having tested orbit determination at all. That is precisely the
-    /// state this suite shipped in. Floors are per-axis for that reason.
+    /// Unscoped entries are enforced against every strict channel. Aggregate
+    /// row counts cannot catch a single dead axis: a run with the full
+    /// propagation and ephemeris grid and ZERO orbit-determination rows has
+    /// tens of thousands of compared rows and passes an aggregate check
+    /// without having tested orbit determination at all. That is precisely
+    /// the state this suite shipped in. Floors are per-axis for that reason.
+    ///
+    /// A `<channel>:` prefix scopes the floor to one named channel, which
+    /// need NOT be strict. That exists because an axis can be real and worth
+    /// gating while living on only one channel: `orbit_determination_radar`
+    /// is produced by the rust runner and by nothing else
+    /// (`empyrean_validation::plan::PLAN_RUST_ONLY_TEST_TYPES`,
+    /// `empyrean-s1ab`), so its floor belongs on `rust`. A scoped floor on a
+    /// channel missing from the summary is a failure, exactly like a strict
+    /// channel that produced nothing.
     ///
     /// Scale these when running an object subset; the wired defaults in the
     /// workflow correspond to the full catalog.
@@ -272,7 +281,7 @@ fn strip_plan(args: StripPlanArgs) -> Result<(), Box<dyn std::error::Error>> {
         .map_err(|e| format!("read {}: {e}", args.input.display()))?;
     let rows: Vec<serde_json::Value> =
         serde_json::from_str(&raw).map_err(|e| format!("parse {}: {e}", args.input.display()))?;
-    let (plan, dropped) = empyrean_validation::plan::strip_to_plan(&rows)?;
+    let (plan, drops) = empyrean_validation::plan::strip_to_plan(&rows)?;
 
     // Same assertion the Makefile makes on the finished plan, made here at
     // the point the rows are actually discarded, so the message can name the
@@ -303,12 +312,24 @@ fn strip_plan(args: StripPlanArgs) -> Result<(), Box<dyn std::error::Error>> {
     }
     std::fs::write(&args.output, serde_json::to_string_pretty(&plan)?)?;
     eprintln!(
-        "Wrote {} plan rows to {} ({} OD; {} rust-only uncertainty-axis rows dropped)",
+        "Wrote {} plan rows to {} ({} OD; {})",
         plan.len(),
         args.output.display(),
         n_od,
-        dropped
+        drops
     );
+    // Name the rust-only test types explicitly on every strip. The rows are
+    // dropped by policy (empyrean-s1ab), and a policy nobody is reminded of
+    // becomes a defect nobody remembers to undo.
+    if drops.rust_only_test_type > 0 {
+        eprintln!(
+            "  NOTE: {} row(s) dropped as rust-only test types [{}] — no replay \
+             driver can fit them yet (empyrean-s1ab). They stay gated by a \
+             `rust:`-scoped ci-check row floor.",
+            drops.rust_only_test_type,
+            empyrean_validation::plan::PLAN_RUST_ONLY_TEST_TYPES.join(", ")
+        );
+    }
     Ok(())
 }
 
@@ -332,6 +353,22 @@ fn merge_external(args: MergeExternalArgs) -> Result<(), Box<dyn std::error::Err
     if let Some(path) = &args.findorb_radar {
         let n = merge_findorb(&mut rows, path)?;
         eprintln!("Merged {n} find_orb radar rows");
+        // Expected while radar is rust-only: the reference channel is built
+        // from the plan, the plan no longer carries radar rows
+        // (`PLAN_RUST_ONLY_TEST_TYPES`), so there is nothing for find_orb's
+        // radar fits to attach to. Say it out loud — a merge that folds zero
+        // rows out of a non-empty input file is otherwise indistinguishable
+        // from a merge that folded everything.
+        if n == 0 {
+            eprintln!(
+                "  NOTE: find_orb ran its radar pass but no reference row accepted it. \
+                 Radar OD is rust-only today (empyrean-s1ab), so the reference channel \
+                 carries no orbit_determination_radar rows to fold onto. find_orb's \
+                 radar fits are preserved verbatim in {} — they are simply not shown \
+                 as a cross-tool comparison until a replay driver can fit radar.",
+                path.display()
+            );
+        }
     }
     if let Some(path) = &args.oorb {
         let n = merge_oorb(&mut rows, path)?;
@@ -1015,30 +1052,95 @@ fn compare_sidecar_candidates(main_path: &std::path::Path) -> Vec<PathBuf> {
     out
 }
 
-/// Parse `--min-rows test_type=count` entries into (test_type, floor) pairs.
+/// One `--min-rows` floor: "this test type must have compared at least this
+/// many rows".
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RowFloor {
+    /// `None` → the floor applies to every `--strict-channels` entry.
+    /// `Some(c)` → it applies to channel `c` alone, strict or not.
+    channel: Option<String>,
+    test_type: String,
+    floor: u64,
+}
+
+impl std::fmt::Display for RowFloor {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match &self.channel {
+            Some(c) => write!(f, "{c}:{}>={}", self.test_type, self.floor),
+            None => write!(f, "{}>={}", self.test_type, self.floor),
+        }
+    }
+}
+
+/// Parse `--min-rows [channel:]test_type=count` entries into [`RowFloor`]s.
 ///
-/// A malformed entry is an error, never a skipped floor: a typo'd test type
-/// that silently enforced nothing would reproduce the exact class of defect
-/// these floors exist to catch.
-fn parse_min_rows(specs: &[String]) -> Result<Vec<(String, u64)>, String> {
+/// A malformed entry is an error, never a skipped floor: a typo'd floor that
+/// silently enforced nothing would reproduce the exact class of defect these
+/// floors exist to catch. The channel name on a scoped floor is checked for
+/// membership for the same reason — `--min-rows rst:...=5` must read as "you
+/// typed it wrong", not as "that channel produced nothing".
+fn parse_min_rows(specs: &[String]) -> Result<Vec<RowFloor>, String> {
     specs
         .iter()
         .map(|spec| {
-            let (tt, n) = spec
-                .split_once('=')
-                .ok_or_else(|| format!("--min-rows expects <test_type>=<count>, got {spec:?}"))?;
-            let tt = tt.trim();
+            let (lhs, n) = spec.split_once('=').ok_or_else(|| {
+                format!("--min-rows expects [<channel>:]<test_type>=<count>, got {spec:?}")
+            })?;
+            let (channel, tt) = match lhs.split_once(':') {
+                Some((c, t)) => (Some(c.trim()), t.trim()),
+                None => (None, lhs.trim()),
+            };
             if tt.is_empty() {
                 return Err(format!("--min-rows entry {spec:?} has an empty test type"));
             }
-            let n: u64 = n
+            let channel = match channel {
+                None => None,
+                Some("") => {
+                    return Err(format!("--min-rows entry {spec:?} has an empty channel"));
+                }
+                Some(c) => {
+                    if !KNOWN_CHANNELS.contains(&c) {
+                        return Err(format!(
+                            "--min-rows entry {spec:?}: {c:?} is not a known channel \
+                             (known: {})",
+                            KNOWN_CHANNELS.join(", ")
+                        ));
+                    }
+                    Some(c.to_string())
+                }
+            };
+            let floor: u64 = n
                 .trim()
                 .parse()
                 .map_err(|e| format!("--min-rows entry {spec:?}: bad count: {e}"))?;
-            Ok((tt.to_string(), n))
+            Ok(RowFloor {
+                channel,
+                test_type: tt.to_string(),
+                floor,
+            })
         })
         .collect()
 }
+
+/// Channel names a `--min-rows` floor (or `--strict-channels`) may name.
+///
+/// The `channels` module constants plus the externally-merged comparators that
+/// only ever appear as their own result JSON. Validated against so a typo is
+/// "you typed it wrong", not "that channel produced nothing".
+const KNOWN_CHANNELS: [&str; 12] = [
+    channels::RUST,
+    channels::PYTHON,
+    channels::C,
+    channels::CLI,
+    channels::CORE,
+    channels::ASSIST,
+    channels::FINDORB,
+    channels::KETE,
+    "oorb",
+    "jorbit",
+    "layup",
+    "orbfit",
+];
 
 /// Every reason this summary fails the gate, as human-readable lines.
 ///
@@ -1048,7 +1150,7 @@ fn parse_min_rows(specs: &[String]) -> Result<Vec<(String, u64)>, String> {
 fn ci_check_failures(
     channels: &[serde_json::Value],
     strict_channels: &[String],
-    min_rows: &[(String, u64)],
+    min_rows: &[RowFloor],
     summary_path: &std::path::Path,
 ) -> Vec<String> {
     let mut failures = Vec::new();
@@ -1084,24 +1186,99 @@ fn ci_check_failures(
             ));
         }
 
-        // Per-axis floors. `by_test_type` is keyed by test type; a missing
-        // key and a zero count are the same failure — the axis was not
-        // exercised — and are reported as such rather than skipped.
-        for (tt, floor) in min_rows {
-            let n = ch["by_test_type"][tt]["n_compared"].as_u64();
-            match n {
-                Some(n) if n >= *floor => {}
-                Some(n) => {
-                    failures.push(format!("{want}: {tt} compared {n} rows, floor is {floor}"))
-                }
-                None => failures.push(format!(
-                    "{want}: {tt} is absent from the summary (floor is {floor}) — \
-                     that axis was never exercised"
-                )),
-            }
+        // Unscoped per-axis floors apply to every strict channel. Scoped
+        // floors are handled below, against the one channel they name.
+        for f in min_rows.iter().filter(|f| f.channel.is_none()) {
+            failures.extend(floor_failures(ch, want, f, true));
         }
     }
+
+    // Channel-scoped floors. The channel need not be strict — `rust` is the
+    // reference, never strict, and yet it is the only channel that carries
+    // the radar OD axis (empyrean-s1ab). Absence is a failure here for the
+    // same reason it is for a strict channel: a floor that evaluates to
+    // nothing because its channel vanished is a gate that stopped checking.
+    for f in min_rows.iter().filter(|f| f.channel.is_some()) {
+        let want = f.channel.as_deref().expect("filtered to Some");
+        let Some(ch) = channels
+            .iter()
+            .find(|c| c["channel"].as_str() == Some(want))
+        else {
+            let present: Vec<&str> = channels
+                .iter()
+                .filter_map(|c| c["channel"].as_str())
+                .collect();
+            failures.push(format!(
+                "{want}: ABSENT from {} — a row floor is scoped to it ({f}) but the \
+                 channel produced no rows at all (present: [{}])",
+                summary_path.display(),
+                present.join(", ")
+            ));
+            continue;
+        };
+        let strict = strict_channels.iter().any(|s| s == want);
+        failures.extend(floor_failures(ch, want, f, strict));
+    }
     failures
+}
+
+/// Evaluate one row floor against one summary channel entry.
+///
+/// Two metrics, because a floor has two things to say:
+///
+/// - `n_rows` — the channel PRODUCED this many rows on this axis. Checked
+///   always. This is the structural-death check: an axis nobody ran.
+/// - `n_compared` — this many of them paired with a reference row and were
+///   actually diffed. Checked only for `--strict-channels`, whose whole job is
+///   to match the reference. It is meaningless for a channel that owns an axis
+///   alone: `orbit_determination_radar` exists on `rust` and nowhere else
+///   (`plan::PLAN_RUST_ONLY_TEST_TYPES`, empyrean-s1ab), so its `n_compared` is
+///   structurally 0 and a floor on it would fail forever no matter how much
+///   radar work ran.
+///
+/// `by_test_type` is keyed by test type; a missing key and a zero count are the
+/// same failure — the axis was not exercised — and are reported as such rather
+/// than skipped.
+fn floor_failures(
+    ch: &serde_json::Value,
+    channel: &str,
+    f: &RowFloor,
+    strict: bool,
+) -> Vec<String> {
+    let (tt, floor) = (&f.test_type, f.floor);
+    let entry = &ch["by_test_type"][tt];
+    if entry.is_null() {
+        return vec![format!(
+            "{channel}: {tt} is absent from the summary (floor is {floor}) — \
+             that axis was never exercised"
+        )];
+    }
+    let mut out = Vec::new();
+    // `n_rows` predates nothing — it was added with the scoped floors. Treat a
+    // summary that lacks it as a hard error rather than skipping the check: a
+    // stale summary silently passing a floor is the defect, not the fix.
+    match entry["n_rows"].as_u64() {
+        Some(n) if n >= floor => {}
+        Some(n) => out.push(format!(
+            "{channel}: {tt} produced {n} rows, floor is {floor}"
+        )),
+        None => out.push(format!(
+            "{channel}: {tt} carries no n_rows count (floor is {floor}) — the summary \
+             predates per-axis row counts; regenerate it with this build of `report`"
+        )),
+    }
+    if strict {
+        match entry["n_compared"].as_u64() {
+            Some(n) if n >= floor => {}
+            Some(n) => out.push(format!(
+                "{channel}: {tt} compared {n} rows, floor is {floor}"
+            )),
+            None => out.push(format!(
+                "{channel}: {tt} carries no n_compared count (floor is {floor})"
+            )),
+        }
+    }
+    out
 }
 
 fn ci_check(args: CiCheckArgs) -> Result<(), Box<dyn std::error::Error>> {
@@ -1126,7 +1303,7 @@ fn ci_check(args: CiCheckArgs) -> Result<(), Box<dyn std::error::Error>> {
                 "ci-check: per-axis row floors met [{}]",
                 min_rows
                     .iter()
-                    .map(|(tt, n)| format!("{tt}>={n}"))
+                    .map(RowFloor::to_string)
                     .collect::<Vec<_>>()
                     .join(", ")
             );
@@ -1175,12 +1352,26 @@ mod tests {
     // The gate that shipped had two holes, both of which let a channel that
     // computed nothing report success. These tests pin both shut.
 
-    /// A summary channel entry with the given per-axis compared counts.
+    /// A summary channel entry with the given per-axis counts. Rows produced
+    /// and rows compared are equal here — the interesting case where they
+    /// differ gets its own builder, [`summary_channel_split`].
     fn summary_channel(name: &str, by_tt: &[(&str, u64)]) -> serde_json::Value {
-        let total: u64 = by_tt.iter().map(|(_, n)| *n).sum();
+        let split: Vec<(&str, u64, u64)> = by_tt.iter().map(|(tt, n)| (*tt, *n, *n)).collect();
+        summary_channel_split(name, &split)
+    }
+
+    /// A summary channel entry with per-axis (rows produced, rows compared)
+    /// counts that may differ — the shape a rust-only axis takes.
+    fn summary_channel_split(name: &str, by_tt: &[(&str, u64, u64)]) -> serde_json::Value {
+        let total: u64 = by_tt.iter().map(|(_, _, n)| *n).sum();
         let by_test_type: serde_json::Map<String, serde_json::Value> = by_tt
             .iter()
-            .map(|(tt, n)| ((*tt).to_string(), serde_json::json!({ "n_compared": n })))
+            .map(|(tt, rows, compared)| {
+                (
+                    (*tt).to_string(),
+                    serde_json::json!({ "n_rows": rows, "n_compared": compared }),
+                )
+            })
             .collect();
         serde_json::json!({
             "channel": name,
@@ -1260,12 +1451,21 @@ mod tests {
         let above = vec![summary_channel("core", &[("orbit_determination", 55)])];
         assert!(check(&above, &["core"], &["orbit_determination=50"]).is_empty());
 
-        // One short — a partially-run catalog is a failure, not a pass.
+        // One short — a partially-run catalog is a failure, not a pass. A
+        // strict channel reports both halves: it produced 49 and compared 49.
         let below = vec![summary_channel("core", &[("orbit_determination", 49)])];
         let failures = check(&below, &["core"], &["orbit_determination=50"]);
-        assert_eq!(failures.len(), 1, "{failures:?}");
+        assert_eq!(failures.len(), 2, "{failures:?}");
         assert!(
-            failures[0].contains("compared 49 rows, floor is 50"),
+            failures
+                .iter()
+                .any(|f| f.contains("produced 49 rows, floor is 50")),
+            "{failures:?}"
+        );
+        assert!(
+            failures
+                .iter()
+                .any(|f| f.contains("compared 49 rows, floor is 50")),
             "{failures:?}"
         );
     }
@@ -1278,6 +1478,114 @@ mod tests {
         assert!(parse_min_rows(&strict(["orbit_determination"].as_ref())).is_err());
         assert!(parse_min_rows(&strict(["=50"].as_ref())).is_err());
         assert!(parse_min_rows(&strict(["orbit_determination=lots"].as_ref())).is_err());
+        // Channel-scoped form.
+        assert_eq!(
+            parse_min_rows(&strict(["rust:orbit_determination_radar=5"].as_ref())).unwrap(),
+            vec![RowFloor {
+                channel: Some("rust".into()),
+                test_type: "orbit_determination_radar".into(),
+                floor: 5,
+            }]
+        );
+        assert!(parse_min_rows(&strict([":orbit_determination=5"].as_ref())).is_err());
+        // A channel name nobody emits must read as "you typed it wrong", not
+        // as "that channel produced nothing".
+        assert!(parse_min_rows(&strict(["rst:orbit_determination=5"].as_ref())).is_err());
+    }
+
+    #[test]
+    fn scoped_floors_gate_a_non_strict_channel() {
+        // Radar OD is produced only by the rust runner (empyrean-s1ab), and
+        // rust is never a strict channel — it IS the reference. A floor that
+        // could only be expressed against a strict channel would therefore
+        // have to be dropped entirely, silently un-gating the axis. Scoped
+        // floors exist so it stays gated where the rows actually are.
+        //
+        // Note the (rows, compared) split on the rust radar axis: 5 rows
+        // produced, 0 compared. That is not a degenerate case, it is THE
+        // case — the reference channel carries no radar rows to pair with,
+        // so a compared-count floor could never pass. Non-strict channels are
+        // floored on rows produced for exactly this reason.
+        let channels = vec![
+            summary_channel("core", &[("orbit_determination", 50)]),
+            summary_channel_split(
+                "rust",
+                &[
+                    ("orbit_determination", 50, 50),
+                    ("orbit_determination_radar", 5, 0),
+                ],
+            ),
+        ];
+        assert!(
+            check(
+                &channels,
+                &["core"],
+                &["orbit_determination=50", "rust:orbit_determination_radar=5"],
+            )
+            .is_empty()
+        );
+
+        // The scoped floor is enforced against rust ALONE — core carries no
+        // radar rows by design and must not be failed for it.
+        let short = vec![
+            summary_channel("core", &[("orbit_determination", 50)]),
+            summary_channel_split(
+                "rust",
+                &[
+                    ("orbit_determination", 50, 50),
+                    ("orbit_determination_radar", 4, 0),
+                ],
+            ),
+        ];
+        let failures = check(
+            &short,
+            &["core"],
+            &["orbit_determination=50", "rust:orbit_determination_radar=5"],
+        );
+        assert_eq!(failures.len(), 1, "{failures:?}");
+        assert!(
+            failures[0].starts_with("rust: orbit_determination_radar produced 4 rows, floor is 5"),
+            "{failures:?}"
+        );
+    }
+
+    #[test]
+    fn strict_channel_floors_check_produced_and_compared() {
+        // A strict channel that emitted the rows but paired none of them has
+        // not exercised the axis — the reference never saw its work. Rows
+        // produced alone is the weaker claim, and for a strict channel the
+        // stronger one is available and must be made.
+        let channels = vec![summary_channel_split(
+            "core",
+            &[("orbit_determination", 50, 0)],
+        )];
+        let failures = check(&channels, &["core"], &["orbit_determination=50"]);
+        assert!(
+            failures
+                .iter()
+                .any(|f| f == "core: orbit_determination compared 0 rows, floor is 50"),
+            "{failures:?}"
+        );
+        // …and the rows-produced half stays silent: the channel did emit 50.
+        assert!(
+            !failures.iter().any(|f| f.contains("produced")),
+            "{failures:?}"
+        );
+    }
+
+    #[test]
+    fn scoped_floor_on_an_absent_channel_fails() {
+        // Same severity as an absent strict channel: a floor whose channel
+        // vanished evaluates to nothing, which is a gate that stopped
+        // checking rather than a gate that passed.
+        let channels = vec![summary_channel("core", &[("orbit_determination", 50)])];
+        let failures = check(&channels, &["core"], &["rust:orbit_determination_radar=5"]);
+        assert_eq!(failures.len(), 1, "{failures:?}");
+        assert!(failures[0].starts_with("rust: ABSENT"), "{failures:?}");
+        assert!(
+            failures[0].contains("rust:orbit_determination_radar>=5"),
+            "names the floor that could not be evaluated: {failures:?}"
+        );
     }
 
     #[test]

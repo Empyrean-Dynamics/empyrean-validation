@@ -178,6 +178,16 @@ struct ChannelRollup {
 
 #[derive(Debug, Clone, Default)]
 struct TestTypeRollup {
+    /// Rows of this test type the channel EMITTED, whether or not a
+    /// reference row existed to pair them with.
+    ///
+    /// Distinct from `n_compared` on purpose. A test type that only one
+    /// channel produces — `orbit_determination_radar` is rust-only today,
+    /// see `plan::PLAN_RUST_ONLY_TEST_TYPES` — has no counterpart in the
+    /// reference channel, so `n_compared` is structurally 0 and cannot carry
+    /// a row floor. `n_rows` is what says "the pass ran and produced work",
+    /// which is exactly the structural-death class the floors exist to catch.
+    n_rows: usize,
     n_compared: usize,
     n_bit_identical: usize,
     p50_dr_km: f64,
@@ -290,8 +300,12 @@ fn rollup_channels(results: &[ValidationResult]) -> Vec<ChannelRollup> {
         let mut by_tt_row_max_diff: BTreeMap<String, Vec<f64>> = BTreeMap::new();
         let mut by_tt_bit_identical: BTreeMap<String, usize> = BTreeMap::new();
         let mut by_tt_compared: BTreeMap<String, usize> = BTreeMap::new();
+        // Counted BEFORE the reference-pairing filter below, so a test type
+        // this channel alone produces still reports a row count.
+        let mut by_tt_rows: BTreeMap<String, usize> = BTreeMap::new();
 
         for r in rows {
+            *by_tt_rows.entry(r.test_type.clone()).or_default() += 1;
             let key = (
                 r.object.clone(),
                 r.dt_days as i64,
@@ -438,6 +452,7 @@ fn rollup_channels(results: &[ValidationResult]) -> Vec<ChannelRollup> {
             by_test_type.insert(
                 tt.to_string(),
                 TestTypeRollup {
+                    n_rows: by_tt_rows.get(tt).copied().unwrap_or(0),
                     n_compared: n_compared_tt,
                     n_bit_identical,
                     p50_dr_km: p50,
@@ -520,6 +535,7 @@ fn write_summary(rollups: &[ChannelRollup], path: &Path) -> Result<(), String> {
                     (
                         tt.clone(),
                         serde_json::json!({
+                            "n_rows": x.n_rows,
                             "n_compared": x.n_compared,
                             "n_bit_identical": x.n_bit_identical,
                             "p50_dr_km": nan_or(x.p50_dr_km),
