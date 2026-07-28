@@ -31,45 +31,37 @@ security boundary the matrix was built around. Tracking is the only option that
 delivers the fixtures to a secretless leg via the checkout it already does.
 
 Cost, measured: 50 files, 42 MB in the working tree; **6.02 MiB of git objects
-on disk** as written, deltaing down to **4.51 MiB** when packed. Everything else
-in the repo packs to 1.72 MiB, so these fixtures are now the bulk of it — still
-two orders of magnitude below any GitHub limit, and one refresh per quarter
-keeps it there for years. `../psv-radar/` adds nothing on top: its optical
-tables are byte-identical to these, so packing both together is still 4.51 MiB.
+on disk** as written, deltaing down to **4.51 MiB** when packed. A full pack of
+HEAD with all history is **5.20 MiB**, so these fixtures are the bulk of the
+repository — still two orders of magnitude below any GitHub limit, and one
+refresh per quarter keeps it there for years. `../psv-radar/` adds nothing on
+top: its optical tables are byte-identical to these, so packing both together
+is still 4.51 MiB.
 
 > **Correction.** The commit that staged these files (`23479ea`) reported
 > "~4.5 MB compressed against a 6 MB pack". The first number is the packed
 > figure and is right, but it is not what the commit put on disk — loose
 > objects are zlib-only, with no delta compression, so the tree gained 6.02 MiB
-> until something repacked it. The second number was simply wrong: the repo
-> without these fixtures packs to 1.72 MiB, not 6 MB, so this is not a 75%
-> addition to the repo, it is a tripling of it. The decision above stands on
-> either figure; the record should not.
+> until something repacked it. The "6 MB pack" it was compared against was
+> wrong: the whole repository at HEAD packs to 5.20 MiB *including* these
+> fixtures, so the fixtures are not a fraction of the repo, they are most of
+> it. The decision above stands on any of these figures; the record should not.
 >
-> Reproduce: `git ls-tree -r HEAD -- fixtures/psv | awk '{print $3}'`, then
-> `git cat-file --batch-check='%(objectsize:disk)'` summed for the on-disk
-> figure, or `git pack-objects --stdout > /dev/null` piped through `wc -c` for
-> the packed one.
-
-Redistribution is not in question: the astrometry is MPC-published optical
-observation records (freely available for scientific use) and, in the radar
-fixtures, JPL `sb_radar` delay/Doppler astrometry (US government work). This
-repo already tracked `../psv-radar/`, whose optical tables are byte-identical to
-the files here, so the precedent was set in-tree.
-
-Reproducibility settles it: `Cargo.toml` pins `empyrean` and `hyperjet` exactly
-so "a checkout of a validation tag reproduces the validation-of-record". Without
-the fixtures in the tree that claim was false for every OD row.
-
-## Refreshing
-
-Observations churn — arcs extend, records are debiased, catalogs are re-reduced.
-Re-fetch a fixture through the engine's own MPC/ADES client and commit the
-result as its own revision; the diff is the observation delta and the tag is the
-arc-of-record for that validation run. Fixtures are only meaningful alongside
-the catalog entry that names them, so add or remove them in the same commit as
-the corresponding `src/catalog.rs` change.
-
-`make check-fixtures` asserts the set is present and non-empty; every OD target
-depends on it, so a missing set fails with that message instead of silently
-producing zero rows.
+> A figure for "the repo without the fixtures" is deliberately not quoted here:
+> it varies by half a megabyte depending on whether you pack HEAD or `--all`
+> and on how the excluded object set is built, and two people measuring it got
+> two different answers. The two numbers above are the ones that reproduce.
+>
+> Reproduce (each command is standalone; the pack ones need the `git rev-parse`
+> upstream, since `pack-objects` reads revisions from stdin):
+>
+> ```sh
+> # on-disk size of the fixture blobs (6.02 MiB)
+> git ls-tree -r HEAD -- fixtures/psv | awk '{print $3}' \
+>   | git cat-file --batch-check='%(objectsize:disk)' \
+>   | awk '{s+=$1} END {printf "%.2f MiB\n", s/1048576}'
+>
+> # full pack of HEAD with history (5.20 MiB)
+> git rev-parse HEAD | git pack-objects --stdout --revs \
+>   | wc -c | awk '{printf "%.2f MiB\n", $1/1048576}'
+> ```

@@ -324,8 +324,8 @@ fn strip_plan(args: StripPlanArgs) -> Result<(), Box<dyn std::error::Error>> {
     if n_od > 0 && n_optical == 0 {
         return Err(format!(
             "{} carries {n_od} orbit-determination-family row(s) but ZERO \
-             `{}` rows. The recovery axes ({}) are checks layered on top of the \
-             optical fit, not substitutes for it — a plan with only those \
+             `{}` rows. The other family axes ({}) are checks layered on top of \
+             the optical fit, not substitutes for it — a plan with only those \
              deletes the OD axis proper while still looking non-empty.",
             args.input.display(),
             test_types::ORBIT_DETERMINATION,
@@ -1396,15 +1396,45 @@ fn floor_failures(
     // `n_rows` predates nothing — it was added with the scoped floors. Treat a
     // summary that lacks it as a hard error rather than skipping the check: a
     // stale summary silently passing a floor is the defect, not the fix.
-    match entry["n_rows"].as_u64() {
-        Some(n) if n >= floor => {}
-        Some(n) => out.push(format!(
-            "{channel}: {tt} produced {n} rows, floor is {floor}"
-        )),
-        None => out.push(format!(
-            "{channel}: {tt} carries no n_rows count (floor is {floor}) — the summary \
-             predates per-axis row counts; regenerate it with this build of `report`"
-        )),
+    let rows_ok = match entry["n_rows"].as_u64() {
+        Some(n) if n >= floor => true,
+        Some(n) => {
+            out.push(format!(
+                "{channel}: {tt} produced {n} rows, floor is {floor}"
+            ));
+            false
+        }
+        None => {
+            out.push(format!(
+                "{channel}: {tt} carries no n_rows count (floor is {floor}) — the summary \
+                 predates per-axis row counts; regenerate it with this build of `report`"
+            ));
+            false
+        }
+    };
+    // A row floor alone gates for EXISTENCE, not health: the runners emit a
+    // failure row for every non-convergent or unreadable case, so a floor
+    // counting rows is satisfied by total breakage of the axis it protects.
+    // Strict channels get their health check from the separate
+    // `passing == total` assertion, but a rust-only axis has no reference
+    // channel and so no strict check to fall back on — the convergence count
+    // is the only thing standing between "the pass ran" and "the pass worked".
+    // Only when the row floor PASSED. If it failed, the row shortage already
+    // explains the convergence shortage and reporting both says the same thing
+    // twice — worse, it would claim the pass ran when it may not have.
+    if rows_ok {
+        match entry["n_converged"].as_u64() {
+            Some(n) if n >= floor => {}
+            Some(n) => out.push(format!(
+                "{channel}: {tt} produced {} rows but only {n} CONVERGED, floor is {floor} — \
+                 the pass ran and emitted failure rows rather than being skipped",
+                entry["n_rows"].as_u64().unwrap_or(0)
+            )),
+            None => out.push(format!(
+                "{channel}: {tt} carries no n_converged count (floor is {floor}) — the summary \
+                 predates per-axis convergence counts; regenerate it with this build of `report`"
+            )),
+        }
     }
     if strict {
         match entry["n_compared"].as_u64() {
@@ -1506,15 +1536,31 @@ mod tests {
     }
 
     /// A summary channel entry with per-axis (rows produced, rows compared)
-    /// counts that may differ — the shape a rust-only axis takes.
+    /// counts that may differ — the shape a rust-only axis takes. Every row
+    /// counts as converged; the failure-row case has its own helper below.
     fn summary_channel_split(name: &str, by_tt: &[(&str, u64, u64)]) -> serde_json::Value {
-        let total: u64 = by_tt.iter().map(|(_, _, n)| *n).sum();
+        let split: Vec<(&str, u64, u64, u64)> =
+            by_tt.iter().map(|(tt, r, c)| (*tt, *r, *r, *c)).collect();
+        summary_channel_split_conv(name, &split)
+    }
+
+    /// As above, but with the converged count stated separately, so a test can
+    /// build the "the pass ran and emitted nothing but failure rows" shape.
+    fn summary_channel_split_conv(
+        name: &str,
+        by_tt: &[(&str, u64, u64, u64)],
+    ) -> serde_json::Value {
+        let total: u64 = by_tt.iter().map(|(_, _, _, n)| *n).sum();
         let by_test_type: serde_json::Map<String, serde_json::Value> = by_tt
             .iter()
-            .map(|(tt, rows, compared)| {
+            .map(|(tt, rows, converged, compared)| {
                 (
                     (*tt).to_string(),
-                    serde_json::json!({ "n_rows": rows, "n_compared": compared }),
+                    serde_json::json!({
+                        "n_rows": rows,
+                        "n_converged": converged,
+                        "n_compared": compared,
+                    }),
                 )
             })
             .collect();
@@ -1768,6 +1814,36 @@ mod tests {
                 &["orbit_determination=50", "rust:orbit_determination_radar=5"],
             )
             .is_empty()
+        );
+
+        // A row floor alone gates for EXISTENCE, not health. The runners emit
+        // a failure row for every non-convergent or unreadable case — that is
+        // deliberate, since a silent skip is what left this channel dead for
+        // months — so an axis that ran and failed COMPLETELY still satisfies a
+        // row floor. On a strict channel the separate passing==total assertion
+        // catches it; a rust-only axis has no reference and therefore no such
+        // check, so without a convergence floor the radar axis would be gated
+        // for having been attempted rather than for having worked.
+        let all_failed = vec![
+            summary_channel("core", &[("orbit_determination", 50)]),
+            summary_channel_split_conv(
+                "rust",
+                &[
+                    ("orbit_determination", 50, 50, 50),
+                    // 5 rows produced, ZERO converged: every radar fit failed.
+                    ("orbit_determination_radar", 5, 0, 0),
+                ],
+            ),
+        ];
+        let failures = check(
+            &all_failed,
+            &["core"],
+            &["orbit_determination=50", "rust:orbit_determination_radar=5"],
+        );
+        assert_eq!(failures.len(), 1, "{failures:?}");
+        assert!(
+            failures[0].contains("only 0 CONVERGED"),
+            "the convergence shortfall must be named, not the row count: {failures:?}"
         );
 
         // The scoped floor is enforced against rust ALONE — core carries no

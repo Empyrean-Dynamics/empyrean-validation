@@ -188,6 +188,18 @@ struct TestTypeRollup {
     /// a row floor. `n_rows` is what says "the pass ran and produced work",
     /// which is exactly the structural-death class the floors exist to catch.
     n_rows: usize,
+    /// Rows of this test type that reported a converged fit.
+    ///
+    /// `n_rows` alone gates for EXISTENCE, not health: the runners emit a
+    /// failure row for every non-convergent, unreadable or empty case
+    /// (deliberately — a silent skip is what left the OD channel dead for
+    /// months), so a row floor is satisfied by total breakage. Strict
+    /// channels get their health check from `passing == total`, but a
+    /// rust-only test type has no reference to be compared against and so
+    /// no strict check to fall back on. This is what a floor on such a
+    /// type must actually test. Non-OD test types leave it equal to
+    /// `n_rows` — they carry no convergence concept.
+    n_converged: usize,
     n_compared: usize,
     n_bit_identical: usize,
     p50_dr_km: f64,
@@ -303,9 +315,17 @@ fn rollup_channels(results: &[ValidationResult]) -> Vec<ChannelRollup> {
         // Counted BEFORE the reference-pairing filter below, so a test type
         // this channel alone produces still reports a row count.
         let mut by_tt_rows: BTreeMap<String, usize> = BTreeMap::new();
+        // Convergence per test type. `od_converged` is None for test types
+        // that have no fit (propagation, ephemeris); those count as
+        // converged so their rollup reads n_converged == n_rows and a
+        // floor on them behaves exactly as before.
+        let mut by_tt_converged: BTreeMap<String, usize> = BTreeMap::new();
 
         for r in rows {
             *by_tt_rows.entry(r.test_type.clone()).or_default() += 1;
+            if r.od_converged.unwrap_or(true) {
+                *by_tt_converged.entry(r.test_type.clone()).or_default() += 1;
+            }
             let key = (
                 r.object.clone(),
                 r.dt_days as i64,
@@ -453,6 +473,7 @@ fn rollup_channels(results: &[ValidationResult]) -> Vec<ChannelRollup> {
                 tt.to_string(),
                 TestTypeRollup {
                     n_rows: by_tt_rows.get(tt).copied().unwrap_or(0),
+                    n_converged: by_tt_converged.get(tt).copied().unwrap_or(0),
                     n_compared: n_compared_tt,
                     n_bit_identical,
                     p50_dr_km: p50,
@@ -536,6 +557,7 @@ fn write_summary(rollups: &[ChannelRollup], path: &Path) -> Result<(), String> {
                         tt.clone(),
                         serde_json::json!({
                             "n_rows": x.n_rows,
+                            "n_converged": x.n_converged,
                             "n_compared": x.n_compared,
                             "n_bit_identical": x.n_bit_identical,
                             "p50_dr_km": nan_or(x.p50_dr_km),
@@ -4340,7 +4362,13 @@ function buildPillars() {{
     const conv = od.filter(r => r.od_converged).length;
     const chiE = median(od.map(r => r.od_reduced_chi2).filter(v => v != null));
     const chiJ = median(od.map(r => r.ref_od_reduced_chi2).filter(v => v != null));
-    const radarObjs = uniq(results.filter(r => r.channel === odCh && r.test_type === 'orbit_determination_radar').map(r => r.object)).length;
+    // Counted across ALL channels, not just `odCh`. Radar OD is rust-only
+    // (it is stripped from the plan, so the reference channel has no radar
+    // rows), and scoping this to the OD channel silently dropped the chip
+    // the moment that became true — the radar work vanishing from the
+    // report headline with no log line and no empty state, which is the
+    // same silent-empty failure this suite exists to catch.
+    const radarObjs = uniq(results.filter(r => r.test_type === 'orbit_determination_radar').map(r => r.object)).length;
     const ngRows = results.filter(r => r.channel === odCh && r.test_type === 'non_grav_recovery');
     let ngPass = 0;
     for (const r of ngRows) {{
