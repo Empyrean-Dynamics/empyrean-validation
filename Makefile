@@ -58,6 +58,10 @@ FIXTURES_PSV := $(ROOT)/fixtures/psv
 # Radar-augmented fixtures (optical + ADES <radar> table) for the objects with
 # radar astrometry; drives the find_orb radar-OD reference pass.
 FIXTURES_PSV_RADAR := $(ROOT)/fixtures/psv-radar
+# The fixture DATA is not in git: fixtures/manifest.json (tracked) pins an
+# immutable public-read GCS snapshot, and the fetch script materializes +
+# verifies it. See fixtures/README.md for the contract.
+FETCH_FIXTURES := $(ROOT)/scripts/fetch-fixtures.sh
 
 # Per-channel runners (rust / python / c / cli) live in this repo's
 # runners/ directory alongside the external-reference runners. They
@@ -179,7 +183,7 @@ comma := ,
 REPORT_INPUTS := $(if $(WITH_CORE),$(RUST)$(comma)$(PYTHON)$(comma)$(C_OUT)$(comma)$(CLI_OUT)$(comma)$(CORE_MERGED),$(RUST_MERGED)$(comma)$(PYTHON)$(comma)$(C_OUT)$(comma)$(CLI_OUT))
 
 # ── Targets ────────────────────────────────────────────────
-.PHONY: all setup build run report clean clean-results clean-all archive help check-fixtures \
+.PHONY: all setup build run report clean clean-results clean-all archive help fixtures check-fixtures \
         setup-assist setup-findorb setup-oorb setup-orbfit setup-kete setup-jorbit setup-layup \
         build-empyrean-c build-rust build-c build-cli build-wheel build-core build-empyrean-validation \
         run-rust run-python run-c run-cli run-assist run-findorb run-oorb run-orbfit \
@@ -206,41 +210,24 @@ help:
 
 all: build run report
 
-# ── Fixture guard ──────────────────────────────────────────
+# ── Fixtures ───────────────────────────────────────────────
 # Every OD channel reads $(FIXTURES_PSV); the find_orb radar pass reads
-# $(FIXTURES_PSV_RADAR). Both are tracked in-repo (see
-# fixtures/psv/README.md), so a plain checkout carries them. If they are
-# absent anyway — a sparse checkout, an out-of-band deletion, a stale
-# worktree — say so here, with the reason and the fix.
+# $(FIXTURES_PSV_RADAR). The data lives in an immutable public-read GCS
+# snapshot pinned bit-exactly by fixtures/manifest.json (tracked); the
+# fetch script downloads whatever is missing/stale over plain HTTPS and
+# verifies EVERY file's sha256 on EVERY invocation — so no target below
+# can ever fit a partial, stale, or contaminated set, and it exits
+# nonzero naming each offending file when it cannot deliver that.
 #
-# Before this guard existed, `fixtures/psv` was a bare directory
-# prerequisite of the layup output, so an absent fixture set aborted the
-# whole build with GNU make's "No rule to make target
-# '.../fixtures/psv'" — which names a path but not a problem. Every other
-# OD target had no prerequisite at all and simply produced zero rows.
-#
-# Order-only (`| check-fixtures`) on the file targets: the guard must run
-# before them, but a phony prerequisite must never mark a completed
-# multi-hour channel output as out of date.
-check-fixtures:
-	@test -d "$(FIXTURES_PSV)" || { \
-	    echo "ERROR: optical OD fixtures are missing: $(FIXTURES_PSV)"; \
-	    echo "       They are tracked in this repo — see fixtures/psv/README.md."; \
-	    echo "       Restore them with: git checkout -- fixtures/psv"; \
-	    exit 1; }
-	@n_opt=`ls -1 "$(FIXTURES_PSV)"/*.psv 2>/dev/null | wc -l | tr -d ' '`; \
-	 test "$$n_opt" -gt 0 || { \
-	    echo "ERROR: $(FIXTURES_PSV) exists but holds no .psv files."; \
-	    echo "       Every OD channel would emit zero rows. Restore them with:"; \
-	    echo "       git checkout -- fixtures/psv"; \
-	    exit 1; }; \
-	 n_rad=`ls -1 "$(FIXTURES_PSV_RADAR)"/*.psv 2>/dev/null | wc -l | tr -d ' '`; \
-	 test "$$n_rad" -gt 0 || { \
-	    echo "ERROR: $(FIXTURES_PSV_RADAR) holds no .psv files."; \
-	    echo "       The radar OD pass would emit zero rows. Restore them with:"; \
-	    echo "       git checkout -- fixtures/psv-radar"; \
-	    exit 1; }; \
-	 echo "Fixtures: $$n_opt optical + $$n_rad radar PSV files"
+# Phony on purpose: the verify must run every time. Order-only
+# (`| fixtures`) on the file targets: the guard must run before them, but
+# a phony prerequisite must never mark a completed multi-hour channel
+# output as out of date.
+fixtures:
+	@$(FETCH_FIXTURES)
+
+# Back-compat alias — CI steps and muscle memory both know this name.
+check-fixtures: fixtures
 
 # ── Setup (one-time) ───────────────────────────────────────
 # OrbFit's runner is gated on WITH_ORBFIT (see `run`), so only set it up
@@ -394,7 +381,7 @@ $(RUST_PROPEPH): $(RUST_BIN)
 RUST_OD_ORBITS := $(RESULTS_DIR)/validation_rust_od_orbits.jsonl
 RUST_OD_COMPARE := $(RESULTS_DIR)/validation_rust_od_compare.jsonl
 
-$(RUST_OD): $(RUST_BIN) | check-fixtures
+$(RUST_OD): $(RUST_BIN) | fixtures
 	@echo "──── Rust channel: orbit determination ─────────────────"
 	@$(DYLD) $(RUST_BIN) od $(ONLY_FLAG) --tier $(TIERS) \
 	    --data-dir $(DATA_DIR) \
@@ -413,7 +400,7 @@ $(RUST): $(RUST_PROPEPH) $(RUST_OD)
 	@$(WHEEL_PY) -c "import json,sys; \
 a=json.load(open('$(RUST_PROPEPH)')); \
 b=json.load(open('$(RUST_OD)')); \
-sys.exit('ERROR: $(RUST_OD) carries zero OD rows. The rust OD pass produced nothing — a runner that emits no rows at all is a dead channel, not a passing one. Check the fixture guard (make check-fixtures) and the runner log above.') if not b else None; \
+sys.exit('ERROR: $(RUST_OD) carries zero OD rows. The rust OD pass produced nothing — a runner that emits no rows at all is a dead channel, not a passing one. Check the fixture fetch (make fixtures) and the runner log above.') if not b else None; \
 json.dump(a+b, open('$(RUST)','w'), indent=2, default=str); \
 print(f'Wrote {len(a)+len(b)} unified rust rows ({len(a)} prop+eph, {len(b)} OD) to $(RUST)')"
 
@@ -463,7 +450,7 @@ if not od:
         "find_orb, OrbFit, layup,\n"
         "       SBDB merge, the report's OD section) would no-op and report "
         "success on an untested axis.\n"
-        "       Run `make check-fixtures` and re-read the rust OD runner log."
+        "       Run `make fixtures` and re-read the rust OD runner log."
     )
 if not any(r.get("test_type") == "orbit_determination" for r in od):
     sys.exit(
@@ -503,14 +490,14 @@ endif
 check-plan: $(PLAN)
 	@python3 -c "$$ASSERT_PLAN_HAS_OD" $(PLAN) $(OD_TEST_TYPES)
 
-run-python: $(PLAN) check-plan check-fixtures
+run-python: $(PLAN) check-plan fixtures
 	@echo "──── Python channel: replay plan ───────────────────────"
 	@$(WHEEL_PY) $(EMPYREAN_RUNNERS)/python/run.py \
 	    --input $(PLAN) --output $(PYTHON) \
 	    --fixtures-dir $(FIXTURES_PSV) \
 	    --data-dir $(DATA_DIR)
 
-run-c: $(PLAN) $(C_BIN) check-plan check-fixtures
+run-c: $(PLAN) $(C_BIN) check-plan fixtures
 	@echo "──── C channel: replay plan (prop / eph / OD) ──────────"
 	@$(WHEEL_PY) $(EMPYREAN_RUNNERS)/c/drive.py \
 	    --input $(PLAN) \
@@ -518,7 +505,7 @@ run-c: $(PLAN) $(C_BIN) check-plan check-fixtures
 	    --fixtures-dir $(FIXTURES_PSV) \
 	    $(if $(filter-out $(HOME)/.empyrean/data,$(DATA_DIR)),--data-dir $(DATA_DIR),)
 
-run-cli: $(PLAN) $(CLI_BIN) check-plan check-fixtures
+run-cli: $(PLAN) $(CLI_BIN) check-plan fixtures
 	@echo "──── CLI channel: fork-exec one binary per plan row ────"
 	@$(DYLD) $(WHEEL_PY) $(EMPYREAN_RUNNERS)/cli/drive.py \
 	    --input $(PLAN) \
@@ -540,7 +527,7 @@ run-assist: $(PLAN) check-plan $(ASSIST_PY)
 # produced a green leg that ran no comparator at all. Fail with the fix
 # instead; the matrix's fail-fast:false keeps the other comparators alive and
 # reduce then omits find_orb honestly.
-run-findorb: $(ASSIST_PY) check-plan check-fixtures
+run-findorb: $(ASSIST_PY) check-plan fixtures
 	@test -x "$(FO_BIN)" || { \
 	    echo "ERROR: find_orb binary not built: $(FO_BIN)"; \
 	    echo "       Build it with: make setup-findorb"; \
@@ -590,7 +577,7 @@ setup-orbfit:
 	@cd $(EMP_VAL_RUNNERS)/orbfit && ./setup.sh
 
 run-orbfit: $(ORBFIT_OUT)
-$(ORBFIT_OUT): $(PLAN) | check-plan check-fixtures
+$(ORBFIT_OUT): $(PLAN) | check-plan fixtures
 	@echo "──── OrbFit: external OD reference (neofit2.x via docker) ──"
 	@$(EMP_VAL_RUNNERS)/orbfit/run_orbfit.py \
 	    --plan $(PLAN) --output $(ORBFIT_OUT) --psv-dir $(FIXTURES_PSV)
@@ -603,7 +590,7 @@ ifneq ($(WITH_CORE),1)
 	@echo "──── Core channel skipped (empyrean-core not found) ────"
 endif
 
-$(CORE_OUT): $(PLAN) $(CORE_BIN) | check-plan check-fixtures
+$(CORE_OUT): $(PLAN) $(CORE_BIN) | check-plan fixtures
 	@echo "──── Core channel: replay plan via empyrean-core ───────"
 	@$(DYLD) $(CORE_BIN) --input $(PLAN) --output $(CORE_OUT) \
 	    --fixtures-dir $(FIXTURES_PSV)
@@ -624,7 +611,7 @@ $(KETE_PY):
 	@cd $(EMP_VAL_RUNNERS)/kete && ./setup.sh
 
 run-kete: $(KETE_OUT)
-$(KETE_OUT): $(PLAN) $(KETE_PY) | check-plan check-fixtures
+$(KETE_OUT): $(PLAN) $(KETE_PY) | check-plan fixtures
 	@echo "──── Kete: external all-test-types reference ──────────"
 	@$(KETE_PY) $(EMP_VAL_RUNNERS)/kete/run_kete.py \
 	    --input $(PLAN) --output $(KETE_OUT) \
@@ -667,7 +654,7 @@ run-layup: $(LAYUP_OUT)
 # asked for layup and a missing venv is a failure. The `echo '[]'` fallback
 # reported a comparator that never executed as a successful empty comparison.
 # Opt out with WITH_LAYUP= rather than by silently producing nothing.
-$(LAYUP_OUT): | check-fixtures
+$(LAYUP_OUT): | fixtures
 	@test -x "$(LAYUP_PY)" || { \
 	    echo "ERROR: layup venv not built: $(LAYUP_PY)"; \
 	    echo "       Build it with: make setup-layup, or opt out with WITH_LAYUP="; \

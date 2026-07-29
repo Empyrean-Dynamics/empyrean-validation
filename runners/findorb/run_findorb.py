@@ -544,9 +544,9 @@ def main() -> int:
         # compare is a failure with a cause, and the cause is named here.
         print(
             f"ERROR: no PSV files found in {psv_dir}\n"
-            "       find_orb had nothing to fit. The fixtures are tracked in-repo "
-            "(fixtures/psv/README.md);\n"
-            "       `make check-fixtures` asserts they are present.",
+            "       find_orb had nothing to fit. The fixtures come from the GCS "
+            "snapshot pinned by fixtures/manifest.json;\n"
+            "       `make fixtures` fetches + verifies them.",
             file=sys.stderr,
         )
         return 1

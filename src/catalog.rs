@@ -825,8 +825,8 @@ const SHORT_ARC_NEOS: &[ValidationObject] = &[
 /// Named here rather than counted from the directory listing at gate time,
 /// because a floor derived from the very files it is meant to protect is
 /// self-fulfilling: delete a fixture and the floor obligingly drops to match.
-/// The list is the claim; [`radar_fixture_objects_match_the_tracked_files`]
-/// is what stops it drifting from the tree.
+/// The list is the claim; [`radar_fixture_objects_match_the_fixture_files`]
+/// is what stops it drifting from the fetched fixture set.
 pub const RADAR_FIXTURE_OBJECTS: [&str; 5] = ["Apophis", "Bennu", "Didymos", "Eros", "Toutatis"];
 
 /// Returns the full validation object catalog (44 objects across 13
@@ -882,10 +882,10 @@ mod tests {
     }
 
     #[test]
-    fn radar_fixture_objects_match_the_tracked_files() {
+    fn radar_fixture_objects_match_the_fixture_files() {
         // The CI row floor for the radar OD axis is
-        // RADAR_FIXTURE_OBJECTS.len(); if the list and the tracked fixtures
-        // drift, the floor silently stops describing the work. Adding a radar
+        // RADAR_FIXTURE_OBJECTS.len(); if the list and the fetched fixtures
+        // (`make fixtures`, pinned by fixtures/manifest.json) drift, the floor silently stops describing the work. Adding a radar
         // fixture without adding it here under-strictens the gate; naming an
         // object here without the fixture makes the gate unsatisfiable. Both
         // fail right here instead.

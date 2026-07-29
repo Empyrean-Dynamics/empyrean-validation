@@ -549,8 +549,9 @@ def main() -> int:
                 # drivers. A silent `continue` deleted the OD row from this
                 # channel's output while the run still exited 0, so a channel
                 # that fitted nothing looked like one that fitted everything.
-                # The fixtures are tracked in-repo now; a missing one is a
-                # broken checkout, never a normal condition.
+                # The fixtures are fetched + hash-verified by `make fixtures`
+                # (fixtures/README.md); a missing one here means something
+                # bypassed that gate, never a normal condition.
                 print(
                     f"  {r['object']} OD FAIL: no PSV fixture at {psv_path}",
                     file=sys.stderr,
@@ -704,9 +705,10 @@ def main() -> int:
         print(
             f"ERROR: {n_missing_fixture} OD row(s) had no PSV fixture under "
             f"{args.fixtures_dir}.\n"
-            "       The fixtures are tracked in-repo (fixtures/psv/README.md); "
-            "`make check-fixtures` asserts\n"
-            "       they are present. Those OD rows are missing from this "
+            "       The fixtures come from the GCS snapshot pinned by "
+            "fixtures/manifest.json;\n"
+            "       `make fixtures` fetches + verifies them. Those OD rows are "
+            "missing from this "
             "channel's output entirely.",
             file=sys.stderr,
         )

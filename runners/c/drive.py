@@ -287,8 +287,9 @@ def main() -> int:
                 # message at all: the OD row vanished from the C channel's
                 # output and the run still exited 0, so a channel that fitted
                 # nothing was indistinguishable from one that fitted
-                # everything. The fixtures are tracked in-repo now, so a
-                # missing one is a broken checkout, never a normal condition.
+                # everything. The fixtures are fetched + hash-verified by
+                # `make fixtures` (fixtures/README.md), so a missing one here
+                # means something bypassed that gate, never a normal condition.
                 print(
                     f"  {r['object']} OD FAIL: no PSV fixture at {psv}",
                     file=sys.stderr,
@@ -404,9 +405,10 @@ def main() -> int:
         print(
             f"ERROR: {n_missing_fixture} OD row(s) had no PSV fixture under "
             f"{args.fixtures_dir}.\n"
-            "       The fixtures are tracked in-repo (fixtures/psv/README.md); "
-            "`make check-fixtures` asserts\n"
-            "       they are present. Those OD rows are missing from this "
+            "       The fixtures come from the GCS snapshot pinned by "
+            "fixtures/manifest.json;\n"
+            "       `make fixtures` fetches + verifies them. Those OD rows are "
+            "missing from this "
             "channel's output entirely.",
             file=sys.stderr,
         )

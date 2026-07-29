@@ -211,7 +211,7 @@ struct CiCheckArgs {
     ///
     /// The floors are not free-standing numbers, they are facts about the
     /// catalog: one `orbit_determination` row per catalog object, and one
-    /// `orbit_determination_radar` row per object with a tracked radar
+    /// `orbit_determination_radar` row per object with a manifest-pinned radar
     /// fixture. Spelling them as literals in the workflow meant adding a
     /// catalog object silently under-strictened the gate — the floor stayed
     /// at the old count and the new object's absence from the OD axis would
@@ -1242,7 +1242,7 @@ fn parse_min_rows(specs: &[String]) -> Result<Vec<RowFloor>, String> {
 ///   emits exactly one, success or failure row, for every object it is given,
 ///   and every replay channel replays what the plan carries. Unscoped, so it
 ///   applies to every strict channel.
-/// - `orbit_determination_radar` — one row per object with a tracked radar
+/// - `orbit_determination_radar` — one row per object with a manifest-pinned radar
 ///   fixture, scoped to `rust`: those rows are stripped from the plan while
 ///   radar OD is rust-only (`plan::PLAN_RUST_ONLY_TEST_TYPES`,
 ///   `empyrean-s1ab`), so `rust` is the only channel that has them.

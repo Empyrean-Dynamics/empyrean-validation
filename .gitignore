@@ -5,9 +5,14 @@ Cargo.lock
 # own isolated workspaces under runners/).
 **/target/
 
-# NOTE: `fixtures/psv/` is TRACKED (it used to be ignored). The OD channel
-# is only alive in CI if the fixtures ride the checkout — see
-# fixtures/psv/README.md for the rationale and the refresh procedure.
+# Fixture DATA is not tracked: fixtures/manifest.json (tracked) pins an
+# immutable public-read GCS snapshot, and scripts/fetch-fixtures.sh
+# materializes + hash-verifies the working copies here. The per-directory
+# READMEs stay in git. Contract: fixtures/README.md.
+fixtures/psv/*
+!fixtures/psv/README.md
+fixtures/psv-radar/*
+!fixtures/psv-radar/README.md
 
 # Compiled C-channel runner binary — `make -C runners/c` output.
 runners/c/runner
