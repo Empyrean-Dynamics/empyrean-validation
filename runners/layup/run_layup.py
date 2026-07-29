@@ -366,6 +366,24 @@ def main() -> int:
 
     orbitfit_bin = _orbitfit_binary()
     psv_files = sorted(args.psv_dir.glob("*.psv"))
+    if not psv_files:
+        # Without this, an empty fixture directory produced `[]` and exit 0:
+        # reduce folded the file in because it EXISTED, and the report showed
+        # a layup comparison that had compared nothing. The Makefile's
+        # `$(LAYUP_OUT): | fixtures` prereq covers the `make` path, but
+        # runners/README.md documents invoking this script directly, which
+        # bypasses it — and since the fixtures left git, "directory present,
+        # zero .psv" is the DEFAULT state of a fresh checkout rather than an
+        # anomaly. A comparator with nothing to compare is a failure with a
+        # cause, and the cause is named here (mirrors run_findorb.py).
+        print(
+            f"ERROR: no PSV files found in {args.psv_dir}\n"
+            "       layup had nothing to fit. The fixtures come from the GCS "
+            "snapshot pinned by fixtures/manifest.json;\n"
+            "       `make fixtures` fetches + verifies them.",
+            file=sys.stderr,
+        )
+        return 1
 
     only = None
     if args.only:

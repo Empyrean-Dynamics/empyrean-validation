@@ -45,6 +45,13 @@ implementation, and writes its own per-channel JSON.
 ./jorbit/setup.sh
 ./layup/setup.sh
 
+# Fixtures. The ADES PSV astrometry is NOT in the checkout — it lives in the
+# GCS snapshot pinned by fixtures/manifest.json. Any runner that reads
+# ../fixtures/psv (layup below, find_orb internally) has nothing to fit until
+# this has been run and exited 0. `make` targets depend on it automatically;
+# the direct invocations below do not.
+make -C .. fixtures
+
 # Run.
 ./assist/.venv/bin/python assist/run_assist.py   --plan  validation_plan.json --output validation_assist.json
 ./findorb/install/bin/fo                                                                  # find_orb is invoked from run_findorb.py
