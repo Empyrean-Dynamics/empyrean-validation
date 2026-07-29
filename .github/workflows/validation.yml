@@ -14,8 +14,12 @@ name: Validation Suite
 #
 #   • prep   — download + cache all shared data ONCE, build the rust
 #              reference, and emit the canonical validation_plan.json.
-#              The only job that touches the network (JPL/NAIF/SBDB) or
-#              carries the private-engine checkout for the reference.
+#              The only job that touches the authenticated network
+#              (JPL/NAIF/SBDB) or carries the private-engine checkout for
+#              the reference. (Every fixture-consuming job additionally
+#              fetches the public OD fixture snapshot pinned by
+#              fixtures/manifest.json — plain HTTPS, no credential,
+#              cached by snapshot id.)
 #   • empyrean — the five distribution channels that need the private
 #              empyrean + empyrean-core source built; they share one
 #              build so they run together in a single job.
@@ -296,6 +300,37 @@ jobs:
           key: cargo-${{ hashFiles('**/Cargo.lock', '**/Cargo.toml') }}
           restore-keys: cargo-
 
+      # ── OD fixtures (GCS snapshot pinned by fixtures/manifest.json) ────
+      # Same poison discipline as the data kernels above: restore by
+      # snapshot key, ALWAYS run the fetch — on a cache hit it is a pure
+      # sha256 verify of every file, so a poisoned or truncated cache
+      # fails here instead of reaching a fit — and SAVE only on a miss,
+      # after a fully verified fetch. Plain public HTTPS (the data is
+      # public MPC astrometry): no gcloud, no credential.
+      - name: Read fixture snapshot id
+        id: fixtures-key
+        working-directory: empyrean-validation
+        run: python3 -c "import json; print('id=' + json.load(open('fixtures/manifest.json'))['snapshot_id'])" >> "$GITHUB_OUTPUT"
+      - name: Restore OD fixtures
+        id: cache-fixtures
+        uses: actions/cache/restore@v4
+        with:
+          path: |
+            empyrean-validation/fixtures/psv/*.psv
+            empyrean-validation/fixtures/psv-radar/*.psv
+          key: fixtures-${{ steps.fixtures-key.outputs.id }}
+      - name: Fetch + verify OD fixtures
+        working-directory: empyrean-validation
+        run: make fixtures
+      - name: Save OD fixtures
+        if: steps.cache-fixtures.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            empyrean-validation/fixtures/psv/*.psv
+            empyrean-validation/fixtures/psv-radar/*.psv
+          key: fixtures-${{ steps.fixtures-key.outputs.id }}
+
       # ── Build the rust reference + the plan ────────────────────
       # `make plan` builds the rust runner, runs prop+eph + OD, and
       # strips the result into the canonical plan every other channel
@@ -305,16 +340,6 @@ jobs:
       # it); `make plan` then runs prop+eph + OD and strips the canonical
       # plan. The wheel venv is built too because the plan-strip script
       # runs under it.
-      # The ADES optical fixtures the OD channel fits are tracked in-repo
-      # (fixtures/psv/, see its README), so they ride the checkout above —
-      # no download, no cache, no credential. They were `.gitignore`d for
-      # the life of this repo, which is why every published
-      # validation_rust_od.json was an empty list: nothing ever staged
-      # them. Assert them here so a sparse/partial checkout fails at the
-      # top of the job instead of producing a zero-row OD channel.
-      - name: Assert OD fixtures are staged
-        working-directory: empyrean-validation
-        run: make check-fixtures
 
       - name: Build rust reference + generate plan
         working-directory: empyrean-validation
@@ -435,6 +460,32 @@ jobs:
           key: cargo-${{ hashFiles('**/Cargo.lock', '**/Cargo.toml') }}
           restore-keys: cargo-
 
+      # OD fixtures: same restore → always-verify fetch → save-on-miss
+      # discipline as prep (see the comment there).
+      - name: Read fixture snapshot id
+        id: fixtures-key
+        working-directory: empyrean-validation
+        run: python3 -c "import json; print('id=' + json.load(open('fixtures/manifest.json'))['snapshot_id'])" >> "$GITHUB_OUTPUT"
+      - name: Restore OD fixtures
+        id: cache-fixtures
+        uses: actions/cache/restore@v4
+        with:
+          path: |
+            empyrean-validation/fixtures/psv/*.psv
+            empyrean-validation/fixtures/psv-radar/*.psv
+          key: fixtures-${{ steps.fixtures-key.outputs.id }}
+      - name: Fetch + verify OD fixtures
+        working-directory: empyrean-validation
+        run: make fixtures
+      - name: Save OD fixtures
+        if: steps.cache-fixtures.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            empyrean-validation/fixtures/psv/*.psv
+            empyrean-validation/fixtures/psv-radar/*.psv
+          key: fixtures-${{ steps.fixtures-key.outputs.id }}
+
       - name: Download plan + rust reference
         uses: actions/download-artifact@v4
         with:
@@ -475,7 +526,9 @@ jobs:
   # One matrix leg per independent reference implementation. Each replays
   # the prebuilt plan through an upstream tool. NO private checkout, NO
   # secrets — these run untrusted-ish upstream code isolated from the PAT
-  # and the GCP identity. fail-fast:false so a single dead comparator
+  # and the GCP identity. (The OD fixture fetch below keeps that true:
+  # public-read objects over plain HTTPS, no credential involved.)
+  # fail-fast:false so a single dead comparator
   # leaves its channel missing from the report (loudly) without sinking
   # the rest of the matrix.
   external:
@@ -564,6 +617,34 @@ jobs:
       - name: Install LAPACK/BLAS (OpenOrb only)
         if: matrix.tool == 'oorb'
         run: sudo apt-get update && sudo apt-get install -y --no-install-recommends liblapack-dev libblas-dev
+
+      # OD fixtures: same restore → always-verify fetch → save-on-miss
+      # discipline as prep (see the comment there). Public-read objects
+      # over plain HTTPS, so this leg stays exactly as secretless as it
+      # was when the fixtures rode the checkout: no PAT, no GCP identity.
+      - name: Read fixture snapshot id
+        id: fixtures-key
+        working-directory: empyrean-validation
+        run: python3 -c "import json; print('id=' + json.load(open('fixtures/manifest.json'))['snapshot_id'])" >> "$GITHUB_OUTPUT"
+      - name: Restore OD fixtures
+        id: cache-fixtures
+        uses: actions/cache/restore@v4
+        with:
+          path: |
+            empyrean-validation/fixtures/psv/*.psv
+            empyrean-validation/fixtures/psv-radar/*.psv
+          key: fixtures-${{ steps.fixtures-key.outputs.id }}
+      - name: Fetch + verify OD fixtures
+        working-directory: empyrean-validation
+        run: make fixtures
+      - name: Save OD fixtures
+        if: steps.cache-fixtures.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            empyrean-validation/fixtures/psv/*.psv
+            empyrean-validation/fixtures/psv-radar/*.psv
+          key: fixtures-${{ steps.fixtures-key.outputs.id }}
 
       - name: Download plan
         uses: actions/download-artifact@v4
@@ -681,7 +762,7 @@ jobs:
       #
       # `--catalog-floors` derives the numbers instead of restating them: one
       # orbit_determination row per catalog object, one
-      # orbit_determination_radar row per tracked radar fixture. They used to
+      # orbit_determination_radar row per manifest-pinned radar fixture. They used to
       # be spelled here as 50 and 5, coupled to the catalog by nothing at all,
       # so adding a catalog object silently under-strictened the gate — the
       # floor stayed at the old count and the new object's absence from the OD

@@ -59,5 +59,34 @@ jobs:
         with:
           rustflags: ""
 
+      # The harness tests read the OD fixture set (catalog.rs pins
+      # RADAR_FIXTURE_OBJECTS against the files on disk), which is not in
+      # git: fixtures/manifest.json pins an immutable public-read GCS
+      # snapshot. Same restore → always-verify fetch → save-on-miss poison
+      # discipline as .github/workflows/validation.yml: the fetch script
+      # verifies every sha256 even on a cache hit, so a poisoned cache
+      # fails here rather than reaching a test.
+      - name: Read fixture snapshot id
+        id: fixtures-key
+        run: python3 -c "import json; print('id=' + json.load(open('fixtures/manifest.json'))['snapshot_id'])" >> "$GITHUB_OUTPUT"
+      - name: Restore OD fixtures
+        id: cache-fixtures
+        uses: actions/cache/restore@v4
+        with:
+          path: |
+            fixtures/psv/*.psv
+            fixtures/psv-radar/*.psv
+          key: fixtures-${{ steps.fixtures-key.outputs.id }}
+      - name: Fetch + verify OD fixtures
+        run: ./scripts/fetch-fixtures.sh
+      - name: Save OD fixtures
+        if: steps.cache-fixtures.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            fixtures/psv/*.psv
+            fixtures/psv-radar/*.psv
+          key: fixtures-${{ steps.fixtures-key.outputs.id }}
+
       - name: Unit tests
         run: cargo test --verbose
