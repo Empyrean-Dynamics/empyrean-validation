@@ -1018,8 +1018,24 @@ fn run_radar_od(
             let ms_fail = t0r.elapsed().as_secs_f64() * 1000.0;
             eprintln!("  {}: radar OD FAIL ({e}) — emitting failure row", obj.name);
             let mut row = radar_failure(format!("radar determine FAIL: {e}"));
-            row.n_obs_used = Some(obs_r.len() as u32);
-            row.od_iterations = Some(od_config.max_iterations);
+            // `n_obs_used` and `od_iterations` are left EMPTY, not filled with
+            // stand-ins. The fit failed, so it used no observations and ran an
+            // unknown number of iterations; the only honest value is "no
+            // value".
+            //
+            // What used to be here: `n_obs_used = obs_r.len()` (the fixture's
+            // observation count, never a fitted selection) and
+            // `od_iterations = od_config.max_iterations` (the CAP, echoed back
+            // as though the solver had reached it). Both read as measurements
+            // in the results JSON and in the report, and both are fiction.
+            // Measured cost of that: Bennu's radar row reported "100
+            // iterations, 603 observations" for a solve that stopped at 27
+            // iterations on damping exhaustion having selected nothing — which
+            // is a completely different failure, with a completely different
+            // fix, from the "hit the iteration cap on a 603-observation arc"
+            // the row described. The real cause is in `error`, which carries
+            // the solver's own stop reason; nothing needs to be invented
+            // alongside it.
             row.emp_time_ms = Some(ms_fail);
             results.push(row);
             return results;
