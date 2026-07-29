@@ -5,7 +5,7 @@ Cross-channel and external-reference validation for the empyrean astrodynamics s
 
 <a href="https://github.com/Empyrean-Dynamics/empyrean-validation/actions/workflows/rust.yml"><img src="https://github.com/Empyrean-Dynamics/empyrean-validation/actions/workflows/rust.yml/badge.svg" alt="CI"></a>
 <a href="https://github.com/Empyrean-Dynamics/empyrean-validation/actions/workflows/validation.yml"><img src="https://github.com/Empyrean-Dynamics/empyrean-validation/actions/workflows/validation.yml/badge.svg" alt="Validation Suite"></a>
-<a href="https://github.com/Empyrean-Dynamics/empyrean/releases/tag/v0.8.1"><img src="https://img.shields.io/badge/validates-empyrean%200.8.1-1a1a2e?style=flat-square" alt="validates empyrean 0.8.1"></a>
+<a href="https://github.com/Empyrean-Dynamics/empyrean/releases/tag/v0.9.0"><img src="https://img.shields.io/badge/validates-empyrean%200.9.0-1a1a2e?style=flat-square" alt="validates empyrean 0.9.0"></a>
 <br>
 <a href="LICENSE"><img src="https://img.shields.io/badge/license-BSD--3--Clause-blue.svg?style=flat-square" alt="License"></a>
 <a href="https://doi.org/10.5281/zenodo.21315119"><img src="https://zenodo.org/badge/1225313390.svg" alt="DOI"></a>
@@ -48,18 +48,23 @@ plan; results are folded onto the core channel's rows:
 
 | Tool | Origin | Axes compared |
 |------|--------|---------------|
+| [JPL](https://ssd.jpl.nasa.gov/) | NASA JPL SSD — Horizons + SBDB (one solution, two views) | propagation, ephemeris (Horizons truth); orbit determination — JPL's reported fit quality (normalized rms → reduced-χ² + n_obs) and fitted orbit + covariance (SBDB) |
 | [ASSIST](https://github.com/matthewholman/assist) | Holman et al. — ephemeris-driven REBOUND (pinned 1.2.3 / rebound 4.6.0) | propagation (f64 and first-order STM modes), timing |
-| [find_orb](https://github.com/Bill-Gray/find_orb) | Bill Gray / Project Pluto | orbit determination, fitted orbits |
-| [OpenOrb](https://github.com/oorb/oorb) | Granvik et al., University of Helsinki | propagation, ephemeris |
+| [layup](https://github.com/Smithsonian/layup) | Matthew Holman / Smithsonian — ASSIST-backed orbit fitter (opt-in, `WITH_LAYUP=1`) | orbit determination (χ² / reduced-χ² / n_obs / convergence) |
+| [find_orb](https://github.com/Bill-Gray/find_orb) | Bill Gray / Project Pluto | orbit determination, fitted orbits; propagation + ephemeris of its own fitted orbit (fit-then-propagate) |
 | [OrbFit](http://adams.dm.unipi.it/orbfit/) | OrbFit Consortium / MPC (opt-in, `WITH_ORBFIT=1`) | orbit determination (CMC2003 rejection) |
+| [OpenOrb](https://github.com/oorb/oorb) | Granvik et al., University of Helsinki | propagation, ephemeris |
 | [kete](https://github.com/dahlend/kete) | Dar Dahlen (opt-in) | propagation, ephemeris, OD sanity check |
 | [jorbit](https://github.com/ben-cassese/jorbit) | Ben Cassese — JAX-based (opt-in) | propagation, OD sanity check |
-| [layup](https://github.com/Smithsonian/layup) | Matthew Holman / Smithsonian — ASSIST-backed orbit fitter (opt-in, `WITH_LAYUP=1`) | orbit determination (χ² / reduced-χ² / n_obs / convergence) |
 
-Initial conditions come from **JPL SBDB**; reference states and observed
-quantities come from **JPL Horizons**. ASSIST runs only first-order
-variational (STM) mode — it does not encode second-order derivatives, so
-empyrean's second-order rows have no external counterpart.
+**JPL is one source of truth, two views:** SBDB supplies initial conditions,
+the fitted orbit + covariance, and JPL's own reported orbit-fit quality
+(normalized rms, n_obs, radar counts, data-arc, condition code); Horizons
+supplies the reference states and observed quantities that same solution
+propagates to. So "Empyrean vs JPL" is a complete comparison across
+propagation, ephemeris, and orbit determination in one selection. ASSIST runs
+only first-order variational (STM) mode — it does not encode second-order
+derivatives, so empyrean's second-order rows have no external counterpart.
 
 ## What lives here
 

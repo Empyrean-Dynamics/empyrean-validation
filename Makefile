@@ -21,7 +21,9 @@
 #   make run       # run all channels (rust / python / c / cli / core / assist / findorb)
 #   make report    # merge + generate HTML report + ci-summary JSON
 #   make all       # build + run + report
-#   make clean     # remove generated JSONs and HTML; keep external installs
+#   make clean     # remove derived report/summary/plan; KEEP channel results
+#   make archive   # snapshot a completed run to results/archive/<timestamp>/
+#   make clean-results  # delete channel results (requires an archive first)
 #
 # Override defaults:
 #   make all OBJECTS="Apophis,Bennu" TIERS="standard"
@@ -43,6 +45,12 @@ EMPYREAN_VALIDATION_ROOT := $(ROOT)
 
 OBJECTS ?=
 TIERS ?= standard
+# Matrix-CI plumbing. When PLAN_PREBUILT=1 the plan is assumed to have been
+# produced by an upstream `prep` job and dropped into $(RESULTS_DIR) as an
+# artifact, so the plan target only asserts its presence instead of rebuilding
+# it from the rust channel. This lets the replay + external channels run in
+# isolated matrix legs that never build or run the rust reference themselves.
+PLAN_PREBUILT ?=
 DATA_DIR ?= $(HOME)/.empyrean/data
 CACHE_DIR ?= $(HOME)/.empyrean/cache
 RESULTS_DIR := $(ROOT)/results
@@ -50,6 +58,10 @@ FIXTURES_PSV := $(ROOT)/fixtures/psv
 # Radar-augmented fixtures (optical + ADES <radar> table) for the objects with
 # radar astrometry; drives the find_orb radar-OD reference pass.
 FIXTURES_PSV_RADAR := $(ROOT)/fixtures/psv-radar
+# The fixture DATA is not in git: fixtures/manifest.json (tracked) pins an
+# immutable public-read GCS snapshot, and the fetch script materializes +
+# verifies it. See fixtures/README.md for the contract.
+FETCH_FIXTURES := $(ROOT)/scripts/fetch-fixtures.sh
 
 # Per-channel runners (rust / python / c / cli) live in this repo's
 # runners/ directory alongside the external-reference runners. They
@@ -79,6 +91,38 @@ FO_BIN := $(EMP_VAL_RUNNERS)/findorb/install/bin/fo
 # feature flag.
 CORE_BIN := $(EMPYREAN_CORE_ROOT)/target/release/validate-core
 WITH_CORE := $(if $(wildcard $(EMPYREAN_CORE_ROOT)/Cargo.toml),1,)
+
+# OpenOrb: DEFAULT-OFF, and that is a decision, not an oversight.
+#
+# run_oorb.py needs ref_sun_pos_au / ref_sun_vel_au_d on each row to convert
+# OpenOrb's heliocentric convention into the plan's SSB frame. Only
+# `empyrean-validation plan` populates those; the plan CI and this Makefile
+# actually use is stripped from the rust runner's output, which never does.
+# Measured: 0 of 652 rust rows and 0 of 448 plan rows carry the key, so 100%
+# of oorb's rows skip. The runner now exits nonzero on that instead of writing
+# a pass-through of untouched plan rows and calling it a green channel — which
+# means running it today is a guaranteed, permanent failure, not a flaky one.
+#
+# It cannot simply be plumbed: ref_sun_* are not among the 70 keys of the
+# v0.7.0 schema empyrean-core pins, so adding them to PLAN_CARRIED_KEYS
+# reintroduces the deny_unknown_fields break the whitelist strip exists to
+# kill. Sequencing (empyrean-jg3o): tag the validation schema -> re-pin
+# empyrean-core -> populate ref_sun_* -> set WITH_OORB=1 here and restore the
+# `oorb` matrix leg in .github/workflows/validation.yml.
+#
+# Turning it off rather than leaving it red is the point: a leg that is always
+# red teaches people to ignore red, and a leg that skips in silence is the
+# defect this whole branch exists to eliminate. Set WITH_OORB=1 to run it
+# anyway — the runner's honest nonzero exit is deliberately intact, so a
+# premature re-enable fails immediately and says why.
+#
+# Defined here, above every target that references it: GNU make expands a
+# prerequisite list when the rule is READ, so a flag defined below `setup`
+# reads as empty there no matter what it is later assigned.
+WITH_OORB ?=
+# Why the OpenOrb channel is absent, in one line, for the reduce log. Empty
+# when WITH_OORB is set, so a re-enabled leg stops claiming to be disabled.
+OORB_DISABLED_REASON := $(if $(WITH_OORB),,the plan carries no ref_sun_pos_au/ref_sun_vel_au_d and cannot until the validation schema is tagged and empyrean-core re-pinned (empyrean-jg3o); leg turned off in .github/workflows/validation.yml and behind WITH_OORB here)
 
 # DYLD path for runtime linking against libempyrean.dylib (built by
 # empyrean-c into the empyrean repo's target/release).
@@ -139,12 +183,12 @@ comma := ,
 REPORT_INPUTS := $(if $(WITH_CORE),$(RUST)$(comma)$(PYTHON)$(comma)$(C_OUT)$(comma)$(CLI_OUT)$(comma)$(CORE_MERGED),$(RUST_MERGED)$(comma)$(PYTHON)$(comma)$(C_OUT)$(comma)$(CLI_OUT))
 
 # ── Targets ────────────────────────────────────────────────
-.PHONY: all setup build run report clean help \
+.PHONY: all setup build run report clean clean-results clean-all archive help fixtures check-fixtures \
         setup-assist setup-findorb setup-oorb setup-orbfit setup-kete setup-jorbit setup-layup \
         build-empyrean-c build-rust build-c build-cli build-wheel build-core build-empyrean-validation \
         run-rust run-python run-c run-cli run-assist run-findorb run-oorb run-orbfit \
         run-core run-kete run-jorbit run-layup \
-        merge-external plan
+        merge-external plan check-plan reduce
 
 help:
 	@echo "Targets:"
@@ -153,7 +197,9 @@ help:
 	@echo "  make run       # all channels$(if $(WITH_CORE), (incl. core),)"
 	@echo "  make report    # merged HTML + summary"
 	@echo "  make all       # build + run + report"
-	@echo "  make clean     # remove generated JSONs + HTML"
+	@echo "  make clean     # remove derived report/summary/plan (results kept)"
+	@echo "  make archive   # snapshot a completed run to results/archive/<ts>/"
+	@echo "  make clean-results  # delete channel results (archive required)"
 	@echo
 	@echo "Channels: rust, python, c, cli$(if $(WITH_CORE), + core,)"
 	@echo "Variables:  OBJECTS='A,B' TIERS=standard DATA_DIR=$(DATA_DIR)"
@@ -164,12 +210,31 @@ help:
 
 all: build run report
 
+# ── Fixtures ───────────────────────────────────────────────
+# Every OD channel reads $(FIXTURES_PSV); the find_orb radar pass reads
+# $(FIXTURES_PSV_RADAR). The data lives in an immutable public-read GCS
+# snapshot pinned bit-exactly by fixtures/manifest.json (tracked); the
+# fetch script downloads whatever is missing/stale over plain HTTPS and
+# verifies EVERY file's sha256 on EVERY invocation — so no target below
+# can ever fit a partial, stale, or contaminated set, and it exits
+# nonzero naming each offending file when it cannot deliver that.
+#
+# Phony on purpose: the verify must run every time. Order-only
+# (`| fixtures`) on the file targets: the guard must run before them, but
+# a phony prerequisite must never mark a completed multi-hour channel
+# output as out of date.
+fixtures:
+	@$(FETCH_FIXTURES)
+
+# Back-compat alias — CI steps and muscle memory both know this name.
+check-fixtures: fixtures
+
 # ── Setup (one-time) ───────────────────────────────────────
 # OrbFit's runner is gated on WITH_ORBFIT (see `run`), so only set it up
 # when it will actually run — otherwise `make setup` pulls a Docker image
 # for a comparator that never executes (and fails the setup if Docker is
 # unavailable).
-setup: setup-assist setup-findorb setup-oorb $(if $(WITH_ORBFIT),setup-orbfit,) $(if $(WITH_LAYUP),setup-layup,)
+setup: setup-assist setup-findorb setup-kete setup-jorbit $(if $(WITH_OORB),setup-oorb,) $(if $(WITH_ORBFIT),setup-orbfit,) $(if $(WITH_LAYUP),setup-layup,)
 	@echo
 	@echo "External dependencies installed."
 
@@ -253,26 +318,38 @@ build-empyrean-validation:
 	@echo "──── Building empyrean-validation CLI ──────────────────"
 	@cd $(EMPYREAN_VALIDATION_ROOT) && cargo build --release --bin empyrean-validation
 
+# File target so rules that need the binary (plan strip, merge, report) can
+# depend on it directly instead of failing with "No rule to make target"
+# when it hasn't been built yet. Delegates to the phony recipe above so
+# cargo's fingerprinting still decides whether to rebuild.
+$(EMP_VAL_BIN):
+	@$(MAKE) --no-print-directory build-empyrean-validation
+
 # ── Run pipeline ───────────────────────────────────────────
 # Channel order: rust first (produces the unified $(RUST) input every other
 # channel consumes), then the four replay channels (python / c / cli / core),
 # then the externals. Each non-rust channel reads exactly one file and writes
 # exactly one file.
-# Public-report channel set: ASSIST + OrbFit + OpenOrb + find_orb are
-# the four canonical externals surfaced in the headline report. kete +
-# jorbit stay as opt-in runners — invoke `make run-kete` / `make run-jorbit`
-# explicitly to produce their JSONs, and pass `INCLUDE_OPTIONAL=1` to
-# the `report` target to surface them in the rendered HTML.
+# Default external set: ASSIST + OpenOrb + find_orb + kete + jorbit +
+# layup all run as part of `make run` and fold into the merged report.
 #
-# OrbFit ships its runner via Docker but is not yet end-to-end
-# (Cartesian seed orbit + equinoctial→Cartesian conversion pending).
-# Set `WITH_ORBFIT=1` to opt in once those are in place.
-WITH_ORBFIT ?=
-# layup is opt-in too (WITH_LAYUP=1) — brand-new upstream (v0.0.1) with a heavy
-# C-extension build, so it stays out of the default `make all` path, same as
-# OrbFit.
-WITH_LAYUP ?=
-run: run-rust run-python run-c run-cli run-assist run-findorb run-oorb \
+# OrbFit runs its runner via the MPC's Docker container (neofit2.x): it
+# refits each OD object from empyrean's IC as a heliocentric Cartesian
+# seed and folds the post-fit RMS + observation counts onto the OD rows.
+# Default-on. On Apple Silicon the amd64-only image runs under qemu
+# (5-10x slower per fit — patience, not a hang); native amd64 CI is fast.
+# Set WITH_ORBFIT= (empty) to skip on hosts without Docker. Deep-encounter
+# impactors (e.g. 2008 TC3, 2024 BX1) can overflow neofit2.x's encounter
+# propagation and are surfaced as per-object errors, never silently.
+WITH_ORBFIT ?= 1
+# layup: OD reference from ADES PSV astrometry (Smithsonian, ASSIST-backed).
+# Default-on; set WITH_LAYUP= (empty) to skip on hosts where its heavy
+# C-extension venv is unavailable.
+WITH_LAYUP ?= 1
+# OpenOrb is gated on WITH_OORB, defined above with the reason it is off.
+run: run-rust run-python run-c run-cli run-assist run-findorb \
+     run-kete run-jorbit \
+     $(if $(WITH_OORB),run-oorb,) \
      $(if $(WITH_ORBFIT),run-orbfit,) \
      $(if $(WITH_LAYUP),run-layup,) \
      $(if $(WITH_CORE),run-core,)
@@ -291,18 +368,39 @@ $(RUST_PROPEPH): $(RUST_BIN)
 	    --data-dir $(DATA_DIR) --cache-dir $(CACHE_DIR) \
 	    --output $(RUST_PROPEPH)
 
-$(RUST_OD): $(RUST_BIN)
+# `validate od` writes TWO JSONL sidecars beside $(RUST_OD), named from its
+# stem: $(RUST_OD_ORBITS) (per-object fitted + propagated orbit + covariance)
+# and $(RUST_OD_COMPARE) (fitted-vs-reference Keplerian Mahalanobis
+# comparisons, the sole input to the report's §12). They are not channel
+# results and no make rule names them as outputs, which is how CI came to
+# stage the four channel JSONs and leave both sidecars behind in the prep
+# job's workspace — §12 was empty in every published report. Declared here so
+# the coupling is visible: the prep upload in .github/workflows/validation.yml
+# lists both by name, and `report` now fails rather than rendering an
+# unexplained empty §12 when OD rows arrive without them.
+RUST_OD_ORBITS := $(RESULTS_DIR)/validation_rust_od_orbits.jsonl
+RUST_OD_COMPARE := $(RESULTS_DIR)/validation_rust_od_compare.jsonl
+
+$(RUST_OD): $(RUST_BIN) | fixtures
 	@echo "──── Rust channel: orbit determination ─────────────────"
 	@$(DYLD) $(RUST_BIN) od $(ONLY_FLAG) --tier $(TIERS) \
 	    --data-dir $(DATA_DIR) \
 	    --fixtures-dir $(FIXTURES_PSV) \
 	    --output $(RUST_OD)
+	@for f in $(RUST_OD_ORBITS) $(RUST_OD_COMPARE); do \
+	    test -f "$$f" || { \
+	        echo "ERROR: $(RUST_BIN) od did not write its sidecar $$f."; \
+	        echo "       The report's §12 (fitted orbit + covariance vs references)"; \
+	        echo "       has no other input and would render empty."; \
+	        exit 1; }; \
+	 done
 
 $(RUST): $(RUST_PROPEPH) $(RUST_OD)
 	@echo "──── Rust channel: merge prop+eph + OD into unified ────"
-	@$(WHEEL_PY) -c "import json; \
+	@$(WHEEL_PY) -c "import json,sys; \
 a=json.load(open('$(RUST_PROPEPH)')); \
 b=json.load(open('$(RUST_OD)')); \
+sys.exit('ERROR: $(RUST_OD) carries zero OD rows. The rust OD pass produced nothing — a runner that emits no rows at all is a dead channel, not a passing one. Check the fixture fetch (make fixtures) and the runner log above.') if not b else None; \
 json.dump(a+b, open('$(RUST)','w'), indent=2, default=str); \
 print(f'Wrote {len(a)+len(b)} unified rust rows ({len(a)} prop+eph, {len(b)} OD) to $(RUST)')"
 
@@ -312,26 +410,94 @@ print(f'Wrote {len(a)+len(b)} unified rust rows ({len(a)} prop+eph, {len(b)} OD)
 # separation_arcsec, channel set to "plan"). Every replay channel reads
 # the plan instead of validation_rust.json so they don't depend on rust's
 # results.
-plan: $(PLAN)
-$(PLAN): $(RUST)
-	@echo "──── Plan: strip channel-specific fields from rust unified ─"
-	@$(WHEEL_PY) -c "import json; \
-rows=json.load(open('$(RUST)')); \
-clear_fields=['emp_pos_au','emp_time_ms','emp_vs_horizons_km','separation_arcsec','d_ra_arcsec','d_dec_arcsec','d_rho_km','d_light_time_s','od_iterations','od_converged','od_rms_ra_arcsec','od_rms_dec_arcsec','od_rms_combined_arcsec','od_chi2','od_reduced_chi2','od_a1','od_a2','od_a3','od_a1_sigma','od_a2_sigma','od_a3_sigma','assist_vs_horizons_km','emp_vs_assist_km','assist_time_ms','speed_ratio','findorb_rms_residual','findorb_n_obs_used','findorb_n_obs_rejected']; \
-rows=[r for r in rows if r.get('propagation_uncertainty') not in ('auto', 'second_order_with_cov')]; \
-[r.update({f: None for f in clear_fields}) for r in rows]; \
-[r.update(channel='plan') for r in rows]; \
-json.dump(rows, open('$(PLAN)','w'), indent=2, default=str); \
-print(f'Wrote {len(rows)} plan rows to $(PLAN) (auto + second-order excluded — rust-only axes)')"
+#
+# A plan with zero OD rows is not a smaller plan — it is a plan that
+# silently deletes an entire test axis from every downstream channel.
+# That is exactly what shipped: the plan carried 0 orbit_determination
+# rows, so python / c / cli / core / find_orb / OrbFit / layup each
+# replayed nothing on the OD axis and reported success. Assert the count
+# on BOTH plan paths — the one that generates it and the one that
+# receives it as a prep artifact — so no leg can replay a gutted plan.
+#
+# OD_TEST_TYPES mirrors empyrean_validation::schema::test_types::
+# ORBIT_DETERMINATION_FAMILY, which cannot be imported here: the external
+# matrix legs run this assertion under a bare python3 with no cargo toolchain
+# and no built harness. The unit test
+# `makefile_od_test_type_list_matches_the_schema` reads this very line and
+# fails if the two ever disagree, so the duplication is checked rather than
+# trusted.
+#
+# Counted by NAME rather than as "not propagation and not ephemeris". The
+# complement counts a typo'd test type as OD, and it counts the narrower
+# recovery axes as if they were the OD axis — a plan of nothing but
+# `non_grav_recovery` rows satisfied the old form while carrying not one row
+# of the axis this assertion protects. So both halves are asserted: some OD
+# row must exist, and `orbit_determination` itself must be among them.
+OD_TEST_TYPES := orbit_determination,orbit_determination_radar,non_grav_recovery,dt_recovery,photometry_recovery,thrust_recovery
+define ASSERT_PLAN_HAS_OD
+import json, sys
+from collections import Counter
 
-run-python: $(PLAN)
+path, od_types = sys.argv[1], sys.argv[2].split(",")
+rows = json.load(open(path))
+od = [r for r in rows if r.get("test_type") in od_types]
+if not od:
+    seen = ", ".join(f"{n} {t}" for t, n in sorted(Counter(r.get("test_type") for r in rows).items()))
+    sys.exit(
+        f"ERROR: {path} carries ZERO orbit-determination rows "
+        f"({len(rows)} rows total; test types present: {seen}).\n"
+        "       Every OD consumer downstream (python / c / cli / core replay, "
+        "find_orb, OrbFit, layup,\n"
+        "       SBDB merge, the report's OD section) would no-op and report "
+        "success on an untested axis.\n"
+        "       Run `make fixtures` and re-read the rust OD runner log."
+    )
+if not any(r.get("test_type") == "orbit_determination" for r in od):
+    sys.exit(
+        f"ERROR: {path} carries {len(od)} orbit-determination-family rows but ZERO "
+        "`orbit_determination` rows.\n"
+        "       The recovery axes (non_grav / dt / photometry / thrust) are checks "
+        "layered on top of the\n"
+        "       optical fit, not substitutes for it — a plan with only those deletes "
+        "the OD axis proper\n"
+        "       while still looking non-empty."
+    )
+c = Counter(r["test_type"] for r in od)
+print("  plan OD rows: " + ", ".join(f"{n} {t}" for t, n in sorted(c.items())))
+endef
+export ASSERT_PLAN_HAS_OD
+
+plan: $(PLAN) check-plan
+ifeq ($(PLAN_PREBUILT),1)
+# Matrix-CI replay/external leg: the plan was produced by the prep job and
+# staged here as an artifact. Assert its presence loudly rather than silently
+# rebuilding it (which would need the rust reference this leg deliberately
+# does not carry).
+$(PLAN):
+	@test -f $(PLAN) || { echo "ERROR: PLAN_PREBUILT=1 but $(PLAN) is missing — the prep job's plan artifact was not staged into $(RESULTS_DIR)."; exit 1; }
+	@echo "──── Plan: using prebuilt artifact $(PLAN) ─────────────"
+else
+$(PLAN): $(RUST) $(EMP_VAL_BIN)
+	@echo "──── Plan: strip rust unified down to the plan contract ────"
+	@$(EMP_VAL_BIN) strip-plan --input $(RUST) --output $(PLAN)
+endif
+
+# Phony so the assertion runs on EVERY invocation, not just the one that
+# built the plan file. `plan` and every plan-consuming target depend on
+# this, so a leg handed a gutted prep artifact refuses to replay it —
+# python3 rather than $(WHEEL_PY) because the external legs carry no
+# wheel venv.
+check-plan: $(PLAN)
+	@python3 -c "$$ASSERT_PLAN_HAS_OD" $(PLAN) $(OD_TEST_TYPES)
+
+run-python: $(PLAN) check-plan fixtures
 	@echo "──── Python channel: replay plan ───────────────────────"
 	@$(WHEEL_PY) $(EMPYREAN_RUNNERS)/python/run.py \
 	    --input $(PLAN) --output $(PYTHON) \
 	    --fixtures-dir $(FIXTURES_PSV) \
 	    --data-dir $(DATA_DIR)
 
-run-c: $(PLAN) $(C_BIN)
+run-c: $(PLAN) $(C_BIN) check-plan fixtures
 	@echo "──── C channel: replay plan (prop / eph / OD) ──────────"
 	@$(WHEEL_PY) $(EMPYREAN_RUNNERS)/c/drive.py \
 	    --input $(PLAN) \
@@ -339,7 +505,7 @@ run-c: $(PLAN) $(C_BIN)
 	    --fixtures-dir $(FIXTURES_PSV) \
 	    $(if $(filter-out $(HOME)/.empyrean/data,$(DATA_DIR)),--data-dir $(DATA_DIR),)
 
-run-cli: $(PLAN) $(CLI_BIN)
+run-cli: $(PLAN) $(CLI_BIN) check-plan fixtures
 	@echo "──── CLI channel: fork-exec one binary per plan row ────"
 	@$(DYLD) $(WHEEL_PY) $(EMPYREAN_RUNNERS)/cli/drive.py \
 	    --input $(PLAN) \
@@ -347,32 +513,34 @@ run-cli: $(PLAN) $(CLI_BIN)
 	    --fixtures-dir $(FIXTURES_PSV) \
 	    $(if $(filter-out $(HOME)/.empyrean/data,$(DATA_DIR)),--data-dir $(DATA_DIR),)
 
-run-assist: $(PLAN) $(ASSIST_PY)
+run-assist: $(PLAN) check-plan $(ASSIST_PY)
 	@echo "──── ASSIST: external propagator reference ─────────────"
 	@$(ASSIST_PY) $(EMP_VAL_RUNNERS)/assist/run_assist.py $(PLAN) \
 	    --output $(ASSIST_OUT) \
 	    --horizons-cache $(CACHE_DIR)/horizons \
 	    --data-dir $(DATA_DIR)
 
-# find_orb's binary is an optional, non-fatal build (see findorb/setup.sh).
-# When it's absent, skip the comparison and emit empty result files so the
-# merge step still has valid (empty) inputs — the missing comparator is
-# surfaced here and by its absence from the report, never silently faked.
-run-findorb: $(ASSIST_PY)
-	@if [ -x "$(FO_BIN)" ]; then \
-	    echo "──── find_orb: external OD reference ───────────────────"; \
-	    $(ASSIST_PY) $(EMP_VAL_RUNNERS)/findorb/run_findorb.py $(FIXTURES_PSV) \
-	        --output $(FINDORB_OUT) --fo-binary $(FO_BIN) \
-	        --data-dir $(DATA_DIR); \
-	    echo "──── find_orb: radar-augmented OD reference (psv-radar) ─"; \
-	    $(ASSIST_PY) $(EMP_VAL_RUNNERS)/findorb/run_findorb.py $(FIXTURES_PSV_RADAR) \
-	        --output $(FINDORB_RADAR_OUT) --fo-binary $(FO_BIN) \
-	        --data-dir $(DATA_DIR) --test-type orbit_determination_radar; \
-	else \
-	    echo "──── find_orb: SKIPPED (binary not built — see setup warning) ──"; \
-	    echo '[]' > $(FINDORB_OUT); \
-	    echo '[]' > $(FINDORB_RADAR_OUT); \
-	fi
+# find_orb's binary is an optional, non-fatal BUILD (see findorb/setup.sh) —
+# but a missing binary at RUN time is a failure, not a skip. This used to
+# `echo '[]' > $(FINDORB_OUT)` and succeed, which handed the merge a
+# syntactically valid file asserting "find_orb compared zero objects" and
+# produced a green leg that ran no comparator at all. Fail with the fix
+# instead; the matrix's fail-fast:false keeps the other comparators alive and
+# reduce then omits find_orb honestly.
+run-findorb: $(ASSIST_PY) check-plan fixtures
+	@test -x "$(FO_BIN)" || { \
+	    echo "ERROR: find_orb binary not built: $(FO_BIN)"; \
+	    echo "       Build it with: make setup-findorb"; \
+	    echo "       (An empty result file would report 'find_orb compared nothing' as a pass.)"; \
+	    exit 1; }
+	@echo "──── find_orb: external OD reference ───────────────────"
+	@$(ASSIST_PY) $(EMP_VAL_RUNNERS)/findorb/run_findorb.py $(FIXTURES_PSV) \
+	    --output $(FINDORB_OUT) --fo-binary $(FO_BIN) \
+	    --data-dir $(DATA_DIR) --plan $(PLAN)
+	@echo "──── find_orb: radar-augmented OD reference (psv-radar) ─"
+	@$(ASSIST_PY) $(EMP_VAL_RUNNERS)/findorb/run_findorb.py $(FIXTURES_PSV_RADAR) \
+	    --output $(FINDORB_RADAR_OUT) --fo-binary $(FO_BIN) \
+	    --data-dir $(DATA_DIR) --test-type orbit_determination_radar
 
 # ── OpenOrb (oorb) external comparison — propagation + ephemeris ─
 # Independent Fortran implementation (Granvik et al., University of
@@ -387,20 +555,18 @@ $(OORB_BIN):
 	@cd $(EMP_VAL_RUNNERS)/oorb && ./setup.sh
 
 run-oorb: $(OORB_OUT)
-# oorb's binary is an optional, non-fatal build (see oorb/setup.sh). When
-# it's absent, skip the comparison and emit an empty result file so the
-# merge step still has a valid input — the missing comparator is surfaced
-# here and by its absence from the report, never silently faked.
-$(OORB_OUT): $(PLAN) $(ASSIST_PY)
-	@if [ -x "$(OORB_BIN)" ]; then \
-	    echo "──── OpenOrb: external prop + ephemeris reference ──────"; \
-	    $(ASSIST_PY) $(EMP_VAL_RUNNERS)/oorb/run_oorb.py \
-	        --input $(PLAN) --output $(OORB_OUT) \
-	        --prefix $(EMP_VAL_RUNNERS)/oorb/install; \
-	else \
-	    echo "──── OpenOrb: SKIPPED (binary not built — see setup warning) ──"; \
-	    echo '[]' > $(OORB_OUT); \
-	fi
+# Same rule as find_orb: an optional BUILD, but a missing binary at RUN time
+# is a failure. The `echo '[]'` fallback made a leg that compared nothing
+# indistinguishable from a leg that compared everything and agreed.
+$(OORB_OUT): $(PLAN) $(ASSIST_PY) | check-plan
+	@test -x "$(OORB_BIN)" || { \
+	    echo "ERROR: OpenOrb binary not built: $(OORB_BIN)"; \
+	    echo "       Build it with: make setup-oorb"; \
+	    exit 1; }
+	@echo "──── OpenOrb: external prop + ephemeris reference ──────"
+	@$(ASSIST_PY) $(EMP_VAL_RUNNERS)/oorb/run_oorb.py \
+	    --input $(PLAN) --output $(OORB_OUT) \
+	    --prefix $(EMP_VAL_RUNNERS)/oorb/install
 
 # ── OrbFit external comparison — orbit determination ─────────────
 # OrbFit Consortium (University of Pisa) / IAU Minor Planet Center.
@@ -411,10 +577,10 @@ setup-orbfit:
 	@cd $(EMP_VAL_RUNNERS)/orbfit && ./setup.sh
 
 run-orbfit: $(ORBFIT_OUT)
-$(ORBFIT_OUT): $(PLAN)
-	@echo "──── OrbFit: external OD reference (via docker) ────────"
+$(ORBFIT_OUT): $(PLAN) | check-plan fixtures
+	@echo "──── OrbFit: external OD reference (neofit2.x via docker) ──"
 	@$(EMP_VAL_RUNNERS)/orbfit/run_orbfit.py \
-	    --plan $(PLAN) --output $(ORBFIT_OUT)
+	    --plan $(PLAN) --output $(ORBFIT_OUT) --psv-dir $(FIXTURES_PSV)
 
 # Optional: empyrean-core direct (no FFI). Replays the plan in-process so
 # the report's Section 09 can show binding-translation drift (rust wrapper
@@ -424,7 +590,7 @@ ifneq ($(WITH_CORE),1)
 	@echo "──── Core channel skipped (empyrean-core not found) ────"
 endif
 
-$(CORE_OUT): $(PLAN) $(CORE_BIN)
+$(CORE_OUT): $(PLAN) $(CORE_BIN) | check-plan fixtures
 	@echo "──── Core channel: replay plan via empyrean-core ───────"
 	@$(DYLD) $(CORE_BIN) --input $(PLAN) --output $(CORE_OUT) \
 	    --fixtures-dir $(FIXTURES_PSV)
@@ -445,7 +611,7 @@ $(KETE_PY):
 	@cd $(EMP_VAL_RUNNERS)/kete && ./setup.sh
 
 run-kete: $(KETE_OUT)
-$(KETE_OUT): $(PLAN) $(KETE_PY)
+$(KETE_OUT): $(PLAN) $(KETE_PY) | check-plan fixtures
 	@echo "──── Kete: external all-test-types reference ──────────"
 	@$(KETE_PY) $(EMP_VAL_RUNNERS)/kete/run_kete.py \
 	    --input $(PLAN) --output $(KETE_OUT) \
@@ -464,7 +630,7 @@ $(JORBIT_PY):
 	@cd $(EMP_VAL_RUNNERS)/jorbit && ./setup.sh
 
 run-jorbit: $(JORBIT_OUT)
-$(JORBIT_OUT): $(PLAN) $(JORBIT_PY)
+$(JORBIT_OUT): $(PLAN) $(JORBIT_PY) | check-plan
 	@echo "──── jorbit: external (opt-in) reference ───────────────"
 	@$(JORBIT_PY) $(EMP_VAL_RUNNERS)/jorbit/run_jorbit.py \
 	    --input $(PLAN) --output $(JORBIT_OUT)
@@ -483,20 +649,20 @@ $(LAYUP_PY):
 	@cd $(EMP_VAL_RUNNERS)/layup && ./setup.sh
 
 run-layup: $(LAYUP_OUT)
-# layup's venv is an optional, heavy build (see layup/setup.sh). When it's
-# absent, skip the fit and emit an empty result file so the merge step still
-# has a valid input — the missing comparator is surfaced here and by its
-# absence from the report, never silently faked.
-$(LAYUP_OUT): $(FIXTURES_PSV)
-	@if [ -x "$(LAYUP_PY)" ]; then \
-	    echo "──── layup: external OD reference (ADES PSV) ───────────"; \
-	    $(LAYUP_PY) $(EMP_VAL_RUNNERS)/layup/run_layup.py $(FIXTURES_PSV) \
-	        --output $(LAYUP_OUT); \
-	else \
-	    echo "──── layup: SKIPPED (venv not built — run 'make setup-layup') ──"; \
-	    mkdir -p $(RESULTS_DIR); \
-	    echo '[]' > $(LAYUP_OUT); \
-	fi
+# layup's venv is an optional, heavy BUILD (see layup/setup.sh), but it is
+# only ever *run* when WITH_LAYUP is set — so at this point the caller has
+# asked for layup and a missing venv is a failure. The `echo '[]'` fallback
+# reported a comparator that never executed as a successful empty comparison.
+# Opt out with WITH_LAYUP= rather than by silently producing nothing.
+$(LAYUP_OUT): | fixtures
+	@test -x "$(LAYUP_PY)" || { \
+	    echo "ERROR: layup venv not built: $(LAYUP_PY)"; \
+	    echo "       Build it with: make setup-layup, or opt out with WITH_LAYUP="; \
+	    exit 1; }
+	@echo "──── layup: external OD reference (ADES PSV) ───────────"
+	@mkdir -p $(RESULTS_DIR)
+	@$(LAYUP_PY) $(EMP_VAL_RUNNERS)/layup/run_layup.py $(FIXTURES_PSV) \
+	    --output $(LAYUP_OUT)
 
 # ── Merge external + report ────────────────────────────────
 # Channel-agnostic meta operations live in this repo's CLI binary. It
@@ -516,22 +682,28 @@ INCLUDE_OPTIONAL ?=
 # choice. If `core` isn't present (WITH_CORE not set), fall back to
 # folding onto rust rows for backward compat.
 merge-external: $(if $(WITH_CORE),$(CORE_MERGED),$(RUST_MERGED))
-$(CORE_MERGED): $(CORE_OUT) $(ASSIST_OUT) $(FINDORB_OUT) $(FINDORB_RADAR_OUT) $(OORB_OUT) \
+$(CORE_MERGED): $(CORE_OUT) $(ASSIST_OUT) $(FINDORB_OUT) $(FINDORB_RADAR_OUT) $(if $(WITH_OORB),$(OORB_OUT),) \
+                $(KETE_OUT) $(JORBIT_OUT) \
                 $(if $(WITH_ORBFIT),$(ORBFIT_OUT),) $(if $(WITH_LAYUP),$(LAYUP_OUT),) $(EMP_VAL_BIN)
-	@echo "──── Merge ASSIST + find_orb + OpenOrb$(if $(WITH_ORBFIT), + OrbFit,)$(if $(WITH_LAYUP), + layup,) into core ──"
+	@echo "──── Merge ASSIST + find_orb$(if $(WITH_OORB), + OpenOrb,) + kete + jorbit$(if $(WITH_ORBFIT), + OrbFit,)$(if $(WITH_LAYUP), + layup,) into core ──"
 	@$(EMP_VAL_BIN) merge-external -i $(CORE_OUT) -o $(CORE_MERGED) \
 	    --assist $(ASSIST_OUT) --findorb $(FINDORB_OUT) \
 	    --findorb-radar $(FINDORB_RADAR_OUT) \
-	    --oorb $(OORB_OUT) \
+	    $(if $(WITH_OORB),--oorb $(OORB_OUT),) \
+	    --kete $(KETE_OUT) --jorbit $(JORBIT_OUT) \
+	    --jpl-sbdb-cache $(CACHE_DIR)/sbdb \
 	    $(if $(WITH_ORBFIT),--orbfit $(ORBFIT_OUT),) \
 	    $(if $(WITH_LAYUP),--layup $(LAYUP_OUT),)
-$(RUST_MERGED): $(RUST) $(ASSIST_OUT) $(FINDORB_OUT) $(FINDORB_RADAR_OUT) $(OORB_OUT) \
+$(RUST_MERGED): $(RUST) $(ASSIST_OUT) $(FINDORB_OUT) $(FINDORB_RADAR_OUT) $(if $(WITH_OORB),$(OORB_OUT),) \
+                $(KETE_OUT) $(JORBIT_OUT) \
                 $(if $(WITH_ORBFIT),$(ORBFIT_OUT),) $(if $(WITH_LAYUP),$(LAYUP_OUT),) $(EMP_VAL_BIN)
-	@echo "──── Merge ASSIST + find_orb + OpenOrb$(if $(WITH_ORBFIT), + OrbFit,)$(if $(WITH_LAYUP), + layup,) into rust (fallback) ──"
+	@echo "──── Merge ASSIST + find_orb$(if $(WITH_OORB), + OpenOrb,) + kete + jorbit$(if $(WITH_ORBFIT), + OrbFit,)$(if $(WITH_LAYUP), + layup,) into rust (fallback) ──"
 	@$(EMP_VAL_BIN) merge-external -i $(RUST) -o $(RUST_MERGED) \
 	    --assist $(ASSIST_OUT) --findorb $(FINDORB_OUT) \
 	    --findorb-radar $(FINDORB_RADAR_OUT) \
-	    --oorb $(OORB_OUT) \
+	    $(if $(WITH_OORB),--oorb $(OORB_OUT),) \
+	    --kete $(KETE_OUT) --jorbit $(JORBIT_OUT) \
+	    --jpl-sbdb-cache $(CACHE_DIR)/sbdb \
 	    $(if $(WITH_ORBFIT),--orbfit $(ORBFIT_OUT),) \
 	    $(if $(WITH_LAYUP),--layup $(LAYUP_OUT),)
 
@@ -546,12 +718,108 @@ report: $(RUST) $(PYTHON) $(C_OUT) $(CLI_OUT) $(if $(WITH_CORE),$(CORE_MERGED),$
 	@echo "Summary: $(SUMMARY)"
 	@echo "Channels: rust, python, c, cli$(if $(WITH_CORE), + core,)"
 
-# ── Cleanup ────────────────────────────────────────────────
-clean:
-	rm -rf $(RESULTS_DIR)
-	@echo "Removed $(RESULTS_DIR). External deps preserved."
+# ── Matrix-CI reduce ───────────────────────────────────────
+# Merge external references + render the report from channel JSONs that
+# upstream matrix legs produced and staged into $(RESULTS_DIR). Unlike the
+# `report` target this does NOT go through the per-channel file-target rules
+# (those would try to rebuild missing binaries), so it never rebuilds a
+# channel — the legs own that. It builds only the validation harness itself,
+# then folds in whatever external channels are actually present: a leg that
+# failed under the matrix's fail-fast:false leaves its JSON absent, and reduce
+# skips it *loudly* (printed to the log and, by its absence, to the report)
+# rather than faking or defaulting it. The empyrean replay channels
+# (rust/python/c/cli/core) come from a single upstream job that succeeds or
+# fails atomically, so REPORT_INPUTS still lists them directly.
+#
+# `add` takes a third argument: the reason the channel is deliberately off, or
+# empty when it should have been there. The message used to read "leg failed
+# or was disabled" for both cases, which is unreadable — the next person
+# cannot tell a policy decision from a breakage, and both look like the
+# channel merely went missing. A DISABLED line names the decision and the
+# bead; a MISSING line says the leg was expected and did not deliver.
+reduce: build-empyrean-validation
+	@echo "──── Reduce: merge external references + render report ─"
+	@ref=""; merged=""; \
+	if [ -f "$(CORE_OUT)" ]; then ref="$(CORE_OUT)"; merged="$(CORE_MERGED)"; \
+	elif [ -f "$(RUST)" ]; then ref="$(RUST)"; merged="$(RUST_MERGED)"; \
+	else echo "ERROR: reduce found neither $(CORE_OUT) nor $(RUST) — no reference channel was staged."; exit 1; fi; \
+	echo "Reference channel: $$ref  →  $$merged"; \
+	flags=""; \
+	add() { \
+	    if [ -f "$$2" ]; then \
+	        if [ -n "$$3" ]; then \
+	            echo "  NOTE $$1 — marked DISABLED ($$3) yet $$2 IS staged; folding it in anyway. Someone re-enabled the leg without clearing the note."; \
+	        fi; \
+	        flags="$$flags $$1 $$2"; \
+	    elif [ -n "$$3" ]; then \
+	        echo "  skip $$1 — DISABLED by decision: $$3"; \
+	    else \
+	        echo "  skip $$1 — MISSING: $$2 was not staged. Its matrix leg was expected to run and did not deliver (fail-fast:false keeps the rest alive); the report omits this comparator."; \
+	    fi; }; \
+	add --assist        "$(ASSIST_OUT)"          ""; \
+	add --findorb       "$(FINDORB_OUT)"         ""; \
+	add --findorb-radar "$(FINDORB_RADAR_OUT)"   ""; \
+	add --oorb          "$(OORB_OUT)"            "$(OORB_DISABLED_REASON)"; \
+	add --kete          "$(KETE_OUT)"            ""; \
+	add --jorbit        "$(JORBIT_OUT)"          ""; \
+	add --orbfit        "$(ORBFIT_OUT)"          ""; \
+	add --layup         "$(LAYUP_OUT)"           ""; \
+	if [ -d "$(CACHE_DIR)/sbdb" ]; then flags="$$flags --jpl-sbdb-cache $(CACHE_DIR)/sbdb"; fi; \
+	$(EMP_VAL_BIN) merge-external -i "$$ref" -o "$$merged" $$flags
+	@$(EMP_VAL_BIN) report \
+	    --results $(REPORT_INPUTS) \
+	    --output $(REPORT) \
+	    --summary $(SUMMARY)
+	@echo "Report: $(REPORT)"
+	@echo "Summary: $(SUMMARY)"
 
-clean-all: clean
+# ── Cleanup ────────────────────────────────────────────────
+# Completed runs archive here, one timestamped directory per `make archive`.
+ARCHIVE_DIR := $(RESULTS_DIR)/archive
+
+# `clean` no longer removes results/. It used to be `rm -rf $(RESULTS_DIR)`,
+# which on 2026-07-23 destroyed a seven-hour local validation run — the
+# obvious, muscle-memory command silently deleting the single most expensive
+# artifact in the repo. Results are not build output: a full run costs hours of
+# CPU and cannot be regenerated from source alone (it depends on the JPL
+# responses cached at the time). Removing them is now something you have to ask
+# for by name.
+clean:
+	@rm -f $(REPORT) $(SUMMARY) $(RUST_MERGED) $(CORE_MERGED) $(PLAN)
+	@echo "Removed the derived report / summary / merge / plan from $(RESULTS_DIR)."
+	@echo "Per-channel results are PRESERVED — 'make clean-results' removes those,"
+	@echo "'make archive' snapshots them to $(ARCHIVE_DIR)/<timestamp>/ first."
+
+# The explicit one. Named so it cannot be typed by accident, and it refuses to
+# run without an archived copy — the whole point is that hours of compute are
+# never one keystroke from gone.
+clean-results:
+	@test -d "$(ARCHIVE_DIR)" && [ -n "`ls -1 $(ARCHIVE_DIR) 2>/dev/null`" ] || { \
+	    echo "ERROR: refusing to delete $(RESULTS_DIR) with nothing in $(ARCHIVE_DIR)."; \
+	    echo "       A full run is hours of CPU and is not reproducible from source"; \
+	    echo "       alone (it depends on the JPL responses cached at the time)."; \
+	    echo "       Run 'make archive' first, or 'rm -rf $(RESULTS_DIR)' if you"; \
+	    echo "       really mean it."; \
+	    exit 1; }
+	@find $(RESULTS_DIR) -mindepth 1 -maxdepth 1 ! -name archive -exec rm -rf {} +
+	@echo "Removed the channel outputs in $(RESULTS_DIR). $(ARCHIVE_DIR) preserved."
+
+# Snapshot a completed run. Timestamped so consecutive runs accumulate instead
+# of overwriting, which is what makes a run comparable to the one before it.
+archive:
+	@test -d "$(RESULTS_DIR)" || { echo "Nothing to archive: $(RESULTS_DIR) does not exist."; exit 1; }
+	@stamp=`date -u +%Y%m%d_%H%M%S`; dest="$(ARCHIVE_DIR)/$$stamp"; \
+	 mkdir -p "$$dest"; \
+	 n=0; \
+	 for f in $(RESULTS_DIR)/*; do \
+	     [ -e "$$f" ] || continue; \
+	     case "$$f" in $(ARCHIVE_DIR)) continue ;; esac; \
+	     cp -R "$$f" "$$dest"/ && n=$$((n+1)); \
+	 done; \
+	 test "$$n" -gt 0 || { echo "Nothing to archive: $(RESULTS_DIR) is empty."; rmdir "$$dest"; exit 1; }; \
+	 echo "Archived $$n result artifact(s) to $$dest"
+
+clean-all: clean clean-results
 	rm -rf $(ASSIST_VENV) $(KETE_VENV)
 	rm -rf $(EMP_VAL_RUNNERS)/findorb/build $(EMP_VAL_RUNNERS)/findorb/install
 	rm -f $(C_BIN)

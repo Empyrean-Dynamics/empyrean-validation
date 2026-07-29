@@ -17,7 +17,7 @@ path = "src/main.rs"
 # checkout of a validation tag reproduces the validation-of-record for
 # that release. Dev-tree validation is an uncommitted local override —
 # see "Local development overrides" in the README.
-empyrean = "=0.8.1"
+empyrean = "=0.9.0"
 # Shared validation framework: schema (`ValidationResult`,
 # `ValidationPlan`), test object catalog, position-error / angular-
 # separation metric helpers, and the HTML report renderer. Owned

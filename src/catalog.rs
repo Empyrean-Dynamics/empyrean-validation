@@ -13,17 +13,19 @@
 //! - **Self-Perturber** — Iris, Vesta, Pallas, Hygiea (SB441-N16 bodies that
 //!   appear in the perturber set; their OD must exclude themselves)
 //! - **TNO** — Eris, Makemake, Varuna
-//! - **Comet** — 67P, 2P/Encke, 103P/Hartley 2, 46P/Wirtanen
+//! - **Comet** — 67P, 2P/Encke, 103P/Hartley 2, 46P/Wirtanen, 96P/Machholz, C/2023 A3
 //! - **Centaur** — Chiron
 //! - **Jupiter Trojan** — Hektor, Patroclus, Achilles
 //! - **Neptune Trojan** — 2001 QR322, 2005 TN53, 2008 LC18
 //! - **Earth Trojan** — 2010 TK7, 2020 XL5
-//! - **ISO** — 1I/'Oumuamua, 2I/Borisov
+//! - **ISO** — 1I/'Oumuamua, 2I/Borisov, 3I/ATLAS
 //! - **TCO** — 2020 CD3, 2024 PT5
 //! - **Impactor** — 2008 TC3, 2023 CX1, 2024 BX1, 2014 AA, 2018 LA
 //! - **Short-arc NEO** — 2026 FQ12, 2026 FO12, 2026 DA
 //!
-//! Total: 44 objects across 13 populations.
+//! Total: 50 objects across 13 populations. The NEO set includes the
+//! GR-stress orbit 2021 PH27, the 2032 lunar-encounter object 2024 YR4,
+//! and the rock comet Phaethon.
 
 use serde::Serialize;
 
@@ -271,6 +273,42 @@ const NEOS: &[ValidationObject] = &[
         epoch_mjd: None,
         skip_od: false,
     },
+    ValidationObject {
+        name: "2021 PH27",
+        sbdb_query: "2021 PH27",
+        horizons_command: "DES=2021 PH27;",
+        mpc_designation: "2021 PH27",
+        population: "NEO",
+        dt_days: None,
+        notes: "GR stress: q=0.13 AU, largest known asteroid perihelion precession (~53 arcsec/century)",
+        horizons_only: false,
+        epoch_mjd: None,
+        skip_od: false,
+    },
+    ValidationObject {
+        name: "2024 YR4",
+        sbdb_query: "2024 YR4",
+        horizons_command: "DES=2024 YR4;",
+        mpc_designation: "2024 YR4",
+        population: "NEO",
+        dt_days: None,
+        notes: "2028 Earth close approach + 2032 lunar-encounter window; short-arc chaotic amplification",
+        horizons_only: false,
+        epoch_mjd: None,
+        skip_od: false,
+    },
+    ValidationObject {
+        name: "Phaethon",
+        sbdb_query: "3200",
+        horizons_command: "3200;",
+        mpc_designation: "3200",
+        population: "NEO",
+        dt_days: None,
+        notes: "Rock comet: q=0.14 AU, Geminids parent, Yarkovsky A2 with custom g(r); dense optical + radar arc",
+        horizons_only: false,
+        epoch_mjd: None,
+        skip_od: false,
+    },
 ];
 
 const MBAS: &[ValidationObject] = &[
@@ -466,6 +504,30 @@ const COMETS: &[ValidationObject] = &[
         epoch_mjd: None,
         skip_od: false,
     },
+    ValidationObject {
+        name: "96P/Machholz",
+        sbdb_query: "96P",
+        horizons_command: "DES=96P;CAP;NOFRAG",
+        mpc_designation: "96P",
+        population: "Comet",
+        dt_days: None,
+        notes: "Sungrazing periodic: q=0.12 AU + i=58 deg + A1/A2/A3 non-grav (Kozai-driven)",
+        horizons_only: false,
+        epoch_mjd: None,
+        skip_od: false,
+    },
+    ValidationObject {
+        name: "C/2023 A3",
+        sbdb_query: "C/2023 A3",
+        horizons_command: "DES=C/2023 A3;CAP;NOFRAG",
+        mpc_designation: "C/2023 A3",
+        population: "Comet",
+        dt_days: None,
+        notes: "Near-parabolic (e=1.000): element-conversion conditioning edge; dense 7k-obs arc, A1/A2 non-grav",
+        horizons_only: false,
+        epoch_mjd: None,
+        skip_od: false,
+    },
 ];
 
 const CENTAURS: &[ValidationObject] = &[ValidationObject {
@@ -611,6 +673,18 @@ const ISOS: &[ValidationObject] = &[
         epoch_mjd: None,
         skip_od: false,
     },
+    ValidationObject {
+        name: "3I/ATLAS",
+        sbdb_query: "3I",
+        horizons_command: "DES=3I;",
+        mpc_designation: "3I",
+        population: "ISO",
+        dt_days: None,
+        notes: "Most hyperbolic orbit observed (e=6.1), retrograde (i=175 deg), full Marsden g(r) + DT non-grav",
+        horizons_only: false,
+        epoch_mjd: None,
+        skip_od: false,
+    },
 ];
 
 const TCOS: &[ValidationObject] = &[
@@ -744,6 +818,17 @@ const SHORT_ARC_NEOS: &[ValidationObject] = &[
     },
 ];
 
+/// Catalog objects that have a radar-augmented fixture in
+/// `fixtures/psv-radar/` and therefore produce an
+/// `orbit_determination_radar` row.
+///
+/// Named here rather than counted from the directory listing at gate time,
+/// because a floor derived from the very files it is meant to protect is
+/// self-fulfilling: delete a fixture and the floor obligingly drops to match.
+/// The list is the claim; [`radar_fixture_objects_match_the_fixture_files`]
+/// is what stops it drifting from the fetched fixture set.
+pub const RADAR_FIXTURE_OBJECTS: [&str; 5] = ["Apophis", "Bennu", "Didymos", "Eros", "Toutatis"];
+
 /// Returns the full validation object catalog (44 objects across 13
 /// populations). Order matches the populations enumerated in the module
 /// docstring.
@@ -792,8 +877,43 @@ mod tests {
     use super::*;
 
     #[test]
-    fn catalog_has_43_objects() {
-        assert_eq!(all_objects().len(), 44);
+    fn catalog_has_50_objects() {
+        assert_eq!(all_objects().len(), 50);
+    }
+
+    #[test]
+    fn radar_fixture_objects_match_the_fixture_files() {
+        // The CI row floor for the radar OD axis is
+        // RADAR_FIXTURE_OBJECTS.len(); if the list and the fetched fixtures
+        // (`make fixtures`, pinned by fixtures/manifest.json) drift, the floor silently stops describing the work. Adding a radar
+        // fixture without adding it here under-strictens the gate; naming an
+        // object here without the fixture makes the gate unsatisfiable. Both
+        // fail right here instead.
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("fixtures/psv-radar");
+        let mut on_disk: Vec<String> = std::fs::read_dir(&dir)
+            .unwrap_or_else(|e| panic!("read {}: {e}", dir.display()))
+            .filter_map(|e| {
+                let p = e.ok()?.path();
+                (p.extension()? == "psv").then(|| p.file_stem()?.to_str().map(str::to_string))?
+            })
+            .collect();
+        on_disk.sort();
+        let mut named: Vec<String> = RADAR_FIXTURE_OBJECTS
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        named.sort();
+        assert_eq!(on_disk, named);
+
+        // …and each one is a real catalog entry, so a floor derived from this
+        // list counts rows the runner can actually produce.
+        for name in RADAR_FIXTURE_OBJECTS {
+            assert_eq!(
+                filter_by_name(&[name]).len(),
+                1,
+                "{name} has a radar fixture but is not in the catalog"
+            );
+        }
     }
 
     #[test]

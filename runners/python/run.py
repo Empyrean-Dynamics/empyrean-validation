@@ -18,6 +18,7 @@ import math
 import sys
 import time
 from datetime import datetime, timezone
+from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
 
 import numpy as np
@@ -38,6 +39,22 @@ _TIER_TO_INT = {"approximate": 0, "basic": 1, "standard": 2}
 _FRAME_ICRF = 0
 _REP_CARTESIAN = 0
 _AU_KM = 149_597_870.700
+
+
+def _wheel_source_version() -> str:
+    """Provenance string stamped on every python-channel row.
+
+    The python channel IS the empyrean wheel — it calls the binding directly
+    — so it reports the installed wheel version. No-hidden-fallbacks: when the
+    version can't be resolved, stamp an explicit ``unknown (<reason>)`` rather
+    than a silent blank or a fabricated value.
+    """
+    try:
+        return f"empyrean {version('empyrean')} (python wheel)"
+    except PackageNotFoundError:
+        return "empyrean unknown (empyrean distribution not found)"
+    except Exception as e:  # noqa: BLE001
+        return f"empyrean unknown ({e})"
 
 
 def _ensure_initialized(data_dir: str | None) -> None:
@@ -436,6 +453,7 @@ def main() -> int:
     )
 
     timestamp = datetime.now(timezone.utc).isoformat()
+    source_version = _wheel_source_version()
 
     # Per-object JPL SBDB reference non-grav, keyed by object name. The
     # optical-only orbit_determination rows carry ic_a1/a2/a3 = None, but the
@@ -454,6 +472,7 @@ def main() -> int:
 
     out_rows = []
     n_skipped = 0
+    n_missing_fixture = 0
     for r in rust_rows:
         ic_pos = r.get("ic_pos_au")
         ic_vel = r.get("ic_vel_au_d")
@@ -473,6 +492,10 @@ def main() -> int:
         new = dict(r)
         new["channel"] = "python"
         new["timestamp"] = timestamp
+        # This channel exercised the wheel, not the rust engine the input row
+        # carried; overwrite the inherited source_version with our own. The
+        # non_grav_recovery row is a dict(new) copy, so it inherits this stamp.
+        new["source_version"] = source_version
         # Reset all empyrean-output fields; we'll repopulate from the Python channel.
         for k in (
             "emp_vs_horizons_km",
@@ -522,6 +545,18 @@ def main() -> int:
             # fixture with the slash rewritten to "_".
             psv_path = args.fixtures_dir / f"{r['object'].replace('/', '_')}.psv"
             if not psv_path.exists():
+                # Loudly, and fatally at the end — same seam as the C and CLI
+                # drivers. A silent `continue` deleted the OD row from this
+                # channel's output while the run still exited 0, so a channel
+                # that fitted nothing looked like one that fitted everything.
+                # The fixtures are fetched + hash-verified by `make fixtures`
+                # (fixtures/README.md); a missing one here means something
+                # bypassed that gate, never a normal condition.
+                print(
+                    f"  {r['object']} OD FAIL: no PSV fixture at {psv_path}",
+                    file=sys.stderr,
+                )
+                n_missing_fixture += 1
                 n_skipped += 1
                 continue
             psv_text = psv_path.read_text()
@@ -666,6 +701,18 @@ def main() -> int:
         f"Wrote {len(out_rows)} python rows to {args.output} (skipped {n_skipped})",
         file=sys.stderr,
     )
+    if n_missing_fixture:
+        print(
+            f"ERROR: {n_missing_fixture} OD row(s) had no PSV fixture under "
+            f"{args.fixtures_dir}.\n"
+            "       The fixtures come from the GCS snapshot pinned by "
+            "fixtures/manifest.json;\n"
+            "       `make fixtures` fetches + verifies them. Those OD rows are "
+            "missing from this "
+            "channel's output entirely.",
+            file=sys.stderr,
+        )
+        return 1
     return 0
 
 

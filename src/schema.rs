@@ -140,6 +140,67 @@ pub mod test_types {
     /// fitted state + χ² + RMS and so cannot see a silent drop to a
     /// gravity-only fit.
     pub const NON_GRAV_RECOVERY: &str = "non_grav_recovery";
+    /// Run differential correction solving for the non-grav time delay DT
+    /// (`solve_for` includes DT, on top of Marsden A1/A2/A3) on a comet
+    /// with a known SBDB DT signal (67P = +45.689 d, 2I/Borisov =
+    /// −65.130 d) and compare the fitted DT ± σ (`od_dt` ± `od_dt_sigma`,
+    /// σ from the solved covariance's DT slot) across channels. Distinct
+    /// from [`NON_GRAV_RECOVERY`]: guards DT *recovery* — a fit that
+    /// silently dropped DT reads loudly as a missing `od_dt`.
+    pub const DT_RECOVERY: &str = "dt_recovery";
+    /// Run a post-OD photometric H/G fit on an object with reported
+    /// magnitudes and compare the fitted H ± σ plus slopes (`od_h`,
+    /// `od_g1`, `od_g2`) and the admitted model (`od_photometry_model`)
+    /// across channels. Photometry is fit after the orbit is solved and
+    /// never touches the state.
+    pub const PHOTOMETRY_RECOVERY: &str = "photometry_recovery";
+    /// Run differential correction solving for thrust Δv segments on an
+    /// object with a known maneuver and compare the fitted Δv ± σ
+    /// (`od_thrust_dv_m_per_s`) across channels. Scaffolded — the schema
+    /// and core-reference replay exist, but there is no maneuvering-object
+    /// fixture yet, so no channel emits these rows today.
+    pub const THRUST_RECOVERY: &str = "thrust_recovery";
+
+    /// Every canonical test type, in declaration order.
+    ///
+    /// The membership set for anything that accepts a test-type name from
+    /// outside this crate — a `--min-rows` floor, a runner's `--test-type`
+    /// flag. A name checked for syntax but never for membership turns a typo
+    /// into "that axis was never exercised", which reads as a dead channel
+    /// when the truth is a misspelling.
+    pub const ALL: [&str; 8] = [
+        PROPAGATION,
+        EPHEMERIS,
+        ORBIT_DETERMINATION,
+        ORBIT_DETERMINATION_RADAR,
+        NON_GRAV_RECOVERY,
+        DT_RECOVERY,
+        PHOTOMETRY_RECOVERY,
+        THRUST_RECOVERY,
+    ];
+
+    /// The orbit-determination family: every test type whose row comes from a
+    /// differential-correction fit rather than a propagate / ephemeris call.
+    ///
+    /// Named as a set because "is this an OD row?" was being answered by
+    /// `test_type not in (propagation, ephemeris)` in three places. That
+    /// complement is a trap: it counts every future test type as OD, and it
+    /// counts a *typo* as OD, so an assertion built on it can be satisfied by
+    /// rows that are not orbit determination at all. Enumerate instead — a new
+    /// test type then has to declare which side it is on.
+    pub const ORBIT_DETERMINATION_FAMILY: [&str; 6] = [
+        ORBIT_DETERMINATION,
+        ORBIT_DETERMINATION_RADAR,
+        NON_GRAV_RECOVERY,
+        DT_RECOVERY,
+        PHOTOMETRY_RECOVERY,
+        THRUST_RECOVERY,
+    ];
+
+    /// Is this the name of an orbit-determination test type?
+    pub fn is_orbit_determination(test_type: &str) -> bool {
+        ORBIT_DETERMINATION_FAMILY.contains(&test_type)
+    }
 }
 
 /// Canonical [`ValidationResult::propagation_uncertainty`] values.
@@ -197,6 +258,16 @@ pub struct ValidationResult {
     /// Empyrean output Cartesian position (AU, ICRF, SSB-centered).
     /// Propagation + OD rows.
     pub emp_pos_au: Option<[f64; 3]>,
+    /// Propagated position 3×3 covariance (AU², ICRF, SSB-centered) — the
+    /// position block of Empyrean's STM-propagated 6×6. Lets the report show
+    /// the propagation offset as a Mahalanobis distance
+    /// \\(d = \sqrt{\Delta r^\top C^{-1} \Delta r}\\) instead of raw km.
+    /// Populated only on `first_order_with_cov` propagation rows (Empyrean is
+    /// the only tool that propagates a covariance). NOTE: the validation
+    /// attaches a synthetic typical-NEO input covariance, so `d` is measured
+    /// against that propagated envelope, not the object's real OD covariance.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub emp_pos_cov_au2: Option<[[f64; 3]; 3]>,
     /// Wall-clock per row (ms). Best-of `n_timing_runs`.
     pub emp_time_ms: Option<f64>,
     /// Angular separation vs Horizons (arcsec). Ephemeris rows.
@@ -205,6 +276,15 @@ pub struct ValidationResult {
     pub d_ra_arcsec: Option<f64>,
     /// dDec vs Horizons (arcsec). Ephemeris rows.
     pub d_dec_arcsec: Option<f64>,
+    /// Sky-plane 2×2 covariance in (RA·cosδ, Dec) arcsec² — the input
+    /// covariance mapped through the ephemeris Jacobian
+    /// \\(C_\text{radec} = J\,C_\text{in}\,J^\top\\) (RA row/col scaled by
+    /// cosδ to match `d_ra_arcsec`). Lets the report show the sky-plane offset
+    /// as a Mahalanobis distance instead of raw mas. Populated only on
+    /// `first_order_with_cov` ephemeris rows; same synthetic-input caveat as
+    /// [`emp_pos_cov_au2`](Self::emp_pos_cov_au2).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub emp_radec_cov_arcsec2: Option<[[f64; 2]; 2]>,
     /// Range diff vs Horizons (km). Ephemeris rows.
     pub d_rho_km: Option<f64>,
     /// Light-time diff vs Horizons (s). Ephemeris rows.
@@ -252,6 +332,58 @@ pub struct ValidationResult {
     pub ref_rho_au: Option<f64>,
     /// Horizons truth one-way light time (days).
     pub ref_light_time_d: Option<f64>,
+    /// Sun's SSB position at the target epoch (AU, ICRF). Propagation rows.
+    /// Lets observer-/Sun-centered external tools (OpenOrb's heliocentric
+    /// orbit convention) convert to and from the plan's SSB frame without
+    /// their own planetary-ephemeris query.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ref_sun_pos_au: Option<[f64; 3]>,
+    /// Sun's SSB velocity at the target epoch (AU/day, ICRF). Propagation
+    /// rows. The velocity matters as much as the position: feeding an SSB
+    /// velocity to a heliocentric integrator is a ~12 m/s error → a
+    /// semi-major-axis bias → ~10⁶ km/yr of along-track drift.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ref_sun_vel_au_d: Option<[f64; 3]>,
+
+    // ── JPL SBDB OD-fit reference ───────────────────────────────────
+    // JPL's own reported orbit-solution quality for this object, read
+    // from the SBDB `orbit` block (the same solution Horizons propagates,
+    // so Horizons + SBDB are one "JPL" source of truth). Populated on OD
+    // rows by `merge-external --jpl-sbdb-cache`. All `skip_serializing_if
+    // = is_none`, so the on-disk contract is byte-unchanged until a JPL
+    // merge fills them.
+    /// SBDB normalized (weighted, dimensionless) RMS of the fit residuals
+    /// — `sqrt(mean((residual/σ)²))`. NOT an arcsec RMS; ≈ √(reduced χ²).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ref_od_rms_normalized: Option<f64>,
+    /// Reduced χ² implied by the SBDB normalized RMS (`rms²`). Comparable
+    /// to layup's `layup_reduced_chi2` (drops the k-dof correction).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ref_od_reduced_chi2: Option<f64>,
+    /// SBDB `n_obs_used` — optical observations used in the JPL fit.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ref_od_n_obs_used: Option<u32>,
+    /// SBDB `n_del_obs_used` — radar delay (range) measurements used.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ref_od_n_del_obs_used: Option<u32>,
+    /// SBDB `n_dop_obs_used` — radar Doppler (range-rate) measurements used.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ref_od_n_dop_obs_used: Option<u32>,
+    /// SBDB `data_arc` — observed-arc span in days.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ref_od_data_arc_days: Option<u32>,
+    /// SBDB `condition_code` — MPC orbit-uncertainty parameter (0 best, 9 worst).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ref_od_condition_code: Option<u8>,
+    /// SBDB `soln_date` — date the JPL solution was computed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ref_od_soln_date: Option<String>,
+    /// SBDB `pe_used` — planetary ephemeris of the JPL fit (e.g. DE441).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ref_od_pe_used: Option<String>,
+    /// SBDB `sb_used` — small-body perturber set of the JPL fit (e.g. SB441-N16).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ref_od_sb_used: Option<String>,
 
     // ── OD-specific output ──────────────────────────────────────────
     /// Observation count after rejection. Populated when
@@ -299,6 +431,57 @@ pub struct ValidationResult {
     /// 1σ on the fitted A3, √(C₉ₓ₉[8][8]).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub od_a3_sigma: Option<f64>,
+
+    // Populated only on `dt_recovery` rows: the fitted non-grav time
+    // delay DT and its 1σ from the solved covariance's DT slot. `None`
+    // (not 0/NaN) when the fit did not actually solve DT — a missing σ
+    // reads loudly as "DT not recovered".
+    /// Fitted non-grav time delay DT (days).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub od_dt: Option<f64>,
+    /// 1σ on the fitted DT (days), √(C[dt_slot][dt_slot]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub od_dt_sigma: Option<f64>,
+
+    // Populated only on `photometry_recovery` rows: the fitted H/G
+    // parameters ± 1σ (from the 3×3 photometric covariance) plus the
+    // admitted model. `None` when photometry did not run or fit.
+    /// Fitted absolute magnitude H (mag).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub od_h: Option<f64>,
+    /// 1σ on the fitted H (mag).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub od_h_sigma: Option<f64>,
+    /// Fitted first slope parameter (G / G12 / G1 by model).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub od_g1: Option<f64>,
+    /// 1σ on the fitted first slope.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub od_g1_sigma: Option<f64>,
+    /// Fitted second slope parameter (G2 for HG1G2; `None` otherwise).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub od_g2: Option<f64>,
+    /// 1σ on the fitted second slope.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub od_g2_sigma: Option<f64>,
+    /// Photometric model actually fitted (`honly`/`hg`/`hg12`/`hg1g2`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub od_photometry_model: Option<String>,
+    /// Reduced χ² of the photometric fit.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub od_photometry_reduced_chi2: Option<f64>,
+
+    // Populated only on `thrust_recovery` rows: fitted thrust Δv per
+    // segment (m/s, integration-frame components) ± 1σ. Empty when no
+    // thrust was recovered. Scaffolded — no fixture emits these yet.
+    /// Fitted thrust Δv per segment (m/s, integration-frame components).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub od_thrust_dv_m_per_s: Vec<[f64; 3]>,
+    /// Per-component 1σ on the fitted thrust Δv (m/s), same layout as
+    /// [`od_thrust_dv_m_per_s`](Self::od_thrust_dv_m_per_s).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub od_thrust_dv_sigma_m_per_s: Vec<[f64; 3]>,
+
     /// NAIF IDs of perturbers excluded from the force model during this
     /// OD fit. Populated for SB441-N16 self-perturbers (so the body's
     /// own gravity does not act on itself during integration). Empty
@@ -333,6 +516,43 @@ pub struct ValidationResult {
     pub findorb_n_obs_used: Option<u32>,
     /// find_orb observation count rejected.
     pub findorb_n_obs_rejected: Option<u32>,
+    // find_orb propagation + ephemeris reference: find_orb's own FITTED
+    // orbit propagated by find_orb to the plan's epochs (fit-then-propagate
+    // — NOT a replay of the plan's initial conditions like ASSIST/OpenOrb),
+    // via fo's state-vector and observables ephemerides.
+    /// |find_orb − Horizons| in km. Propagation rows. fo's geocentric
+    /// equatorial-J2000 geometric vector converted to SSB with Earth's
+    /// DE440 state at the merge step.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub findorb_vs_horizons_km: Option<f64>,
+    /// |empyrean − find_orb| in km. Propagation rows.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub emp_vs_findorb_km: Option<f64>,
+    /// find_orb angular separation vs Horizons (arcsec). Ephemeris rows.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub findorb_separation_arcsec: Option<f64>,
+    /// find_orb dRA·cos(δ) vs Horizons (arcsec). Ephemeris rows.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub findorb_d_ra_arcsec: Option<f64>,
+    /// find_orb dDec vs Horizons (arcsec). Ephemeris rows.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub findorb_d_dec_arcsec: Option<f64>,
+    /// find_orb range diff vs Horizons (km). Ephemeris rows.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub findorb_d_rho_km: Option<f64>,
+    /// find_orb OD fit wall clock (ms). Per-fit subprocess cost including
+    /// the full astrometry pipeline — NOT comparable to per-row propagation
+    /// times (fo's marginal per-epoch propagation cost is ~0; the ~5-8 s
+    /// invocation toll dominates).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub findorb_time_ms: Option<f64>,
+    /// kete wall clock per row (ms). In-process (Rust core).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kete_time_ms: Option<f64>,
+    /// jorbit wall clock per row (ms). In-process but JAX: dominated by a
+    /// ~1 s per-call JIT/dispatch floor in this per-row replay harness.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub jorbit_time_ms: Option<f64>,
 
     // ── OpenOrb (oorb) external reference ───────────────────────────
     // Propagation + ephemeris reference. Independent Fortran
@@ -378,6 +598,13 @@ pub struct ValidationResult {
     /// OrbFit wall-clock per row (ms).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub orbfit_time_ms: Option<f64>,
+    /// OrbFit per-object failure message (e.g. neofit2.x encounter-
+    /// propagation overflow on an impact-terminated arc). Distinguishes
+    /// "attempted and failed" from "never attempted" (both leave the
+    /// numeric fields `None`); a failed fit must stay visible in the
+    /// merged report, never collapse into a blank.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub orbfit_error: Option<String>,
 
     // ── layup external reference ────────────────────────────────────
     // OD reference. Independent orbit fitter (Smithsonian / CfA; Matthew
@@ -421,6 +648,18 @@ pub struct ValidationResult {
     pub layup_time_ms: Option<f64>,
 
     // ── Metadata ────────────────────────────────────────────────────
+    /// Version of the tool/engine the emitting channel actually exercised,
+    /// carried for provenance so a merged report (and the archived per-channel
+    /// JSONs) records exactly which code produced each row. Each channel stamps
+    /// its OWN version — the rust channel the empyrean-core/villeneuve/scott/
+    /// nolan engine string, the python channel the `empyrean` wheel version, the
+    /// external channels their respective tool versions. `None` where a channel
+    /// has not (yet) been taught to stamp itself (e.g. the core channel). The
+    /// `default` keeps older channel JSONs (and `Value`-based external merges)
+    /// deserializing; `skip_serializing_if` keeps rows that never set it
+    /// byte-identical to the pre-provenance schema.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_version: Option<String>,
     /// ISO 8601 timestamp at row creation.
     pub timestamp: String,
     /// Free-form notes (e.g., known close approaches, IOD pathologies).
@@ -445,10 +684,12 @@ impl ValidationResult {
             observer: None,
             emp_vs_horizons_km: None,
             emp_pos_au: None,
+            emp_pos_cov_au2: None,
             emp_time_ms: None,
             separation_arcsec: None,
             d_ra_arcsec: None,
             d_dec_arcsec: None,
+            emp_radec_cov_arcsec2: None,
             d_rho_km: None,
             d_light_time_s: None,
             ic_pos_au: None,
@@ -468,6 +709,18 @@ impl ValidationResult {
             ref_dec_rad: None,
             ref_rho_au: None,
             ref_light_time_d: None,
+            ref_sun_pos_au: None,
+            ref_sun_vel_au_d: None,
+            ref_od_rms_normalized: None,
+            ref_od_reduced_chi2: None,
+            ref_od_n_obs_used: None,
+            ref_od_n_del_obs_used: None,
+            ref_od_n_dop_obs_used: None,
+            ref_od_data_arc_days: None,
+            ref_od_condition_code: None,
+            ref_od_soln_date: None,
+            ref_od_pe_used: None,
+            ref_od_sb_used: None,
             n_obs_used: None,
             od_iterations: None,
             od_converged: None,
@@ -482,6 +735,18 @@ impl ValidationResult {
             od_a1_sigma: None,
             od_a2_sigma: None,
             od_a3_sigma: None,
+            od_dt: None,
+            od_dt_sigma: None,
+            od_h: None,
+            od_h_sigma: None,
+            od_g1: None,
+            od_g1_sigma: None,
+            od_g2: None,
+            od_g2_sigma: None,
+            od_photometry_model: None,
+            od_photometry_reduced_chi2: None,
+            od_thrust_dv_m_per_s: Vec::new(),
+            od_thrust_dv_sigma_m_per_s: Vec::new(),
             excluded_perturbers_naif: Vec::new(),
             propagation_uncertainty: None,
             assist_vs_horizons_km: None,
@@ -491,6 +756,15 @@ impl ValidationResult {
             findorb_rms_residual: None,
             findorb_n_obs_used: None,
             findorb_n_obs_rejected: None,
+            findorb_vs_horizons_km: None,
+            emp_vs_findorb_km: None,
+            findorb_separation_arcsec: None,
+            findorb_d_ra_arcsec: None,
+            findorb_d_dec_arcsec: None,
+            findorb_d_rho_km: None,
+            findorb_time_ms: None,
+            kete_time_ms: None,
+            jorbit_time_ms: None,
             oorb_vs_horizons_km: None,
             emp_vs_oorb_km: None,
             oorb_time_ms: None,
@@ -502,11 +776,13 @@ impl ValidationResult {
             orbfit_n_obs_used: None,
             orbfit_n_obs_rejected: None,
             orbfit_time_ms: None,
+            orbfit_error: None,
             layup_chi2: None,
             layup_reduced_chi2: None,
             layup_n_obs_used: None,
             layup_converged: None,
             layup_time_ms: None,
+            source_version: None,
             timestamp: String::new(),
             notes: String::new(),
         }
@@ -705,6 +981,52 @@ mod tests {
     use super::*;
 
     #[test]
+    fn every_test_type_is_classified_exactly_once() {
+        // ALL and the propagation/ephemeris + OD-family split must stay in
+        // lockstep. A new test type added to the module but not to ALL is
+        // invisible to every membership check; one added to ALL but to
+        // neither side of the split is a row nothing knows how to count.
+        for tt in test_types::ALL {
+            let od = test_types::ORBIT_DETERMINATION_FAMILY.contains(&tt);
+            let prop_eph = matches!(tt, test_types::PROPAGATION | test_types::EPHEMERIS);
+            assert!(
+                od ^ prop_eph,
+                "{tt} is in neither or both of (propagation/ephemeris) and \
+                 ORBIT_DETERMINATION_FAMILY"
+            );
+        }
+        assert_eq!(
+            test_types::ALL.len(),
+            test_types::ORBIT_DETERMINATION_FAMILY.len() + 2,
+            "a test type is missing from ALL"
+        );
+    }
+
+    #[test]
+    fn makefile_od_test_type_list_matches_the_schema() {
+        // The Makefile's plan assertion runs under a bare python3 on the
+        // external matrix legs — no cargo, no built harness — so it cannot
+        // import ORBIT_DETERMINATION_FAMILY and carries its own copy. Check
+        // the copy instead of trusting it: a test type added here and not
+        // there silently drops out of the assertion that guards the OD axis.
+        let makefile =
+            std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/Makefile")).unwrap();
+        let line = makefile
+            .lines()
+            .find(|l| l.starts_with("OD_TEST_TYPES :="))
+            .expect("Makefile defines OD_TEST_TYPES");
+        let listed: Vec<&str> = line
+            .split_once(":=")
+            .unwrap()
+            .1
+            .trim()
+            .split(',')
+            .map(str::trim)
+            .collect();
+        assert_eq!(listed, test_types::ORBIT_DETERMINATION_FAMILY.to_vec());
+    }
+
+    #[test]
     fn empty_round_trips_through_json() {
         let r = ValidationResult::empty();
         let s = serde_json::to_string(&r).unwrap();
@@ -765,6 +1087,65 @@ mod tests {
         assert!(s.contains("layup_chi2"));
         let r2: ValidationResult = serde_json::from_str(&s).unwrap();
         assert_eq!(r, r2);
+    }
+
+    #[test]
+    fn source_version_round_trips_and_omits_when_none() {
+        // Provenance field contract, three ways:
+        //   1. None is omitted entirely (skip_serializing_if), so rows that
+        //      never stamp it stay byte-identical to the pre-provenance schema.
+        //   2. A stamped value survives a serialize -> deserialize round trip.
+        //   3. An "old" JSON written before this field existed (no
+        //      `source_version` key at all) deserializes cleanly to None via
+        //      serde default, even under deny_unknown_fields — this is what
+        //      keeps historical channel JSONs and the core channel (which does
+        //      not yet stamp) loading through the same `validate report` path.
+        let none = ValidationResult::empty();
+        let s_none = serde_json::to_string(&none).unwrap();
+        assert!(
+            !s_none.contains("source_version"),
+            "source_version must be omitted when None",
+        );
+
+        let mut r = ValidationResult::empty();
+        r.channel = "rust".into();
+        r.source_version =
+            Some("empyrean-core 0.9.0\nvilleneuve 1.20.2\nscott 1.15.0\nnolan 0.9.2".into());
+        let s = serde_json::to_string(&r).unwrap();
+        assert!(s.contains("source_version"));
+        let r2: ValidationResult = serde_json::from_str(&s).unwrap();
+        assert_eq!(r, r2);
+        assert_eq!(r2.source_version, r.source_version);
+
+        // An old JSON with the full known field set but NO source_version key.
+        let old = r#"{
+            "object": "Apophis", "population": "NEO",
+            "epoch_mjd_tdb": 0.0, "dt_days": 0.0, "t_mjd_tdb": 0.0,
+            "force_model": "standard", "test_type": "propagation",
+            "channel": "core", "observer": null,
+            "emp_vs_horizons_km": null, "emp_pos_au": null, "emp_time_ms": null,
+            "separation_arcsec": null, "d_ra_arcsec": null, "d_dec_arcsec": null,
+            "d_rho_km": null, "d_light_time_s": null,
+            "ic_pos_au": null, "ic_vel_au_d": null,
+            "ic_a1": null, "ic_a2": null, "ic_a3": null,
+            "ic_g_alpha": null, "ic_g_r0": null, "ic_g_m": null,
+            "ic_g_n": null, "ic_g_k": null,
+            "ref_pos_au": null, "ref_vel_au_d": null,
+            "ref_ra_rad": null, "ref_dec_rad": null,
+            "ref_rho_au": null, "ref_light_time_d": null,
+            "n_obs_used": null, "od_iterations": null, "od_converged": null,
+            "od_rms_ra_arcsec": null, "od_rms_dec_arcsec": null,
+            "od_rms_combined_arcsec": null,
+            "od_chi2": null, "od_reduced_chi2": null,
+            "assist_vs_horizons_km": null, "emp_vs_assist_km": null,
+            "assist_time_ms": null, "speed_ratio": null,
+            "findorb_rms_residual": null, "findorb_n_obs_used": null,
+            "findorb_n_obs_rejected": null,
+            "timestamp": "", "notes": ""
+        }"#;
+        let loaded: ValidationResult =
+            serde_json::from_str(old).expect("old JSON without source_version must load");
+        assert_eq!(loaded.source_version, None);
     }
 
     #[test]

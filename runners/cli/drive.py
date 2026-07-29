@@ -21,11 +21,31 @@ import math
 import subprocess
 import sys
 from datetime import datetime, timezone
+from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
 
 
 _TIER_TO_INT = {"approximate": 0, "basic": 1, "standard": 2}
 _AU_KM = 149_597_870.700
+
+
+def _driver_source_version() -> str:
+    """Provenance string stamped on every cli-channel row.
+
+    The CLI runner is a separate binary (empyrean-cli-runner) and exposes no
+    version command over its daemon protocol, so this driver reports the
+    version of the ``empyrean`` distribution installed in its own environment
+    — labelled ``(driver-reported)`` because it is the driver's view, which
+    may differ from the binary's linked engine if they were built separately.
+    No-hidden-fallbacks: an unresolved version stamps an explicit
+    ``unknown (<reason>)`` rather than a silent blank.
+    """
+    try:
+        return f"empyrean {version('empyrean')} (driver-reported)"
+    except PackageNotFoundError:
+        return "empyrean unknown (empyrean distribution not found)"
+    except Exception as e:  # noqa: BLE001
+        return f"empyrean unknown ({e})"
 
 
 def _ic_line(r):
@@ -147,8 +167,10 @@ def main() -> int:
     )
 
     timestamp = datetime.now(timezone.utc).isoformat()
+    source_version = _driver_source_version()
     out_rows = []
     n_skipped = 0
+    n_missing_fixture = 0
 
     for r in rust_rows:
         tt = r.get("test_type")
@@ -182,6 +204,7 @@ def main() -> int:
             new = dict(r)
             new["channel"] = "cli"
             new["timestamp"] = timestamp
+            new["source_version"] = source_version
             new["emp_pos_au"] = [x, y, z]
             new["emp_time_ms"] = ms
             ref = r.get("ref_pos_au")
@@ -215,6 +238,7 @@ def main() -> int:
             new = dict(r)
             new["channel"] = "cli"
             new["timestamp"] = timestamp
+            new["source_version"] = source_version
             new["emp_time_ms"] = ms
             ref_ra = r.get("ref_ra_rad")
             ref_dec = r.get("ref_dec_rad")
@@ -249,6 +273,18 @@ def main() -> int:
             # fixture with the slash rewritten to "_".
             psv = args.fixtures_dir / f"{r['object'].replace('/', '_')}.psv"
             if not psv.exists():
+                # Loudly, and fatally at the end — same seam as the C
+                # driver. A silent `continue` deleted the OD row from this
+                # channel's output while the run still exited 0, so a channel
+                # that fitted nothing looked like one that fitted everything.
+                # The fixtures are fetched + hash-verified by `make fixtures`
+                # (fixtures/README.md); a missing one here means something
+                # bypassed that gate, never a normal condition.
+                print(
+                    f"  {r['object']} OD FAIL: no PSV fixture at {psv}",
+                    file=sys.stderr,
+                )
+                n_missing_fixture += 1
                 n_skipped += 1
                 continue
             tier = _TIER_TO_INT.get(r["force_model"])
@@ -279,6 +315,7 @@ def main() -> int:
             new = dict(r)
             new["channel"] = "cli"
             new["timestamp"] = timestamp
+            new["source_version"] = source_version
             new["emp_pos_au"] = [x, y, z]
             new["emp_time_ms"] = ms
             new["od_iterations"] = iters
@@ -305,6 +342,7 @@ def main() -> int:
                 ng = dict(r)
                 ng["channel"] = "cli"
                 ng["timestamp"] = timestamp
+                ng["source_version"] = source_version
                 ng["test_type"] = "non_grav_recovery"
                 # Position + rms of the NON-GRAV fit, not the optical-only one.
                 ng["emp_pos_au"] = [ng_px, ng_py, ng_pz]
@@ -337,6 +375,18 @@ def main() -> int:
         f"Wrote {len(out_rows)} cli rows to {args.output} (skipped {n_skipped})",
         file=sys.stderr,
     )
+    if n_missing_fixture:
+        print(
+            f"ERROR: {n_missing_fixture} OD row(s) had no PSV fixture under "
+            f"{args.fixtures_dir}.\n"
+            "       The fixtures come from the GCS snapshot pinned by "
+            "fixtures/manifest.json;\n"
+            "       `make fixtures` fetches + verifies them. Those OD rows are "
+            "missing from this "
+            "channel's output entirely.",
+            file=sys.stderr,
+        )
+        return 1
     return 0
 
 

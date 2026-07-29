@@ -366,6 +366,24 @@ def main() -> int:
 
     orbitfit_bin = _orbitfit_binary()
     psv_files = sorted(args.psv_dir.glob("*.psv"))
+    if not psv_files:
+        # Without this, an empty fixture directory produced `[]` and exit 0:
+        # reduce folded the file in because it EXISTED, and the report showed
+        # a layup comparison that had compared nothing. The Makefile's
+        # `$(LAYUP_OUT): | fixtures` prereq covers the `make` path, but
+        # runners/README.md documents invoking this script directly, which
+        # bypasses it — and since the fixtures left git, "directory present,
+        # zero .psv" is the DEFAULT state of a fresh checkout rather than an
+        # anomaly. A comparator with nothing to compare is a failure with a
+        # cause, and the cause is named here (mirrors run_findorb.py).
+        print(
+            f"ERROR: no PSV files found in {args.psv_dir}\n"
+            "       layup had nothing to fit. The fixtures come from the GCS "
+            "snapshot pinned by fixtures/manifest.json;\n"
+            "       `make fixtures` fetches + verifies them.",
+            file=sys.stderr,
+        )
+        return 1
 
     only = None
     if args.only:
@@ -373,6 +391,15 @@ def main() -> int:
 
     timestamp = datetime.now(timezone.utc).isoformat()
     version = _layup_version(orbitfit_bin) if orbitfit_bin else None
+    # Provenance stamped on every record. Reuse the version already resolved
+    # from the layup venv above (the same interpreter this runs under).
+    # No-hidden-fallbacks: an unresolved version stamps an explicit
+    # "unknown (<reason>)" rather than a silent blank.
+    source_version = (
+        f"layup {version}"
+        if version
+        else "layup unknown (layup-orbitfit version not resolved)"
+    )
 
     records: list[dict] = []
     if not _HAVE_PANDAS or orbitfit_bin is None:
@@ -411,6 +438,7 @@ def main() -> int:
             "object": obj_name,
             "test_type": "orbit_determination",
             "timestamp": timestamp,
+            "source_version": source_version,
             "layup_version": version,
             # Provenance for the χ² interpretation: which weighting produced csq.
             "layup_weighting": ("veres2017" if args.weight_data else "flat_default")

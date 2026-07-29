@@ -63,6 +63,12 @@ pub fn run_propagation_validation(
 ) -> Vec<ValidationResult> {
     let timestamp = chrono::Utc::now().to_rfc3339();
     let channel = "rust".to_string();
+    // Provenance: the exact empyrean engine (empyrean-core / villeneuve /
+    // scott / nolan) this channel exercises. Stamped on every row so the
+    // merged report records which code produced the numbers. `None` only if
+    // the version FFI fails — same accessor the CapturedOrbit sidecar uses,
+    // so a row and its sidecar always agree.
+    let engine_version = empyrean::version_string().ok();
 
     eprintln!("Fetching initial conditions...");
 
@@ -84,11 +90,10 @@ pub fn run_propagation_validation(
         ng_dt: Option<f64>,
         dt_list: &'static [f64],
         horizons_vectors: HashMap<i64, ([f64; 3], [f64; 3])>,
-        horizons_ephemeris: HashMap<i64, EphemerisEntry>,
+        horizons_ephemeris: HashMap<(&'static str, i64), EphemerisEntry>,
     }
 
     let obs_codes = empyrean_validation::catalog::OBSERVER_CODES;
-    let obs_code = obs_codes[0];
     let mut obj_data: Vec<ObjData> = Vec::new();
 
     for obj in objs {
@@ -171,23 +176,34 @@ pub fn run_propagation_validation(
             }
         }
 
-        let mut horizons_ephemeris: HashMap<i64, EphemerisEntry> = HashMap::new();
-        for &dt in dt_list {
-            let target = epoch + dt;
-            match empyrean::query_horizons(
-                &[obj.horizons_command],
-                obs_code,
-                &[target],
-                Some(horizons_cache_dir),
-            ) {
-                Ok(r) if !r.is_empty() => {
-                    horizons_ephemeris.insert(dt as i64, r.into_iter().next().unwrap());
-                }
-                Ok(_) => {
-                    eprintln!("  {}: dt={dt:+.0}d ephemeris SKIP (empty)", obj.name);
-                }
-                Err(e) => {
-                    eprintln!("  {}: dt={dt:+.0}d ephemeris SKIP ({e})", obj.name);
+        // Ephemeris (RA/Dec) is observer-dependent — fetch from every site so
+        // the report can average the sky-plane separation over the sites.
+        let mut horizons_ephemeris: HashMap<(&'static str, i64), EphemerisEntry> = HashMap::new();
+        for &obs_code in obs_codes {
+            for &dt in dt_list {
+                let target = epoch + dt;
+                match empyrean::query_horizons(
+                    &[obj.horizons_command],
+                    obs_code,
+                    &[target],
+                    Some(horizons_cache_dir),
+                ) {
+                    Ok(r) if !r.is_empty() => {
+                        horizons_ephemeris
+                            .insert((obs_code, dt as i64), r.into_iter().next().unwrap());
+                    }
+                    Ok(_) => {
+                        eprintln!(
+                            "  {}: {obs_code} dt={dt:+.0}d ephemeris SKIP (empty)",
+                            obj.name
+                        );
+                    }
+                    Err(e) => {
+                        eprintln!(
+                            "  {}: {obs_code} dt={dt:+.0}d ephemeris SKIP ({e})",
+                            obj.name
+                        );
+                    }
                 }
             }
         }
@@ -260,6 +276,9 @@ pub fn run_propagation_validation(
         tag: &'static str,
         attach: bool,
         method: UncertaintyMethod,
+        /// Timing repetitions (best-of-N). The sampling methods cost
+        /// ~100-120 propagations per call, so they measure once.
+        timing_runs: usize,
     }
     let modes: Vec<UncertaintyAxis> = if config.attach_covariance {
         vec![
@@ -267,21 +286,41 @@ pub fn run_propagation_validation(
                 tag: "first_order_with_cov",
                 attach: true,
                 method: UncertaintyMethod::FirstOrder,
+                timing_runs: 0,
             },
             UncertaintyAxis {
                 tag: "f64_no_cov",
                 attach: false,
                 method: UncertaintyMethod::FirstOrder,
+                timing_runs: 0,
             },
             UncertaintyAxis {
                 tag: "second_order_with_cov",
                 attach: true,
                 method: UncertaintyMethod::SecondOrder,
+                timing_runs: 0,
             },
             UncertaintyAxis {
                 tag: "auto",
                 attach: true,
                 method: UncertaintyMethod::auto(),
+                timing_runs: 0,
+            },
+            // The full uncertainty ladder, for the report's performance
+            // strip: sigma-point (120 samples at the wrapper defaults) and
+            // seeded Monte Carlo with 100 samples. Sampling methods cost
+            // ~100-120 propagations per call — timing_runs = 1.
+            UncertaintyAxis {
+                tag: "sigma_point_with_cov",
+                attach: true,
+                method: UncertaintyMethod::sigma_point(),
+                timing_runs: 1,
+            },
+            UncertaintyAxis {
+                tag: "monte_carlo_100_with_cov",
+                attach: true,
+                method: UncertaintyMethod::monte_carlo(100),
+                timing_runs: 1,
             },
         ]
     } else {
@@ -289,6 +328,7 @@ pub fn run_propagation_validation(
             tag: "f64_no_cov",
             attach: false,
             method: UncertaintyMethod::FirstOrder,
+            timing_runs: 0,
         }]
     };
 
@@ -369,10 +409,16 @@ pub fn run_propagation_validation(
                         };
 
                         let mut emp_times = Vec::new();
+                        let mut emp_pos_cov: Option<[[f64; 3]; 3]> = None;
                         let mut emp_state: Option<[f64; 3]> = None;
                         let mut failed = false;
 
-                        for _ in 0..config.n_timing_runs {
+                        let runs = if axis.timing_runs > 0 {
+                            axis.timing_runs
+                        } else {
+                            config.n_timing_runs
+                        };
+                        for _ in 0..runs {
                             let t0 = Instant::now();
                             match ctx.propagate(&[orbit.clone()], &[target], &prop_config) {
                                 Ok(result) => {
@@ -380,6 +426,16 @@ pub fn run_propagation_validation(
                                     emp_times.push(ms);
                                     if !result.states.is_empty() {
                                         emp_state = Some(result.states[0].position);
+                                        // Propagated position 3×3 covariance (AU²) — present only
+                                        // when a covariance was propagated (first_order_with_cov).
+                                        emp_pos_cov = result.covariance_at_cartesian(0, 0).ok().map(|tc| {
+                                            let m = tc.matrix;
+                                            [
+                                                [m[0][0], m[0][1], m[0][2]],
+                                                [m[1][0], m[1][1], m[1][2]],
+                                                [m[2][0], m[2][1], m[2][2]],
+                                            ]
+                                        });
                                     } else {
                                         eprintln!(
                                             "  {} {tier_str} dt={dt:+.0}d {} empyrean Ok but states.len()=0 (likely AGM mixture-only return; skipping row)",
@@ -425,10 +481,12 @@ pub fn run_propagation_validation(
                             observer: None,
                             emp_vs_horizons_km: Some(emp_vs_hor),
                             emp_pos_au: Some(emp_pos),
+                            emp_pos_cov_au2: emp_pos_cov,
                             emp_time_ms: Some(emp_ms),
                             separation_arcsec: None,
                             d_ra_arcsec: None,
                             d_dec_arcsec: None,
+                            emp_radec_cov_arcsec2: None,
                             d_rho_km: None,
                             d_light_time_s: None,
                             ic_pos_au: Some(data.ic_pos),
@@ -448,6 +506,18 @@ pub fn run_propagation_validation(
                             ref_dec_rad: None,
                             ref_rho_au: None,
                             ref_light_time_d: None,
+                            ref_sun_pos_au: None,
+                            ref_sun_vel_au_d: None,
+                            ref_od_rms_normalized: None,
+                            ref_od_reduced_chi2: None,
+                            ref_od_n_obs_used: None,
+                            ref_od_n_del_obs_used: None,
+                            ref_od_n_dop_obs_used: None,
+                            ref_od_data_arc_days: None,
+                            ref_od_condition_code: None,
+                            ref_od_soln_date: None,
+                            ref_od_pe_used: None,
+                            ref_od_sb_used: None,
                             n_obs_used: None,
                             od_iterations: None,
                             od_converged: None,
@@ -462,6 +532,18 @@ pub fn run_propagation_validation(
                             od_a1_sigma: None,
                             od_a2_sigma: None,
                             od_a3_sigma: None,
+                            od_dt: None,
+                            od_dt_sigma: None,
+                            od_h: None,
+                            od_h_sigma: None,
+                            od_g1: None,
+                            od_g1_sigma: None,
+                            od_g2: None,
+                            od_g2_sigma: None,
+                            od_photometry_model: None,
+                            od_photometry_reduced_chi2: None,
+                            od_thrust_dv_m_per_s: Vec::new(),
+                            od_thrust_dv_sigma_m_per_s: Vec::new(),
                             excluded_perturbers_naif: Vec::new(),
                             propagation_uncertainty: Some(uncertainty_tag.to_string()),
                             assist_vs_horizons_km: None,
@@ -471,6 +553,15 @@ pub fn run_propagation_validation(
                             findorb_rms_residual: None,
                             findorb_n_obs_used: None,
                             findorb_n_obs_rejected: None,
+                            findorb_vs_horizons_km: None,
+                            emp_vs_findorb_km: None,
+                            findorb_separation_arcsec: None,
+                            findorb_d_ra_arcsec: None,
+                            findorb_d_dec_arcsec: None,
+                            findorb_d_rho_km: None,
+                            findorb_time_ms: None,
+                            kete_time_ms: None,
+                            jorbit_time_ms: None,
                             // External-reference fields populated by merge-external:
                             // OpenOrb (prop + ephemeris) and OrbFit (OD).
                             oorb_vs_horizons_km: None,
@@ -484,20 +575,30 @@ pub fn run_propagation_validation(
                             orbfit_n_obs_used: None,
                             orbfit_n_obs_rejected: None,
                             orbfit_time_ms: None,
+                            orbfit_error: None,
                             layup_chi2: None,
                             layup_reduced_chi2: None,
                             layup_n_obs_used: None,
                             layup_converged: None,
                             layup_time_ms: None,
+                            source_version: engine_version.clone(),
                             timestamp: timestamp.clone(),
                             notes: data.notes.clone(),
                         });
                     }
                 }
 
-                // Ephemeris tests (Standard tier)
+                // Ephemeris tests (Standard tier) — one row per observing site.
+                // Only for the two plan modes (first_order / f64): the
+                // timing-ladder modes (Jet2 / auto / sigma-point / MC) have no
+                // ephemeris plan rows to compare against, and the sampling
+                // methods would pay ~100 propagations per site for nothing.
+                if !matches!(axis.tag, "first_order_with_cov" | "f64_no_cov") {
+                    continue;
+                }
+                for &obs_code in obs_codes {
                 for &dt in data.dt_list {
-                    let Some(hor) = data.horizons_ephemeris.get(&(dt as i64)) else {
+                    let Some(hor) = data.horizons_ephemeris.get(&(obs_code, dt as i64)) else {
                         continue;
                     };
                     // Reference entries carry degrees over the wrapper
@@ -549,6 +650,44 @@ pub fn run_propagation_validation(
                             let d_ra_arcsec = d_ra.to_degrees() * 3600.0;
                             let d_dec_arcsec = d_dec.to_degrees() * 3600.0;
 
+                            // Sky-plane 2×2 covariance (arcsec², RA·cosδ) = the input
+                            // covariance mapped through the ephemeris Jacobian. Rows 0,1
+                            // of the [6][n_params] Jacobian are ∂RA,∂Dec (deg per input
+                            // unit); project only the 6 state columns (C_in is the 6×6
+                            // state covariance), scale RA by cosδ, convert deg→arcsec.
+                            let emp_radec_cov: Option<[[f64; 2]; 2]> =
+                                match (&covariance, eph.sensitivity.first()) {
+                                    (Some(cin), Some(sens))
+                                        if sens.jacobian.len() >= 2 * (sens.n_params as usize) =>
+                                    {
+                                        let np = sens.n_params as usize;
+                                        let hra = &sens.jacobian[0..np];
+                                        let hdec = &sens.jacobian[np..2 * np];
+                                        let quad = |ha: &[f64], hb: &[f64]| {
+                                            let mut s = 0.0;
+                                            for i in 0..6 {
+                                                for j in 0..6 {
+                                                    s += ha[i] * cin[i][j] * hb[j];
+                                                }
+                                            }
+                                            s
+                                        };
+                                        let cosd = emp_dec_rad.cos();
+                                        let a2 = 3600.0_f64 * 3600.0;
+                                        Some([
+                                            [
+                                                quad(hra, hra) * cosd * cosd * a2,
+                                                quad(hra, hdec) * cosd * a2,
+                                            ],
+                                            [
+                                                quad(hra, hdec) * cosd * a2,
+                                                quad(hdec, hdec) * a2,
+                                            ],
+                                        ])
+                                    }
+                                    _ => None,
+                                };
+
                             let d_rho_km = Some((entry.rho_au - hor.rho_au) * compare::AU_KM);
                             let d_lt_s = if entry.light_time_days.is_finite() {
                                 hor_light_time_d
@@ -574,10 +713,12 @@ pub fn run_propagation_validation(
                                 observer: Some(obs_code.to_string()),
                                 emp_vs_horizons_km: None,
                                 emp_pos_au: None,
+                                emp_pos_cov_au2: None,
                                 emp_time_ms: None,
                                 separation_arcsec: Some(sep),
                                 d_ra_arcsec: Some(d_ra_arcsec),
                                 d_dec_arcsec: Some(d_dec_arcsec),
+                                emp_radec_cov_arcsec2: emp_radec_cov,
                                 d_rho_km,
                                 d_light_time_s: d_lt_s,
                                 ic_pos_au: Some(data.ic_pos),
@@ -597,6 +738,18 @@ pub fn run_propagation_validation(
                                 ref_dec_rad: Some(hor_dec_rad),
                                 ref_rho_au: Some(hor.rho_au),
                                 ref_light_time_d: hor_light_time_d,
+                                ref_sun_pos_au: None,
+                                ref_sun_vel_au_d: None,
+                                ref_od_rms_normalized: None,
+                                ref_od_reduced_chi2: None,
+                                ref_od_n_obs_used: None,
+                                ref_od_n_del_obs_used: None,
+                                ref_od_n_dop_obs_used: None,
+                                ref_od_data_arc_days: None,
+                                ref_od_condition_code: None,
+                                ref_od_soln_date: None,
+                                ref_od_pe_used: None,
+                                ref_od_sb_used: None,
                                 n_obs_used: None,
                                 od_iterations: None,
                                 od_converged: None,
@@ -611,6 +764,18 @@ pub fn run_propagation_validation(
                                 od_a1_sigma: None,
                                 od_a2_sigma: None,
                                 od_a3_sigma: None,
+                                od_dt: None,
+                                od_dt_sigma: None,
+                                od_h: None,
+                                od_h_sigma: None,
+                                od_g1: None,
+                                od_g1_sigma: None,
+                                od_g2: None,
+                                od_g2_sigma: None,
+                                od_photometry_model: None,
+                                od_photometry_reduced_chi2: None,
+                                od_thrust_dv_m_per_s: Vec::new(),
+                                od_thrust_dv_sigma_m_per_s: Vec::new(),
                                 excluded_perturbers_naif: Vec::new(),
                                 propagation_uncertainty: Some(uncertainty_tag.to_string()),
                                 assist_vs_horizons_km: None,
@@ -620,6 +785,15 @@ pub fn run_propagation_validation(
                                 findorb_rms_residual: None,
                                 findorb_n_obs_used: None,
                                 findorb_n_obs_rejected: None,
+                                findorb_vs_horizons_km: None,
+                                emp_vs_findorb_km: None,
+                                findorb_separation_arcsec: None,
+                                findorb_d_ra_arcsec: None,
+                                findorb_d_dec_arcsec: None,
+                                findorb_d_rho_km: None,
+                                findorb_time_ms: None,
+                                kete_time_ms: None,
+                                jorbit_time_ms: None,
                                 oorb_vs_horizons_km: None,
                                 emp_vs_oorb_km: None,
                                 oorb_time_ms: None,
@@ -631,11 +805,13 @@ pub fn run_propagation_validation(
                                 orbfit_n_obs_used: None,
                                 orbfit_n_obs_rejected: None,
                                 orbfit_time_ms: None,
+                            orbfit_error: None,
                                 layup_chi2: None,
                                 layup_reduced_chi2: None,
                                 layup_n_obs_used: None,
                                 layup_converged: None,
                                 layup_time_ms: None,
+                                source_version: engine_version.clone(),
                                 timestamp: timestamp.clone(),
                                 notes: data.notes.clone(),
                             });
@@ -645,6 +821,7 @@ pub fn run_propagation_validation(
                         }
                     }
                 }
+                } // end for &obs_code (observing sites)
                 } // end for &attach
 
                 results
@@ -669,6 +846,322 @@ pub struct OdValidationOutput {
     /// Bidirectional comparisons: per (empyrean_od, reference) pair, one
     /// comparison at the fit epoch and one at the reference epoch.
     pub orbit_comparisons: Vec<OrbitComparison>,
+}
+
+/// Build an OD **failure row**: a `ValidationResult` that records *why* no fit
+/// was produced, in the same row stream a successful fit would have joined.
+///
+/// The `determine()` error path already emitted one of these (empyrean-8l28);
+/// this lifts that pattern out so every way an OD can fail to produce a number
+/// goes through it. A fixture that is missing, unreadable, unparseable, or
+/// empty is a validation *failure*, not an absence — the project rule is "no
+/// hidden fallbacks in scientific code: never silently substitute defaults,
+/// drop observations, or degrade quality; every mismatch must surface loudly."
+///
+/// The distinction is not cosmetic. A row carrying `od_converged: false` and
+/// the reason in `notes` reaches the report and the row counts; a row that was
+/// never emitted is indistinguishable downstream from "this object was never
+/// part of the run". That is precisely how the OD channel stayed dead in CI
+/// for the life of this repo: fifty missing fixtures produced fifty `eprintln`
+/// lines nobody reads and an empty JSON array that every consumer treated as
+/// "nothing to do". Fifty failure rows in the report would have said it out
+/// loud on the first run.
+///
+/// Callers fill in whatever they know (`n_obs_used`, `emp_time_ms`,
+/// `od_iterations`); everything else stays `None`, which reads as "not
+/// measured" rather than a fabricated zero.
+fn od_failure_row(
+    obj: &ValidationObject,
+    test_type: &str,
+    channel: &str,
+    tier_str: &str,
+    excluded_naif: &[i32],
+    engine_version: Option<String>,
+    note: String,
+) -> ValidationResult {
+    let mut row = ValidationResult::empty();
+    row.object = obj.name.to_string();
+    row.population = obj.population.to_string();
+    row.test_type = test_type.to_string();
+    row.channel = channel.to_string();
+    row.force_model = tier_str.to_string();
+    row.od_converged = Some(false);
+    row.excluded_perturbers_naif = excluded_naif.to_vec();
+    row.source_version = engine_version;
+    row.timestamp = chrono::Utc::now().to_rfc3339();
+    row.notes = note;
+    row
+}
+
+/// Second OD pass: **optical + radar**, for the objects that have a
+/// radar-augmented fixture in `fixtures/psv-radar/`.
+///
+/// Reads the same optical arc plus the ADES `<radar>` delay/Doppler table and
+/// runs a second `determine` with the same `od_config`, emitting an
+/// `orbit_determination_radar` row so the report and the find_orb merge
+/// cross-check the radar-tightened orbit exactly as they do the optical-only
+/// fit.
+///
+/// **Independent of the optical fixture by construction.** This used to be
+/// nested inside the optical fit's success path, so the five tracked radar
+/// fixtures — the only OD fixtures that were ever committed to this repo —
+/// could not run at all while `fixtures/psv/` was absent: the optical branch
+/// returned first. find_orb still spent CI time on its radar pass, merging
+/// onto rows that could not exist. Reachability is the whole point of pulling
+/// it out here.
+///
+/// Objects with no radar fixture (45 of 50) return no rows — that is an
+/// absence, not a failure. Every other outcome is a row: a fixture present but
+/// unreadable, unparseable, carrying no radar records, or failing to converge
+/// is a failure with a reason, never a log line.
+#[allow(clippy::too_many_arguments)]
+fn run_radar_od(
+    ctx: &Context,
+    obj: &ValidationObject,
+    fixtures_dir: &std::path::Path,
+    od_config: &ODConfig,
+    channel: &str,
+    tier_str: &str,
+    engine_version: Option<String>,
+    timestamp: &str,
+) -> Vec<ValidationResult> {
+    let mut results: Vec<ValidationResult> = Vec::new();
+    let excluded_naif_r: Vec<i32> = od_config
+        .excluded_perturbers
+        .iter()
+        .copied()
+        .map(Origin::naif_id)
+        .collect();
+    let radar_failure = |note: String| -> ValidationResult {
+        od_failure_row(
+            obj,
+            empyrean_validation::schema::test_types::ORBIT_DETERMINATION_RADAR,
+            channel,
+            tier_str,
+            &excluded_naif_r,
+            engine_version.clone(),
+            note,
+        )
+    };
+
+    let Some(radar_psv) = fixtures_dir
+        .parent()
+        .map(|p| p.join("psv-radar"))
+        .into_iter()
+        .flat_map(|d| {
+            [
+                d.join(format!("{}.psv", obj.name)),
+                d.join(format!("{}.psv", obj.name.replace('/', "_"))),
+                d.join(format!("{}.psv", obj.mpc_designation)),
+            ]
+        })
+        .find(|p| p.exists())
+    else {
+        // No radar fixture for this object — the normal case for the bulk of
+        // the catalog. Nothing to report.
+        return results;
+    };
+
+    let psv_r = match std::fs::read_to_string(&radar_psv) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!(
+                "  {}: radar FAIL (read PSV: {e}) — emitting failure row",
+                obj.name
+            );
+            results.push(radar_failure(format!(
+                "read radar PSV {}: {e}",
+                radar_psv.display()
+            )));
+            return results;
+        }
+    };
+    let obs_r = match ctx.read_ades(&psv_r) {
+        Ok(o) => o,
+        Err(e) => {
+            eprintln!(
+                "  {}: radar FAIL (parse PSV: {e}) — emitting failure row",
+                obj.name
+            );
+            results.push(radar_failure(format!(
+                "parse radar PSV {}: {e}",
+                radar_psv.display()
+            )));
+            return results;
+        }
+    };
+    if obs_r.radar_len() == 0 {
+        eprintln!(
+            "  {}: radar FAIL (fixture carries zero radar records) — emitting failure row",
+            obj.name
+        );
+        let mut row = radar_failure(format!(
+            "radar PSV {} parsed to {} observations but zero <radar> records",
+            radar_psv.display(),
+            obs_r.len()
+        ));
+        row.n_obs_used = Some(obs_r.len() as u32);
+        results.push(row);
+        return results;
+    }
+
+    eprintln!(
+        "  {}: + radar OD ({} obs incl {} radar)...",
+        obj.name,
+        obs_r.len(),
+        obs_r.radar_len()
+    );
+    let t0r = std::time::Instant::now();
+    let dr = match ctx.determine(&obs_r, None, od_config) {
+        Ok(dr) => dr,
+        Err(e) => {
+            let ms_fail = t0r.elapsed().as_secs_f64() * 1000.0;
+            eprintln!("  {}: radar OD FAIL ({e}) — emitting failure row", obj.name);
+            let mut row = radar_failure(format!("radar determine FAIL: {e}"));
+            // `n_obs_used` and `od_iterations` are left EMPTY, not filled with
+            // stand-ins. The fit failed, so it used no observations and ran an
+            // unknown number of iterations; the only honest value is "no
+            // value".
+            //
+            // What used to be here: `n_obs_used = obs_r.len()` (the fixture's
+            // observation count, never a fitted selection) and
+            // `od_iterations = od_config.max_iterations` (the CAP, echoed back
+            // as though the solver had reached it). Both read as measurements
+            // in the results JSON and in the report, and both are fiction.
+            // Measured cost of that: Bennu's radar row reported "100
+            // iterations, 603 observations" for a solve that stopped at 27
+            // iterations on damping exhaustion having selected nothing — which
+            // is a completely different failure, with a completely different
+            // fix, from the "hit the iteration cap on a 603-observation arc"
+            // the row described. The real cause is in `error`, which carries
+            // the solver's own stop reason; nothing needs to be invented
+            // alongside it.
+            row.emp_time_ms = Some(ms_fail);
+            results.push(row);
+            return results;
+        }
+    };
+    let ms_r = t0r.elapsed().as_secs_f64() * 1000.0;
+    let orbit_r = dr.state();
+    eprintln!(
+        "    radar: converged={} rms_combined={:.4} ({:.0}ms)",
+        dr.converged, dr.summary.rms_combined_arcsec, ms_r
+    );
+    results.push(ValidationResult {
+        object: obj.name.to_string(),
+        population: obj.population.to_string(),
+        epoch_mjd_tdb: orbit_r.epoch.mjd_tdb().unwrap_or(f64::NAN),
+        dt_days: 0.0,
+        t_mjd_tdb: orbit_r.epoch.mjd_tdb().unwrap_or(f64::NAN),
+        force_model: tier_str.to_string(),
+        test_type: empyrean_validation::schema::test_types::ORBIT_DETERMINATION_RADAR.to_string(),
+        channel: channel.to_string(),
+        observer: None,
+        emp_vs_horizons_km: None,
+        emp_pos_au: Some(orbit_r.position),
+        emp_pos_cov_au2: None,
+        emp_time_ms: Some(ms_r),
+        separation_arcsec: None,
+        d_ra_arcsec: None,
+        d_dec_arcsec: None,
+        emp_radec_cov_arcsec2: None,
+        d_rho_km: None,
+        d_light_time_s: None,
+        ic_pos_au: None,
+        ic_vel_au_d: None,
+        ic_a1: None,
+        ic_a2: None,
+        ic_a3: None,
+        ic_g_alpha: None,
+        ic_g_r0: None,
+        ic_g_m: None,
+        ic_g_n: None,
+        ic_g_k: None,
+        ic_non_grav_dt: None,
+        ref_pos_au: None,
+        ref_vel_au_d: None,
+        ref_ra_rad: None,
+        ref_dec_rad: None,
+        ref_rho_au: None,
+        ref_light_time_d: None,
+        ref_sun_pos_au: None,
+        ref_sun_vel_au_d: None,
+        ref_od_rms_normalized: None,
+        ref_od_reduced_chi2: None,
+        ref_od_n_obs_used: None,
+        ref_od_n_del_obs_used: None,
+        ref_od_n_dop_obs_used: None,
+        ref_od_data_arc_days: None,
+        ref_od_condition_code: None,
+        ref_od_soln_date: None,
+        ref_od_pe_used: None,
+        ref_od_sb_used: None,
+        n_obs_used: Some(dr.summary.num_selected as u32),
+        od_iterations: Some(dr.iterations),
+        od_converged: Some(dr.converged),
+        od_rms_ra_arcsec: Some(dr.summary.rms_ra_arcsec),
+        od_rms_dec_arcsec: Some(dr.summary.rms_dec_arcsec),
+        od_rms_combined_arcsec: Some(dr.summary.rms_combined_arcsec),
+        od_chi2: Some(dr.summary.chi2),
+        od_reduced_chi2: Some(dr.summary.reduced_chi2),
+        od_a1: None,
+        od_a2: None,
+        od_a3: None,
+        od_a1_sigma: None,
+        od_a2_sigma: None,
+        od_a3_sigma: None,
+        od_dt: None,
+        od_dt_sigma: None,
+        od_h: None,
+        od_h_sigma: None,
+        od_g1: None,
+        od_g1_sigma: None,
+        od_g2: None,
+        od_g2_sigma: None,
+        od_photometry_model: None,
+        od_photometry_reduced_chi2: None,
+        od_thrust_dv_m_per_s: Vec::new(),
+        od_thrust_dv_sigma_m_per_s: Vec::new(),
+        excluded_perturbers_naif: excluded_naif_r,
+        propagation_uncertainty: None,
+        assist_vs_horizons_km: None,
+        emp_vs_assist_km: None,
+        assist_time_ms: None,
+        speed_ratio: None,
+        findorb_rms_residual: None,
+        findorb_n_obs_used: None,
+        findorb_n_obs_rejected: None,
+        findorb_vs_horizons_km: None,
+        emp_vs_findorb_km: None,
+        findorb_separation_arcsec: None,
+        findorb_d_ra_arcsec: None,
+        findorb_d_dec_arcsec: None,
+        findorb_d_rho_km: None,
+        findorb_time_ms: None,
+        kete_time_ms: None,
+        jorbit_time_ms: None,
+        oorb_vs_horizons_km: None,
+        emp_vs_oorb_km: None,
+        oorb_time_ms: None,
+        oorb_separation_arcsec: None,
+        oorb_d_ra_arcsec: None,
+        oorb_d_dec_arcsec: None,
+        oorb_d_rho_km: None,
+        orbfit_rms_arcsec: None,
+        orbfit_n_obs_used: None,
+        orbfit_n_obs_rejected: None,
+        orbfit_time_ms: None,
+        orbfit_error: None,
+        layup_chi2: None,
+        layup_reduced_chi2: None,
+        layup_n_obs_used: None,
+        layup_converged: None,
+        layup_time_ms: None,
+        source_version: engine_version.clone(),
+        timestamp: timestamp.to_string(),
+        notes: format!("optical+radar ({} radar obs)", obs_r.radar_len()),
+    });
+    results
 }
 
 /// Run orbit-determination validation: load PSV from
@@ -696,6 +1189,13 @@ pub fn run_od_validation(
 ) -> OdValidationOutput {
     let timestamp = chrono::Utc::now().to_rfc3339();
     let channel = "rust".to_string();
+    // Provenance: the exact empyrean engine (empyrean-core / villeneuve /
+    // scott / nolan) this channel exercises. Stamped on every row (including
+    // the OD-failure row) so the merged report records which code produced —
+    // or failed to produce — the fit. `None` only if the version FFI fails;
+    // same accessor the CapturedOrbit sidecar uses, so a row and its sidecar
+    // always agree.
+    let engine_version = empyrean::version_string().ok();
     let tier_str = match tier {
         ForceModelTier::Approximate => "approximate",
         ForceModelTier::Basic => "basic",
@@ -716,517 +1216,484 @@ pub fn run_od_validation(
     // `emp_time_ms` is wall-clock cost of one ctx.determine() call (under
     // N-way contention with concurrent fits) — cross-channel comparability
     // is preserved because every channel measures the same per-call shape.
-    let per_object: Vec<(Vec<ValidationResult>, Vec<CapturedOrbit>, Vec<OrbitComparison>)> =
-        objs.par_iter().map(|obj| {
+    let per_object: Vec<(
+        Vec<ValidationResult>,
+        Vec<CapturedOrbit>,
+        Vec<OrbitComparison>,
+    )> = objs
+        .par_iter()
+        .map(|obj| {
             let mut results: Vec<ValidationResult> = Vec::new();
             let mut captured_orbits: Vec<CapturedOrbit> = Vec::new();
             let mut orbit_comparisons: Vec<OrbitComparison> = Vec::new();
-        // Try common PSV filename variants. Object names with a "/"
-        // (the comets — "2P/Encke", "103P/Hartley 2", the interstellars)
-        // are stored with the slash rewritten to "_" so the name is not
-        // read as a path separator; try that sanitized form too.
-        let candidates = [
-            fixtures_dir.join(format!("{}.psv", obj.name)),
-            fixtures_dir.join(format!("{}.psv", obj.name.replace('/', "_"))),
-            fixtures_dir.join(format!("{}.psv", obj.mpc_designation)),
-        ];
-        let path = candidates.iter().find(|p| p.exists());
-        let Some(path) = path else {
-            eprintln!(
-                "  {}: SKIP (no PSV at {})",
-                obj.name,
-                candidates[0].display()
-            );
-            return (results, captured_orbits, orbit_comparisons);
-        };
-
-        let psv = match std::fs::read_to_string(path) {
-            Ok(s) => s,
-            Err(e) => {
-                eprintln!("  {}: SKIP (read PSV: {e})", obj.name);
-                return (results, captured_orbits, orbit_comparisons);
-            }
-        };
-
-        let observations = match ctx.read_ades(&psv) {
-            Ok(o) => o,
-            Err(e) => {
-                eprintln!("  {}: SKIP (parse PSV: {e})", obj.name);
-                return (results, captured_orbits, orbit_comparisons);
-            }
-        };
-
-        if observations.is_empty() {
-            eprintln!("  {}: SKIP (zero observations)", obj.name);
-            return (results, captured_orbits, orbit_comparisons);
-        }
-
-        let n_obs = observations.len();
-        // SB441-N16 self-perturbers: exclude the body's own gravity from
-        // the perturber set during fitting. Without this the integrator
-        // self-pulls and converges to junk fixed points (Pallas RMS 8000″,
-        // Iris RMS 149″, etc.). The validation catalog tags these with
-        // population = "Self-Perturber"; mpc_designation carries the
-        // asteroid number for Origin::Asteroid construction.
-        let excluded_origins: Vec<Origin> = if obj.population == "Self-Perturber" {
-            match obj.mpc_designation.parse::<i32>() {
-                Ok(n) => vec![Origin::Asteroid(n)],
-                Err(_) => Vec::new(),
-            }
-        } else {
-            Vec::new()
-        };
-        let excluded_naif: Vec<i32> = excluded_origins
-            .iter()
-            .copied()
-            .map(Origin::naif_id)
-            .collect();
-        eprintln!(
-            "  {}: {} observations, running determine{}...",
-            obj.name,
-            n_obs,
-            if excluded_naif.is_empty() {
-                String::new()
+            // SB441-N16 self-perturbers: exclude the body's own gravity from
+            // the perturber set during fitting. Without this the integrator
+            // self-pulls and converges to junk fixed points (Pallas RMS 8000″,
+            // Iris RMS 149″, etc.). The validation catalog tags these with
+            // population = "Self-Perturber"; mpc_designation carries the
+            // asteroid number for Origin::Asteroid construction.
+            //
+            // Derived from the catalog entry alone, so it is hoisted above the
+            // fixture load: a failure row for a fixture that never loaded still
+            // records which perturber set the fit *would* have used.
+            let excluded_origins: Vec<Origin> = if obj.population == "Self-Perturber" {
+                match obj.mpc_designation.parse::<i32>() {
+                    Ok(n) => vec![Origin::Asteroid(n)],
+                    Err(_) => Vec::new(),
+                }
             } else {
-                format!(" (excluded perturbers: {excluded_naif:?})")
-            },
-        );
+                Vec::new()
+            };
+            let excluded_naif: Vec<i32> = excluded_origins
+                .iter()
+                .copied()
+                .map(Origin::naif_id)
+                .collect();
+            // Fit configuration. Hoisted above both OD passes because it
+            // depends only on the catalog entry — the radar pass below must be
+            // able to build it without the optical fixture having loaded.
+            let od_config = ODConfig {
+                force_model: tier,
+                max_iterations,
+                excluded_perturbers: excluded_origins,
+                ..ODConfig::default()
+            };
 
-        let t0 = std::time::Instant::now();
-        let od_config = ODConfig {
-            force_model: tier,
-            max_iterations,
-            excluded_perturbers: excluded_origins,
-            ..ODConfig::default()
-        };
-        let determine_result = match ctx.determine(&observations, None, &od_config) {
-            Ok(r) => r,
-            Err(e) => {
-                // empyrean-8l28: emit an explicit failure row so the
-                // downstream report sees the failure rather than the
-                // fixture silently disappearing. Project rule:
-                // "no hidden fallbacks in scientific code — every
-                // mismatch must surface loudly."
-                let ms_fail = t0.elapsed().as_secs_f64() * 1000.0;
+            // ── Radar OD (independent of the optical fixture) ──────────────
+            // Runs FIRST and unconditionally. It used to be nested inside the
+            // optical fit's success path, which made the five tracked radar
+            // fixtures unreachable whenever the (untracked) optical fixtures were
+            // absent — i.e. in every CI run this repo has ever done.
+            results.extend(run_radar_od(
+                ctx,
+                obj,
+                fixtures_dir,
+                &od_config,
+                &channel,
+                &tier_str,
+                engine_version.clone(),
+                &timestamp,
+            ));
+
+            // Emit a failure row for any way the optical fixture fails to become
+            // observations. See `od_failure_row` for why these are rows and not
+            // log lines.
+            let fixture_failure = |note: String| -> ValidationResult {
+                od_failure_row(
+                    obj,
+                    empyrean_validation::schema::test_types::ORBIT_DETERMINATION,
+                    &channel,
+                    &tier_str,
+                    &excluded_naif,
+                    engine_version.clone(),
+                    note,
+                )
+            };
+
+            // Try common PSV filename variants. Object names with a "/"
+            // (the comets — "2P/Encke", "103P/Hartley 2", the interstellars)
+            // are stored with the slash rewritten to "_" so the name is not
+            // read as a path separator; try that sanitized form too.
+            let candidates = [
+                fixtures_dir.join(format!("{}.psv", obj.name)),
+                fixtures_dir.join(format!("{}.psv", obj.name.replace('/', "_"))),
+                fixtures_dir.join(format!("{}.psv", obj.mpc_designation)),
+            ];
+            let path = candidates.iter().find(|p| p.exists());
+            let Some(path) = path else {
                 eprintln!(
-                    "  {}: determine FAIL ({e}) — emitting failure row",
+                    "  {}: FAIL (no PSV at {}) — emitting failure row",
+                    obj.name,
+                    candidates[0].display()
+                );
+                results.push(fixture_failure(format!(
+                    "no PSV fixture: none of {} exist",
+                    candidates
+                        .iter()
+                        .map(|p| p.display().to_string())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                )));
+                return (results, captured_orbits, orbit_comparisons);
+            };
+
+            let psv = match std::fs::read_to_string(path) {
+                Ok(s) => s,
+                Err(e) => {
+                    eprintln!(
+                        "  {}: FAIL (read PSV: {e}) — emitting failure row",
+                        obj.name
+                    );
+                    results.push(fixture_failure(format!("read PSV {}: {e}", path.display())));
+                    return (results, captured_orbits, orbit_comparisons);
+                }
+            };
+
+            let observations = match ctx.read_ades(&psv) {
+                Ok(o) => o,
+                Err(e) => {
+                    eprintln!(
+                        "  {}: FAIL (parse PSV: {e}) — emitting failure row",
+                        obj.name
+                    );
+                    results.push(fixture_failure(format!(
+                        "parse PSV {}: {e}",
+                        path.display()
+                    )));
+                    return (results, captured_orbits, orbit_comparisons);
+                }
+            };
+
+            if observations.is_empty() {
+                eprintln!(
+                    "  {}: FAIL (zero observations) — emitting failure row",
                     obj.name
                 );
-                let mut row = empyrean_validation::schema::ValidationResult::empty();
-                row.object = obj.name.to_string();
-                row.population = obj.population.to_string();
-                row.test_type =
-                    empyrean_validation::schema::test_types::ORBIT_DETERMINATION.to_string();
-                row.channel = channel.clone();
-                row.force_model = tier_str.clone();
-                row.n_obs_used = Some(n_obs as u32);
-                row.od_converged = Some(false);
-                row.od_iterations = Some(max_iterations);
-                row.emp_time_ms = Some(ms_fail);
-                row.excluded_perturbers_naif = excluded_naif.clone();
-                row.timestamp = chrono::Utc::now().to_rfc3339();
-                row.notes = format!("determine FAIL: {e}");
+                let mut row = fixture_failure(format!(
+                    "PSV {} parsed to zero observations",
+                    path.display()
+                ));
+                row.n_obs_used = Some(0);
                 results.push(row);
                 return (results, captured_orbits, orbit_comparisons);
             }
-        };
-        let ms = t0.elapsed().as_secs_f64() * 1000.0;
 
-        eprintln!(
-            "    converged={} iterations={} rms_ra={:.4} rms_dec={:.4} chi2={:.2} ({:.0}ms)",
-            determine_result.converged,
-            determine_result.iterations,
-            determine_result.summary.rms_ra_arcsec,
-            determine_result.summary.rms_dec_arcsec,
-            determine_result.summary.chi2,
-            ms
-        );
+            let n_obs = observations.len();
+            eprintln!(
+                "  {}: {} observations, running determine{}...",
+                obj.name,
+                n_obs,
+                if excluded_naif.is_empty() {
+                    String::new()
+                } else {
+                    format!(" (excluded perturbers: {excluded_naif:?})")
+                },
+            );
 
-        // `DetermineResult.orbit` is now a re-feedable `Orbit`; take the
-        // bare state snapshot (epoch/position/velocity/covariance/frame/
-        // origin) the validation channel records.
-        let orbit = determine_result.state();
-
-        // Capture the fitted state + cov in three coordinate views
-        // (native Cartesian, Sun-centered ICRF Cartesian, Sun-centered
-        // ecliptic-J2000 Keplerian) for the orbit-comparison panel.
-        // Transformation via `ctx.transform` propagates covariance
-        // through the Jacobian.
-        let fit_native = propagated_state_to_coord(&orbit);
-        let empy_version = empyrean::version_string().ok();
-        let fit_captured = match capture_orbit(
-            ctx,
-            obj.name,
-            orbit_sources::EMPYREAN_OD,
-            empy_version.clone(),
-            &fit_native,
-        ) {
-            Ok(captured) => Some(captured),
-            Err(e) => {
-                eprintln!("  {}: fit orbit-capture transform FAIL ({e})", obj.name);
-                None
-            }
-        };
-        if let Some(c) = &fit_captured {
-            captured_orbits.push(c.clone());
-        }
-
-        // Capture SBDB's published orbit (if any) so the comparison
-        // kernel can pair empyrean_od ↔ sbdb. SBDB returns
-        // CometaryCoordinates with covariance for objects that have
-        // a published solution; short-arc impactors typically do not.
-        // `sbdb_nongrav` carries SBDB's published Marsden (A1, A2, A3) for
-        // this object — the reference signal the non-grav-recovery second
-        // pass below compares against. `None` when SBDB has no orbit.
-        let (sbdb_native, sbdb_captured, sbdb_nongrav) =
-            match empyrean::query_sbdb(&[obj.sbdb_query], sbdb_cache_dir) {
-                Ok(batch) if !batch.orbits.is_empty() => {
-                    let sbdb_state = batch.orbits[0].state;
-                    let sbdb_orbit_id = batch.orbit_ids.first().cloned();
-                    let sbdb_ng = (
-                        batch.orbits[0].a1,
-                        batch.orbits[0].a2,
-                        batch.orbits[0].a3,
+            let t0 = std::time::Instant::now();
+            let determine_result = match ctx.determine(&observations, None, &od_config) {
+                Ok(r) => r,
+                Err(e) => {
+                    // empyrean-8l28: emit an explicit failure row so the
+                    // downstream report sees the failure rather than the
+                    // fixture silently disappearing. Project rule:
+                    // "no hidden fallbacks in scientific code — every
+                    // mismatch must surface loudly."
+                    let ms_fail = t0.elapsed().as_secs_f64() * 1000.0;
+                    eprintln!(
+                        "  {}: determine FAIL ({e}) — emitting failure row",
+                        obj.name
                     );
-                    let captured = match capture_orbit(
-                        ctx,
-                        obj.name,
-                        orbit_sources::SBDB,
-                        sbdb_orbit_id,
-                        &sbdb_state,
-                    ) {
-                        Ok(c) => {
-                            captured_orbits.push(c.clone());
-                            Some(c)
-                        }
-                        Err(e) => {
-                            eprintln!("  {}: SBDB orbit-capture transform FAIL ({e})", obj.name,);
-                            None
-                        }
-                    };
-                    (Some(sbdb_state), captured, Some(sbdb_ng))
-                }
-                Ok(_) => {
-                    eprintln!("  {}: SBDB returned empty batch", obj.name);
-                    (None, None, None)
-                }
-                Err(e) => {
-                    eprintln!("  {}: SBDB SKIP ({e})", obj.name);
-                    (None, None, None)
+                    let mut row = fixture_failure(format!("determine FAIL: {e}"));
+                    row.n_obs_used = Some(n_obs as u32);
+                    row.od_iterations = Some(max_iterations);
+                    row.emp_time_ms = Some(ms_fail);
+                    results.push(row);
+                    return (results, captured_orbits, orbit_comparisons);
                 }
             };
+            let ms = t0.elapsed().as_secs_f64() * 1000.0;
 
-        // Bidirectional orbit-vs-orbit comparison. For each (fit,
-        // sbdb) pair, propagate one side to the other's epoch and
-        // compare in Keplerian space. This produces two rows per pair
-        // — one at the fit epoch, one at the sbdb epoch — so the
-        // report can show how much each side's uncertainty inflates
-        // under propagation.
-        if let (Some(fit_c), Some(sbdb_native), Some(sbdb_c)) =
-            (&fit_captured, &sbdb_native, &sbdb_captured)
-        {
-            let prop_cfg = empyrean::PropagationConfig {
-                force_model: tier,
-                uncertainty_method: empyrean::UncertaintyMethod::FirstOrder,
-                frame: empyrean::Frame::ICRF,
-                ..empyrean::PropagationConfig::default()
-            };
+            eprintln!(
+                "    converged={} iterations={} rms_ra={:.4} rms_dec={:.4} chi2={:.2} ({:.0}ms)",
+                determine_result.converged,
+                determine_result.iterations,
+                determine_result.summary.rms_ra_arcsec,
+                determine_result.summary.rms_dec_arcsec,
+                determine_result.summary.chi2,
+                ms
+            );
 
-            // Direction A: bring sbdb to fit's epoch; compare at fit's epoch.
-            match propagate_and_capture(
+            // `DetermineResult.orbit` is now a re-feedable `Orbit`; take the
+            // bare state snapshot (epoch/position/velocity/covariance/frame/
+            // origin) the validation channel records.
+            let orbit = determine_result.state();
+
+            // Capture the fitted state + cov in three coordinate views
+            // (native Cartesian, Sun-centered ICRF Cartesian, Sun-centered
+            // ecliptic-J2000 Keplerian) for the orbit-comparison panel.
+            // Transformation via `ctx.transform` propagates covariance
+            // through the Jacobian.
+            let fit_native = propagated_state_to_coord(&orbit);
+            let empy_version = engine_version.clone();
+            let fit_captured = match capture_orbit(
                 ctx,
                 obj.name,
-                "sbdb_at_fit_epoch",
-                empy_version.clone(),
-                sbdb_native,
-                fit_c.epoch_mjd_tdb,
-                &prop_cfg,
-            ) {
-                Ok(sbdb_at_fit) => {
-                    captured_orbits.push(sbdb_at_fit.clone());
-                    // Re-tag as canonical SBDB so the kernel pairs it
-                    // with empyrean_od (kernel only matches the two
-                    // canonical source tags).
-                    let mut sbdb_at_fit_as_sbdb = sbdb_at_fit.clone();
-                    sbdb_at_fit_as_sbdb.source = orbit_sources::SBDB.to_string();
-                    let mut rows = compare_orbits(&[fit_c.clone(), sbdb_at_fit_as_sbdb], 1.0);
-                    for r in rows.iter_mut() {
-                        r.common_epoch_source = "fit".to_string();
-                        r.notes
-                            .push("reference (SBDB) propagated to fit epoch via STM".to_string());
-                    }
-                    orbit_comparisons.extend(rows);
-                }
-                Err(e) => {
-                    eprintln!("  {}: propagate SBDB→fit_epoch FAIL ({e})", obj.name,);
-                }
-            }
-
-            // Direction B: bring fit to sbdb's epoch; compare at sbdb's epoch.
-            match propagate_and_capture(
-                ctx,
-                obj.name,
-                "fit_at_sbdb_epoch",
+                orbit_sources::EMPYREAN_OD,
                 empy_version.clone(),
                 &fit_native,
-                sbdb_c.epoch_mjd_tdb,
-                &prop_cfg,
             ) {
-                Ok(fit_at_sbdb) => {
-                    captured_orbits.push(fit_at_sbdb.clone());
-                    // Manually pair: kernel only pairs empyrean_od ↔
-                    // sbdb|findorb, so we synthesize a comparison
-                    // record by feeding an empyrean_od-tagged copy of the
-                    // propagated state.
-                    let mut fit_at_sbdb_as_fit = fit_at_sbdb.clone();
-                    fit_at_sbdb_as_fit.source = orbit_sources::EMPYREAN_OD.to_string();
-                    let mut rows = compare_orbits(&[fit_at_sbdb_as_fit, sbdb_c.clone()], 1.0);
-                    for r in rows.iter_mut() {
-                        r.common_epoch_source = "sbdb".to_string();
-                        r.notes
-                            .push("fit propagated to SBDB epoch via STM".to_string());
-                    }
-                    orbit_comparisons.extend(rows);
-                }
+                Ok(captured) => Some(captured),
                 Err(e) => {
-                    eprintln!("  {}: propagate fit→sbdb_epoch FAIL ({e})", obj.name,);
+                    eprintln!("  {}: fit orbit-capture transform FAIL ({e})", obj.name);
+                    None
                 }
+            };
+            if let Some(c) = &fit_captured {
+                captured_orbits.push(c.clone());
             }
-        }
-        results.push(ValidationResult {
-            object: obj.name.to_string(),
-            population: obj.population.to_string(),
-            epoch_mjd_tdb: orbit.epoch.mjd_tdb().unwrap_or(f64::NAN),
-            dt_days: 0.0,
-            t_mjd_tdb: orbit.epoch.mjd_tdb().unwrap_or(f64::NAN),
-            force_model: tier_str.clone(),
-            test_type: "orbit_determination".to_string(),
-            channel: channel.clone(),
-            observer: None,
-            emp_vs_horizons_km: None,
-            emp_pos_au: Some(orbit.position),
-            emp_time_ms: Some(ms),
-            separation_arcsec: None,
-            d_ra_arcsec: None,
-            d_dec_arcsec: None,
-            d_rho_km: None,
-            d_light_time_s: None,
-            ic_pos_au: None,
-            ic_vel_au_d: None,
-            ic_a1: None,
-            ic_a2: None,
-            ic_a3: None,
-            ic_g_alpha: None,
-            ic_g_r0: None,
-            ic_g_m: None,
-            ic_g_n: None,
-            ic_g_k: None,
-            ic_non_grav_dt: None,
-            ref_pos_au: None,
-            ref_vel_au_d: None,
-            ref_ra_rad: None,
-            ref_dec_rad: None,
-            ref_rho_au: None,
-            ref_light_time_d: None,
-            n_obs_used: Some(determine_result.summary.num_selected as u32),
-            od_iterations: Some(determine_result.iterations),
-            od_converged: Some(determine_result.converged),
-            od_rms_ra_arcsec: Some(determine_result.summary.rms_ra_arcsec),
-            od_rms_dec_arcsec: Some(determine_result.summary.rms_dec_arcsec),
-            od_rms_combined_arcsec: Some(determine_result.summary.rms_combined_arcsec),
-            od_chi2: Some(determine_result.summary.chi2),
-            od_reduced_chi2: Some(determine_result.summary.reduced_chi2),
-            od_a1: None,
-            od_a2: None,
-            od_a3: None,
-            od_a1_sigma: None,
-            od_a2_sigma: None,
-            od_a3_sigma: None,
-            excluded_perturbers_naif: excluded_naif,
-            propagation_uncertainty: None,
-            assist_vs_horizons_km: None,
-            emp_vs_assist_km: None,
-            assist_time_ms: None,
-            speed_ratio: None,
-            findorb_rms_residual: None,
-            findorb_n_obs_used: None,
-            findorb_n_obs_rejected: None,
-            oorb_vs_horizons_km: None,
-            emp_vs_oorb_km: None,
-            oorb_time_ms: None,
-            oorb_separation_arcsec: None,
-            oorb_d_ra_arcsec: None,
-            oorb_d_dec_arcsec: None,
-            oorb_d_rho_km: None,
-            orbfit_rms_arcsec: None,
-            orbfit_n_obs_used: None,
-            orbfit_n_obs_rejected: None,
-            orbfit_time_ms: None,
-            layup_chi2: None,
-            layup_reduced_chi2: None,
-            layup_n_obs_used: None,
-            layup_converged: None,
-            layup_time_ms: None,
-            timestamp: timestamp.clone(),
-            notes: obj.notes.to_string(),
-        });
 
-        // ── Second OD: optical + radar (objects with a psv-radar fixture) ──
-        // For objects that have radar astrometry, read the radar-augmented
-        // fixture (the same optical arc plus the ADES `<radar>` delay/Doppler
-        // table, in the sibling `psv-radar/` dir) and run a second determine,
-        // reusing the same `od_config`. The radar-tightened orbit is emitted as
-        // a separate `orbit_determination_radar` row so the report / find_orb
-        // merge cross-checks it the same way as the optical-only fit. Objects
-        // without a psv-radar fixture (the bulk of the catalog) are untouched.
-        let radar_psv = fixtures_dir
-            .parent()
-            .map(|p| p.join("psv-radar"))
-            .into_iter()
-            .flat_map(|d| {
-                [
-                    d.join(format!("{}.psv", obj.name)),
-                    d.join(format!("{}.psv", obj.name.replace('/', "_"))),
-                    d.join(format!("{}.psv", obj.mpc_designation)),
-                ]
-            })
-            .find(|p| p.exists());
-        if let Some(radar_psv) = radar_psv {
-            match std::fs::read_to_string(&radar_psv)
-                .ok()
-                .and_then(|s| ctx.read_ades(&s).ok())
+            // Capture SBDB's published orbit (if any) so the comparison
+            // kernel can pair empyrean_od ↔ sbdb. SBDB returns
+            // CometaryCoordinates with covariance for objects that have
+            // a published solution; short-arc impactors typically do not.
+            // `sbdb_nongrav` carries SBDB's published Marsden (A1, A2, A3) for
+            // this object — the reference signal the non-grav-recovery second
+            // pass below compares against. `None` when SBDB has no orbit.
+            let (sbdb_native, sbdb_captured, sbdb_nongrav) =
+                match empyrean::query_sbdb(&[obj.sbdb_query], sbdb_cache_dir) {
+                    Ok(batch) if !batch.orbits.is_empty() => {
+                        let sbdb_state = batch.orbits[0].state;
+                        let sbdb_orbit_id = batch.orbit_ids.first().cloned();
+                        let sbdb_ng = (batch.orbits[0].a1, batch.orbits[0].a2, batch.orbits[0].a3);
+                        let captured = match capture_orbit(
+                            ctx,
+                            obj.name,
+                            orbit_sources::SBDB,
+                            sbdb_orbit_id,
+                            &sbdb_state,
+                        ) {
+                            Ok(c) => {
+                                captured_orbits.push(c.clone());
+                                Some(c)
+                            }
+                            Err(e) => {
+                                eprintln!(
+                                    "  {}: SBDB orbit-capture transform FAIL ({e})",
+                                    obj.name,
+                                );
+                                None
+                            }
+                        };
+                        (Some(sbdb_state), captured, Some(sbdb_ng))
+                    }
+                    Ok(_) => {
+                        eprintln!("  {}: SBDB returned empty batch", obj.name);
+                        (None, None, None)
+                    }
+                    Err(e) => {
+                        eprintln!("  {}: SBDB SKIP ({e})", obj.name);
+                        (None, None, None)
+                    }
+                };
+
+            // Bidirectional orbit-vs-orbit comparison. For each (fit,
+            // sbdb) pair, propagate one side to the other's epoch and
+            // compare in Keplerian space. This produces two rows per pair
+            // — one at the fit epoch, one at the sbdb epoch — so the
+            // report can show how much each side's uncertainty inflates
+            // under propagation.
+            if let (Some(fit_c), Some(sbdb_native), Some(sbdb_c)) =
+                (&fit_captured, &sbdb_native, &sbdb_captured)
             {
-                Some(obs_r) if obs_r.radar_len() > 0 => {
-                    eprintln!(
-                        "  {}: + radar OD ({} obs incl {} radar)...",
-                        obj.name,
-                        obs_r.len(),
-                        obs_r.radar_len()
-                    );
-                    let t0r = std::time::Instant::now();
-                    match ctx.determine(&obs_r, None, &od_config) {
-                        Ok(dr) => {
-                            let ms_r = t0r.elapsed().as_secs_f64() * 1000.0;
-                            let orbit_r = dr.state();
-                            eprintln!(
-                                "    radar: converged={} rms_combined={:.4} ({:.0}ms)",
-                                dr.converged, dr.summary.rms_combined_arcsec, ms_r
+                let prop_cfg = empyrean::PropagationConfig {
+                    force_model: tier,
+                    uncertainty_method: empyrean::UncertaintyMethod::FirstOrder,
+                    frame: empyrean::Frame::ICRF,
+                    ..empyrean::PropagationConfig::default()
+                };
+
+                // Direction A: bring sbdb to fit's epoch; compare at fit's epoch.
+                match propagate_and_capture(
+                    ctx,
+                    obj.name,
+                    "sbdb_at_fit_epoch",
+                    empy_version.clone(),
+                    sbdb_native,
+                    fit_c.epoch_mjd_tdb,
+                    &prop_cfg,
+                ) {
+                    Ok(sbdb_at_fit) => {
+                        captured_orbits.push(sbdb_at_fit.clone());
+                        // Re-tag as canonical SBDB so the kernel pairs it
+                        // with empyrean_od (kernel only matches the two
+                        // canonical source tags).
+                        let mut sbdb_at_fit_as_sbdb = sbdb_at_fit.clone();
+                        sbdb_at_fit_as_sbdb.source = orbit_sources::SBDB.to_string();
+                        let mut rows = compare_orbits(&[fit_c.clone(), sbdb_at_fit_as_sbdb], 1.0);
+                        for r in rows.iter_mut() {
+                            r.common_epoch_source = "fit".to_string();
+                            r.notes.push(
+                                "reference (SBDB) propagated to fit epoch via STM".to_string(),
                             );
-                            let excluded_naif_r: Vec<i32> = od_config
-                                .excluded_perturbers
-                                .iter()
-                                .copied()
-                                .map(Origin::naif_id)
-                                .collect();
-                            results.push(ValidationResult {
-                                object: obj.name.to_string(),
-                                population: obj.population.to_string(),
-                                epoch_mjd_tdb: orbit_r.epoch.mjd_tdb().unwrap_or(f64::NAN),
-                                dt_days: 0.0,
-                                t_mjd_tdb: orbit_r.epoch.mjd_tdb().unwrap_or(f64::NAN),
-                                force_model: tier_str.clone(),
-                                test_type:
-                                    empyrean_validation::schema::test_types::ORBIT_DETERMINATION_RADAR
-                                        .to_string(),
-                                channel: channel.clone(),
-                                observer: None,
-                                emp_vs_horizons_km: None,
-                                emp_pos_au: Some(orbit_r.position),
-                                emp_time_ms: Some(ms_r),
-                                separation_arcsec: None,
-                                d_ra_arcsec: None,
-                                d_dec_arcsec: None,
-                                d_rho_km: None,
-                                d_light_time_s: None,
-                                ic_pos_au: None,
-                                ic_vel_au_d: None,
-                                ic_a1: None,
-                                ic_a2: None,
-                                ic_a3: None,
-                                ic_g_alpha: None,
-                                ic_g_r0: None,
-                                ic_g_m: None,
-                                ic_g_n: None,
-                                ic_g_k: None,
-                                ic_non_grav_dt: None,
-                                ref_pos_au: None,
-                                ref_vel_au_d: None,
-                                ref_ra_rad: None,
-                                ref_dec_rad: None,
-                                ref_rho_au: None,
-                                ref_light_time_d: None,
-                                n_obs_used: Some(dr.summary.num_selected as u32),
-                                od_iterations: Some(dr.iterations),
-                                od_converged: Some(dr.converged),
-                                od_rms_ra_arcsec: Some(dr.summary.rms_ra_arcsec),
-                                od_rms_dec_arcsec: Some(dr.summary.rms_dec_arcsec),
-                                od_rms_combined_arcsec: Some(dr.summary.rms_combined_arcsec),
-                                od_chi2: Some(dr.summary.chi2),
-                                od_reduced_chi2: Some(dr.summary.reduced_chi2),
-                                od_a1: None,
-                                od_a2: None,
-                                od_a3: None,
-                                od_a1_sigma: None,
-                                od_a2_sigma: None,
-                                od_a3_sigma: None,
-                                excluded_perturbers_naif: excluded_naif_r,
-                                propagation_uncertainty: None,
-                                assist_vs_horizons_km: None,
-                                emp_vs_assist_km: None,
-                                assist_time_ms: None,
-                                speed_ratio: None,
-                                findorb_rms_residual: None,
-                                findorb_n_obs_used: None,
-                                findorb_n_obs_rejected: None,
-                                oorb_vs_horizons_km: None,
-                                emp_vs_oorb_km: None,
-                                oorb_time_ms: None,
-                                oorb_separation_arcsec: None,
-                                oorb_d_ra_arcsec: None,
-                                oorb_d_dec_arcsec: None,
-                                oorb_d_rho_km: None,
-                                orbfit_rms_arcsec: None,
-                                orbfit_n_obs_used: None,
-                                orbfit_n_obs_rejected: None,
-                                orbfit_time_ms: None,
-                                layup_chi2: None,
-                                layup_reduced_chi2: None,
-                                layup_n_obs_used: None,
-                                layup_converged: None,
-                                layup_time_ms: None,
-                                timestamp: timestamp.clone(),
-                                notes: format!("optical+radar ({} radar obs)", obs_r.radar_len()),
-                            });
                         }
-                        Err(e) => {
-                            eprintln!("  {}: radar OD FAIL ({e})", obj.name);
-                        }
+                        orbit_comparisons.extend(rows);
+                    }
+                    Err(e) => {
+                        eprintln!("  {}: propagate SBDB→fit_epoch FAIL ({e})", obj.name,);
                     }
                 }
-                _ => {}
-            }
-        }
 
-        // ── Third OD: non-grav recovery (objects with an SBDB A2 signal) ──
-        // For objects whose JPL SBDB reference carries a non-zero
-        // transverse non-grav coefficient (Yarkovsky NEOs like Apophis /
-        // Bennu and the comets), re-fit the SAME optical arc with
-        // `solve_for = StateAndNonGrav` and emit a separate
-        // `non_grav_recovery` row carrying the FITTED A1/A2/A3 ± 1σ so the
-        // report can compare fitted-vs-JPL in σ. The 1σ comes from the
-        // fitted 9×9 (state + A1/A2/A3) covariance diagonal: σ_aᵢ =
-        // sqrt(C9x9[6+i][6+i]).
-        //
-        // Loud-failure rule: if the fit did NOT actually recover non-grav
-        // — the 9×9 is absent (`covariance_9x9 == None`) or a fitted a-value
-        // is non-finite — that axis is emitted as `None` (never 0, never
-        // NaN) so a missing value reads as "non-grav not recovered". (The
-        // engine currently has a bug where StateAndNonGrav can silently
-        // fall back to a 6-param state-only fit, so most of these rows
-        // legitimately come back `None` for now — that is correct.)
-        if let Some((ref_a1, ref_a2, ref_a3)) = sbdb_nongrav
-            && ref_a2 != 0.0 {
-                eprintln!("  {}: + non-grav recovery OD (SBDB A2={ref_a2:.3e})...", obj.name);
+                // Direction B: bring fit to sbdb's epoch; compare at sbdb's epoch.
+                match propagate_and_capture(
+                    ctx,
+                    obj.name,
+                    "fit_at_sbdb_epoch",
+                    empy_version.clone(),
+                    &fit_native,
+                    sbdb_c.epoch_mjd_tdb,
+                    &prop_cfg,
+                ) {
+                    Ok(fit_at_sbdb) => {
+                        captured_orbits.push(fit_at_sbdb.clone());
+                        // Manually pair: kernel only pairs empyrean_od ↔
+                        // sbdb|findorb, so we synthesize a comparison
+                        // record by feeding an empyrean_od-tagged copy of the
+                        // propagated state.
+                        let mut fit_at_sbdb_as_fit = fit_at_sbdb.clone();
+                        fit_at_sbdb_as_fit.source = orbit_sources::EMPYREAN_OD.to_string();
+                        let mut rows = compare_orbits(&[fit_at_sbdb_as_fit, sbdb_c.clone()], 1.0);
+                        for r in rows.iter_mut() {
+                            r.common_epoch_source = "sbdb".to_string();
+                            r.notes
+                                .push("fit propagated to SBDB epoch via STM".to_string());
+                        }
+                        orbit_comparisons.extend(rows);
+                    }
+                    Err(e) => {
+                        eprintln!("  {}: propagate fit→sbdb_epoch FAIL ({e})", obj.name,);
+                    }
+                }
+            }
+            results.push(ValidationResult {
+                object: obj.name.to_string(),
+                population: obj.population.to_string(),
+                epoch_mjd_tdb: orbit.epoch.mjd_tdb().unwrap_or(f64::NAN),
+                dt_days: 0.0,
+                t_mjd_tdb: orbit.epoch.mjd_tdb().unwrap_or(f64::NAN),
+                force_model: tier_str.clone(),
+                test_type: "orbit_determination".to_string(),
+                channel: channel.clone(),
+                observer: None,
+                emp_vs_horizons_km: None,
+                emp_pos_au: Some(orbit.position),
+                emp_pos_cov_au2: None,
+                emp_time_ms: Some(ms),
+                separation_arcsec: None,
+                d_ra_arcsec: None,
+                d_dec_arcsec: None,
+                emp_radec_cov_arcsec2: None,
+                d_rho_km: None,
+                d_light_time_s: None,
+                ic_pos_au: None,
+                ic_vel_au_d: None,
+                ic_a1: None,
+                ic_a2: None,
+                ic_a3: None,
+                ic_g_alpha: None,
+                ic_g_r0: None,
+                ic_g_m: None,
+                ic_g_n: None,
+                ic_g_k: None,
+                ic_non_grav_dt: None,
+                ref_pos_au: None,
+                ref_vel_au_d: None,
+                ref_ra_rad: None,
+                ref_dec_rad: None,
+                ref_rho_au: None,
+                ref_light_time_d: None,
+                ref_sun_pos_au: None,
+                ref_sun_vel_au_d: None,
+                ref_od_rms_normalized: None,
+                ref_od_reduced_chi2: None,
+                ref_od_n_obs_used: None,
+                ref_od_n_del_obs_used: None,
+                ref_od_n_dop_obs_used: None,
+                ref_od_data_arc_days: None,
+                ref_od_condition_code: None,
+                ref_od_soln_date: None,
+                ref_od_pe_used: None,
+                ref_od_sb_used: None,
+                n_obs_used: Some(determine_result.summary.num_selected as u32),
+                od_iterations: Some(determine_result.iterations),
+                od_converged: Some(determine_result.converged),
+                od_rms_ra_arcsec: Some(determine_result.summary.rms_ra_arcsec),
+                od_rms_dec_arcsec: Some(determine_result.summary.rms_dec_arcsec),
+                od_rms_combined_arcsec: Some(determine_result.summary.rms_combined_arcsec),
+                od_chi2: Some(determine_result.summary.chi2),
+                od_reduced_chi2: Some(determine_result.summary.reduced_chi2),
+                od_a1: None,
+                od_a2: None,
+                od_a3: None,
+                od_a1_sigma: None,
+                od_a2_sigma: None,
+                od_a3_sigma: None,
+                od_dt: None,
+                od_dt_sigma: None,
+                od_h: None,
+                od_h_sigma: None,
+                od_g1: None,
+                od_g1_sigma: None,
+                od_g2: None,
+                od_g2_sigma: None,
+                od_photometry_model: None,
+                od_photometry_reduced_chi2: None,
+                od_thrust_dv_m_per_s: Vec::new(),
+                od_thrust_dv_sigma_m_per_s: Vec::new(),
+                excluded_perturbers_naif: excluded_naif,
+                propagation_uncertainty: None,
+                assist_vs_horizons_km: None,
+                emp_vs_assist_km: None,
+                assist_time_ms: None,
+                speed_ratio: None,
+                findorb_rms_residual: None,
+                findorb_n_obs_used: None,
+                findorb_n_obs_rejected: None,
+                findorb_vs_horizons_km: None,
+                emp_vs_findorb_km: None,
+                findorb_separation_arcsec: None,
+                findorb_d_ra_arcsec: None,
+                findorb_d_dec_arcsec: None,
+                findorb_d_rho_km: None,
+                findorb_time_ms: None,
+                kete_time_ms: None,
+                jorbit_time_ms: None,
+                oorb_vs_horizons_km: None,
+                emp_vs_oorb_km: None,
+                oorb_time_ms: None,
+                oorb_separation_arcsec: None,
+                oorb_d_ra_arcsec: None,
+                oorb_d_dec_arcsec: None,
+                oorb_d_rho_km: None,
+                orbfit_rms_arcsec: None,
+                orbfit_n_obs_used: None,
+                orbfit_n_obs_rejected: None,
+                orbfit_time_ms: None,
+                orbfit_error: None,
+                layup_chi2: None,
+                layup_reduced_chi2: None,
+                layup_n_obs_used: None,
+                layup_converged: None,
+                layup_time_ms: None,
+                source_version: empy_version.clone(),
+                timestamp: timestamp.clone(),
+                notes: obj.notes.to_string(),
+            });
+
+            // ── Third OD: non-grav recovery (objects with an SBDB A2 signal) ──
+            // For objects whose JPL SBDB reference carries a non-zero
+            // transverse non-grav coefficient (Yarkovsky NEOs like Apophis /
+            // Bennu and the comets), re-fit the SAME optical arc with
+            // `solve_for = StateAndNonGrav` and emit a separate
+            // `non_grav_recovery` row carrying the FITTED A1/A2/A3 ± 1σ so the
+            // report can compare fitted-vs-JPL in σ. The 1σ comes from the
+            // fitted 9×9 (state + A1/A2/A3) covariance diagonal: σ_aᵢ =
+            // sqrt(C9x9[6+i][6+i]).
+            //
+            // Loud-failure rule: if the fit did NOT actually recover non-grav
+            // — the 9×9 is absent (`covariance_9x9 == None`) or a fitted a-value
+            // is non-finite — that axis is emitted as `None` (never 0, never
+            // NaN) so a missing value reads as "non-grav not recovered". (The
+            // engine currently has a bug where StateAndNonGrav can silently
+            // fall back to a 6-param state-only fit, so most of these rows
+            // legitimately come back `None` for now — that is correct.)
+            if let Some((ref_a1, ref_a2, ref_a3)) = sbdb_nongrav
+                && ref_a2 != 0.0
+            {
+                eprintln!(
+                    "  {}: + non-grav recovery OD (SBDB A2={ref_a2:.3e})...",
+                    obj.name
+                );
                 let ng_config = ODConfig {
                     solve_for: empyrean::SolveForParams::StateAndNonGrav,
                     ..od_config.clone()
@@ -1280,17 +1747,18 @@ pub fn run_od_validation(
                             dt_days: 0.0,
                             t_mjd_tdb: orbit_n.epoch.mjd_tdb().unwrap_or(f64::NAN),
                             force_model: tier_str.clone(),
-                            test_type:
-                                empyrean_validation::schema::test_types::NON_GRAV_RECOVERY
-                                    .to_string(),
+                            test_type: empyrean_validation::schema::test_types::NON_GRAV_RECOVERY
+                                .to_string(),
                             channel: channel.clone(),
                             observer: None,
                             emp_vs_horizons_km: None,
                             emp_pos_au: Some(orbit_n.position),
+                            emp_pos_cov_au2: None,
                             emp_time_ms: Some(ms_n),
                             separation_arcsec: None,
                             d_ra_arcsec: None,
                             d_dec_arcsec: None,
+                            emp_radec_cov_arcsec2: None,
                             d_rho_km: None,
                             d_light_time_s: None,
                             ic_pos_au: None,
@@ -1310,6 +1778,18 @@ pub fn run_od_validation(
                             ref_dec_rad: None,
                             ref_rho_au: None,
                             ref_light_time_d: None,
+                            ref_sun_pos_au: None,
+                            ref_sun_vel_au_d: None,
+                            ref_od_rms_normalized: None,
+                            ref_od_reduced_chi2: None,
+                            ref_od_n_obs_used: None,
+                            ref_od_n_del_obs_used: None,
+                            ref_od_n_dop_obs_used: None,
+                            ref_od_data_arc_days: None,
+                            ref_od_condition_code: None,
+                            ref_od_soln_date: None,
+                            ref_od_pe_used: None,
+                            ref_od_sb_used: None,
                             n_obs_used: Some(dr.summary.num_selected as u32),
                             od_iterations: Some(dr.iterations),
                             od_converged: Some(dr.converged),
@@ -1324,6 +1804,18 @@ pub fn run_od_validation(
                             od_a1_sigma,
                             od_a2_sigma,
                             od_a3_sigma,
+                            od_dt: None,
+                            od_dt_sigma: None,
+                            od_h: None,
+                            od_h_sigma: None,
+                            od_g1: None,
+                            od_g1_sigma: None,
+                            od_g2: None,
+                            od_g2_sigma: None,
+                            od_photometry_model: None,
+                            od_photometry_reduced_chi2: None,
+                            od_thrust_dv_m_per_s: Vec::new(),
+                            od_thrust_dv_sigma_m_per_s: Vec::new(),
                             excluded_perturbers_naif: excluded_naif_n,
                             propagation_uncertainty: None,
                             assist_vs_horizons_km: None,
@@ -1333,6 +1825,15 @@ pub fn run_od_validation(
                             findorb_rms_residual: None,
                             findorb_n_obs_used: None,
                             findorb_n_obs_rejected: None,
+                            findorb_vs_horizons_km: None,
+                            emp_vs_findorb_km: None,
+                            findorb_separation_arcsec: None,
+                            findorb_d_ra_arcsec: None,
+                            findorb_d_dec_arcsec: None,
+                            findorb_d_rho_km: None,
+                            findorb_time_ms: None,
+                            kete_time_ms: None,
+                            jorbit_time_ms: None,
                             oorb_vs_horizons_km: None,
                             emp_vs_oorb_km: None,
                             oorb_time_ms: None,
@@ -1344,11 +1845,13 @@ pub fn run_od_validation(
                             orbfit_n_obs_used: None,
                             orbfit_n_obs_rejected: None,
                             orbfit_time_ms: None,
+                            orbfit_error: None,
                             layup_chi2: None,
                             layup_reduced_chi2: None,
                             layup_n_obs_used: None,
                             layup_converged: None,
                             layup_time_ms: None,
+                            source_version: empy_version.clone(),
                             timestamp: timestamp.clone(),
                             notes: format!(
                                 "non-grav recovery (solve_for=StateAndNonGrav, 9x9={})",
@@ -1362,8 +1865,9 @@ pub fn run_od_validation(
                 }
             }
 
-        (results, captured_orbits, orbit_comparisons)
-    }).collect();
+            (results, captured_orbits, orbit_comparisons)
+        })
+        .collect();
 
     // Flatten per-object triples back into the function-level accumulators.
     // Input order is preserved by `.par_iter().map().collect()` (Rayon's

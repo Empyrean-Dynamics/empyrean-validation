@@ -5,10 +5,14 @@ Cargo.lock
 # own isolated workspaces under runners/).
 **/target/
 
-# ADES observation fixtures for the validation catalog — the per-object
-# `.psv` files churn over time as observations are added / debiased /
-# re-fetched. Carried out-of-band, not tracked.
-fixtures/psv/
+# Fixture DATA is not tracked: fixtures/manifest.json (tracked) pins an
+# immutable public-read GCS snapshot, and scripts/fetch-fixtures.sh
+# materializes + hash-verifies the working copies here. The per-directory
+# READMEs stay in git. Contract: fixtures/README.md.
+fixtures/psv/*
+!fixtures/psv/README.md
+fixtures/psv-radar/*
+!fixtures/psv-radar/README.md
 
 # Compiled C-channel runner binary — `make -C runners/c` output.
 runners/c/runner
