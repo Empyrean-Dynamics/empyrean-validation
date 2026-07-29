@@ -31,6 +31,16 @@ The objects are public-read — MPC astrometry is public data — so readers
 gcloud and no credential of any kind. `gcloud` is used only by the snapshot
 *upload* (`scripts/upload-fixture-snapshot.sh`).
 
+How that public read is conferred depends on the bucket's access-control
+mode, and the upload script resolves it *before* transferring a byte:
+`empyrean-validation` has uniform bucket-level access enabled, so per-object
+ACLs are inert and visibility comes from the bucket-wide
+`allUsers → roles/storage.objectViewer` IAM binding; on a bucket without UBLA
+the script grants a per-object ACL scoped to the snapshot prefix instead. It
+refuses to upload into a bucket where neither path yields a public read
+(including `public_access_prevention=enforced`), rather than minting a
+permanent snapshot nobody outside the project could fetch.
+
 The fetch script verifies **every** file's sha256 against the manifest on
 **every** invocation — cache hit or miss — re-fetches anything missing or
 stale (atomic temp-file-then-rename, never a partial write), fails loudly
