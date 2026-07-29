@@ -1,0 +1,337 @@
+{
+  "snapshot_id": "2026-07-29-75ab459bc8b2",
+  "base_url": "https://storage.googleapis.com/empyrean-validation/fixtures",
+  "hash_algorithm": "sha256",
+  "files": [
+    {
+      "path": "psv/103P_Hartley 2.psv",
+      "sha256": "290f638ece826b399fa565bad4ba3f523717835daa4e94a80da6c409141dfd26",
+      "bytes": 2646330,
+      "data_rows": 9764
+    },
+    {
+      "path": "psv/1I_'Oumuamua.psv",
+      "sha256": "b5d78291c80d5b1a3eee5dac0c4a877e94b8c4cb77896bc5d417fbbc503abce5",
+      "bytes": 34134,
+      "data_rows": 222
+    },
+    {
+      "path": "psv/2001 QR322.psv",
+      "sha256": "612a92da8141495f934d5068ebf25613df956f4972d58e52fc9ee3fb1608ae69",
+      "bytes": 17175,
+      "data_rows": 103
+    },
+    {
+      "path": "psv/2005 TN53.psv",
+      "sha256": "ef1e62e0b3f66984facde33cf12b06283b1e71f83ea7287606819c15879dcaaf",
+      "bytes": 2850,
+      "data_rows": 26
+    },
+    {
+      "path": "psv/2008 LC18.psv",
+      "sha256": "9d43f006c29e4a4c80b9deadf2d83952134a694c640136a84de378b2c828c736",
+      "bytes": 3060,
+      "data_rows": 28
+    },
+    {
+      "path": "psv/2008 TC3.psv",
+      "sha256": "9f22fbe7f4c7a12349bb18ea4e350345091a72e424d5880f85ea25e52f30c2b0",
+      "bytes": 92835,
+      "data_rows": 883
+    },
+    {
+      "path": "psv/2010 TK7.psv",
+      "sha256": "e5a1e5b87d8cb8613b45367d43b28300dcb8cadc7896aca87e40f5babf454456",
+      "bytes": 28845,
+      "data_rows": 154
+    },
+    {
+      "path": "psv/2014 AA.psv",
+      "sha256": "3de7b8f24a32c1baf4878c8f804479ea509f6c780183639623b3ad02d055ae1d",
+      "bytes": 815,
+      "data_rows": 7
+    },
+    {
+      "path": "psv/2018 LA.psv",
+      "sha256": "3c73a00e5ec373d0510756316370cc9a78adeeac5227f4ba367f877690d720f3",
+      "bytes": 2770,
+      "data_rows": 18
+    },
+    {
+      "path": "psv/2020 AV2.psv",
+      "sha256": "48224b2c695ee198da75fcb67e80e1d648d08d0323cae1d2f9d92aa2f4f5af88",
+      "bytes": 114255,
+      "data_rows": 407
+    },
+    {
+      "path": "psv/2020 CD3.psv",
+      "sha256": "1ae65392a992afbf62467d88e2e0a4846ce836ff16df121e15f7c829681f7f74",
+      "bytes": 29305,
+      "data_rows": 144
+    },
+    {
+      "path": "psv/2020 XL5.psv",
+      "sha256": "8a60456b9c01d8573a2df00af4038ac4cf7961efc20bac9bd80f1ba855655312",
+      "bytes": 18553,
+      "data_rows": 61
+    },
+    {
+      "path": "psv/2021 PH27.psv",
+      "sha256": "ae5fcc42b4d05ce8c72f9a862bddbb9e23659406aef04e61f8704f42729e1b37",
+      "bytes": 13264,
+      "data_rows": 105
+    },
+    {
+      "path": "psv/2023 CX1.psv",
+      "sha256": "9b08f170cc8412792be1c3211b7421fca1262446fd8137e4eae4bcf4ea5db22c",
+      "bytes": 81933,
+      "data_rows": 368
+    },
+    {
+      "path": "psv/2024 BX1.psv",
+      "sha256": "3ef06391785cdd60cc1b65e2d8f5adcea93614bdd90b03f79e97b1c883cbb3a9",
+      "bytes": 65486,
+      "data_rows": 328
+    },
+    {
+      "path": "psv/2024 PT5.psv",
+      "sha256": "de97bd0b2545114aef9a9c0661261a0e77ac60bd54031f6da5699997894c813c",
+      "bytes": 88791,
+      "data_rows": 410
+    },
+    {
+      "path": "psv/2024 YR4.psv",
+      "sha256": "6c123aeb36bbfa598bf2631da49fc9dd2c66c9d7cdb7adb075bb23fb75347e28",
+      "bytes": 65708,
+      "data_rows": 512
+    },
+    {
+      "path": "psv/2026 DA.psv",
+      "sha256": "0ebf5dc7b487c8ccdc63eb959d028dcd1a7255195a9235748f87ecfb0c8938a0",
+      "bytes": 4065,
+      "data_rows": 24
+    },
+    {
+      "path": "psv/2026 FO12.psv",
+      "sha256": "dccf73f00a2640087d57cd131c503ac77c457f1933b4daa69587d22f7fced933",
+      "bytes": 11740,
+      "data_rows": 66
+    },
+    {
+      "path": "psv/2026 FQ12.psv",
+      "sha256": "52c67e7e8087672e573849c6ab8267af0e299d9a737dc3dbcb8b6d9cf6c16666",
+      "bytes": 28305,
+      "data_rows": 137
+    },
+    {
+      "path": "psv/2I_Borisov.psv",
+      "sha256": "d79d8d7b6ea288289bae0eb0b6727ee916edc321d24d01cd4d1c1b88eff6bf12",
+      "bytes": 847818,
+      "data_rows": 3350
+    },
+    {
+      "path": "psv/2P_Encke.psv",
+      "sha256": "709aba4b496579357a2b96fab5afc57f7ca274ec06decc85ac544cd94298634b",
+      "bytes": 1601413,
+      "data_rows": 5860
+    },
+    {
+      "path": "psv/3I_ATLAS.psv",
+      "sha256": "513022ba92951ee3eef78af3f1e1a9427be8726a61f8a611d5722200c00689ea",
+      "bytes": 958370,
+      "data_rows": 8421
+    },
+    {
+      "path": "psv/46P_Wirtanen.psv",
+      "sha256": "ca082806ffb9192115a960a70aa18b8706e7fa7c0d9a97358b015c3150a73faa",
+      "bytes": 2113041,
+      "data_rows": 7492
+    },
+    {
+      "path": "psv/67P.psv",
+      "sha256": "b13a848727dc9c963ab6123237b6032332827fca27542d7f3332585f80cabab1",
+      "bytes": 2961925,
+      "data_rows": 11134
+    },
+    {
+      "path": "psv/96P_Machholz.psv",
+      "sha256": "3a09247203aa8731bfbbb6a8d8765216bb506afac475539d859bf5e80da1bdee",
+      "bytes": 143425,
+      "data_rows": 1483
+    },
+    {
+      "path": "psv/Achilles.psv",
+      "sha256": "1a34010d4bef4ebb551cbe46dcd4331a813818a714990052ae0a28c514d2589f",
+      "bytes": 1493805,
+      "data_rows": 5150
+    },
+    {
+      "path": "psv/Apophis.psv",
+      "sha256": "cf7a3493da27c12a436b2f403dae5f8ad95ed4794231d28c8d1ae1600c9b2e1b",
+      "bytes": 2675416,
+      "data_rows": 9520
+    },
+    {
+      "path": "psv/Bennu.psv",
+      "sha256": "4bb0f13fce0f7d1f88376536e8669311fb490fdb7df008327f5370f8081be826",
+      "bytes": 105111,
+      "data_rows": 603
+    },
+    {
+      "path": "psv/C_2023 A3.psv",
+      "sha256": "29652d283db52e719c48f968e840e4fd63913a0dfbe90a0bad88c244ad8f57cb",
+      "bytes": 1089599,
+      "data_rows": 9467
+    },
+    {
+      "path": "psv/Chiron.psv",
+      "sha256": "ed5e923c0a4b79cb86d47b7454aa1ec5fe4822ad8554057aa5916f60cf3066f5",
+      "bytes": 1609663,
+      "data_rows": 5588
+    },
+    {
+      "path": "psv/Didymos.psv",
+      "sha256": "826c1665b0c6c85a488d338b903791e223040980f46139ab9ec074a965db4908",
+      "bytes": 1707920,
+      "data_rows": 6034
+    },
+    {
+      "path": "psv/Duende.psv",
+      "sha256": "41da9718753217ffa5e47e5a1cdd0dc80be2af22bc56b4f7e90754787b74c0d0",
+      "bytes": 127583,
+      "data_rows": 1071
+    },
+    {
+      "path": "psv/Eris.psv",
+      "sha256": "44cac8858fe1f4400d9a1a323fa91a353545daa394df4a3562466f4159e1738e",
+      "bytes": 818231,
+      "data_rows": 3394
+    },
+    {
+      "path": "psv/Eros.psv",
+      "sha256": "b0823af8199f51bef4116ea80626937faf70e5ee6458697c8aae85edc504296a",
+      "bytes": 3800657,
+      "data_rows": 13150
+    },
+    {
+      "path": "psv/Farnocchia.psv",
+      "sha256": "d46ef939c222451409b4457bb08bc7e283a7723603de92c9b4178fcae47880f0",
+      "bytes": 300175,
+      "data_rows": 1119
+    },
+    {
+      "path": "psv/Hektor.psv",
+      "sha256": "62624c3049eed44cca2926550e138579a39f4ef86b592ab8e552fd380856c2fe",
+      "bytes": 1987543,
+      "data_rows": 6691
+    },
+    {
+      "path": "psv/Holman.psv",
+      "sha256": "938502b0bfafa315477c31170c8e6349abb4650d50964c5d15816c319ede33ea",
+      "bytes": 1341347,
+      "data_rows": 4722
+    },
+    {
+      "path": "psv/Hygiea.psv",
+      "sha256": "dc39e15fea91906bc69ed22d1b821c91e6459f1f294fc5963c06f610a7a8250b",
+      "bytes": 1117616,
+      "data_rows": 3893
+    },
+    {
+      "path": "psv/Iris.psv",
+      "sha256": "18a26f8c57a1c9d4b3781ea947fb8d6081f4f1187bebc88ab95fc0a6cc011654",
+      "bytes": 964776,
+      "data_rows": 3520
+    },
+    {
+      "path": "psv/Lutetia.psv",
+      "sha256": "192299d459c01d23f1cade309a00c4b8e8621d4a703812dce8034fa7eeec3c62",
+      "bytes": 1815837,
+      "data_rows": 6461
+    },
+    {
+      "path": "psv/Makemake.psv",
+      "sha256": "87b01f42022256db3bfaed342a12225822038c530d25c58cf5a42dcecdec6b33",
+      "bytes": 1399985,
+      "data_rows": 5784
+    },
+    {
+      "path": "psv/Nysa.psv",
+      "sha256": "137da1afdac565e63b5e01f5189c99a1a13139961df3c83bb168bebf9dbaa3da",
+      "bytes": 2349198,
+      "data_rows": 8300
+    },
+    {
+      "path": "psv/Pallas.psv",
+      "sha256": "73a6808ec9aeb511c9f2a1a2f4804c60343b60cc57f546d3a709e4fe15c4ef6d",
+      "bytes": 1331020,
+      "data_rows": 4839
+    },
+    {
+      "path": "psv/Parijskij.psv",
+      "sha256": "219fd003ab9f8558bbe517f978114fda6b01e187439ab7b00a916b895f99d9ed",
+      "bytes": 1431663,
+      "data_rows": 4970
+    },
+    {
+      "path": "psv/Patroclus.psv",
+      "sha256": "8a3096f7c12bf6f4a1d5984a2d0925265a7de34d753f445558640faec5dd7c22",
+      "bytes": 1989730,
+      "data_rows": 6860
+    },
+    {
+      "path": "psv/Phaethon.psv",
+      "sha256": "2e40af855649a8703663c4acc755bed701af8c826157e700affe7f66ad2e36e3",
+      "bytes": 982746,
+      "data_rows": 9017
+    },
+    {
+      "path": "psv/Toutatis.psv",
+      "sha256": "7c75e8937665215d5a8fabcdf79e4ab01cd14349c931fc07e26254f94d90d77c",
+      "bytes": 569832,
+      "data_rows": 7155
+    },
+    {
+      "path": "psv/Varuna.psv",
+      "sha256": "f0fce18519da7ea059f58d6197ede65fcbdb9e79adfd966a21fc47a174b7edc8",
+      "bytes": 142106,
+      "data_rows": 940
+    },
+    {
+      "path": "psv/Vesta.psv",
+      "sha256": "8214ebe4346dffa3c70b7c6c0c6760e2b189d0bc438eb363aaf6cd2c6c20884b",
+      "bytes": 827345,
+      "data_rows": 3709
+    },
+    {
+      "path": "psv-radar/Apophis.psv",
+      "sha256": "a9d398c7443fd4ee6776f0cb2eac9469e0a97980e843f889c9475847cbaa5d5b",
+      "bytes": 2680879,
+      "data_rows": 9570
+    },
+    {
+      "path": "psv-radar/Bennu.psv",
+      "sha256": "14e4e3e8e7a394fd64da174a3f3391a0c5d22713a29ed10327b4e50a7777dba2",
+      "bytes": 108359,
+      "data_rows": 632
+    },
+    {
+      "path": "psv-radar/Didymos.psv",
+      "sha256": "d6e7acb0fbc8b74875d647b110b33099783f4c7518d511a5c715b3f00b46436b",
+      "bytes": 1708716,
+      "data_rows": 6043
+    },
+    {
+      "path": "psv-radar/Eros.psv",
+      "sha256": "d17b9128e8d6622a99eab5cbf0c6b788094dd79511ea0219853f0c08c63f0fdc",
+      "bytes": 3801403,
+      "data_rows": 13156
+    },
+    {
+      "path": "psv-radar/Toutatis.psv",
+      "sha256": "72790bff6691a807d1b14d2b3f80cf0bc75c0ff2c5d58cc6aea670436c77c2f9",
+      "bytes": 576653,
+      "data_rows": 7217
+    }
+  ]
+}
