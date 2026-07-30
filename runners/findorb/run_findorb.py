@@ -347,7 +347,31 @@ def run_findorb(
         fit_ms = (time.perf_counter() - t_fit0) * 1000.0
 
         if result.returncode != 0:
-            print(f"    find_orb failed (rc={result.returncode})")
+            # Surface find_orb's OWN diagnostics. Printing only the return code
+            # made a channel that failed on all 50 objects undiagnosable from
+            # CI: `capture_output=True` swallowed everything fo said about why,
+            # leaving `rc=134` and nothing else, which is not a cause. Signal
+            # deaths are decoded because 134 is the common one here (SIGABRT)
+            # and "rc=134" does not read as "the process was killed".
+            rc = result.returncode
+            how = f"rc={rc}"
+            if rc < 0:
+                how = f"killed by signal {-rc}"
+            elif rc > 128:
+                how = f"rc={rc} (killed by signal {rc - 128})"
+            print(f"    find_orb failed ({how})")
+            for stream, text in (("stdout", result.stdout), ("stderr", result.stderr)):
+                text = (text or "").strip()
+                if not text:
+                    continue
+                lines = text.splitlines()
+                shown = lines[-25:]
+                if len(lines) > len(shown):
+                    print(f"      [{stream}: last {len(shown)} of {len(lines)} lines]")
+                else:
+                    print(f"      [{stream}]")
+                for line in shown:
+                    print(f"        {line}")
             return None
 
         # Parse output files
