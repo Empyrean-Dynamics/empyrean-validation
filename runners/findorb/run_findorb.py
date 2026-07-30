@@ -200,10 +200,24 @@ def populate_fo_directory(working_dir: str, data_dir: Optional[pathlib.Path] = N
     # Based on: https://github.com/B612-Asteroid-Institute/adam_fo/blob/main/src/adam_fo/environ.dat.tpl
     lines = []
 
-    # JPL ephemeris path
+    # JPL ephemeris. Linked into the working directory and named RELATIVELY,
+    # never by absolute path: find_orb copies this string into a 94-byte buffer,
+    # and CI's workspace nests the checkout three deep, so the absolute path is
+    #   /home/runner/work/empyrean-validation/empyrean-validation/empyrean-validation/data/linux_p1550p2650.440
+    # — 103 characters, 9 over. On macOS that strlcpy overflow prints a warning
+    # and continues; on Linux, where the binary is built with _FORTIFY_SOURCE,
+    # it ABORTS, so `fo` died with SIGABRT (rc=134) on every single object and
+    # the channel fitted nothing. The runner already uses bare relative names
+    # elsewhere for exactly this reason; this was the last absolute path left.
+    #
+    # A symlink rather than a copy: the DE file is ~100 MB and this runs once
+    # per object.
     jpl_path = data_dir / "linux_p1550p2650.440" if data_dir else None
     if jpl_path and jpl_path.exists():
-        lines.append(f'LINUX_JPL_FILENAME={jpl_path.absolute()}')
+        link = os.path.join(working_dir, "jpl_de.440")
+        if not os.path.lexists(link):
+            os.symlink(jpl_path.absolute(), link)
+        lines.append("LINUX_JPL_FILENAME=jpl_de.440")
 
     # Perturbers: all planets + Pluto + Moon + asteroid perturbers (hex)
     lines.append('PERTURBERS=1007fe')
