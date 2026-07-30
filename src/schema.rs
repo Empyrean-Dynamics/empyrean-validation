@@ -647,6 +647,115 @@ pub struct ValidationResult {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub layup_time_ms: Option<f64>,
 
+    // ── GRSS external reference ─────────────────────────────────────
+    // Propagation + ephemeris + OD reference. GRSS — the Gauss-Radau
+    // Small-body Simulator (Makadia et al.; github.com/rahil-makadia/grss)
+    // — is an independent C++ propagation/OD core with a Python interface,
+    // run in its own venv and never linked into empyrean. It is the widest
+    // external reference in the suite: the only one that covers all three
+    // axes AND, with find_orb, one of only two that ingests radar
+    // astrometry. Populated by `merge-external` from the GRSS runner's
+    // output (`--grss`, plus `--grss-radar` for its radar pass).
+    /// |GRSS − Horizons| in km (propagation rows).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub grss_vs_horizons_km: Option<f64>,
+    /// |empyrean − GRSS| in km (propagation rows).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub emp_vs_grss_km: Option<f64>,
+    /// GRSS wall-clock per row (ms). In-process (C++ core behind pybind11),
+    /// so comparable to `kete_time_ms` in kind; on OD rows it is the whole
+    /// least-squares fit and NOT comparable to a per-row propagation time.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub grss_time_ms: Option<f64>,
+    /// GRSS angular separation vs Horizons (ephemeris rows, arcsec).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub grss_separation_arcsec: Option<f64>,
+    /// GRSS dRA·cos(Dec) vs Horizons (ephemeris rows, arcsec).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub grss_d_ra_arcsec: Option<f64>,
+    /// GRSS dDec vs Horizons (ephemeris rows, arcsec).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub grss_d_dec_arcsec: Option<f64>,
+    /// GRSS d|range| vs Horizons (ephemeris rows, km).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub grss_d_rho_km: Option<f64>,
+    /// GRSS combined post-fit RA·cosδ + Dec residual RMS (arcsec) — the
+    /// find_orb / OrbFit convention, directly comparable to
+    /// `od_rms_combined_arcsec` and `findorb_rms_residual`. NOT GRSS's own
+    /// `unweighted_rms`, which mixes arcsec with µs and Hz whenever radar
+    /// is in the fit and is therefore not an angular RMS at all.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub grss_rms_arcsec: Option<f64>,
+    /// GRSS post-fit χ². Same caveat as `layup_chi2`: χ² depends on each
+    /// tool's weighting / debiasing / error model, so reduced χ² is the
+    /// more tool-agnostic comparison.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub grss_chi2: Option<f64>,
+    /// GRSS reduced χ² (`χ² / (n_measurements − n_fit)`). Compare to
+    /// `od_reduced_chi2` / `layup_reduced_chi2`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub grss_reduced_chi2: Option<f64>,
+    /// Whether GRSS's least-squares reached its convergence test.
+    /// Comparable to `od_converged` / `layup_converged`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub grss_converged: Option<bool>,
+    /// GRSS accepted optical observation count. Comparable to
+    /// `n_obs_used` / `findorb_n_obs_used`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub grss_n_obs_used: Option<u32>,
+    /// GRSS rejected optical observation count (auto + forced).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub grss_n_obs_rejected: Option<u32>,
+    /// Observations GRSS could not ingest at all, excluded before the fit —
+    /// a star catalog outside its ADES table, or an off-Earth observation
+    /// whose observer position the fixture does not carry. Distinct from
+    /// `grss_n_obs_rejected`, which is an outlier decision GRSS made from
+    /// the residuals: this count is astrometry GRSS never saw, and it is
+    /// reported so a GRSS fit over fewer observations than empyrean's or
+    /// find_orb's cannot read as a cleaner fit.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub grss_n_obs_unsupported: Option<u32>,
+    /// GRSS post-fit radar **delay** residual RMS (µs). New axis: no other
+    /// channel in the suite reports a radar residual.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub grss_rms_delay_us: Option<f64>,
+    /// GRSS post-fit radar **Doppler** residual RMS (Hz).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub grss_rms_doppler_hz: Option<f64>,
+    /// GRSS accepted radar delay (range) measurements. Pairs directly with
+    /// JPL's own [`ref_od_n_del_obs_used`](Self::ref_od_n_del_obs_used).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub grss_n_delay_used: Option<u32>,
+    /// GRSS accepted radar Doppler (range-rate) measurements. Pairs with
+    /// JPL's [`ref_od_n_dop_obs_used`](Self::ref_od_n_dop_obs_used).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub grss_n_doppler_used: Option<u32>,
+    /// 1σ position uncertainty from GRSS's fitted 6×6 covariance (km),
+    /// √(tr C_pos). The optical-vs-optical+radar ratio is the radar
+    /// tightening for that object.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub grss_sigma_pos_km: Option<f64>,
+    /// A known, quantified difference between GRSS's force model and the
+    /// plan's, on a row that DID produce a valid GRSS measurement. Distinct
+    /// from [`grss_error`](Self::grss_error), which means the row produced
+    /// nothing: conflating the two would either hide a real number or invent a
+    /// failure. Today it carries the Marsden non-grav time delay `DT` — GRSS's
+    /// `NongravParameters` has no DT term, so the plan's `ic_non_grav_dt`
+    /// cannot be applied and the five objects that carry one (67P,
+    /// 103P/Hartley 2, 46P/Wirtanen, 2I/Borisov, 3I/ATLAS) are compared under a
+    /// different force model — and, on radar OD rows, the surface-bounce
+    /// (`com=0`) records fitted at `radius=0` because the plan carries no body
+    /// radius.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub grss_model_note: Option<String>,
+    /// GRSS per-row failure message. Distinguishes "attempted and failed"
+    /// from "never attempted" (both leave the numeric fields `None`), for
+    /// the same reason [`orbfit_error`](Self::orbfit_error) exists: a fit
+    /// that ran and did not converge must stay visible in the merged
+    /// report, never collapse into a blank.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub grss_error: Option<String>,
+
     // ── Metadata ────────────────────────────────────────────────────
     /// Version of the tool/engine the emitting channel actually exercised,
     /// carried for provenance so a merged report (and the archived per-channel
@@ -782,6 +891,27 @@ impl ValidationResult {
             layup_n_obs_used: None,
             layup_converged: None,
             layup_time_ms: None,
+            grss_vs_horizons_km: None,
+            emp_vs_grss_km: None,
+            grss_time_ms: None,
+            grss_separation_arcsec: None,
+            grss_d_ra_arcsec: None,
+            grss_d_dec_arcsec: None,
+            grss_d_rho_km: None,
+            grss_rms_arcsec: None,
+            grss_chi2: None,
+            grss_reduced_chi2: None,
+            grss_converged: None,
+            grss_n_obs_used: None,
+            grss_n_obs_rejected: None,
+            grss_n_obs_unsupported: None,
+            grss_rms_delay_us: None,
+            grss_rms_doppler_hz: None,
+            grss_n_delay_used: None,
+            grss_n_doppler_used: None,
+            grss_sigma_pos_km: None,
+            grss_model_note: None,
+            grss_error: None,
             source_version: None,
             timestamp: String::new(),
             notes: String::new(),

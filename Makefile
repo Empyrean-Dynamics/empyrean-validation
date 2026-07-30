@@ -77,7 +77,7 @@ RUST_BIN := $(EMPYREAN_RUNNERS)/rust/target/release/validate
 C_BIN := $(EMPYREAN_RUNNERS)/c/runner
 CLI_BIN := $(EMPYREAN_RUNNERS)/cli/target/release/empyrean-cli-runner
 
-# External-reference runners (assist / findorb / kete / oorb / jorbit)
+# External-reference runners (assist / findorb / kete / oorb / jorbit / grss)
 # live under this repo's runners/ directory.
 EMP_VAL_BIN := $(EMPYREAN_VALIDATION_ROOT)/target/release/empyrean-validation
 EMP_VAL_RUNNERS := $(EMPYREAN_VALIDATION_ROOT)/runners
@@ -134,7 +134,7 @@ ONLY_FLAG := $(if $(OBJECTS),--only "$(OBJECTS)",)
 # Output JSONs
 #
 # `validation_plan.json` is the canonical test fixture every replay channel
-# (python / c / cli / core / assist / findorb / kete) consumes — it carries
+# (python / c / cli / core / assist / findorb / kete / grss) consumes — it carries
 # the test grid, fetched initial conditions, and Horizons reference values
 # but no channel-specific results. It is derived from the rust output by
 # stripping channel-specific fields, so the IC/ref data is shared via the
@@ -155,6 +155,12 @@ FINDORB_RADAR_OUT := $(RESULTS_DIR)/validation_findorb_radar.json
 OORB_OUT := $(RESULTS_DIR)/validation_oorb.json
 ORBFIT_OUT := $(RESULTS_DIR)/validation_orbfit.json
 KETE_OUT := $(RESULTS_DIR)/validation_kete.json
+# GRSS external reference (Makadia et al.) — propagation + ephemeris + OD, and
+# with find_orb one of only two radar-capable references in the suite. Two
+# passes, mirroring find_orb: the plan-driven one and a radar pass over the
+# psv-radar fixtures whose rows attach to the `orbit_determination_radar` rows.
+GRSS_OUT := $(RESULTS_DIR)/validation_grss.json
+GRSS_RADAR_OUT := $(RESULTS_DIR)/validation_grss_radar.json
 JORBIT_OUT := $(RESULTS_DIR)/validation_jorbit.json
 # layup external OD reference (opt-in, WITH_LAYUP=1); its rows attach to the
 # `orbit_determination` OD rows in the merge, alongside find_orb + OrbFit.
@@ -185,6 +191,7 @@ REPORT_INPUTS := $(if $(WITH_CORE),$(RUST)$(comma)$(PYTHON)$(comma)$(C_OUT)$(com
 # ── Targets ────────────────────────────────────────────────
 .PHONY: all setup build run report clean clean-results clean-all archive help fixtures check-fixtures \
         setup-assist setup-findorb setup-oorb setup-orbfit setup-kete setup-jorbit setup-layup \
+        setup-grss run-grss \
         build-empyrean-c build-rust build-c build-cli build-wheel build-core build-empyrean-validation \
         run-rust run-python run-c run-cli run-assist run-findorb run-oorb run-orbfit \
         run-core run-kete run-jorbit run-layup \
@@ -234,7 +241,7 @@ check-fixtures: fixtures
 # when it will actually run — otherwise `make setup` pulls a Docker image
 # for a comparator that never executes (and fails the setup if Docker is
 # unavailable).
-setup: setup-assist setup-findorb setup-kete setup-jorbit $(if $(WITH_OORB),setup-oorb,) $(if $(WITH_ORBFIT),setup-orbfit,) $(if $(WITH_LAYUP),setup-layup,)
+setup: setup-assist setup-findorb setup-kete setup-jorbit setup-grss $(if $(WITH_OORB),setup-oorb,) $(if $(WITH_ORBFIT),setup-orbfit,) $(if $(WITH_LAYUP),setup-layup,)
 	@echo
 	@echo "External dependencies installed."
 
@@ -342,7 +349,7 @@ $(EMP_VAL_BIN):
 # then the externals. Each non-rust channel reads exactly one file and writes
 # exactly one file.
 # Default external set: ASSIST + OpenOrb + find_orb + kete + jorbit +
-# layup all run as part of `make run` and fold into the merged report.
+# layup + GRSS all run as part of `make run` and fold into the merged report.
 #
 # OrbFit runs its runner via the MPC's Docker container (neofit2.x): it
 # refits each OD object from empyrean's IC as a heliocentric Cartesian
@@ -359,7 +366,7 @@ WITH_ORBFIT ?= 1
 WITH_LAYUP ?= 1
 # OpenOrb is gated on WITH_OORB, defined above with the reason it is off.
 run: run-rust run-python run-c run-cli run-assist run-findorb \
-     run-kete run-jorbit \
+     run-kete run-jorbit run-grss \
      $(if $(WITH_OORB),run-oorb,) \
      $(if $(WITH_ORBFIT),run-orbfit,) \
      $(if $(WITH_LAYUP),run-layup,) \
@@ -857,6 +864,48 @@ $(KETE_OUT): $(PLAN) $(KETE_PY) | check-plan fixtures
 	    --input $(PLAN) --output $(KETE_OUT) \
 	    --fixtures-dir $(FIXTURES_PSV)
 
+# ── GRSS external comparison — propagation + ephemeris + OD ──
+# The Gauss-Radau Small-body Simulator (Makadia et al.;
+# github.com/rahil-makadia/grss): a C++ propagation/OD core behind a Python
+# interface, installed from PyPI into its own venv and never linked into
+# empyrean. The widest external reference in the suite — the only one covering
+# all three axes — and, with find_orb, one of only two that ingests radar
+# astrometry, which is what turns radar OD from a single-witness comparison
+# into a cross-check.
+#
+# Two passes, mirroring run-findorb: the plan-driven pass (propagation +
+# ephemeris + optical OD) and a radar pass over $(FIXTURES_PSV_RADAR) whose
+# rows attach to the `orbit_determination_radar` OD rows. GRSS's LSQ is seeded
+# from the plan's IC, so the radar pass reads the plan too.
+GRSS_VENV := $(EMP_VAL_RUNNERS)/grss/.venv
+GRSS_PY := $(GRSS_VENV)/bin/python
+
+setup-grss: $(GRSS_PY)
+$(GRSS_PY):
+	@echo "──── Setting up grss venv + SPICE kernels ──────────────"
+	@cd $(EMP_VAL_RUNNERS)/grss && ./setup.sh
+
+run-grss: $(GRSS_OUT)
+# Same rule as find_orb / layup: the venv is an optional BUILD, but a missing
+# interpreter at RUN time is a failure, not a skip. An empty result file would
+# report a comparator that never executed as a successful empty comparison.
+$(GRSS_OUT): $(PLAN) | check-plan fixtures
+	@test -x "$(GRSS_PY)" || { \
+	    echo "ERROR: grss venv not built: $(GRSS_PY)"; \
+	    echo "       Build it with: make setup-grss"; \
+	    echo "       (An empty result file would report 'GRSS compared nothing' as a pass.)"; \
+	    exit 1; }
+	@echo "──── GRSS: external prop + eph + OD reference ──────────"
+	@$(GRSS_PY) $(EMP_VAL_RUNNERS)/grss/run_grss.py \
+	    --input $(PLAN) --output $(GRSS_OUT) \
+	    --fixtures-dir $(FIXTURES_PSV) \
+	    $(if $(OBJECTS),--objects "$(OBJECTS)",)
+	@echo "──── GRSS: radar-augmented OD reference (psv-radar) ────"
+	@$(GRSS_PY) $(EMP_VAL_RUNNERS)/grss/run_grss.py --radar \
+	    --input $(PLAN) --output $(GRSS_RADAR_OUT) \
+	    --fixtures-dir $(FIXTURES_PSV_RADAR) \
+	    $(if $(OBJECTS),--objects "$(OBJECTS)",)
+
 # ── jorbit (opt-in, parallel to kete) ────────────────────────
 # JAX-based propagator + OD (independent — affiliation pending
 # verification). Out of the public-report headline set; invoke
@@ -910,7 +959,7 @@ $(LAYUP_OUT): | fixtures
 # with the row format every channel runner emits.
 #
 # Headline externals folded onto rust rows by default: ASSIST + find_orb
-# + OpenOrb + OrbFit. kete + jorbit are opt-in — their per-row data is
+# + OpenOrb + OrbFit + GRSS. kete + jorbit are opt-in — their per-row data is
 # present in their own JSONs but not folded onto the rust rows unless
 # the user explicitly opts in via the recipe below (see
 # INCLUDE_OPTIONAL).
@@ -923,26 +972,28 @@ INCLUDE_OPTIONAL ?=
 # folding onto rust rows for backward compat.
 merge-external: $(if $(WITH_CORE),$(CORE_MERGED),$(RUST_MERGED))
 $(CORE_MERGED): $(CORE_OUT) $(ASSIST_OUT) $(FINDORB_OUT) $(FINDORB_RADAR_OUT) $(if $(WITH_OORB),$(OORB_OUT),) \
-                $(KETE_OUT) $(JORBIT_OUT) \
+                $(KETE_OUT) $(JORBIT_OUT) $(GRSS_OUT) \
                 $(if $(WITH_ORBFIT),$(ORBFIT_OUT),) $(if $(WITH_LAYUP),$(LAYUP_OUT),) $(EMP_VAL_BIN)
-	@echo "──── Merge ASSIST + find_orb$(if $(WITH_OORB), + OpenOrb,) + kete + jorbit$(if $(WITH_ORBFIT), + OrbFit,)$(if $(WITH_LAYUP), + layup,) into core ──"
+	@echo "──── Merge ASSIST + find_orb$(if $(WITH_OORB), + OpenOrb,) + kete + jorbit + GRSS$(if $(WITH_ORBFIT), + OrbFit,)$(if $(WITH_LAYUP), + layup,) into core ──"
 	@$(EMP_VAL_BIN) merge-external -i $(CORE_OUT) -o $(CORE_MERGED) \
 	    --assist $(ASSIST_OUT) --findorb $(FINDORB_OUT) \
 	    --findorb-radar $(FINDORB_RADAR_OUT) \
 	    $(if $(WITH_OORB),--oorb $(OORB_OUT),) \
 	    --kete $(KETE_OUT) --jorbit $(JORBIT_OUT) \
+	    --grss $(GRSS_OUT) --grss-radar $(GRSS_RADAR_OUT) \
 	    --jpl-sbdb-cache $(CACHE_DIR)/sbdb \
 	    $(if $(WITH_ORBFIT),--orbfit $(ORBFIT_OUT),) \
 	    $(if $(WITH_LAYUP),--layup $(LAYUP_OUT),)
 $(RUST_MERGED): $(RUST) $(ASSIST_OUT) $(FINDORB_OUT) $(FINDORB_RADAR_OUT) $(if $(WITH_OORB),$(OORB_OUT),) \
-                $(KETE_OUT) $(JORBIT_OUT) \
+                $(KETE_OUT) $(JORBIT_OUT) $(GRSS_OUT) \
                 $(if $(WITH_ORBFIT),$(ORBFIT_OUT),) $(if $(WITH_LAYUP),$(LAYUP_OUT),) $(EMP_VAL_BIN)
-	@echo "──── Merge ASSIST + find_orb$(if $(WITH_OORB), + OpenOrb,) + kete + jorbit$(if $(WITH_ORBFIT), + OrbFit,)$(if $(WITH_LAYUP), + layup,) into rust (fallback) ──"
+	@echo "──── Merge ASSIST + find_orb$(if $(WITH_OORB), + OpenOrb,) + kete + jorbit + GRSS$(if $(WITH_ORBFIT), + OrbFit,)$(if $(WITH_LAYUP), + layup,) into rust (fallback) ──"
 	@$(EMP_VAL_BIN) merge-external -i $(RUST) -o $(RUST_MERGED) \
 	    --assist $(ASSIST_OUT) --findorb $(FINDORB_OUT) \
 	    --findorb-radar $(FINDORB_RADAR_OUT) \
 	    $(if $(WITH_OORB),--oorb $(OORB_OUT),) \
 	    --kete $(KETE_OUT) --jorbit $(JORBIT_OUT) \
+	    --grss $(GRSS_OUT) --grss-radar $(GRSS_RADAR_OUT) \
 	    --jpl-sbdb-cache $(CACHE_DIR)/sbdb \
 	    $(if $(WITH_ORBFIT),--orbfit $(ORBFIT_OUT),) \
 	    $(if $(WITH_LAYUP),--layup $(LAYUP_OUT),)
@@ -1002,6 +1053,8 @@ reduce: build-empyrean-validation
 	add --oorb          "$(OORB_OUT)"            "$(OORB_DISABLED_REASON)"; \
 	add --kete          "$(KETE_OUT)"            ""; \
 	add --jorbit        "$(JORBIT_OUT)"          ""; \
+	add --grss          "$(GRSS_OUT)"             ""; \
+	add --grss-radar    "$(GRSS_RADAR_OUT)"       ""; \
 	add --orbfit        "$(ORBFIT_OUT)"          ""; \
 	add --layup         "$(LAYUP_OUT)"           ""; \
 	if [ -d "$(CACHE_DIR)/sbdb" ]; then flags="$$flags --jpl-sbdb-cache $(CACHE_DIR)/sbdb"; fi; \
@@ -1060,7 +1113,7 @@ archive:
 	 echo "Archived $$n result artifact(s) to $$dest"
 
 clean-all: clean clean-results
-	rm -rf $(ASSIST_VENV) $(KETE_VENV)
+	rm -rf $(ASSIST_VENV) $(KETE_VENV) $(GRSS_VENV)
 	rm -rf $(EMP_VAL_RUNNERS)/findorb/build $(EMP_VAL_RUNNERS)/findorb/install
 	rm -f $(C_BIN)
 	rm -rf $(EMPYREAN_RUNNERS)/cli/target $(EMPYREAN_RUNNERS)/rust/target

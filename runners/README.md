@@ -1,8 +1,8 @@
 # External Reference Runners
 
 Standalone runners that exercise independent astrodynamics
-implementations (ASSIST, find_orb, OpenOrb, OrbFit, kete, jorbit, layup)
-against the same canonical
+implementations (ASSIST, find_orb, OpenOrb, OrbFit, kete, jorbit, layup,
+GRSS) against the same canonical
 validation plan and emit JSON conforming to the
 [`ValidationResult`](../src/schema.rs) schema. The empyrean validation
 report folds these into a multi-channel comparison so each empyrean
@@ -26,6 +26,7 @@ flags.
 | [`orbfit/`](orbfit/) | [OrbFit](https://adams.dm.unipi.it/orbfit/) (OrbFit Consortium / IAU Minor Planet Center, `neofit2.x`) | GPL-3.0 | Orbit determination — the MPC's production NEO refit. Seeds neofit2.x with empyrean's IC as a heliocentric Cartesian orbit (`epoch/<desig>.eq0`), then runs its differential correction against the ADES astrometry (a *refit from empyrean's seed*, not a blind IOD — OrbFit's workflow always refines a prior orbit). Canonical implementation of CMC2003 χ²-with-hysteresis rejection; folds post-fit RMS + used/rejected counts onto the OD rows. Runs via the MPC's Docker container (`minorplanetcenter/orbfit`, amd64), never linked into empyrean. Default-on (`WITH_ORBFIT=` to skip). |
 | [`oorb/`](oorb/) | [OpenOrb](https://github.com/oorb/oorb) (Granvik et al., Fortran orbit-computation library) | GPL-3.0 | Propagation and ephemeris generation — full n-body (Bulirsch–Stoer, planets + Moon + Pluto, relativity; the stock conf's 2-body default is force-patched, and the plan's SSB states are converted to/from OpenOrb's heliocentric convention using the Sun state carried on plan rows). Built from upstream Fortran source via `setup.sh`; the runner shells out to the `oorb` CLI binary. The pip-installable Python wrapper (`pyoorb`) is intentionally not used — it has the same Fortran build dependency anyway and its sdist breaks on Python 3.12. OD skipped (Ranging/LSL doesn't fit per-row replay). |
 | [`kete/`](kete/) | [kete](https://github.com/dahlend/kete) (Dahl & friends) | BSD-3-Clause | Propagation, ephemeris generation, and OD. Full Marsden non-grav (A1/A2/A3 + g(r) + dt) via `NonGravModel`; astrometric RA/Dec with an explicit light-time iteration; self-perturbers in kete's massive-asteroid set (Vesta/Pallas/Hygiea) run planets-only. Pure Python (rebuild-from-PyPI). |
+| [`grss/`](grss/) | [GRSS](https://github.com/rahil-makadia/grss) (Rahil Makadia et al., Gauss-Radau Small-body Simulator) | GPL-3.0 | Propagation, ephemeris **and** orbit determination — the only external reference covering all three axes, and with find_orb one of only two that ingests **radar** astrometry (delay + Doppler), which is what makes radar OD a cross-check instead of a single witness. Reports the suite's only post-fit radar residual RMS. GPL, so — like ASSIST / jorbit / OrbFit — never linked into empyrean: a C++ core behind a Python interface, installed from PyPI into its own venv and driven only as a subprocess. Runs two passes like find_orb: plan-driven (prop + eph + optical OD), then `--radar` over `fixtures/psv-radar/`. Its OD is a **refit seeded from the plan's IC** (like OrbFit, unlike find_orb / layup), holding the plan's Marsden non-grav parameters fixed. `setup.sh` fetches only the DE440-case SPICE kernels (~235 MB) rather than the 4.4 GB set `import grss` would pull, and stamps the kernel version into every row's `source_version`; `GRSS_DE_KERNEL=441` + `--de-kernel 441` opts into the full DE441 set. Known force-model difference, carried on every affected row as `grss_model_note` and re-stated in the runner's summary: GRSS's `NongravParameters` has **no Marsden DT term**, so the plan's `ic_non_grav_dt` is not modelled — 67P, 103P/Hartley 2, 46P/Wirtanen, 2I/Borisov and 3I/ATLAS are compared under a different force model and their offsets are km-to-10⁴-km rather than the 4 m median of the rest of the catalog. |
 | [`jorbit/`](jorbit/) | [jorbit](https://github.com/ben-cassese/jorbit) (Cassese, JAX-based N-body integrator) | GPL-3.0 | Propagation and ephemeris generation (gravity-only — the non-grav signal remains in comet residuals, stated loudly; self-perturbers run the planets-only `gr planets` preset). jorbit is GPL and never linked into empyrean — runs in its own venv (also keeps the JAX dep tree off the rest of the suite). OD skipped. |
 
 ## Workflow
@@ -44,6 +45,7 @@ implementation, and writes its own per-channel JSON.
 ./oorb/setup.sh
 ./jorbit/setup.sh
 ./layup/setup.sh
+./grss/setup.sh
 
 # Fixtures. The ADES PSV astrometry is NOT in the checkout — it lives in the
 # GCS snapshot pinned by fixtures/manifest.json. Any runner that reads
@@ -59,6 +61,8 @@ make -C .. fixtures
 python3                   oorb/run_oorb.py       --input validation_plan.json --output validation_oorb.json
 ./jorbit/.venv/bin/python jorbit/run_jorbit.py   --input validation_plan.json --output validation_jorbit.json
 ./layup/.venv/bin/python  layup/run_layup.py     ../fixtures/psv           --output validation_layup.json
+./grss/.venv/bin/python   grss/run_grss.py       --input validation_plan.json --output validation_grss.json
+./grss/.venv/bin/python   grss/run_grss.py --radar --input validation_plan.json --output validation_grss_radar.json
 ```
 
 Outputs are merged by the empyrean-validation report renderer into a
@@ -81,7 +85,12 @@ existing runners — `kete/` is the simplest full-featured template
    initial condition to `t_mjd_tdb`), `ephemeris` (also compute the
    observed RA/Dec/range for `observer` at that epoch), or
    `orbit_determination` (fit the object's MPC astrometry from
-   `fixtures/psv/`). Initial conditions are Cartesian SSB-centered
+   `fixtures/psv/`), or `orbit_determination_radar` (fit the
+   radar-augmented `fixtures/psv-radar/` — optical table plus an ADES
+   `<radar>` table). Note that `strip-plan` removes the radar rows while
+   radar OD is rust-only, so a radar pass is driven by the fixture
+   directory rather than by plan rows: see `findorb/` and `grss/`.
+   Initial conditions are Cartesian SSB-centered
    ICRF, in au and au/day (`ic_pos_au` / `ic_vel_au_d`), with Marsden
    non-grav parameters (`ic_a1`…`ic_g_k`, `ic_non_grav_dt`) when the
    object has them — no network access needed to replay a row.

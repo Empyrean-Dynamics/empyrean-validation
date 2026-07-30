@@ -1151,6 +1151,7 @@ pub fn generate_report(
                     && (r.findorb_rms_residual.is_some()
                         || r.orbfit_rms_arcsec.is_some()
                         || r.layup_reduced_chi2.is_some()
+                        || r.grss_rms_arcsec.is_some()
                         || r.ref_od_reduced_chi2.is_some())
             })
             .count();
@@ -1195,7 +1196,7 @@ pub fn generate_report(
       <tr><td>Force model (standard)</td><td>Point-mass Sun + 8 planets + Moon + Pluto + 16 SB441-N16 asteroids; 1PN GR Einstein-Infeld-Hoffmann for Sun; non-gravitational A1 (radial) / A2 (transverse) / A3 (normal) accelerations with Marsden's <code>g(r)</code>. For asteroids, A2 ≠ 0 is the standard parameterisation of the <b>Yarkovsky effect</b> (Marsden, Sekanina &amp; Yeomans 1973 / Vokrouhlický et al. 2015).</td></tr>
       <tr><td>Integrator</td><td>GR15 (15-stage Gauss-Radau, adaptive step; derived solely from Everhart 1985)</td></tr>
       <tr><td>Autodiff (Jet1 STM)</td><td>forward-mode, N = 6 (or 9 with non-grav)</td></tr>
-      <tr><td>External OD references</td><td>JPL SBDB (reported normalized rms → reduced χ² + n_obs) &middot; layup (Holman, Smithsonian/CfA) &middot; find_orb (Project Pluto, B. Gray)</td></tr>
+      <tr><td>External OD references</td><td>JPL SBDB (reported normalized rms → reduced χ² + n_obs) &middot; layup (Holman, Smithsonian/CfA) &middot; find_orb (Project Pluto, B. Gray) &middot; GRSS (Makadia et al. &mdash; the second radar-capable reference)</td></tr>
       <tr><td>External propagation references</td><td>ASSIST (Holman et al. 2023) on REBOUND IAS15 &middot; OpenOrb (Granvik et al.)</td></tr>
       <tr><td>Observation source</td><td>Minor Planet Center API; fetched at runtime</td></tr>
       <tr><td>Observation weights</td><td>Vereš–Farnocchia–Chesley 2017 (VFC17) per-station RMS floors + nightly deweighting; Eggl–Farnocchia–Chamberlin–Chesley 2020 (EFCC2020) star-catalog debiasing</td></tr>
@@ -1406,7 +1407,7 @@ pub fn generate_report(
     <div class="summary-card"><div class="value">{n_od}</div><div class="label">OD Cases</div></div>
     <div class="summary-card"><div class="value">{n_channels}</div><div class="label">Channels</div></div>
   </div>
-  <div class="section-desc" style="margin-top:6px;">Two axes of validation: the <b>distribution channels</b> agree with each other (every channel returns bit-identical numbers from one shared engine — the <b>Empyrean Internals</b> page), and the engine agrees with <b>independent tools</b> (JPL Horizons, ASSIST, OpenOrb, find_orb, layup — pick any pair above). The stack under test:</div>
+  <div class="section-desc" style="margin-top:6px;">Two axes of validation: the <b>distribution channels</b> agree with each other (every channel returns bit-identical numbers from one shared engine — the <b>Empyrean Internals</b> page), and the engine agrees with <b>independent tools</b> (JPL Horizons, ASSIST, OpenOrb, find_orb, layup, GRSS — pick any pair above). The stack under test:</div>
   <div class="heatmap-container">
   <table class="od-table" style="max-width:720px; margin-bottom:6px;">
     <thead><tr><th style="text-align:left">Component</th><th style="text-align:left">Purpose</th><th>Version</th></tr></thead>
@@ -1461,6 +1462,12 @@ pub fn generate_report(
         <td>Gray (Project Pluto) · MPC-grade OD</td>
         <td>Orbit determination from ADES astrometry (post-fit RMS reference); its fitted orbit is then propagated by find_orb itself to the plan's epochs for propagation + sky-plane comparison (<b>fit-then-propagate</b> &mdash; unlike ASSIST / OpenOrb, which replay the plan's initial conditions, so these diffs include the fit-vs-JPL-orbit difference)</td>
         <td><a href="https://github.com/Empyrean-Dynamics/empyrean-validation/blob/main/runners/findorb/run_findorb.py" target="_blank" rel="noopener"><code>runners/findorb/run_findorb.py</code></a></td>
+      </tr>
+      <tr>
+        <td><b>GRSS</b></td>
+        <td>Makadia et al. &middot; Gauss-Radau Small-body Simulator (C++ core, Python interface)</td>
+        <td>Propagation, ephemeris <i>and</i> orbit determination &mdash; the only external reference covering all three axes, and with find_orb one of only two that ingests <b>radar</b> astrometry (delay + Doppler). Replays the plan's initial conditions (not a fit-then-propagate); its OD is a refit seeded from the plan's IC, holding the plan's Marsden non-grav parameters fixed. Reports the suite's only post-fit radar residuals. GRSS has no Marsden <b>DT</b> (non-grav time delay) term, so the five objects whose plan IC carries one are compared under a different force model &mdash; those rows are marked &dagger; and carry the reason.</td>
+        <td><a href="https://github.com/Empyrean-Dynamics/empyrean-validation/blob/main/runners/grss/run_grss.py" target="_blank" rel="noopener"><code>runners/grss/run_grss.py</code></a></td>
       </tr>
       <tr>
         <td><b>OpenOrb</b></td>
@@ -1609,6 +1616,7 @@ pub fn generate_report(
           <th class="od-col-jpl">JPL χ²<sub>r</sub><br/><small style="font-weight:300; opacity:0.6">(≈ rms²)</small></th>
           <th class="od-col-jpl">JPL n_obs<br/><small style="font-weight:300; opacity:0.6">(+radar · arc)</small></th>
           <th class="od-col-layup">layup χ²<sub>r</sub><br/><small style="font-weight:300; opacity:0.6">(Δ vs Empyrean)</small></th>
+          <th class="od-col-grss">GRSS RMS<br/><small style="font-weight:300; opacity:0.6">(Δ vs Empyrean · radar resid · &dagger;=force-model diff)</small></th>
           <th class="od-col-findorb">find_orb RMS</th>
           <th class="od-col-findorb">find_orb obs coverage</th>
           <th class="od-col-findorb">Δ vs find_orb</th>
@@ -1829,6 +1837,7 @@ const TOOLS = {{
     findorb:  {{ label: 'find_orb', color: '#d05040', truth: false }},
     orbfit:   {{ label: 'OrbFit', color: '#7dd3c0', truth: false }},
     layup:    {{ label: 'layup', color: '#e07bc0', truth: false }},
+    grss:     {{ label: 'GRSS', color: '#8fbf5f', truth: false }},
 }};
 function toolLabel(t) {{ return (TOOLS[t] && TOOLS[t].label) || t; }}
 function toolColor(t) {{ return (TOOLS[t] && TOOLS[t].color) || '#888'; }}
@@ -1843,6 +1852,7 @@ const TOOLS_PRESENT = (() => {{
         findorb: r => r.findorb_rms_residual != null || r.findorb_vs_horizons_km != null || r.findorb_d_ra_arcsec != null,
         orbfit:  r => r.orbfit_rms_arcsec != null,
         layup:   r => r.layup_reduced_chi2 != null || r.layup_converged != null,
+        grss:    r => r.grss_vs_horizons_km != null || r.grss_separation_arcsec != null || r.grss_rms_arcsec != null,
     }};
     for (const r of results) {{
         for (const t in probe) {{ if (probe[t](r)) present.add(t); }}
@@ -1860,6 +1870,8 @@ const TOOL_AXES = {{
     findorb:  new Set(['prop_pos', 'eph', 'od_rms', 'od_nobs']),
     orbfit:   new Set(['od_rms', 'od_nobs']),
     layup:    new Set(['od_chi2', 'od_nobs']),
+    // GRSS is the only external reference that covers every axis at once.
+    grss:     new Set(['prop_pos', 'eph', 'od_rms', 'od_chi2', 'od_nobs', 'time']),
 }};
 // Which (tool, axis) actually have data in THIS run — a tool may be
 // structurally capable of an axis (TOOL_AXES) yet carry no rows for it (e.g.
@@ -1889,6 +1901,13 @@ const TOOL_AXIS_DATA = (() => {{
         if (r.findorb_d_ra_arcsec != null) {{ mark('findorb', 'eph'); mark('jpl', 'eph'); }}
         if (r.ref_od_reduced_chi2 != null) mark('jpl', 'od_chi2');
         if (r.ref_od_n_obs_used != null) mark('jpl', 'od_nobs');
+        if (r.grss_vs_horizons_km != null) {{ mark('grss', 'prop_pos'); mark('jpl', 'prop_pos'); }}
+        if (r.emp_vs_grss_km != null) {{ mark('grss', 'prop_pos'); mark('empyrean', 'prop_pos'); }}
+        if (r.grss_d_ra_arcsec != null) {{ mark('grss', 'eph'); mark('jpl', 'eph'); }}
+        if (r.grss_rms_arcsec != null) mark('grss', 'od_rms');
+        if (r.grss_reduced_chi2 != null) mark('grss', 'od_chi2');
+        if (r.grss_n_obs_used != null) mark('grss', 'od_nobs');
+        if (r.grss_time_ms != null) mark('grss', 'time');
     }}
     return has;
 }})();
@@ -1908,6 +1927,8 @@ function propPosDiffKm(row, t1, t2) {{
         'jpl|oorb': 'oorb_vs_horizons_km',
         'empyrean|findorb': 'emp_vs_findorb_km',
         'findorb|jpl': 'findorb_vs_horizons_km',
+        'empyrean|grss': 'emp_vs_grss_km',
+        'grss|jpl': 'grss_vs_horizons_km',
     }};
     const f = F[[t1, t2].sort().join('|')];
     return (f && row[f] != null) ? row[f] : null;
@@ -1921,6 +1942,7 @@ function ephOffsets(row, tool) {{
     if (tool === 'empyrean') return (row.d_ra_arcsec != null && row.d_dec_arcsec != null) ? [row.d_ra_arcsec, row.d_dec_arcsec] : null;
     if (tool === 'oorb') return (row.oorb_d_ra_arcsec != null && row.oorb_d_dec_arcsec != null) ? [row.oorb_d_ra_arcsec, row.oorb_d_dec_arcsec] : null;
     if (tool === 'findorb') return (row.findorb_d_ra_arcsec != null && row.findorb_d_dec_arcsec != null) ? [row.findorb_d_ra_arcsec, row.findorb_d_dec_arcsec] : null;
+    if (tool === 'grss') return (row.grss_d_ra_arcsec != null && row.grss_d_dec_arcsec != null) ? [row.grss_d_ra_arcsec, row.grss_d_dec_arcsec] : null;
     return null;
 }}
 function ephSepArcsec(row, t1, t2) {{
@@ -1931,10 +1953,10 @@ function ephSepArcsec(row, t1, t2) {{
 }}
 
 // Per-tool absolute scalars.
-function toolTimeMs(row, tool) {{ return ({{ empyrean: row.emp_time_ms, assist: row.assist_time_ms, oorb: row.oorb_time_ms }})[tool] ?? null; }}
-function odRms(row, tool) {{ return ({{ empyrean: row.od_rms_combined_arcsec, findorb: row.findorb_rms_residual, orbfit: row.orbfit_rms_arcsec }})[tool] ?? null; }}
-function odReducedChi2(row, tool) {{ return ({{ empyrean: row.od_reduced_chi2, layup: row.layup_reduced_chi2, jpl: row.ref_od_reduced_chi2 }})[tool] ?? null; }}
-function odNobs(row, tool) {{ return ({{ empyrean: row.n_obs_used, findorb: row.findorb_n_obs_used, orbfit: row.orbfit_n_obs_used, layup: row.layup_n_obs_used, jpl: row.ref_od_n_obs_used }})[tool] ?? null; }}
+function toolTimeMs(row, tool) {{ return ({{ empyrean: row.emp_time_ms, assist: row.assist_time_ms, oorb: row.oorb_time_ms, grss: row.grss_time_ms }})[tool] ?? null; }}
+function odRms(row, tool) {{ return ({{ empyrean: row.od_rms_combined_arcsec, findorb: row.findorb_rms_residual, orbfit: row.orbfit_rms_arcsec, grss: row.grss_rms_arcsec }})[tool] ?? null; }}
+function odReducedChi2(row, tool) {{ return ({{ empyrean: row.od_reduced_chi2, layup: row.layup_reduced_chi2, jpl: row.ref_od_reduced_chi2, grss: row.grss_reduced_chi2 }})[tool] ?? null; }}
+function odNobs(row, tool) {{ return ({{ empyrean: row.n_obs_used, findorb: row.findorb_n_obs_used, orbfit: row.orbfit_n_obs_used, layup: row.layup_n_obs_used, jpl: row.ref_od_n_obs_used, grss: row.grss_n_obs_used }})[tool] ?? null; }}
 
 // ── Mahalanobis (uncertainty-unit) offsets ──────────────────────────────
 // Only Empyrean propagates a covariance, so these are defined only for the
@@ -2009,7 +2031,12 @@ function legalPair(t1, t2, axis) {{
         if (!anchored(t1) && !anchored(t2)) return false; // e.g. ASSIST vs OpenOrb
     }}
     if (axis === 'eph') {{
-        const ok = t => t === 'empyrean' || t === 'jpl' || t === 'oorb' || t === 'findorb';
+        // Whitelist, not a blacklist: an ephemeris pair is only reconstructable
+        // for tools that persist SIGNED (dRA·cosδ, dDec) offsets vs Horizons.
+        // A tool storing only a scalar separation has no direction, so its
+        // difference against another tool is not defined. `ephOffsets` must
+        // know each name listed here.
+        const ok = t => t === 'empyrean' || t === 'jpl' || t === 'oorb' || t === 'findorb' || t === 'grss';
         if (!ok(t1) || !ok(t2)) return false;
     }}
     return true;
@@ -2025,7 +2052,7 @@ const TOOL_RENDERERS = [];
 function onToolChange(fn) {{ TOOL_RENDERERS.push(fn); }}
 
 function populateToolSelects() {{
-    const order = ['empyrean', 'jpl', 'assist', 'layup', 'findorb', 'orbfit', 'oorb'];
+    const order = ['empyrean', 'jpl', 'assist', 'grss', 'layup', 'findorb', 'orbfit', 'oorb'];
     const opts = order.filter(t => TOOLS_PRESENT.has(t));
     for (const id of ['tool1-select', 'tool2-select']) {{
         const sel = document.getElementById(id);
@@ -3291,6 +3318,51 @@ if (odRust.length === 0) {{
         }} else {{
             layupCell = `<span style="color:#8b9198">— <small>(not run)</small></span>`;
         }}
+        // GRSS external OD reference (Makadia et al.). It reports a combined
+        // RA·cosδ + Dec RMS in arcsec, like find_orb / OrbFit, so it pairs
+        // against Empyrean's combined RMS. The `+radar` rows additionally carry
+        // a delay / Doppler post-fit residual RMS — the only radar residual any
+        // channel in this suite reports — shown inline. A fit that ran and did
+        // not converge stays visible with its reason rather than blanking.
+        let grssCell;
+        if (fo.grss_rms_arcsec != null) {{
+            const gr = fo.grss_rms_arcsec;
+            const emp = rust.od_rms_combined_arcsec;
+            const d = (emp != null) ? (gr - emp) : null;
+            let color = '#5b9bd5';
+            if (emp != null && emp > 0) {{
+                const ratio = gr / emp;
+                if (ratio >= 5 || ratio <= 0.2) color = '#e06252';
+                else if (ratio >= 2 || ratio <= 0.5) color = '#e8a040';
+            }}
+            if (fo.grss_converged === false) color = '#e8a040';
+            const dTxt = (d != null)
+                ? ` <small>(${{d >= 0 ? '+' : '−'}}${{Math.abs(d).toFixed(3)}}")</small>`
+                : '';
+            const radarBits = [];
+            if (fo.grss_rms_delay_us != null) radarBits.push(`${{fo.grss_rms_delay_us.toFixed(2)}}µs×${{fo.grss_n_delay_used ?? '?'}}`);
+            if (fo.grss_rms_doppler_hz != null) radarBits.push(`${{fo.grss_rms_doppler_hz.toFixed(2)}}Hz×${{fo.grss_n_doppler_used ?? '?'}}`);
+            const radarTxt = radarBits.length
+                ? `<br/><small style="color:#e8a040" title="GRSS post-fit radar residual RMS × accepted measurements">${{radarBits.join(' · ')}}</small>`
+                : '';
+            const bits = [];
+            if (fo.grss_n_obs_used != null) bits.push(`n_obs=${{fo.grss_n_obs_used}}`);
+            if (fo.grss_reduced_chi2 != null) bits.push(`chi2r=${{fo.grss_reduced_chi2.toFixed(3)}}`);
+            if (fo.grss_sigma_pos_km != null) bits.push(`1-sigma pos=${{fo.grss_sigma_pos_km.toFixed(2)}} km`);
+            if (fo.grss_n_obs_unsupported) bits.push(`${{fo.grss_n_obs_unsupported}} obs GRSS cannot ingest`);
+            if (fo.grss_converged === false) bits.push('LSQ did not converge');
+            if (fo.grss_model_note) bits.push(String(fo.grss_model_note));
+            const tTxt = bits.length ? ` title="${{bits.join('; ')}}"` : '';
+            const convTxt = (fo.grss_converged === false) ? ` <small>(non-conv)</small>` : '';
+            // A force-model difference is marked with a dagger, not left to a
+            // tooltip alone: the number is real but not like-for-like.
+            const noteTxt = fo.grss_model_note ? ` <small style="color:#e8a040">&dagger;</small>` : '';
+            grssCell = `<span style="color:${{color}}"${{tTxt}}>${{gr.toFixed(3)}}"</span>${{dTxt}}${{convTxt}}${{noteTxt}}${{radarTxt}}`;
+        }} else if (fo.grss_error != null) {{
+            grssCell = `<span style="color:#e8a040" title="${{String(fo.grss_error).replace(/"/g, '&quot;')}}">failed <small>(hover)</small></span>`;
+        }} else {{
+            grssCell = `<span style="color:#8b9198">— <small>(not run)</small></span>`;
+        }}
         // JPL SBDB fit quality — the same JPL solution Horizons propagates.
         // reduced χ² ≈ (SBDB normalized rms)², comparable to Empyrean's χ²ᵣ;
         // n_obs shows the optical count plus radar (+Nr) and arc (Ny) and MPC
@@ -3325,7 +3397,7 @@ if (odRust.length === 0) {{
         }} else {{
             jplNobsCell = `<span style="color:#8b9198">—</span>`;
         }}
-        tr.innerHTML = `<td class="obj">${{obj}}</td><td>${{rust.n_obs_used || '—'}}</td><td>${{chi2Cell}}</td><td>${{rmsCell}}</td><td>${{rmsCombinedCell}}</td><td>${{rust.od_iterations || '—'}}</td><td class="od-col-jpl">${{jplChi2Cell}}</td><td class="od-col-jpl">${{jplNobsCell}}</td><td class="od-col-layup">${{layupCell}}</td>${{foBlock}}<td>${{xCh}}</td>`;
+        tr.innerHTML = `<td class="obj">${{obj}}</td><td>${{rust.n_obs_used || '—'}}</td><td>${{chi2Cell}}</td><td>${{rmsCell}}</td><td>${{rmsCombinedCell}}</td><td>${{rust.od_iterations || '—'}}</td><td class="od-col-jpl">${{jplChi2Cell}}</td><td class="od-col-jpl">${{jplNobsCell}}</td><td class="od-col-layup">${{layupCell}}</td><td class="od-col-grss">${{grssCell}}</td>${{foBlock}}<td>${{xCh}}</td>`;
         overview.appendChild(tr);
     }}
 
@@ -3343,7 +3415,7 @@ if (odRust.length === 0) {{
         if (!tbody) return;
         const table = tbody.closest('table');
         if (!table) return;
-        const OD_TOOLS = ['findorb', 'orbfit', 'layup', 'jpl'];
+        const OD_TOOLS = ['findorb', 'orbfit', 'layup', 'jpl', 'grss'];
         // The external OD comparison follows whichever OD tool is in the
         // selected pair (JPL is the default second tool and carries an OD
         // result from SBDB). If none is (e.g. Empyrean vs ASSIST — ASSIST
@@ -4242,12 +4314,14 @@ function buildSpeedStrip() {{
             {{ label: 'Empyrean (σ-point)', color: toolColor('empyrean'), chip: 'in-process · 120 sigma samples', v: empT('propagation', r => r.propagation_uncertainty === 'sigma_point_with_cov') }},
             {{ label: 'Empyrean (MC-100)', color: toolColor('empyrean'), chip: 'in-process · 100 seeded samples', v: empT('propagation', r => r.propagation_uncertainty === 'monte_carlo_100_with_cov') }},
             {{ label: 'OpenOrb', color: toolColor('oorb'), chip: CHIP_SUB, v: extT('propagation', 'oorb_time_ms') }},
+            {{ label: 'GRSS', color: toolColor('grss'), chip: CHIP_IN, v: extT('propagation', 'grss_time_ms') }},
             {{ label: 'jorbit', color: JCOL, chip: CHIP_JAX, v: extT('propagation', 'jorbit_time_ms') }},
         ] }},
         {{ title: 'Ephemeris — per row', entries: [
             {{ label: 'kete', color: KCOL, chip: CHIP_IN, v: extT('ephemeris', 'kete_time_ms') }},
             {{ label: 'Empyrean', color: toolColor('empyrean'), chip: CHIP_IN, v: empT('ephemeris', null) }},
             {{ label: 'OpenOrb', color: toolColor('oorb'), chip: CHIP_SUB, v: extT('ephemeris', 'oorb_time_ms') }},
+            {{ label: 'GRSS', color: toolColor('grss'), chip: CHIP_IN, v: extT('ephemeris', 'grss_time_ms') }},
             {{ label: 'jorbit', color: JCOL, chip: CHIP_JAX + ' · Horizons observer query', v: extT('ephemeris', 'jorbit_time_ms') }},
         ] }},
         {{ title: 'Orbit determination — per fit', entries: [
@@ -4255,6 +4329,7 @@ function buildSpeedStrip() {{
             {{ label: 'layup', color: toolColor('layup'), chip: 'cold subprocess · startup-dominated', v: extT('orbit_determination', 'layup_time_ms') }},
             {{ label: 'find_orb', color: toolColor('findorb'), chip: 'subprocess · full astrometry pipeline', v: extT('orbit_determination', 'findorb_time_ms') }},
             {{ label: 'OrbFit', color: toolColor('orbfit'), chip: CHIP_SUB, v: extT('orbit_determination', 'orbfit_time_ms') }},
+            {{ label: 'GRSS', color: toolColor('grss'), chip: 'in-process · full LSQ fit', v: extT('orbit_determination', 'grss_time_ms') }},
         ] }},
     ];
     let html = '';
@@ -4382,7 +4457,7 @@ function buildPillars() {{
         }}
         if (any && ok) ngPass++;
     }}
-    const fitters = [['findorb_rms_residual', 'find_orb'], ['layup_reduced_chi2', 'layup'], ['orbfit_rms_arcsec', 'OrbFit']]
+    const fitters = [['findorb_rms_residual', 'find_orb'], ['layup_reduced_chi2', 'layup'], ['orbfit_rms_arcsec', 'OrbFit'], ['grss_rms_arcsec', 'GRSS']]
         .filter(([f]) => results.some(r => r[f] != null)).map(([, n]) => n);
 
     // Uncertainty ladder (rust-channel timing medians).
