@@ -81,11 +81,20 @@ build_findorb() {
     echo "Building jpl_eph library..."
     ( cd "$BUILD_DIR/jpl_eph" && make -j"$NPROC" libjpl.a && make install ) || return 1
 
-    # sat_code is itself optional even when the rest builds.
+    # sat_code must INSTALL, not just build: find_orb's elem2tle.cpp does
+    # `#include "norad.h"` unconditionally, and that header only reaches
+    # ~/include via sat_code's install. Previously this step ran a bare `make`
+    # and never installed, so norad.h was never placed — the build just never
+    # got far enough to notice, dying earlier in lunar. `install_lib` is the
+    # library+header target (`install` additionally wants sat_id built).
+    #
+    # Left non-fatal because find_orb's own build is the real gate: without
+    # norad.h it fails there, with `|| return 1`, which is where the failure
+    # belongs.
     echo
     echo "Building sat_code library..."
-    ( cd "$BUILD_DIR/sat_code" && make -j"$NPROC" libsatell.a ) \
-        || echo "Warning: sat_code build failed (non-critical, continuing)"
+    ( cd "$BUILD_DIR/sat_code" && make -j"$NPROC" libsatell.a && make install_lib ) \
+        || echo "Warning: sat_code build failed (find_orb will fail on norad.h)"
 
     echo
     echo "Building find_orb..."
