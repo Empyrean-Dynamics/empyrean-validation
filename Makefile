@@ -426,8 +426,22 @@ LIST_ONLY_FLAG := $(if $(OBJECTS),--only "$(OBJECTS)",)
 # filesystem-safe slug. `list-objects` shares its filter resolution with
 # `plan`, so the matrix and the shards cannot disagree about which objects
 # are in scope.
-list-objects: $(EMP_VAL_BIN)
-	@$(EMP_VAL_BIN) list-objects $(LIST_ONLY_FLAG) --format json
+# Writes the matrix to a FILE rather than stdout, and the CI step reads the
+# file. Piping `make -s list-objects` into fromJson() looked cleaner and was a
+# latent trap: whenever $(EMP_VAL_BIN) had to be built first, make's own
+# "──── Building empyrean-validation CLI ────" banner went to stdout ahead of
+# the JSON, so the matrix expression received "──── Building…" and the entire
+# fan-out failed to expand. A file has no such coupling to make's chatter.
+OBJECTS_JSON := $(RESULTS_DIR)/objects.json
+
+list-objects: $(OBJECTS_JSON)
+
+$(OBJECTS_JSON): $(EMP_VAL_BIN)
+	@mkdir -p $(RESULTS_DIR)
+	@$(EMP_VAL_BIN) list-objects $(LIST_ONLY_FLAG) --format json > $(OBJECTS_JSON)
+	@python3 -c "import json,sys; d=json.load(open('$(OBJECTS_JSON)')); \
+sys.exit('ERROR: $(OBJECTS_JSON) is empty — no objects to validate.') if not d else None; \
+print(f'Wrote {len(d)} objects to $(OBJECTS_JSON)')"
 
 # One object's slice of the reference. OBJECT is the catalog name
 # ("46P/Wirtanen"), SLUG its safe token ("46P_Wirtanen") — both come from

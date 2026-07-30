@@ -256,9 +256,13 @@ jobs:
         id: objects
         working-directory: empyrean-validation
         run: |
-          matrix="$(make -s list-objects OBJECTS="${OBJECTS}" 2>/dev/null)"
-          test -n "$matrix" || { echo "ERROR: list-objects produced nothing." >&2; exit 1; }
-          count="$(printf '%s' "$matrix" | python3 -c 'import json,sys; print(len(json.load(sys.stdin)))')"
+          # Read the matrix from the FILE the target writes, never from make's
+          # stdout: make prints its own recipe banners there whenever it has to
+          # build the CLI first, and that text ahead of the JSON silently breaks
+          # fromJson() and the whole fan-out.
+          make list-objects OBJECTS="${OBJECTS}"
+          matrix="$(cat results/objects.json)"
+          count="$(python3 -c 'import json;print(len(json.load(open("results/objects.json"))))')"
           test "$count" -gt 0 || { echo "ERROR: matrix is empty — no objects to validate." >&2; exit 1; }
           echo "objects=$matrix" >> "$GITHUB_OUTPUT"
           echo "Fanning out $count per-object reference legs."
