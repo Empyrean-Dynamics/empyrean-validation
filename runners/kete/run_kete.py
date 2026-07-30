@@ -221,6 +221,21 @@ def _ephemeris_with_kete(row: dict) -> dict | None:
     except Exception as e:
         print(f"  {row['object']} dt={row.get('dt_days', 0):+.0f} eph FAIL: {e}", file=sys.stderr)
         return None
+    # kete can return a non-finite position without raising — the light-time
+    # loop above diverges rather than throwing. Propagating that onward turned
+    # every derived comparison NaN (separation, dRA, dDec, dRho) and, because
+    # Python's json.dump writes a bare `NaN` that is not valid JSON, the failure
+    # surfaced two jobs later as `Error("expected value", line: 4790)` when the
+    # Rust merger parsed the channel file. A position that is not finite is a
+    # FAILED row with a cause, handled the same way as a raised exception.
+    if not all(math.isfinite(v) for v in (ra_rad, dec_rad, rho_au)):
+        print(
+            f"  {row['object']} dt={row.get('dt_days', 0):+.0f} eph FAIL: "
+            f"kete returned a non-finite position (ra={ra_rad}, dec={dec_rad}, rho={rho_au}); "
+            "refusing to emit NaN comparisons",
+            file=sys.stderr,
+        )
+        return None
     ms = (time.perf_counter() - t0) * 1000.0
     res: dict = {"kete_time_ms": ms}
     ref_ra = row.get("ref_ra_rad")
@@ -392,7 +407,23 @@ def main() -> int:
         out_rows.append(new)
 
     args.output.parent.mkdir(parents=True, exist_ok=True)
-    args.output.write_text(json.dumps(out_rows, indent=2, default=str))
+    # allow_nan=False: Python's json writes bare `NaN` / `Infinity` by default,
+    # which are NOT valid JSON. Rust's serde_json rejects them, so a single
+    # non-finite float here produced a file that parsed fine in Python and blew
+    # up two jobs later in the reduce merge, pointing at a line number instead of
+    # a cause. Failing at the point of production names the runner that did it.
+    try:
+        payload = json.dumps(out_rows, indent=2, default=str, allow_nan=False)
+    except ValueError as e:
+        print(
+            f"ERROR: refusing to write non-finite values to {args.output}: {e}\n"
+            "       Bare NaN/Infinity is invalid JSON; the Rust merger would reject the\n"
+            "       whole channel. A quantity that could not be computed must be null,\n"
+            "       and a row whose observable is not finite is a failure with a cause.",
+            file=sys.stderr,
+        )
+        return 1
+    args.output.write_text(payload)
     print(
         f"Wrote {len(out_rows)} kete rows to {args.output} ({n_skipped} skipped)",
         file=sys.stderr,
