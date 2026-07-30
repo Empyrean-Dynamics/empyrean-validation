@@ -719,7 +719,18 @@ def main() -> int:
 
     args.output.parent.mkdir(parents=True, exist_ok=True)
     with open(args.output, "w") as f:
-        json.dump(out_rows, f, indent=2)
+        try:
+            _payload = json.dumps(out_rows, indent=2, allow_nan=False)
+        except ValueError as _e:
+            print(
+                f"ERROR: refusing to write non-finite values to {args.output}: {_e}\n"
+                "       Bare NaN/Infinity is invalid JSON — Rust's serde_json rejects it, so this\n"
+                "       whole channel would fail the reduce merge with a line number and no cause.\n"
+                "       A quantity that could not be computed must be null.",
+                file=sys.stderr,
+            )
+            raise
+        f.write(_payload)
     print(f"  wrote {args.output}")
     # Non-zero exit only if every object failed — a partial failure set is
     # still useful output and is surfaced per-row via orbfit_error.

@@ -674,7 +674,18 @@ def main() -> int:
     output_path = pathlib.Path(args.output)
     output_path.parent.mkdir(parents=True, exist_ok=True)
     with open(output_path, "w") as f:
-        json.dump(results, f, indent=2, default=str)
+        try:
+            _payload = json.dumps(results, indent=2, default=str, allow_nan=False)
+        except ValueError as _e:
+            print(
+                f"ERROR: refusing to write non-finite values to {args.output}: {_e}\n"
+                "       Bare NaN/Infinity is invalid JSON — Rust's serde_json rejects it, so this\n"
+                "       whole channel would fail the reduce merge with a line number and no cause.\n"
+                "       A quantity that could not be computed must be null.",
+                file=sys.stderr,
+            )
+            raise
+        f.write(_payload)
 
     n_fits = len(psv_files) - n_failed
     print(f"{'=' * 80}")

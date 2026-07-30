@@ -156,7 +156,11 @@ class HorizonsCache:
             "pos": [float(x) for x in pos],
             "vel": [float(x) for x in vel],
         }
-        path.write_text(json.dumps(data, indent=2))
+        # allow_nan=False here too: this is a CACHE, so a non-finite value from
+        # a JPL response would be written once and then silently reused as an
+        # initial condition by every later run. Fail on the way in, not on the
+        # thousandth read.
+        path.write_text(json.dumps(data, indent=2, allow_nan=False))
 
 
 # ── Horizons API ────────────────────────────────────────
@@ -780,7 +784,18 @@ def main():
     output_path = Path(args.output)
     output_path.parent.mkdir(parents=True, exist_ok=True)
     with open(output_path, "w") as f:
-        json.dump(results, f, indent=2, default=str)
+        try:
+            _payload = json.dumps(results, indent=2, default=str, allow_nan=False)
+        except ValueError as _e:
+            print(
+                f"ERROR: refusing to write non-finite values to {args.output}: {_e}\n"
+                "       Bare NaN/Infinity is invalid JSON — Rust's serde_json rejects it, so this\n"
+                "       whole channel would fail the reduce merge with a line number and no cause.\n"
+                "       A quantity that could not be computed must be null.",
+                file=sys.stderr,
+            )
+            raise
+        f.write(_payload)
 
     print(f"\n{'=' * 80}")
     print(f"  Results saved to {output_path}")

@@ -403,16 +403,26 @@ def main() -> int:
 
     records: list[dict] = []
     if not _HAVE_PANDAS or orbitfit_bin is None:
+        # This used to emit `[]` and return 0 "so the merge step still has
+        # input". That is the shape this suite exists to catch: reduce folds the
+        # file in because it EXISTS, and the report shows a layup comparison
+        # that compared nothing, indistinguishable from one that agreed. The
+        # Makefile deleted its own `echo '[]'` fallback for exactly this reason,
+        # and run_findorb.py already fails on a missing binary — layup was the
+        # inconsistent sibling. A comparator with nothing to compare is a
+        # failure with a cause, and the cause is named here.
+        missing = []
         if orbitfit_bin is None:
-            print(
-                "warning: `layup-orbitfit` not found next to this interpreter; emitting empty result.",
-                file=sys.stderr,
-            )
-        # Emit an empty (but valid) result so the merge step still has input.
-        args.output.parent.mkdir(parents=True, exist_ok=True)
-        args.output.write_text(json.dumps(records, indent=2))
-        print(_executive_summary(records, len(psv_files)), file=sys.stderr)
-        return 0
+            missing.append("`layup-orbitfit` was not found next to this interpreter")
+        if not _HAVE_PANDAS:
+            missing.append("pandas failed to import (needed to normalize the PSV fixtures)")
+        print(
+            "ERROR: layup cannot run: " + "; ".join(missing) + ".\n"
+            "       Build the environment with `make setup-layup`.\n"
+            "       (Emitting an empty result would report 'layup compared nothing' as a pass.)",
+            file=sys.stderr,
+        )
+        return 1
 
     print(f"layup OD validation ({len(psv_files)} fixtures)", file=sys.stderr)
     print(f"  layup: {orbitfit_bin} (version {version or '?'})", file=sys.stderr)
@@ -454,7 +464,18 @@ def main() -> int:
         )
 
     args.output.parent.mkdir(parents=True, exist_ok=True)
-    args.output.write_text(json.dumps(records, indent=2, default=str))
+    try:
+        _payload = json.dumps(records, indent=2, default=str, allow_nan=False)
+    except ValueError as _e:
+        print(
+            f"ERROR: refusing to write non-finite values to {args.output}: {_e}\n"
+            "       Bare NaN/Infinity is invalid JSON — Rust's serde_json rejects it, so this\n"
+            "       whole channel would fail the reduce merge with a line number and no cause.\n"
+            "       A quantity that could not be computed must be null.",
+            file=sys.stderr,
+        )
+        raise
+    args.output.write_text(_payload)
     print(f"\nWrote {len(records)} layup records to {args.output}", file=sys.stderr)
     print(_executive_summary(records, len(psv_files)), file=sys.stderr)
     return 0

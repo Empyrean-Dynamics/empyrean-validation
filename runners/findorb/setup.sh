@@ -27,10 +27,17 @@ echo
 mkdir -p "$BUILD_DIR" "$PREFIX/bin"
 
 # find_orb and its dependencies (lunar/jpl_eph/sat_code) are cloned at
-# unpinned upstream HEAD and aren't release-tagged, so a version skew
-# between the four Bill-Gray repos periodically breaks the from-source
-# build (e.g. jpl_url.c in lunar references a symbol liblunar.a doesn't
-# yet export). find_orb is one of several optional external OD
+# unpinned upstream HEAD and aren't release-tagged (all four repos carry
+# zero tags and zero releases), so upstream can change under us at any
+# time. Pinning to a coordinated commit set is tracked separately as
+# bd empyrean-t4bp — it is a validation-of-record concern, since
+# "empyrean agrees with find_orb to X" says little while X floats.
+#
+# It is NOT what keeps this build working: the breakages seen so far have
+# been in utility targets find_orb never links, and the fix for those is
+# to stop building them (see the library-only builds below).
+#
+# find_orb is one of several optional external OD
 # references, so any failure anywhere in this toolchain is non-fatal:
 # the function returns non-zero, we warn loudly, and leave no `fo`
 # binary — so the suite runs without this one comparator rather than
@@ -51,18 +58,33 @@ build_findorb() {
         fi
     done
 
+    # Build ONLY the libraries find_orb links, never each repo's default
+    # target. find_orb's link line is `-llunar -ljpl -lsatell`
+    # (find_orb/makefile), so the ~40 command-line utilities in these repos'
+    # `all:` targets are pure cost — and one of them breaking takes the whole
+    # comparator down with it for no reason. That is exactly what happened:
+    # lunar's `jpl_url` utility stopped linking upstream, while liblunar.a
+    # itself archived fine immediately afterwards in the same run.
+    #
+    # Each repo needs a different incantation, so they are not factored:
+    #   lunar     `install:` depends on $(LIBLUNAR), which is conditionally
+    #             liblunar.a or liblunar.so.1.0.1 — so let make resolve it
+    #             rather than naming the file here.
+    #   jpl_eph   `install:` has NO prerequisite (it just copies libjpl.a), so
+    #             the library must be built explicitly first.
+    #   sat_code  build the library only; install is left as it was.
     echo
     echo "Building lunar library..."
-    ( cd "$BUILD_DIR/lunar" && make -j"$NPROC" && make install ) || return 1
+    ( cd "$BUILD_DIR/lunar" && make -j"$NPROC" install ) || return 1
 
     echo
     echo "Building jpl_eph library..."
-    ( cd "$BUILD_DIR/jpl_eph" && make -j"$NPROC" && make install ) || return 1
+    ( cd "$BUILD_DIR/jpl_eph" && make -j"$NPROC" libjpl.a && make install ) || return 1
 
     # sat_code is itself optional even when the rest builds.
     echo
     echo "Building sat_code library..."
-    ( cd "$BUILD_DIR/sat_code" && make -j"$NPROC" ) \
+    ( cd "$BUILD_DIR/sat_code" && make -j"$NPROC" libsatell.a ) \
         || echo "Warning: sat_code build failed (non-critical, continuing)"
 
     echo
