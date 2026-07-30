@@ -100,6 +100,46 @@ build_findorb() {
     echo "Building find_orb..."
     ( cd "$BUILD_DIR/find_orb" && make -j"$NPROC" fo && cp fo "$PREFIX/bin/fo" ) || return 1
 
+    # find_orb REQUIRES a config directory and asserts if it cannot find one.
+    # miscell.cpp:212 `default_config_dir_name` tries exactly four locations for
+    # cospar.txt — ~/.find_orb/, /software/.find_orb/, /root/.find_orb/, then an
+    # alt dir — and calls assert() when none opens. It never looks in the
+    # process's cwd, so the per-fit working directory the runner stages does not
+    # satisfy it: fo died with SIGABRT on every object.
+    #
+    # Upstream's `make install` does this, but it depends on `all`, which builds
+    # the interactive `find_orb` binary and therefore needs ncurses. Nothing
+    # here uses that binary, so the data files are copied directly instead and
+    # the toolchain keeps needing only what it consumes.
+    #
+    # INSTALL_FILES is read from the makefile rather than hardcoded, so an
+    # upstream addition to the list is picked up instead of silently missing.
+    # One entry is a glob (`?findorb.txt`), hence the inner loop.
+    echo
+    echo "Installing find_orb config directory (~/.find_orb)..."
+    (
+        cd "$BUILD_DIR/find_orb" || exit 1
+        files=$(sed -n '/^INSTALL_FILES[[:space:]]*=/,/[^\\]$/p' makefile \
+                | sed 's/^INSTALL_FILES[[:space:]]*=//; s/\\$//' | tr '\n' ' ')
+        test -n "$files" || {
+            echo "ERROR: could not read INSTALL_FILES from find_orb's makefile." >&2
+            exit 1; }
+        mkdir -p "$HOME/.find_orb"
+        n=0
+        for f in $files; do
+            for g in $f; do
+                [ -f "$g" ] && { cp "$g" "$HOME/.find_orb/"; n=$((n + 1)); }
+            done
+        done
+        # cospar.txt is the specific file the assertion probes for; if it is not
+        # there, fo aborts on every fit, so fail here where the cause is obvious.
+        test -f "$HOME/.find_orb/cospar.txt" || {
+            echo "ERROR: ~/.find_orb/cospar.txt missing after copying $n files." >&2
+            echo "       find_orb asserts on a missing config dir (miscell.cpp)." >&2
+            exit 1; }
+        echo "  installed $n config files"
+    ) || return 1
+
     return 0
 }
 
