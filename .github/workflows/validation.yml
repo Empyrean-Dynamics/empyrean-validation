@@ -309,11 +309,15 @@ jobs:
           data-cache-key: ${{ env.DATA_CACHE_KEY }}
           jpl-cache-key: ${{ env.JPL_CACHE_KEY }}
           role: reader
-      - name: Build engine + harness binaries (warm)
+      # `build-reference`, not `build`: only the rust runner, the harness CLI and
+      # libempyrean are used here. The full `build` measured 375s on a leg, most
+      # of it on the C harness, the CLI and the maturin wheel that a reference
+      # shard never invokes — and this job runs once per catalog object.
+      - name: Build reference prerequisites (warm)
         working-directory: empyrean-validation
         env:
           DATA_DIR: ${{ env.EMPYREAN_DATA_DIR }}
-        run: make build
+        run: make build-reference
       - name: Reference shard — ${{ matrix.object.name }}
         working-directory: empyrean-validation
         env:

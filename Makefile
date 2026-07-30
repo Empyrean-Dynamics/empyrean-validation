@@ -257,6 +257,17 @@ $(FO_BIN):
 # struct-layout segfaults.
 build: build-empyrean-c build-rust build-c build-cli build-wheel build-empyrean-validation $(if $(WITH_CORE),build-core,)
 
+# Exactly what `shard-reference` needs, and nothing else: the rust runner
+# ($(RUST_BIN)), the harness CLI ($(EMP_VAL_BIN)), and libempyrean, which the
+# runner links against via $(DYLD). Measured on a reference leg, the full
+# `build` took 375s — most of it building the C harness, the CLI and the
+# maturin wheel that a reference shard never invokes. Multiplied by one leg per
+# catalog object that is over five hours of billed time per run spent compiling
+# artifacts nobody in that job uses.
+build-reference: build-empyrean-c build-rust build-empyrean-validation
+
+.PHONY: build-reference
+
 # PHONY: cargo's incremental build is cheap when nothing changed and
 # this is the only way to guarantee `libempyrean.dylib` matches the
 # header that bindgen was compiled against.
