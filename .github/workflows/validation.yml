@@ -378,24 +378,24 @@ jobs:
         with:
           pattern: reference-shard-*
           path: empyrean-validation/results/shards
-      # download-artifact nests each artifact under its own name; the assemble
-      # step expects results/shards/<slug>/. Flatten that one level.
-      - name: Normalize shard layout
+      # No flatten step: assemble-reference resolves both the local layout
+      # (shards/<slug>/) and the one download-artifact produces
+      # (shards/reference-shard-<slug>/). A shell step that normalized one into
+      # the other would silently produce nothing if the nesting assumption were
+      # wrong — and that assumption cannot be verified outside a real run.
+      - name: Show staged shards
         working-directory: empyrean-validation/results/shards
-        run: |
-          shopt -s nullglob
-          for d in reference-shard-*/; do
-            slug="${d#reference-shard-}"; slug="${slug%/}"
-            mkdir -p "$slug"
-            mv "$d"* "$slug"/ 2>/dev/null || true
-            rmdir "$d" 2>/dev/null || true
-          done
-          echo "Shard directories present: $(ls -1d */ 2>/dev/null | wc -l)"
+        run: find . -maxdepth 1 -mindepth 1 -type d -print | sort
+      # REFERENCE_ASSEMBLED=1 tells `plan` that the unified reference is already
+      # on disk (assemble-reference just wrote it from the shards). Without it,
+      # make walks $(RUST) -> $(RUST_PROPEPH)/$(RUST_OD) -> $(RUST_BIN), a file
+      # target only the phony `build-rust` produces, and aborts with "No rule to
+      # make target .../validate" — this job deliberately carries no engine.
       - name: Assemble reference + strip plan
         working-directory: empyrean-validation
         run: |
           make assemble-reference OBJECTS="${OBJECTS}"
-          make plan OBJECTS="${OBJECTS}" TIERS="${TIER}"
+          make plan REFERENCE_ASSEMBLED=1 OBJECTS="${OBJECTS}" TIERS="${TIER}"
 
       # Stage the plan + the rust channel outputs for the downstream jobs.
       #
@@ -741,13 +741,22 @@ jobs:
 
   # ── reduce ─────────────────────────────────────────────────────────
   # Merge every staged channel JSON + render the report + gate + publish.
-  # Runs whenever prep and the empyrean channels succeeded, EVEN IF some
-  # external legs failed (always() + explicit result checks): the report
+  # Runs whenever the reference/plan and the empyrean channels succeeded, EVEN
+  # IF some external legs failed (always() + explicit result checks): the report
   # then simply omits the dead comparators, which is the honest outcome.
+  #
+  # The gate names `assemble`, which is what now produces the plan, and which
+  # already refuses to succeed unless prep succeeded and every shard arrived —
+  # so prep is covered transitively. It must name a job that is actually in
+  # `needs`: the `needs` context contains ONLY direct dependencies, so a
+  # leftover `needs.prep.result` here would read null, the ANDed always() could
+  # not rescue it, and reduce would be SKIPPED on every run — dropping the
+  # report, the ci-check row floors and the publish while the workflow still
+  # reported success. `make lint-workflows` catches exactly that mismatch.
   reduce:
     name: Reduce — merge + report + publish
     needs: [assemble, empyrean, external]
-    if: always() && needs.prep.result == 'success' && needs.empyrean.result == 'success'
+    if: always() && needs.assemble.result == 'success' && needs.empyrean.result == 'success'
     runs-on: ubuntu-latest
     timeout-minutes: 45
     # The only job that publishes to GCS, so the only one that may mint the
@@ -786,11 +795,26 @@ jobs:
           key: cargo-${{ hashFiles('empyrean-validation/**/Cargo.lock', 'empyrean-validation/**/Cargo.toml') }}
           restore-keys: cargo-
 
-      # Pull every channel artifact flat into results/. merge-multiple
-      # flattens each single-file artifact into the one results dir.
-      - name: Download all channel artifacts
+      # Pull the plan/reference and the channel artifacts flat into results/.
+      # merge-multiple flattens each single-file artifact into the one results dir.
+      #
+      # These are two EXPLICIT patterns, not a blanket download, because the run
+      # now also carries 50 `reference-shard-<slug>` artifacts and every one of
+      # them contains files named validation_rust_propeph.json,
+      # validation_rust_od.json and the two sidecars. Flattened together with
+      # merge-multiple they would collide on those names and overwrite the
+      # assembled full-catalog reference with whichever single object's shard
+      # landed last — a report built from one object while looking complete.
+      # The shards were already consumed by `assemble`; reduce must not see them.
+      - name: Download plan + assembled reference
         uses: actions/download-artifact@v4
         with:
+          name: prep-plan-and-rust
+          path: empyrean-validation/results
+      - name: Download channel artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: channel*
           path: empyrean-validation/results
           merge-multiple: true
 

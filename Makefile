@@ -395,14 +395,27 @@ $(RUST_OD): $(RUST_BIN) | fixtures
 	        exit 1; }; \
 	 done
 
+ifeq ($(REFERENCE_ASSEMBLED),1)
+# Matrix-CI assemble job: the unified reference was produced by
+# `assemble-reference` from the per-object shards, and this job carries NO
+# engine — no runners/rust binary, no wheel venv. Assert its presence loudly
+# instead of letting make walk the $(RUST_PROPEPH)/$(RUST_OD) chain, which
+# names $(RUST_BIN) as a prerequisite that only the phony `build-rust` produces:
+# make would abort with "No rule to make target .../validate" before running a
+# single recipe. Same shape as PLAN_PREBUILT=1 below, one level up the graph.
+$(RUST):
+	@test -f $(RUST) || { echo "ERROR: REFERENCE_ASSEMBLED=1 but $(RUST) is missing — run assemble-reference first."; exit 1; }
+	@echo "──── Rust channel: using assembled reference $(RUST) ───"
+else
 $(RUST): $(RUST_PROPEPH) $(RUST_OD)
 	@echo "──── Rust channel: merge prop+eph + OD into unified ────"
-	@$(WHEEL_PY) -c "import json,sys; \
+	@python3 -c "import json,sys; \
 a=json.load(open('$(RUST_PROPEPH)')); \
 b=json.load(open('$(RUST_OD)')); \
 sys.exit('ERROR: $(RUST_OD) carries zero OD rows. The rust OD pass produced nothing — a runner that emits no rows at all is a dead channel, not a passing one. Check the fixture fetch (make fixtures) and the runner log above.') if not b else None; \
 json.dump(a+b, open('$(RUST)','w'), indent=2, default=str); \
 print(f'Wrote {len(a)+len(b)} unified rust rows ({len(a)} prop+eph, {len(b)} OD) to $(RUST)')"
+endif
 
 # ── Per-object reference shards (CI matrix fan-out) ─────────
 # The rust reference is the expensive half of this suite: running all three
@@ -475,11 +488,30 @@ shard-reference: $(RUST_BIN) $(EMP_VAL_BIN) | fixtures
 # fatal — never warned about, never skipped.
 assemble-reference: $(EMP_VAL_BIN)
 	@echo "──── Reference: reassemble per-object shards ───────────"
+	@mkdir -p $(SHARD_DIR)
 	@$(EMP_VAL_BIN) list-objects $(LIST_ONLY_FLAG) --format lines > $(SHARD_DIR)/.expected
 	@python3 -c "$$ASSEMBLE_SHARDS" $(SHARD_DIR) $(SHARD_DIR)/.expected \
-	    $(RUST_PROPEPH) $(RUST_OD) $(RUST_OD_ORBITS) $(RUST_OD_COMPARE)
+	    $(RUST_PROPEPH) $(RUST_OD) $(RUST_OD_ORBITS) $(RUST_OD_COMPARE) $(RUST)
 
-.PHONY: list-objects shard-reference assemble-reference
+.PHONY: list-objects shard-reference assemble-reference lint-workflows
+
+# Static-check the workflows. Worth a target of its own because the fan-out
+# introduced a class of bug that nothing else here catches and a green run hides:
+# repointing a job's `needs:` without updating the `if:` that reads
+# `needs.<job>.result`. The `needs` context holds ONLY direct dependencies, so a
+# stale reference reads null, the condition is false forever, and the job is
+# SKIPPED — which does not fail the run. That is how `reduce` came to be silently
+# skipped on every trigger, dropping the report, the ci-check row floors and the
+# publish while the suite reported success. actionlint reports it as
+# `property "prep" is not defined in object type {...}`.
+lint-workflows:
+	@command -v actionlint >/dev/null 2>&1 || { \
+	    echo "ERROR: actionlint is not installed — cannot verify the workflows."; \
+	    echo "       brew install actionlint   (or see github.com/rhysd/actionlint)"; \
+	    exit 1; }
+	@echo "──── actionlint: .github/workflows ─────────────────────"
+	@actionlint -shellcheck= .github/workflows/*.yml
+	@echo "  workflows OK."
 
 # A shard must contain both halves and be parseable. Zero OD rows is legal for
 # one object (not every catalog entry need carry fittable astrometry) but zero
@@ -521,7 +553,9 @@ define ASSEMBLE_SHARDS
 import json, pathlib, sys
 shard_dir = pathlib.Path(sys.argv[1])
 expected_file = pathlib.Path(sys.argv[2])
-out_propeph, out_od, out_orbits, out_compare = (pathlib.Path(p) for p in sys.argv[3:7])
+out_propeph, out_od, out_orbits, out_compare, out_unified = (
+    pathlib.Path(p) for p in sys.argv[3:8]
+)
 
 expected = []
 for line in expected_file.read_text().splitlines():
@@ -531,9 +565,25 @@ for line in expected_file.read_text().splitlines():
 if not expected:
     raise SystemExit("ERROR: catalog enumeration produced zero objects; refusing to assemble.")
 
+def shard_path(slug):
+    """Locate one object's shard directory, whichever layout staged it.
+
+    A local run writes results/shards/<slug>/ directly. CI downloads the
+    per-object artifacts, and actions/download-artifact nests each one under a
+    directory named after the artifact — results/shards/reference-shard-<slug>/.
+    Accepting both means this does not depend on that action's nesting behavior,
+    which cannot be verified outside a real run; a shell step that flattened one
+    layout into the other would silently produce nothing if the assumption were
+    wrong, and every object would then read as missing.
+    """
+    for candidate in (shard_dir / slug, shard_dir / f"reference-shard-{slug}"):
+        if (candidate / "validation_rust_propeph.json").is_file():
+            return candidate
+    return shard_dir / slug  # canonical path, for the error message
+
 propeph, od, orbits, compare, missing = [], [], [], [], []
 for slug, name in expected:
-    d = shard_dir / slug
+    d = shard_path(slug)
     p, o = d / "validation_rust_propeph.json", d / "validation_rust_od.json"
     if not (p.is_file() and o.is_file()):
         missing.append(f"{name} (slug {slug}): "
@@ -566,14 +616,20 @@ if not od:
                      f"{len(expected)} objects. The OD axis produced nothing, which is a "
                      "dead axis, not a passing one. Check the fixture fetch (make fixtures).")
 
-for path, rows in ((out_propeph, propeph), (out_od, od)):
+# The unified reference is written HERE, not by the $(RUST) rule, because the
+# assemble job carries no engine: that rule's prerequisites name $(RUST_BIN),
+# which only the phony `build-rust` produces, so make would abort before
+# running any recipe. Both halves are already in memory, so emit it directly
+# and let `make plan REFERENCE_ASSEMBLED=1` treat it as given.
+for path, rows in ((out_propeph, propeph), (out_od, od), (out_unified, propeph + od)):
     path.parent.mkdir(parents=True, exist_ok=True)
     json.dump(rows, open(path, "w"), indent=2, default=str)
 for path, lines in ((out_orbits, orbits), (out_compare, compare)):
     path.write_text("".join(ln + "\n" for ln in lines))
 
 print(f"Assembled {len(expected)} shards -> {len(propeph)} prop+eph rows, {len(od)} OD rows, "
-      f"{len(orbits)} orbit sidecar rows, {len(compare)} compare sidecar rows")
+      f"{len(orbits)} orbit sidecar rows, {len(compare)} compare sidecar rows; "
+      f"unified {len(propeph) + len(od)} rows -> {out_unified}")
 endef
 export ASSEMBLE_SHARDS
 
