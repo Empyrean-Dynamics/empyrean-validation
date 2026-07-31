@@ -156,6 +156,15 @@ jobs:
                   "repo_url": "https://github.com/dahlend/kete",
               },
               {
+                  # Pinned in runners/grss/setup.sh (GRSS_VERSION), so a new
+                  # upstream release is a real comparison — keep this in step
+                  # with that default when the pin moves.
+                  "name": "grss", "kind": "pypi", "pkg": "grss",
+                  "current": "4.5.7", "current_desc": "pinned 4.5.7",
+                  "source_url": "https://pypi.org/project/grss/",
+                  "repo_url": "https://github.com/rahil-makadia/grss",
+              },
+              {
                   "name": "jorbit", "kind": "pypi", "pkg": "jorbit",
                   "current": None, "current_desc": "unpinned (floor >=1.0)",
                   "source_url": "https://pypi.org/project/jorbit/",

@@ -159,6 +159,17 @@ struct MergeExternalArgs {
     /// Folds per-row wall-clock timing only (`jorbit_time_ms`).
     #[arg(long)]
     jorbit: Option<PathBuf>,
+    /// GRSS per-channel JSON (from `runners/grss/run_grss.py`). Folds
+    /// propagation + ephemeris + OD fields onto matching rows — the widest
+    /// external reference in the suite.
+    #[arg(long)]
+    grss: Option<PathBuf>,
+    /// GRSS radar-augmented JSON (its `--radar` pass over
+    /// `fixtures/psv-radar/`). Its rows attach to the
+    /// `orbit_determination_radar` OD rows, the same way `--findorb-radar`
+    /// does.
+    #[arg(long)]
+    grss_radar: Option<PathBuf>,
     /// JPL SBDB cache directory (e.g. `$CACHE_DIR/sbdb`). Reads each OD
     /// object's cached SBDB response and folds JPL's own reported fit
     /// quality (normalized RMS, n_obs_used, radar counts, data-arc,
@@ -540,6 +551,31 @@ fn merge_external(args: MergeExternalArgs) -> Result<(), Box<dyn std::error::Err
         })?;
         eprintln!("Merged {n} jorbit timing rows");
     }
+    if let Some(path) = &args.grss {
+        let n = merge_grss(&mut rows, path)?;
+        eprintln!("Merged {n} GRSS rows");
+    }
+    if let Some(path) = &args.grss_radar {
+        let n = merge_grss(&mut rows, path)?;
+        eprintln!("Merged {n} GRSS radar rows");
+        // Same expected-zero as `--findorb-radar`: the reference channel is
+        // built from the plan, and the plan no longer carries radar rows
+        // (`PLAN_RUST_ONLY_TEST_TYPES`), so there is nothing for GRSS's radar
+        // fits to attach to. Say it out loud — a merge that folds zero rows
+        // out of a non-empty input file is otherwise indistinguishable from a
+        // merge that folded everything.
+        if n == 0 {
+            eprintln!(
+                "  NOTE: GRSS ran its radar pass but no reference row accepted it. \
+                 Radar OD is rust-only today (empyrean-s1ab), so the reference channel \
+                 carries no orbit_determination_radar rows to fold onto. GRSS's radar \
+                 fits — including its delay/Doppler residual RMS, an axis no other \
+                 channel measures — are preserved verbatim in {} until a replay driver \
+                 can fit radar.",
+                path.display()
+            );
+        }
+    }
     if let Some(dir) = &args.jpl_sbdb_cache {
         let n = merge_jpl(&mut rows, dir)?;
         eprintln!("Merged {n} JPL SBDB OD-reference rows");
@@ -800,6 +836,122 @@ fn merge_layup(
         r.layup_n_obs_used = f["layup_n_obs_used"].as_u64().map(|v| v as u32);
         r.layup_converged = f["layup_converged"].as_bool();
         r.layup_time_ms = f["layup_time_ms"].as_f64();
+        n += 1;
+    }
+    Ok(n)
+}
+
+/// Fold GRSS per-channel JSON onto the reference rows.
+///
+/// GRSS (Makadia et al.) is the widest external reference in the suite: it
+/// covers propagation, ephemeris and orbit determination, and — with find_orb
+/// — is one of only two that ingests radar astrometry. So this merge spans all
+/// three axes rather than one, keyed the way each axis needs:
+///
+/// - `propagation` by (object, dt_days), like [`merge_oorb`]. Deliberately
+///   NOT keyed on `propagation_uncertainty`: GRSS propagates state only, so
+///   its single row is the right comparison for both of empyrean's
+///   uncertainty modes, and the runner emits one row per (object, dt) for
+///   exactly that reason.
+/// - `ephemeris` by (object, dt_days, observer).
+/// - OD by (object, test_type), like [`merge_findorb`], so the optical fit
+///   lands on the `orbit_determination` row and the radar-augmented fit
+///   (GRSS's `--radar` pass over `fixtures/psv-radar/`) on the
+///   `orbit_determination_radar` row.
+fn merge_grss(
+    rows: &mut [ValidationResult],
+    path: &std::path::Path,
+) -> Result<usize, Box<dyn std::error::Error>> {
+    let txt = std::fs::read_to_string(path).map_err(|e| format!("read {}: {e}", path.display()))?;
+    let gr: Vec<serde_json::Value> = serde_json::from_str(&txt)?;
+    let mut prop_idx: std::collections::HashMap<(String, i64), &serde_json::Value> =
+        Default::default();
+    let mut eph_idx: std::collections::HashMap<(String, i64, String), &serde_json::Value> =
+        Default::default();
+    let mut od_idx: std::collections::HashMap<(String, String), &serde_json::Value> =
+        Default::default();
+    for g in &gr {
+        let Some(name) = g["object"].as_str() else {
+            continue;
+        };
+        let dt = g["dt_days"].as_f64().unwrap_or(0.0) as i64;
+        match g["test_type"].as_str() {
+            Some("propagation") => {
+                prop_idx.insert((name.to_string(), dt), g);
+            }
+            Some("ephemeris") => {
+                if let Some(obs) = g["observer"].as_str() {
+                    eph_idx.insert((name.to_string(), dt, obs.to_string()), g);
+                }
+            }
+            Some(tt) if empyrean_validation::schema::test_types::is_orbit_determination(tt) => {
+                od_idx.insert((name.to_string(), tt.to_string()), g);
+            }
+            _ => {}
+        }
+    }
+    let mut n = 0;
+    for r in rows.iter_mut() {
+        let g = match r.test_type.as_str() {
+            "propagation" => prop_idx.get(&(r.object.clone(), r.dt_days as i64)),
+            "ephemeris" => {
+                let Some(obs) = r.observer.as_deref() else {
+                    continue;
+                };
+                eph_idx.get(&(r.object.clone(), r.dt_days as i64, obs.to_string()))
+            }
+            tt if empyrean_validation::schema::test_types::is_orbit_determination(tt) => {
+                od_idx.get(&(r.object.clone(), r.test_type.clone()))
+            }
+            _ => continue,
+        };
+        let Some(g) = g else { continue };
+        // Timing and the failure reason are axis-independent: a row that
+        // failed carries `grss_error` and no numbers, which is how the report
+        // tells "GRSS tried and could not" from "GRSS was never asked".
+        r.grss_time_ms = g["grss_time_ms"].as_f64();
+        r.grss_error = g["grss_error"].as_str().map(String::from);
+        // A named force-model difference travels on every axis, because it
+        // applies to the number on the row rather than to one kind of number.
+        r.grss_model_note = g["grss_model_note"].as_str().map(String::from);
+        match r.test_type.as_str() {
+            "propagation" => {
+                r.grss_vs_horizons_km = g["grss_vs_horizons_km"].as_f64();
+                if let (Some(emp), Some(arr)) = (&r.emp_pos_au, g["grss_pos_au"].as_array())
+                    && arr.len() == 3
+                {
+                    let gp = [
+                        arr[0].as_f64().unwrap_or(0.0),
+                        arr[1].as_f64().unwrap_or(0.0),
+                        arr[2].as_f64().unwrap_or(0.0),
+                    ];
+                    let (dx, dy, dz) = (emp[0] - gp[0], emp[1] - gp[1], emp[2] - gp[2]);
+                    r.emp_vs_grss_km = Some(
+                        (dx * dx + dy * dy + dz * dz).sqrt() * empyrean_validation::compare::AU_KM,
+                    );
+                }
+            }
+            "ephemeris" => {
+                r.grss_separation_arcsec = g["grss_separation_arcsec"].as_f64();
+                r.grss_d_ra_arcsec = g["grss_d_ra_arcsec"].as_f64();
+                r.grss_d_dec_arcsec = g["grss_d_dec_arcsec"].as_f64();
+                r.grss_d_rho_km = g["grss_d_rho_km"].as_f64();
+            }
+            _ => {
+                r.grss_rms_arcsec = g["grss_rms_arcsec"].as_f64();
+                r.grss_chi2 = g["grss_chi2"].as_f64();
+                r.grss_reduced_chi2 = g["grss_reduced_chi2"].as_f64();
+                r.grss_converged = g["grss_converged"].as_bool();
+                r.grss_n_obs_used = g["grss_n_obs_used"].as_u64().map(|v| v as u32);
+                r.grss_n_obs_rejected = g["grss_n_obs_rejected"].as_u64().map(|v| v as u32);
+                r.grss_n_obs_unsupported = g["grss_n_obs_unsupported"].as_u64().map(|v| v as u32);
+                r.grss_rms_delay_us = g["grss_rms_delay_us"].as_f64();
+                r.grss_rms_doppler_hz = g["grss_rms_doppler_hz"].as_f64();
+                r.grss_n_delay_used = g["grss_n_delay_used"].as_u64().map(|v| v as u32);
+                r.grss_n_doppler_used = g["grss_n_doppler_used"].as_u64().map(|v| v as u32);
+                r.grss_sigma_pos_km = g["grss_sigma_pos_km"].as_f64();
+            }
+        }
         n += 1;
     }
     Ok(n)
@@ -1376,7 +1528,7 @@ fn catalog_row_floors() -> Vec<RowFloor> {
 /// The `channels` module constants plus the externally-merged comparators that
 /// only ever appear as their own result JSON. Validated against so a typo is
 /// "you typed it wrong", not "that channel produced nothing".
-const KNOWN_CHANNELS: [&str; 12] = [
+const KNOWN_CHANNELS: [&str; 13] = [
     channels::RUST,
     channels::PYTHON,
     channels::C,
@@ -1389,6 +1541,7 @@ const KNOWN_CHANNELS: [&str; 12] = [
     "jorbit",
     "layup",
     "orbfit",
+    "grss",
 ];
 
 /// Every reason this summary fails the gate, as human-readable lines.
@@ -2138,6 +2291,223 @@ mod tests {
         let n = merge_layup(&mut rows, f.path()).unwrap();
         assert_eq!(n, 0);
         assert_eq!(rows[0].layup_chi2, None);
+    }
+
+    #[test]
+    fn merge_grss_folds_every_axis_onto_the_right_rows() {
+        // GRSS is the only external reference covering all three axes, so the
+        // merge has to route by test type: propagation → position diffs,
+        // ephemeris → sky-plane offsets, OD → fit quality. A field landing on
+        // the wrong axis would read as a comparison that was never made.
+        let mut rows = vec![
+            {
+                let mut p = ValidationResult::empty();
+                p.object = "Eros".into();
+                p.test_type = "propagation".into();
+                p.dt_days = 365.0;
+                p.emp_pos_au = Some([1.0, 2.0, 3.0]);
+                p
+            },
+            {
+                let mut e = ValidationResult::empty();
+                e.object = "Eros".into();
+                e.test_type = "ephemeris".into();
+                e.dt_days = 365.0;
+                e.observer = Some("500".into());
+                e
+            },
+            od_row("Eros"),
+        ];
+
+        let mut f = tempfile::NamedTempFile::new().unwrap();
+        write!(
+            f,
+            r#"[{{"object":"Eros","test_type":"propagation","dt_days":365.0,
+                  "grss_vs_horizons_km":12.5,"grss_pos_au":[1.0,2.0,3.000001],
+                  "grss_time_ms":9.5}},
+                {{"object":"Eros","test_type":"ephemeris","dt_days":365.0,
+                  "observer":"500","grss_separation_arcsec":0.004,
+                  "grss_d_ra_arcsec":-0.003,"grss_d_dec_arcsec":0.002,
+                  "grss_d_rho_km":5.5,"grss_time_ms":11.0}},
+                {{"object":"Eros","test_type":"orbit_determination",
+                  "grss_rms_arcsec":0.52,"grss_chi2":100.0,
+                  "grss_reduced_chi2":0.11,"grss_converged":true,
+                  "grss_n_obs_used":13081,"grss_n_obs_rejected":63,
+                  "grss_n_obs_unsupported":6,"grss_sigma_pos_km":14.9,
+                  "grss_time_ms":6081.0}}]"#
+        )
+        .unwrap();
+
+        let n = merge_grss(&mut rows, f.path()).unwrap();
+        assert_eq!(n, 3, "one row per axis should merge");
+
+        let (prop, eph, od) = (&rows[0], &rows[1], &rows[2]);
+        assert_eq!(prop.grss_vs_horizons_km, Some(12.5));
+        assert_eq!(prop.grss_time_ms, Some(9.5));
+        // |empyrean − GRSS| computed from the raw vectors, not copied.
+        let d = prop.emp_vs_grss_km.expect("emp_vs_grss_km");
+        assert!(
+            (d - 1e-6 * empyrean_validation::compare::AU_KM).abs() < 1e-6,
+            "emp_vs_grss_km was {d}"
+        );
+        // Propagation rows carry no OD or sky-plane fields.
+        assert_eq!(prop.grss_rms_arcsec, None);
+        assert_eq!(prop.grss_separation_arcsec, None);
+
+        assert_eq!(eph.grss_separation_arcsec, Some(0.004));
+        assert_eq!(eph.grss_d_ra_arcsec, Some(-0.003));
+        assert_eq!(eph.grss_d_dec_arcsec, Some(0.002));
+        assert_eq!(eph.grss_d_rho_km, Some(5.5));
+        assert_eq!(eph.grss_vs_horizons_km, None);
+
+        assert_eq!(od.grss_rms_arcsec, Some(0.52));
+        assert_eq!(od.grss_reduced_chi2, Some(0.11));
+        assert_eq!(od.grss_converged, Some(true));
+        assert_eq!(od.grss_n_obs_used, Some(13081));
+        assert_eq!(od.grss_n_obs_rejected, Some(63));
+        assert_eq!(od.grss_n_obs_unsupported, Some(6));
+        assert_eq!(od.grss_sigma_pos_km, Some(14.9));
+        assert_eq!(od.grss_vs_horizons_km, None);
+    }
+
+    #[test]
+    fn merge_grss_radar_pass_lands_on_the_radar_od_row_only() {
+        // The optical and radar-augmented fits are two different fits of the
+        // same object, so they must not overwrite each other: keyed by
+        // (object, test_type) exactly like merge_findorb.
+        let mut rows = vec![od_row("Apophis"), {
+            let mut r = od_row("Apophis");
+            r.test_type = "orbit_determination_radar".into();
+            r
+        }];
+        let mut f = tempfile::NamedTempFile::new().unwrap();
+        write!(
+            f,
+            r#"[{{"object":"Apophis","test_type":"orbit_determination_radar",
+                  "grss_rms_arcsec":0.44,"grss_rms_delay_us":0.669,
+                  "grss_rms_doppler_hz":0.067,"grss_n_delay_used":20,
+                  "grss_n_doppler_used":30,"grss_sigma_pos_km":1.27}}]"#
+        )
+        .unwrap();
+        let n = merge_grss(&mut rows, f.path()).unwrap();
+        assert_eq!(n, 1, "only the radar OD row accepts the radar fit");
+        assert_eq!(rows[1].grss_rms_delay_us, Some(0.669));
+        assert_eq!(rows[1].grss_n_delay_used, Some(20));
+        assert_eq!(rows[1].grss_n_doppler_used, Some(30));
+        // The optical OD row is untouched — a radar residual on the optical
+        // row would claim a radar fit that never happened.
+        assert_eq!(rows[0].grss_rms_arcsec, None);
+        assert_eq!(rows[0].grss_rms_delay_us, None);
+    }
+
+    #[test]
+    fn merge_grss_carries_the_model_note_on_every_axis() {
+        // `grss_model_note` is not a failure — the row has real numbers — but it
+        // says the comparison is not like-for-like (GRSS has no non-grav DT
+        // term). It must reach propagation, ephemeris AND OD rows: the caveat
+        // is a property of the force model, not of one kind of measurement, and
+        // a propagation offset four orders of magnitude out with no note
+        // attached reads as an unexplained numerical outlier.
+        let note = "plan carries a Marsden non-grav time delay DT=+45.689 d; \
+                    GRSS's NongravParameters has no DT term";
+        let mut rows = vec![
+            {
+                let mut p = ValidationResult::empty();
+                p.object = "67P".into();
+                p.test_type = "propagation".into();
+                p.dt_days = 5475.0;
+                p
+            },
+            {
+                let mut e = ValidationResult::empty();
+                e.object = "67P".into();
+                e.test_type = "ephemeris".into();
+                e.dt_days = 5475.0;
+                e.observer = Some("500".into());
+                e
+            },
+            od_row("67P"),
+        ];
+        let mut f = tempfile::NamedTempFile::new().unwrap();
+        write!(
+            f,
+            r#"[{{"object":"67P","test_type":"propagation","dt_days":5475.0,
+                  "grss_vs_horizons_km":1377.1,"grss_model_note":"{note}"}},
+                {{"object":"67P","test_type":"ephemeris","dt_days":5475.0,
+                  "observer":"500","grss_separation_arcsec":1.5,
+                  "grss_model_note":"{note}"}},
+                {{"object":"67P","test_type":"orbit_determination",
+                  "grss_rms_arcsec":7.054,"grss_converged":false,
+                  "grss_model_note":"{note}"}}]"#
+        )
+        .unwrap();
+        let n = merge_grss(&mut rows, f.path()).unwrap();
+        assert_eq!(n, 3);
+        for (i, r) in rows.iter().enumerate() {
+            assert!(
+                r.grss_model_note
+                    .as_deref()
+                    .is_some_and(|s| s.contains("no DT term")),
+                "row {i} ({}) lost the model note",
+                r.test_type
+            );
+            // The note is NOT an error: the row's number stands.
+            assert_eq!(r.grss_error, None, "row {i} invented a failure");
+        }
+        assert_eq!(rows[0].grss_vs_horizons_km, Some(1377.1));
+        assert_eq!(rows[2].grss_rms_arcsec, Some(7.054));
+    }
+
+    #[test]
+    fn merge_grss_carries_the_failure_reason_not_a_blank() {
+        // A GRSS fit that ran and did not converge must stay visible: the
+        // numeric fields are absent but `grss_error` says why, the same
+        // contract `orbfit_error` has. A blank row would be
+        // indistinguishable from "GRSS was never asked".
+        let mut rows = vec![od_row("Bennu")];
+        let mut f = tempfile::NamedTempFile::new().unwrap();
+        write!(
+            f,
+            r#"[{{"object":"Bennu","test_type":"orbit_determination",
+                  "grss_error":"GRSS LSQ did not converge in 10 iteration(s)",
+                  "grss_time_ms":1930.0}}]"#
+        )
+        .unwrap();
+        let n = merge_grss(&mut rows, f.path()).unwrap();
+        assert_eq!(n, 1);
+        assert!(
+            rows[0]
+                .grss_error
+                .as_deref()
+                .unwrap()
+                .contains("did not converge")
+        );
+        assert_eq!(rows[0].grss_rms_arcsec, None);
+        assert_eq!(rows[0].grss_time_ms, Some(1930.0));
+    }
+
+    #[test]
+    fn merge_grss_skips_objects_and_axes_it_has_no_record_for() {
+        // No cross-object leakage and no cross-dt leakage: a GRSS row for
+        // Eros at dt=365 must not fold onto Bennu, nor onto Eros at dt=90.
+        let mut rows = vec![od_row("Bennu"), {
+            let mut p = ValidationResult::empty();
+            p.object = "Eros".into();
+            p.test_type = "propagation".into();
+            p.dt_days = 90.0;
+            p
+        }];
+        let mut f = tempfile::NamedTempFile::new().unwrap();
+        write!(
+            f,
+            r#"[{{"object":"Eros","test_type":"propagation","dt_days":365.0,
+                  "grss_vs_horizons_km":12.5}}]"#
+        )
+        .unwrap();
+        let n = merge_grss(&mut rows, f.path()).unwrap();
+        assert_eq!(n, 0);
+        assert_eq!(rows[0].grss_rms_arcsec, None);
+        assert_eq!(rows[1].grss_vs_horizons_km, None);
     }
 
     #[test]

@@ -620,7 +620,7 @@ jobs:
         # Until then reduce prints a DISABLED line naming this reason, so the
         # channel's absence from the report is explained rather than guessed
         # at.
-        tool: [assist, findorb, kete, jorbit, layup, orbfit]
+        tool: [assist, findorb, kete, jorbit, layup, orbfit, grss]
     steps:
       - name: Checkout empyrean-validation (default)
         uses: actions/checkout@v4
