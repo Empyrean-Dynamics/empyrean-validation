@@ -940,6 +940,7 @@ mod tests {
             "emp_radec_cov_arcsec2",
             "source_version",
             "layup_chi2",
+            "grss_chi2",
             "orbfit_error",
             "some_future_field",
             "emp_delta_v_budget_m_s",

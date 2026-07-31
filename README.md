@@ -51,7 +51,8 @@ plan; results are folded onto the core channel's rows:
 | [JPL](https://ssd.jpl.nasa.gov/) | NASA JPL SSD — Horizons + SBDB (one solution, two views) | propagation, ephemeris (Horizons truth); orbit determination — JPL's reported fit quality (normalized rms → reduced-χ² + n_obs) and fitted orbit + covariance (SBDB) |
 | [ASSIST](https://github.com/matthewholman/assist) | Holman et al. — ephemeris-driven REBOUND (pinned 1.2.3 / rebound 4.6.0) | propagation (f64 and first-order STM modes), timing |
 | [layup](https://github.com/Smithsonian/layup) | Matthew Holman / Smithsonian — ASSIST-backed orbit fitter (opt-in, `WITH_LAYUP=1`) | orbit determination (χ² / reduced-χ² / n_obs / convergence) |
-| [find_orb](https://github.com/Bill-Gray/find_orb) | Bill Gray / Project Pluto | orbit determination, fitted orbits; propagation + ephemeris of its own fitted orbit (fit-then-propagate) |
+| [GRSS](https://github.com/rahil-makadia/grss) | Makadia et al. — small-body propagation + OD with radar | propagation, ephemeris, orbit determination (χ² / reduced-χ² / rms / n_obs), **radar OD** (delay + Doppler residuals) |
+| [find_orb](https://github.com/Bill-Gray/find_orb) | Bill Gray / Project Pluto | orbit determination, fitted orbits; propagation + ephemeris of its own fitted orbit (fit-then-propagate); **radar OD** |
 | [OrbFit](http://adams.dm.unipi.it/orbfit/) | OrbFit Consortium / MPC (opt-in, `WITH_ORBFIT=1`) | orbit determination (CMC2003 rejection) |
 | [OpenOrb](https://github.com/oorb/oorb) | Granvik et al., University of Helsinki | propagation, ephemeris |
 | [kete](https://github.com/dahlend/kete) | Dar Dahlen (opt-in) | propagation, ephemeris, OD sanity check |
