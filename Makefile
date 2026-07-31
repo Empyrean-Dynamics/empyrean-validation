@@ -257,6 +257,17 @@ $(FO_BIN):
 # struct-layout segfaults.
 build: build-empyrean-c build-rust build-c build-cli build-wheel build-empyrean-validation $(if $(WITH_CORE),build-core,)
 
+# Exactly what `shard-reference` needs, and nothing else: the rust runner
+# ($(RUST_BIN)), the harness CLI ($(EMP_VAL_BIN)), and libempyrean, which the
+# runner links against via $(DYLD). Measured on a reference leg, the full
+# `build` took 375s — most of it building the C harness, the CLI and the
+# maturin wheel that a reference shard never invokes. Multiplied by one leg per
+# catalog object that is over five hours of billed time per run spent compiling
+# artifacts nobody in that job uses.
+build-reference: build-empyrean-c build-rust build-empyrean-validation
+
+.PHONY: build-reference
+
 # PHONY: cargo's incremental build is cheap when nothing changed and
 # this is the only way to guarantee `libempyrean.dylib` matches the
 # header that bindgen was compiled against.
@@ -395,14 +406,243 @@ $(RUST_OD): $(RUST_BIN) | fixtures
 	        exit 1; }; \
 	 done
 
+ifeq ($(REFERENCE_ASSEMBLED),1)
+# Matrix-CI assemble job: the unified reference was produced by
+# `assemble-reference` from the per-object shards, and this job carries NO
+# engine — no runners/rust binary, no wheel venv. Assert its presence loudly
+# instead of letting make walk the $(RUST_PROPEPH)/$(RUST_OD) chain, which
+# names $(RUST_BIN) as a prerequisite that only the phony `build-rust` produces:
+# make would abort with "No rule to make target .../validate" before running a
+# single recipe. Same shape as PLAN_PREBUILT=1 below, one level up the graph.
+$(RUST):
+	@test -f $(RUST) || { echo "ERROR: REFERENCE_ASSEMBLED=1 but $(RUST) is missing — run assemble-reference first."; exit 1; }
+	@echo "──── Rust channel: using assembled reference $(RUST) ───"
+else
 $(RUST): $(RUST_PROPEPH) $(RUST_OD)
 	@echo "──── Rust channel: merge prop+eph + OD into unified ────"
-	@$(WHEEL_PY) -c "import json,sys; \
+	@python3 -c "import json,sys; \
 a=json.load(open('$(RUST_PROPEPH)')); \
 b=json.load(open('$(RUST_OD)')); \
 sys.exit('ERROR: $(RUST_OD) carries zero OD rows. The rust OD pass produced nothing — a runner that emits no rows at all is a dead channel, not a passing one. Check the fixture fetch (make fixtures) and the runner log above.') if not b else None; \
 json.dump(a+b, open('$(RUST)','w'), indent=2, default=str); \
 print(f'Wrote {len(a)+len(b)} unified rust rows ({len(a)} prop+eph, {len(b)} OD) to $(RUST)')"
+endif
+
+# ── Per-object reference shards (CI matrix fan-out) ─────────
+# The rust reference is the expensive half of this suite: running all three
+# axes over the full catalog in one process took 176 min and blew the CI job's
+# 180-minute ceiling, taking ~3 hours of completed fits with it (empyrean-qhhw).
+# The work is embarrassingly parallel per object, so CI fans it out one leg per
+# object and reassembles here.
+#
+# Why per-object rather than N balanced shards: cost is NOT predictable from
+# any cheap proxy — Didymos fits 6,034 observations in 25.4 min while Eros
+# fits 13,150 in 47 s — so a static shard table would need measured weights
+# and would silently unbalance whenever the engine or catalog moved. One leg
+# per object is generated from the catalog, self-balancing forever, and isolates
+# a crash or timeout to the single object that caused it.
+SHARD_DIR := $(RESULTS_DIR)/shards
+
+# Same filters as ONLY_FLAG, for the catalog enumeration that drives the matrix.
+LIST_ONLY_FLAG := $(if $(OBJECTS),--only "$(OBJECTS)",)
+
+# Emit the CI matrix: one entry per object, each with its catalog name and a
+# filesystem-safe slug. `list-objects` shares its filter resolution with
+# `plan`, so the matrix and the shards cannot disagree about which objects
+# are in scope.
+# Writes the matrix to a FILE rather than stdout, and the CI step reads the
+# file. Piping `make -s list-objects` into fromJson() looked cleaner and was a
+# latent trap: whenever $(EMP_VAL_BIN) had to be built first, make's own
+# "──── Building empyrean-validation CLI ────" banner went to stdout ahead of
+# the JSON, so the matrix expression received "──── Building…" and the entire
+# fan-out failed to expand. A file has no such coupling to make's chatter.
+OBJECTS_JSON := $(RESULTS_DIR)/objects.json
+
+list-objects: $(OBJECTS_JSON)
+
+$(OBJECTS_JSON): $(EMP_VAL_BIN)
+	@mkdir -p $(RESULTS_DIR)
+	@$(EMP_VAL_BIN) list-objects $(LIST_ONLY_FLAG) --format json > $(OBJECTS_JSON)
+	@python3 -c "import json,sys; d=json.load(open('$(OBJECTS_JSON)')); \
+sys.exit('ERROR: $(OBJECTS_JSON) is empty — no objects to validate.') if not d else None; \
+print(f'Wrote {len(d)} objects to $(OBJECTS_JSON)')"
+
+# One object's slice of the reference. OBJECT is the catalog name
+# ("46P/Wirtanen"), SLUG its safe token ("46P_Wirtanen") — both come from
+# `list-objects` so they always correspond.
+#
+# `od` derives its two JSONL sidecars from the --output stem, so pointing
+# --output into the shard directory lands them there too, with no second path
+# to keep in sync.
+shard-reference: $(RUST_BIN) $(EMP_VAL_BIN) | fixtures
+	@test -n "$(OBJECT)" || { echo "ERROR: shard-reference needs OBJECT=<catalog name>."; exit 1; }
+	@test -n "$(SLUG)"   || { echo "ERROR: shard-reference needs SLUG=<safe token>."; exit 1; }
+	@mkdir -p $(SHARD_DIR)/$(SLUG)
+	@echo "──── Reference shard: $(OBJECT) [prop + ephemeris] ─────"
+	@$(DYLD) $(RUST_BIN) run --only "$(OBJECT)" --tiers $(TIERS) \
+	    --data-dir $(DATA_DIR) --cache-dir $(CACHE_DIR) \
+	    --output $(SHARD_DIR)/$(SLUG)/validation_rust_propeph.json
+	@echo "──── Reference shard: $(OBJECT) [orbit determination] ──"
+	@$(DYLD) $(RUST_BIN) od --only "$(OBJECT)" --tier $(TIERS) \
+	    --data-dir $(DATA_DIR) \
+	    --fixtures-dir $(FIXTURES_PSV) \
+	    --output $(SHARD_DIR)/$(SLUG)/validation_rust_od.json
+	@python3 -c "$$ASSERT_SHARD_COMPLETE" $(SHARD_DIR)/$(SLUG) "$(OBJECT)"
+
+# Reassemble every per-object shard into the canonical reference, then let the
+# existing $(RUST) merge + strip-plan rules take over unchanged.
+#
+# This is the fan-in, and fan-ins are where a parallel pipeline goes quietly
+# wrong: a leg that died leaves its object simply absent, and a report rendered
+# from 49 of 50 objects looks exactly like a healthy one. So the shard set is
+# checked against the catalog enumeration and any missing object is named and
+# fatal — never warned about, never skipped.
+assemble-reference: $(EMP_VAL_BIN)
+	@echo "──── Reference: reassemble per-object shards ───────────"
+	@mkdir -p $(SHARD_DIR)
+	@$(EMP_VAL_BIN) list-objects $(LIST_ONLY_FLAG) --format lines > $(SHARD_DIR)/.expected
+	@python3 -c "$$ASSEMBLE_SHARDS" $(SHARD_DIR) $(SHARD_DIR)/.expected \
+	    $(RUST_PROPEPH) $(RUST_OD) $(RUST_OD_ORBITS) $(RUST_OD_COMPARE) $(RUST)
+
+.PHONY: list-objects shard-reference assemble-reference lint-workflows
+
+# Static-check the workflows. Worth a target of its own because the fan-out
+# introduced a class of bug that nothing else here catches and a green run hides:
+# repointing a job's `needs:` without updating the `if:` that reads
+# `needs.<job>.result`. The `needs` context holds ONLY direct dependencies, so a
+# stale reference reads null, the condition is false forever, and the job is
+# SKIPPED — which does not fail the run. That is how `reduce` came to be silently
+# skipped on every trigger, dropping the report, the ci-check row floors and the
+# publish while the suite reported success. actionlint reports it as
+# `property "prep" is not defined in object type {...}`.
+lint-workflows:
+	@command -v actionlint >/dev/null 2>&1 || { \
+	    echo "ERROR: actionlint is not installed — cannot verify the workflows."; \
+	    echo "       brew install actionlint   (or see github.com/rhysd/actionlint)"; \
+	    exit 1; }
+	@echo "──── actionlint: .github/workflows ─────────────────────"
+	@actionlint -shellcheck= .github/workflows/*.yml
+	@echo "  workflows OK."
+
+# A shard must contain both halves and be parseable. Zero OD rows is legal for
+# one object (not every catalog entry need carry fittable astrometry) but zero
+# prop+eph rows means the run produced nothing for an object CI believes it
+# covered — the silent-empty shape, caught here at the shard rather than after
+# 50 of them have been concatenated into an innocuous-looking whole.
+define ASSERT_SHARD_COMPLETE
+import json, sys, pathlib
+d, obj = pathlib.Path(sys.argv[1]), sys.argv[2]
+propeph, od = d / "validation_rust_propeph.json", d / "validation_rust_od.json"
+problems = []
+counts = {}
+for f in (propeph, od):
+    if not f.is_file():
+        problems.append(f"{f.name}: missing")
+        continue
+    try:
+        counts[f.name] = len(json.load(open(f)))
+    except Exception as exc:
+        problems.append(f"{f.name}: unparseable ({exc})")
+for side in ("validation_rust_od_orbits.jsonl", "validation_rust_od_compare.jsonl"):
+    if counts.get("validation_rust_od.json") and not (d / side).is_file():
+        problems.append(f"{side}: missing, but the OD pass emitted rows")
+if counts.get("validation_rust_propeph.json") == 0:
+    problems.append("validation_rust_propeph.json: zero rows")
+if problems:
+    print(f"ERROR: reference shard for {obj!r} is not usable:", file=sys.stderr)
+    for p in problems:
+        print(f"  - {p}", file=sys.stderr)
+    print("       A shard that is short here is an object silently absent from", file=sys.stderr)
+    print("       the assembled reference and from the report.", file=sys.stderr)
+    raise SystemExit(1)
+print(f"  shard OK: {obj} — {counts.get('validation_rust_propeph.json', 0)} prop+eph rows, "
+      f"{counts.get('validation_rust_od.json', 0)} OD rows")
+endef
+export ASSERT_SHARD_COMPLETE
+
+define ASSEMBLE_SHARDS
+import json, pathlib, sys
+shard_dir = pathlib.Path(sys.argv[1])
+expected_file = pathlib.Path(sys.argv[2])
+out_propeph, out_od, out_orbits, out_compare, out_unified = (
+    pathlib.Path(p) for p in sys.argv[3:8]
+)
+
+expected = []
+for line in expected_file.read_text().splitlines():
+    if line.strip():
+        slug, _, name = line.partition("\t")
+        expected.append((slug, name))
+if not expected:
+    raise SystemExit("ERROR: catalog enumeration produced zero objects; refusing to assemble.")
+
+def shard_path(slug):
+    """Locate one object's shard directory, whichever layout staged it.
+
+    A local run writes results/shards/<slug>/ directly. CI downloads the
+    per-object artifacts, and actions/download-artifact nests each one under a
+    directory named after the artifact — results/shards/reference-shard-<slug>/.
+    Accepting both means this does not depend on that action's nesting behavior,
+    which cannot be verified outside a real run; a shell step that flattened one
+    layout into the other would silently produce nothing if the assumption were
+    wrong, and every object would then read as missing.
+    """
+    for candidate in (shard_dir / slug, shard_dir / f"reference-shard-{slug}"):
+        if (candidate / "validation_rust_propeph.json").is_file():
+            return candidate
+    return shard_dir / slug  # canonical path, for the error message
+
+propeph, od, orbits, compare, missing = [], [], [], [], []
+for slug, name in expected:
+    d = shard_path(slug)
+    p, o = d / "validation_rust_propeph.json", d / "validation_rust_od.json"
+    if not (p.is_file() and o.is_file()):
+        missing.append(f"{name} (slug {slug}): "
+                       f"{'propeph' if not p.is_file() else ''}"
+                       f"{' and ' if not p.is_file() and not o.is_file() else ''}"
+                       f"{'od' if not o.is_file() else ''} shard absent")
+        continue
+    propeph += json.load(open(p))
+    od += json.load(open(o))
+    for src, dst in ((d / "validation_rust_od_orbits.jsonl", orbits),
+                     (d / "validation_rust_od_compare.jsonl", compare)):
+        if src.is_file():
+            dst += [ln for ln in src.read_text().splitlines() if ln.strip()]
+
+if missing:
+    print(f"ERROR: {len(missing)} of {len(expected)} reference shards did not arrive:",
+          file=sys.stderr)
+    for m in missing:
+        print(f"  - {m}", file=sys.stderr)
+    print("       Every object in the catalog gets a matrix leg; a leg that failed or", file=sys.stderr)
+    print("       was cancelled leaves its object ABSENT, and a report built from a", file=sys.stderr)
+    print("       partial reference is indistinguishable from a complete one.", file=sys.stderr)
+    print("       Re-run the failed leg(s); do not assemble around them.", file=sys.stderr)
+    raise SystemExit(1)
+
+# Unlike a single object's shard, the assembled whole having no OD rows means
+# the entire OD axis is dead — the empyrean-7wo5 shape the suite exists to catch.
+if not od:
+    raise SystemExit("ERROR: assembled reference carries zero OD rows across all "
+                     f"{len(expected)} objects. The OD axis produced nothing, which is a "
+                     "dead axis, not a passing one. Check the fixture fetch (make fixtures).")
+
+# The unified reference is written HERE, not by the $(RUST) rule, because the
+# assemble job carries no engine: that rule's prerequisites name $(RUST_BIN),
+# which only the phony `build-rust` produces, so make would abort before
+# running any recipe. Both halves are already in memory, so emit it directly
+# and let `make plan REFERENCE_ASSEMBLED=1` treat it as given.
+for path, rows in ((out_propeph, propeph), (out_od, od), (out_unified, propeph + od)):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    json.dump(rows, open(path, "w"), indent=2, default=str)
+for path, lines in ((out_orbits, orbits), (out_compare, compare)):
+    path.write_text("".join(ln + "\n" for ln in lines))
+
+print(f"Assembled {len(expected)} shards -> {len(propeph)} prop+eph rows, {len(od)} OD rows, "
+      f"{len(orbits)} orbit sidecar rows, {len(compare)} compare sidecar rows; "
+      f"unified {len(propeph) + len(od)} rows -> {out_unified}")
+endef
+export ASSEMBLE_SHARDS
 
 # ── Test plan ──────────────────────────────────────────────
 # The plan is the canonical test fixture: same row schema as a channel

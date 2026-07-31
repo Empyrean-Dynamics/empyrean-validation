@@ -8,21 +8,42 @@ name: Validation Suite
 #
 # ── Pipeline shape (matrix fan-out) ────────────────────────────────
 #
-#   precheck ─► prep ─┬─► empyrean (rust/python/c/cli/core) ─┐
-#                     │                                       ├─► reduce
-#                     └─► external ×N (assist, findorb, …) ───┘
+#   precheck ─► prep ─► reference ×50 ─► assemble ─┬─► empyrean ────┐
+#                       (one leg per object)        │                ├─► reduce
+#                                                   └─► external ×N ─┘
 #
-#   • prep   — download + cache all shared data ONCE, build the rust
-#              reference, and emit the canonical validation_plan.json.
-#              The only job that touches the authenticated network
-#              (JPL/NAIF/SBDB) or carries the private-engine checkout for
-#              the reference. (Every fixture-consuming job additionally
-#              fetches the public OD fixture snapshot pinned by
-#              fixtures/manifest.json — plain HTTPS, no credential,
-#              cached by snapshot id.)
-#   • empyrean — the five distribution channels that need the private
-#              empyrean + empyrean-core source built; they share one
-#              build so they run together in a single job.
+#   • prep   — download + cache all shared data ONCE, build the engine and
+#              harness binaries, and emit the per-object fan-out matrix from
+#              the catalog. The only job that touches the authenticated
+#              network (JPL/NAIF/SBDB) to POPULATE the shared caches; it no
+#              longer runs the reference itself. (Every fixture-consuming job
+#              additionally fetches the public OD fixture snapshot pinned by
+#              fixtures/manifest.json — plain HTTPS, no credential, cached by
+#              snapshot id.)
+#   • reference — one matrix leg per catalog object, each running prop+eph +
+#              OD for its single object into a shard artifact. Running all
+#              three axes over the whole catalog in ONE job took 176 min and
+#              blew the 180-minute ceiling, discarding ~3 hours of completed
+#              fits (empyrean-qhhw). Per object rather than N balanced shards
+#              because fit cost is not predictable from any cheap proxy —
+#              Didymos fits 6,034 observations in 25.4 min, Eros fits 13,150
+#              in 47 s — so a weight table would silently unbalance whenever
+#              the engine or catalog moved. Legs restore prep's caches
+#              read-only and fail on a miss rather than re-downloading 2 GB
+#              of kernels 50 times. fail-fast:false, so one pathological
+#              object cannot cancel the other 49.
+#   • assemble — the fan-in: reassemble every shard into the canonical
+#              reference, then strip it into validation_plan.json. Checks the
+#              arrived shard set against the catalog and fails NAMING any
+#              absent object — a report built from 49 of 50 objects is
+#              otherwise indistinguishable from a complete one. Runs on
+#              always() so a dead leg produces that named error instead of a
+#              skipped job.
+#   • empyrean — the four remaining distribution channels (python / c / cli /
+#              core) that need the private empyrean + empyrean-core source
+#              built; they share one build so they run together in a single
+#              job. The rust channel is the reference and is produced by the
+#              `reference` matrix above.
 #   • external — one matrix leg per independent reference implementation
 #              (ASSIST, find_orb, OpenOrb, kete, jorbit, layup, OrbFit).
 #              Each replays the *prebuilt* plan; needs no secrets and no
@@ -176,7 +197,10 @@ jobs:
     needs: precheck
     if: needs.precheck.outputs.empyrean-available == 'true'
     runs-on: ubuntu-latest
-    timeout-minutes: 180
+    timeout-minutes: 90
+    outputs:
+      # The per-object fan-out matrix, generated from the catalog.
+      objects: ${{ steps.objects.outputs.objects }}
     steps:
       - name: Log trigger source
         run: |
@@ -188,164 +212,194 @@ jobs:
             echo "Source tag:       ${{ github.event.client_payload.tag }}"
           fi
 
-      # ── Sibling-checkout layout ────────────────────────────────
-      # The Makefile expects:
-      #   <workspace>/empyrean/                 (rust / python / c / cli runners)
-      #   <workspace>/empyrean-core/            (validate-core binary)
-      #   <workspace>/empyrean-validation/      (this repo: framework + Makefile + externals)
-      #   <workspace>/<engine siblings>/ (empyrean-core's private deps for [patch])
-      # All paths in the Makefile resolve from `..` of the empyrean-validation
-      # checkout, which means each repo MUST sit alongside it.
+      # This repo must land before the composite action below can be resolved:
+      # the action lives inside it, and `uses: ./...` only resolves a path that
+      # is already on disk.
       - name: Checkout empyrean-validation (default)
         uses: actions/checkout@v4
         with:
           path: empyrean-validation
-      - name: Checkout empyrean (sibling)
-        uses: actions/checkout@v4
-        with:
-          repository: Empyrean-Dynamics/empyrean
-          path: empyrean
-          token: ${{ secrets.GH_PAT }}
-      - name: Checkout empyrean-core (sibling)
-        uses: actions/checkout@v4
-        with:
-          repository: Empyrean-Dynamics/empyrean-core
-          path: empyrean-core
-          token: ${{ secrets.GH_PAT }}
-      - name: Checkout core dep (transitive)
-        uses: actions/checkout@v4
-        with:
-          repository: Empyrean-Dynamics/scott
-          path: scott
-          token: ${{ secrets.GH_PAT }}
-      - name: Checkout core dep 2 (transitive)
-        uses: actions/checkout@v4
-        with:
-          repository: Empyrean-Dynamics/villeneuve
-          path: villeneuve
-          token: ${{ secrets.GH_PAT }}
-      - name: Checkout nolan (transitive)
-        uses: actions/checkout@v4
-        with:
-          repository: Empyrean-Dynamics/nolan
-          path: nolan
-          token: ${{ secrets.GH_PAT }}
-      - name: Configure git for any non-patched private deps
-        run: git config --global url."https://x-access-token:${{ secrets.GH_PAT }}@github.com/".insteadOf "ssh://git@github.com/"
 
+      # Shared with the per-object `reference` matrix via a composite action, so
+      # a leg cannot set its environment up differently from prep and produce
+      # reference numbers that silently are not comparable.
+      - name: Engine setup (writer — populates the shared caches)
+        uses: ./empyrean-validation/.github/actions/engine-setup
+        with:
+          gh-pat: ${{ secrets.GH_PAT }}
+          python-version: ${{ env.PYTHON_VERSION }}
+          data-cache-key: ${{ env.DATA_CACHE_KEY }}
+          jpl-cache-key: ${{ env.JPL_CACHE_KEY }}
+          role: writer
+          install-python-tooling: "true"
+
+      # ── Build the engine + warm the shared caches ──────────────
+      # prep no longer RUNS the reference — it only builds the binaries and
+      # populates the caches (2 GB kernels, JPL responses, cargo) that the
+      # per-object legs restore. Running all three axes over the whole catalog
+      # here is what blew the 180-minute ceiling (empyrean-qhhw).
+      #
+      # `make build` compiles the binaries (the rust runner's file target is
+      # produced by the phony `build-rust`, so a downstream target alone cannot
+      # build it) and builds the wheel venv the plan-strip script runs under.
+      - name: Build engine + harness binaries
+        working-directory: empyrean-validation
+        env:
+          DATA_DIR: ${{ env.EMPYREAN_DATA_DIR }}
+        run: make build
+
+      # The matrix: one entry per catalog object, each carrying the object's
+      # catalog name and a filesystem-safe slug. `list-objects` shares its
+      # filter resolution with `plan`, so the matrix and the shards cannot
+      # disagree about which objects are in scope.
+      - name: Emit per-object matrix
+        id: objects
+        working-directory: empyrean-validation
+        run: |
+          # Read the matrix from the FILE the target writes, never from make's
+          # stdout: make prints its own recipe banners there whenever it has to
+          # build the CLI first, and that text ahead of the JSON silently breaks
+          # fromJson() and the whole fan-out.
+          make list-objects OBJECTS="${OBJECTS}"
+          matrix="$(cat results/objects.json)"
+          count="$(python3 -c 'import json;print(len(json.load(open("results/objects.json"))))')"
+          test "$count" -gt 0 || { echo "ERROR: matrix is empty — no objects to validate." >&2; exit 1; }
+          echo "objects=$matrix" >> "$GITHUB_OUTPUT"
+          echo "Fanning out $count per-object reference legs."
+
+  # ── reference (per-object matrix) ───────────────────────────────────
+  # One leg per catalog object. Each restores the caches prep warmed, rebuilds
+  # warm, and runs prop+eph + OD for its single object into a shard artifact.
+  #
+  # Per object rather than N balanced shards because fit cost is not predictable
+  # from any cheap proxy — Didymos fits 6,034 observations in 25.4 min while Eros
+  # fits 13,150 in 47 s — so a static shard table would need measured weights and
+  # would silently unbalance whenever the engine or catalog moved. One leg per
+  # object is generated from the catalog, self-balancing, and confines a crash or
+  # timeout to the object that caused it instead of losing the whole run.
+  #
+  # fail-fast:false so one pathological object does not cancel the other 49;
+  # `assemble` is what turns a missing shard into a hard failure, by name.
+  reference:
+    name: Reference — ${{ matrix.object.name }}
+    needs: prep
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      # 25 rather than all 50 is free here, and deliberate. Wall-clock is set by
+      # the single slowest object (Didymos, ~35 min of fits) not by queue depth:
+      # the remaining ~130 min of catalog work spread over 25 slots finishes well
+      # inside that, so capping does not extend the run. What it does buy is a
+      # halved peak on the 2 GB kernel-cache restore and headroom under the
+      # 60-concurrent-job account limit.
+      max-parallel: 25
+      matrix:
+        object: ${{ fromJson(needs.prep.outputs.objects) }}
+    steps:
+      - name: Checkout empyrean-validation (default)
+        uses: actions/checkout@v4
+        with:
+          path: empyrean-validation
+      - name: Engine setup (reader — must restore prep's caches)
+        uses: ./empyrean-validation/.github/actions/engine-setup
+        with:
+          gh-pat: ${{ secrets.GH_PAT }}
+          python-version: ${{ env.PYTHON_VERSION }}
+          data-cache-key: ${{ env.DATA_CACHE_KEY }}
+          jpl-cache-key: ${{ env.JPL_CACHE_KEY }}
+          role: reader
+      # `build-reference`, not `build`: only the rust runner, the harness CLI and
+      # libempyrean are used here. The full `build` measured 375s on a leg, most
+      # of it on the C harness, the CLI and the maturin wheel that a reference
+      # shard never invokes — and this job runs once per catalog object.
+      - name: Build reference prerequisites (warm)
+        working-directory: empyrean-validation
+        env:
+          DATA_DIR: ${{ env.EMPYREAN_DATA_DIR }}
+        run: make build-reference
+      - name: Reference shard — ${{ matrix.object.name }}
+        working-directory: empyrean-validation
+        env:
+          DATA_DIR: ${{ env.EMPYREAN_DATA_DIR }}
+        run: |
+          make shard-reference \
+            OBJECT="${{ matrix.object.name }}" \
+            SLUG="${{ matrix.object.slug }}" \
+            TIERS="${TIER}"
+      - name: Upload reference shard
+        uses: actions/upload-artifact@v4
+        with:
+          name: reference-shard-${{ matrix.object.slug }}
+          path: empyrean-validation/results/shards/${{ matrix.object.slug }}/
+          retention-days: 30
+          if-no-files-found: error
+
+  # ── assemble ───────────────────────────────────────────────────────
+  # Fan-in: reassemble every per-object shard into the canonical reference and
+  # strip it into the plan every replay channel reads.
+  #
+  # This is the job that makes the fan-out safe. `assemble-reference` checks the
+  # arrived shard set against the catalog enumeration and fails naming any object
+  # that is missing — a report rendered from 49 of 50 objects is otherwise
+  # indistinguishable from a complete one. It runs even when legs failed
+  # (always()) precisely so it can produce that named error rather than being
+  # skipped into silence.
+  assemble:
+    name: Assemble — reference + plan
+    needs: [prep, reference]
+    if: always() && needs.prep.result == 'success'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout empyrean-validation (default)
+        uses: actions/checkout@v4
+        with:
+          path: empyrean-validation
       - uses: actions-rust-lang/setup-rust-toolchain@v1
         with:
           rustflags: ""
-          cache-workspaces: |
-            empyrean-validation
-            empyrean-validation/runners/rust
-            empyrean-validation/runners/cli
+          cache-workspaces: empyrean-validation
       - uses: actions/setup-python@v5
         with:
           python-version: ${{ env.PYTHON_VERSION }}
-      - name: Install uv (used by empyrean-py wheel build)
-        run: pip install uv
-
-      # ── Data kernels (SPICE + DE440 + bias.dat, ~2 GB) ─────────
-      # Restore by key, but SAVE only after a complete, successful
-      # download so a transient NAIF/JPL outage mid-download can never
-      # poison the cache with a partial kernel set later runs would trust.
-      - name: Restore empyrean data kernels
-        id: cache-data
-        uses: actions/cache/restore@v4
-        with:
-          path: data
-          key: ${{ env.DATA_CACHE_KEY }}
-      - name: Download empyrean data kernels
-        if: steps.cache-data.outputs.cache-hit != 'true'
-        run: |
-          mkdir -p data
-          cd data
-          get() { curl -sSfL --retry 5 --retry-delay 10 --retry-all-errors --connect-timeout 60 "$@"; }
-          get -o de440.bsp https://naif.jpl.nasa.gov/pub/naif/generic_kernels/spk/planets/de440.bsp
-          get -o gm_de440.tpc https://naif.jpl.nasa.gov/pub/naif/generic_kernels/pck/gm_de440.tpc
-          get -o earth_latest_high_prec.bpc https://naif.jpl.nasa.gov/pub/naif/generic_kernels/pck/earth_latest_high_prec.bpc
-          get -o earth_620120_250826.bpc https://naif.jpl.nasa.gov/pub/naif/generic_kernels/pck/earth_620120_250826.bpc
-          get -o earth_2025_250826_2125_predict.bpc https://naif.jpl.nasa.gov/pub/naif/generic_kernels/pck/earth_2025_250826_2125_predict.bpc
-          get -o moon_pa_de440_200625.bpc https://naif.jpl.nasa.gov/pub/naif/generic_kernels/pck/moon_pa_de440_200625.bpc
-          get -o sb441-n16.bsp https://ssd.jpl.nasa.gov/ftp/eph/small_bodies/asteroids_de441/sb441-n16.bsp
-          get -o linux_p1550p2650.440 https://ssd.jpl.nasa.gov/ftp/eph/planets/Linux/de440/linux_p1550p2650.440
-          # Observatory codes: vendored in-repo (MPC throttles Actions IPs).
-          gunzip -c "$GITHUB_WORKSPACE/empyrean-validation/assets/obscodes_extended.json.gz" > obscodes_extended.json
-      - name: Save empyrean data kernels
-        if: steps.cache-data.outputs.cache-hit != 'true'
-        uses: actions/cache/save@v4
-        with:
-          path: data
-          key: ${{ env.DATA_CACHE_KEY }}
-
-      # JPL Horizons + SBDB API responses. prep is the writer: the rust
-      # plan build fetches every IC + reference vector once and caches it,
-      # so the fan-out legs restore a warm cache and never hammer JPL.
-      - name: Cache JPL API responses
-        uses: actions/cache@v4
-        with:
-          path: ~/.empyrean/cache
-          key: ${{ env.JPL_CACHE_KEY }}
-
       - name: Cache cargo state
         uses: actions/cache@v4
         with:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
-            empyrean/target
-            empyrean-core/target
             empyrean-validation/target
-          key: cargo-${{ hashFiles('**/Cargo.lock', '**/Cargo.toml') }}
+          key: cargo-assemble-${{ hashFiles('empyrean-validation/Cargo.lock') }}
           restore-keys: cargo-
-
-      # ── OD fixtures (GCS snapshot pinned by fixtures/manifest.json) ────
-      # Same poison discipline as the data kernels above: restore by
-      # snapshot key, ALWAYS run the fetch — on a cache hit it is a pure
-      # sha256 verify of every file, so a poisoned or truncated cache
-      # fails here instead of reaching a fit — and SAVE only on a miss,
-      # after a fully verified fetch. Plain public HTTPS (the data is
-      # public MPC astrometry): no gcloud, no credential.
-      - name: Read fixture snapshot id
-        id: fixtures-key
+      # Only the harness binary is needed here (list-objects + strip-plan);
+      # no engine, no kernels, no fixtures.
+      - name: Build harness binary
         working-directory: empyrean-validation
-        run: python3 -c "import json; print('id=' + json.load(open('fixtures/manifest.json'))['snapshot_id'])" >> "$GITHUB_OUTPUT"
-      - name: Restore OD fixtures
-        id: cache-fixtures
-        uses: actions/cache/restore@v4
+        run: cargo build --release --bin empyrean-validation
+      - name: Download every reference shard
+        uses: actions/download-artifact@v4
         with:
-          path: |
-            empyrean-validation/fixtures/psv/*.psv
-            empyrean-validation/fixtures/psv-radar/*.psv
-          key: fixtures-${{ steps.fixtures-key.outputs.id }}
-      - name: Fetch + verify OD fixtures
+          pattern: reference-shard-*
+          path: empyrean-validation/results/shards
+      # No flatten step: assemble-reference resolves both the local layout
+      # (shards/<slug>/) and the one download-artifact produces
+      # (shards/reference-shard-<slug>/). A shell step that normalized one into
+      # the other would silently produce nothing if the nesting assumption were
+      # wrong — and that assumption cannot be verified outside a real run.
+      - name: Show staged shards
+        working-directory: empyrean-validation/results/shards
+        run: find . -maxdepth 1 -mindepth 1 -type d -print | sort
+      # REFERENCE_ASSEMBLED=1 tells `plan` that the unified reference is already
+      # on disk (assemble-reference just wrote it from the shards). Without it,
+      # make walks $(RUST) -> $(RUST_PROPEPH)/$(RUST_OD) -> $(RUST_BIN), a file
+      # target only the phony `build-rust` produces, and aborts with "No rule to
+      # make target .../validate" — this job deliberately carries no engine.
+      - name: Assemble reference + strip plan
         working-directory: empyrean-validation
-        run: make fixtures
-      - name: Save OD fixtures
-        if: steps.cache-fixtures.outputs.cache-hit != 'true'
-        uses: actions/cache/save@v4
-        with:
-          path: |
-            empyrean-validation/fixtures/psv/*.psv
-            empyrean-validation/fixtures/psv-radar/*.psv
-          key: fixtures-${{ steps.fixtures-key.outputs.id }}
-
-      # ── Build the rust reference + the plan ────────────────────
-      # `make plan` builds the rust runner, runs prop+eph + OD, and
-      # strips the result into the canonical plan every other channel
-      # replays. This is the reference channel: everything compares to it.
-      # `make build` compiles the binaries (the rust runner's file target
-      # is produced by the phony `build-rust`, so `plan` alone can't build
-      # it); `make plan` then runs prop+eph + OD and strips the canonical
-      # plan. The wheel venv is built too because the plan-strip script
-      # runs under it.
-
-      - name: Build rust reference + generate plan
-        working-directory: empyrean-validation
-        env:
-          DATA_DIR: ${{ env.EMPYREAN_DATA_DIR }}
-        run: make build plan OBJECTS="${OBJECTS}" TIERS="${TIER}"
+        run: |
+          make assemble-reference OBJECTS="${OBJECTS}"
+          make plan REFERENCE_ASSEMBLED=1 OBJECTS="${OBJECTS}" TIERS="${TIER}"
 
       # Stage the plan + the rust channel outputs for the downstream jobs.
       #
@@ -354,15 +408,15 @@ jobs:
       # per-object fitted/propagated orbits and the fitted-vs-reference
       # Keplerian Mahalanobis comparisons, and the reduce job's `report` step
       # is the only consumer. Listing only the four JSON files left them in
-      # prep's workspace and nowhere else, so §12 of every published report —
-      # "fitted orbit + covariance vs references" — was empty, not because
-      # there was nothing to show but because the data never crossed the job
-      # boundary. Same silent-empty family as the OD channel itself.
+      # the producing job's workspace and nowhere else, so §12 of every
+      # published report — "fitted orbit + covariance vs references" — was
+      # empty, not because there was nothing to show but because the data never
+      # crossed the job boundary. Same silent-empty family as the OD channel.
       #
       # Every downstream job pulls this artifact whole (`download-artifact` by
       # name, or reduce's merge-multiple), so the sidecars arrive wherever
       # validation_rust_od.json does; there is no per-file download list to
-      # extend.
+      # extend. The artifact keeps its original name so no consumer changes.
       - name: Upload plan + rust reference
         uses: actions/upload-artifact@v4
         with:
@@ -384,7 +438,7 @@ jobs:
   # through the wheel, the C ABI, the CLI, and empyrean-core direct.
   empyrean:
     name: Empyrean channels — python/c/cli/core
-    needs: prep
+    needs: assemble
     runs-on: ubuntu-latest
     timeout-minutes: 120
     steps:
@@ -533,7 +587,7 @@ jobs:
   # the rest of the matrix.
   external:
     name: External — ${{ matrix.tool }}
-    needs: prep
+    needs: assemble
     runs-on: ubuntu-latest
     timeout-minutes: 180
     strategy:
@@ -691,13 +745,22 @@ jobs:
 
   # ── reduce ─────────────────────────────────────────────────────────
   # Merge every staged channel JSON + render the report + gate + publish.
-  # Runs whenever prep and the empyrean channels succeeded, EVEN IF some
-  # external legs failed (always() + explicit result checks): the report
+  # Runs whenever the reference/plan and the empyrean channels succeeded, EVEN
+  # IF some external legs failed (always() + explicit result checks): the report
   # then simply omits the dead comparators, which is the honest outcome.
+  #
+  # The gate names `assemble`, which is what now produces the plan, and which
+  # already refuses to succeed unless prep succeeded and every shard arrived —
+  # so prep is covered transitively. It must name a job that is actually in
+  # `needs`: the `needs` context contains ONLY direct dependencies, so a
+  # leftover `needs.prep.result` here would read null, the ANDed always() could
+  # not rescue it, and reduce would be SKIPPED on every run — dropping the
+  # report, the ci-check row floors and the publish while the workflow still
+  # reported success. `make lint-workflows` catches exactly that mismatch.
   reduce:
     name: Reduce — merge + report + publish
-    needs: [prep, empyrean, external]
-    if: always() && needs.prep.result == 'success' && needs.empyrean.result == 'success'
+    needs: [assemble, empyrean, external]
+    if: always() && needs.assemble.result == 'success' && needs.empyrean.result == 'success'
     runs-on: ubuntu-latest
     timeout-minutes: 45
     # The only job that publishes to GCS, so the only one that may mint the
@@ -736,11 +799,26 @@ jobs:
           key: cargo-${{ hashFiles('empyrean-validation/**/Cargo.lock', 'empyrean-validation/**/Cargo.toml') }}
           restore-keys: cargo-
 
-      # Pull every channel artifact flat into results/. merge-multiple
-      # flattens each single-file artifact into the one results dir.
-      - name: Download all channel artifacts
+      # Pull the plan/reference and the channel artifacts flat into results/.
+      # merge-multiple flattens each single-file artifact into the one results dir.
+      #
+      # These are two EXPLICIT patterns, not a blanket download, because the run
+      # now also carries 50 `reference-shard-<slug>` artifacts and every one of
+      # them contains files named validation_rust_propeph.json,
+      # validation_rust_od.json and the two sidecars. Flattened together with
+      # merge-multiple they would collide on those names and overwrite the
+      # assembled full-catalog reference with whichever single object's shard
+      # landed last — a report built from one object while looking complete.
+      # The shards were already consumed by `assemble`; reduce must not see them.
+      - name: Download plan + assembled reference
         uses: actions/download-artifact@v4
         with:
+          name: prep-plan-and-rust
+          path: empyrean-validation/results
+      - name: Download channel artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: channel*
           path: empyrean-validation/results
           merge-multiple: true
 
@@ -803,14 +881,50 @@ jobs:
       # sibling-tag-push is exactly the moment the published dashboard must
       # reflect the new engine tag's validation. (Omitting it left the bucket
       # stale while the summary still claimed a publish.)
+      #
+      # But NOT from every ref, and NOT for every object set. `latest/` is the
+      # published dashboard: whatever lands there is read as "this is Empyrean's
+      # validation of record." Two ways that was reachable by a run that has no
+      # business claiming it:
+      #
+      #   - a workflow_dispatch from ANY branch published over main's results,
+      #     so testing a pipeline change republished the dashboard from the
+      #     branch under test;
+      #   - a subset run (OBJECTS=…) published a partial report as canonical.
+      #     ci-check already refuses to enforce its per-axis row floors on a
+      #     subset — it warns and skips them — so the suite already knows a
+      #     subset is not gate-worthy, yet it published one as the gate anyway.
+      #
+      # Both are decided here, once, so the auth step and the upload step cannot
+      # disagree about whether this run is allowed to publish.
+      - name: Decide whether this run may publish
+        id: publish-gate
+        run: |
+          trigger=0
+          case "${{ github.event_name }}" in
+            schedule|push|workflow_dispatch|repository_dispatch) trigger=1 ;;
+          esac
+          if [ "$trigger" -ne 1 ]; then
+            echo "publish=false" >> "$GITHUB_OUTPUT"
+            echo "Not publishing: ${{ github.event_name }} is not a publishing trigger."
+          elif [ "${{ github.ref }}" != "refs/heads/main" ]; then
+            echo "publish=false" >> "$GITHUB_OUTPUT"
+            echo "::notice title=Not publishing::ref is ${{ github.ref }}, not refs/heads/main — results stay as run artifacts so a branch under test cannot overwrite the published dashboard."
+          elif [ -n "${OBJECTS}" ]; then
+            echo "publish=false" >> "$GITHUB_OUTPUT"
+            echo "::notice title=Not publishing::OBJECTS='${OBJECTS}' is a subset, so this run is not the validation of record. ci-check already skips its row floors for subsets; publishing one as latest/ would contradict that."
+          else
+            echo "publish=true" >> "$GITHUB_OUTPUT"
+            echo "Publishing: full catalog on refs/heads/main via ${{ github.event_name }}."
+          fi
       - name: Authenticate to Google Cloud
-        if: github.event_name == 'schedule' || github.event_name == 'push' || github.event_name == 'workflow_dispatch' || github.event_name == 'repository_dispatch'
+        if: steps.publish-gate.outputs.publish == 'true'
         uses: google-github-actions/auth@v2
         with:
           workload_identity_provider: "projects/786706985139/locations/global/workloadIdentityPools/github-pool/providers/github-provider"
           service_account: "empyrean-ci@empyrean-dynamics.iam.gserviceaccount.com"
       - name: Upload to GCS
-        if: github.event_name == 'schedule' || github.event_name == 'push' || github.event_name == 'workflow_dispatch' || github.event_name == 'repository_dispatch'
+        if: steps.publish-gate.outputs.publish == 'true'
         working-directory: empyrean-validation
         run: |
           TIMESTAMP=$(date -u +%Y%m%d_%H%M%S)
@@ -892,9 +1006,14 @@ jobs:
           echo "" >> $GITHUB_STEP_SUMMARY
           # Only claim a GCS publish when one actually happened — otherwise
           # point at the CI artifact so nobody trusts a stale dashboard.
-          case "${{ github.event_name }}" in
-            schedule|push|workflow_dispatch|repository_dispatch)
-              echo "Report published to \`${{ env.GCS_BUCKET }}/latest/validation_report.html\`" >> $GITHUB_STEP_SUMMARY ;;
-            *)
-              echo "Report NOT published to GCS for event \`${{ github.event_name }}\` — see the \`validation-report\` CI artifact on this run." >> $GITHUB_STEP_SUMMARY ;;
-          esac
+          #
+          # Reads the SAME gate output the upload steps are conditioned on,
+          # rather than re-deriving the decision from github.event_name. Two
+          # copies of the rule is how a summary comes to announce a publish
+          # that never ran: the gate now also refuses non-main refs and subset
+          # runs, and an independent copy here would not know that.
+          if [ "${{ steps.publish-gate.outputs.publish }}" = "true" ]; then
+            echo "Report published to \`${{ env.GCS_BUCKET }}/latest/validation_report.html\`" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "Report NOT published to GCS (event \`${{ github.event_name }}\`, ref \`${{ github.ref }}\`, OBJECTS \`${OBJECTS:-<full catalog>}\`) — see the \`validation-report\` CI artifact on this run." >> $GITHUB_STEP_SUMMARY
+          fi

@@ -38,6 +38,19 @@ jobs:
           cargo fmt -- --check
           cargo clippy --all-targets --all-features
 
+      # Static-check the workflows themselves. The validation suite fans out to
+      # ~55 jobs, and its most dangerous failure mode is a job that is SKIPPED
+      # rather than failed: a stale `needs.<job>.result` in an `if:` reads null,
+      # the condition is false forever, and the run reports success with the gate
+      # never having executed. actionlint catches exactly that, plus undefined
+      # matrix/output references. Cheap, and nothing else here can see it.
+      - name: Install actionlint
+        run: |
+          bash <(curl -fsSL https://raw.githubusercontent.com/rhysd/actionlint/main/scripts/download-actionlint.bash)
+          echo "$PWD" >> "$GITHUB_PATH"
+      - name: Lint (workflows)
+        run: make lint-workflows
+
       - name: Build + Lint (rust runner)
         working-directory: runners/rust
         run: |

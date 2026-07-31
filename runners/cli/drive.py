@@ -370,7 +370,18 @@ def main() -> int:
     proc.wait(timeout=5)
 
     args.output.parent.mkdir(parents=True, exist_ok=True)
-    args.output.write_text(json.dumps(out_rows, indent=2, default=str))
+    try:
+        _payload = json.dumps(out_rows, indent=2, default=str, allow_nan=False)
+    except ValueError as _e:
+        print(
+            f"ERROR: refusing to write non-finite values to {args.output}: {_e}\n"
+            "       Bare NaN/Infinity is invalid JSON — Rust's serde_json rejects it, so this\n"
+            "       whole channel would fail the reduce merge with a line number and no cause.\n"
+            "       A quantity that could not be computed must be null.",
+            file=sys.stderr,
+        )
+        raise
+    args.output.write_text(_payload)
     print(
         f"Wrote {len(out_rows)} cli rows to {args.output} (skipped {n_skipped})",
         file=sys.stderr,

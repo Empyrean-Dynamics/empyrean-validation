@@ -1,0 +1,205 @@
+name: Engine setup
+description: >
+  Sibling checkouts, toolchain, and the shared caches every job that builds or
+  runs the private engine needs. Extracted so `prep` and the per-object
+  `reference` matrix cannot drift apart — a matrix leg that set its environment
+  up even slightly differently from prep would produce reference numbers that
+  are not comparable, and nothing downstream would notice.
+
+inputs:
+  gh-pat:
+    description: PAT with read access to the private engine repos.
+    required: true
+  python-version:
+    description: Python to install.
+    required: true
+  data-cache-key:
+    description: Key for the ~2 GB SPICE/DE440 kernel cache.
+    required: true
+  jpl-cache-key:
+    description: Key for the JPL Horizons/SBDB response cache.
+    required: true
+  role:
+    description: >
+      `writer` (prep) may download and save the shared caches. `reader` (matrix
+      legs) must restore them warm and fails on a miss — 50 legs each pulling
+      2 GB from NAIF would hammer an external service the suite does not own,
+      and a leg that silently re-downloaded could disagree with prep's kernels.
+    required: false
+    default: reader
+  install-python-tooling:
+    description: Install uv (only the wheel-building jobs need it).
+    required: false
+    default: "false"
+
+outputs:
+  fixture-snapshot-id:
+    description: snapshot_id from fixtures/manifest.json, for cache keying.
+    value: ${{ steps.fixtures-key.outputs.id }}
+
+runs:
+  using: composite
+  steps:
+    # ── Sibling-checkout layout ────────────────────────────────
+    # The Makefile resolves every sibling from `..` of the
+    # empyrean-validation checkout, so each repo MUST sit alongside it.
+    #
+    # empyrean-validation itself is NOT checked out here: this action lives
+    # inside that repo, and `uses: ./...` can only resolve a path that is
+    # already on disk. Every caller therefore checks out empyrean-validation
+    # into ./empyrean-validation first, and this action adds the siblings.
+    - name: Checkout empyrean (sibling)
+      uses: actions/checkout@v4
+      with:
+        repository: Empyrean-Dynamics/empyrean
+        path: empyrean
+        token: ${{ inputs.gh-pat }}
+    - name: Checkout empyrean-core (sibling)
+      uses: actions/checkout@v4
+      with:
+        repository: Empyrean-Dynamics/empyrean-core
+        path: empyrean-core
+        token: ${{ inputs.gh-pat }}
+    - name: Checkout core dep (transitive)
+      uses: actions/checkout@v4
+      with:
+        repository: Empyrean-Dynamics/scott
+        path: scott
+        token: ${{ inputs.gh-pat }}
+    - name: Checkout core dep 2 (transitive)
+      uses: actions/checkout@v4
+      with:
+        repository: Empyrean-Dynamics/villeneuve
+        path: villeneuve
+        token: ${{ inputs.gh-pat }}
+    - name: Checkout nolan (transitive)
+      uses: actions/checkout@v4
+      with:
+        repository: Empyrean-Dynamics/nolan
+        path: nolan
+        token: ${{ inputs.gh-pat }}
+    - name: Configure git for any non-patched private deps
+      shell: bash
+      run: git config --global url."https://x-access-token:${{ inputs.gh-pat }}@github.com/".insteadOf "ssh://git@github.com/"
+
+    - uses: actions-rust-lang/setup-rust-toolchain@v1
+      with:
+        rustflags: ""
+        cache-workspaces: |
+          empyrean-validation
+          empyrean-validation/runners/rust
+          empyrean-validation/runners/cli
+    - uses: actions/setup-python@v5
+      with:
+        python-version: ${{ inputs.python-version }}
+    - name: Install uv (used by empyrean-py wheel build)
+      if: inputs.install-python-tooling == 'true'
+      shell: bash
+      run: pip install uv
+
+    # ── Data kernels (SPICE + DE440 + bias.dat, ~2 GB) ─────────
+    # Restore by key, but SAVE only after a complete, successful download so a
+    # transient NAIF/JPL outage mid-download can never poison the cache with a
+    # partial kernel set later runs would trust.
+    - name: Restore empyrean data kernels
+      id: cache-data
+      uses: actions/cache/restore@v4
+      with:
+        path: data
+        key: ${{ inputs.data-cache-key }}
+    - name: Require a warm kernel cache (reader role)
+      if: inputs.role != 'writer' && steps.cache-data.outputs.cache-hit != 'true'
+      shell: bash
+      run: |
+        echo "ERROR: data-kernel cache miss on key ${{ inputs.data-cache-key }}," >&2
+        echo "       and this job's role is 'reader' so it will not download them." >&2
+        echo "       prep is the sole writer of this cache. A miss here means prep" >&2
+        echo "       did not run, its download failed, or the key changed between" >&2
+        echo "       jobs in the same run." >&2
+        echo "       Refusing to fetch ~2 GB from NAIF once per matrix leg, and" >&2
+        echo "       refusing to run the reference against kernels prep did not use." >&2
+        exit 1
+    - name: Download empyrean data kernels
+      if: inputs.role == 'writer' && steps.cache-data.outputs.cache-hit != 'true'
+      shell: bash
+      run: |
+        mkdir -p data
+        cd data
+        get() { curl -sSfL --retry 5 --retry-delay 10 --retry-all-errors --connect-timeout 60 "$@"; }
+        get -o de440.bsp https://naif.jpl.nasa.gov/pub/naif/generic_kernels/spk/planets/de440.bsp
+        get -o gm_de440.tpc https://naif.jpl.nasa.gov/pub/naif/generic_kernels/pck/gm_de440.tpc
+        get -o earth_latest_high_prec.bpc https://naif.jpl.nasa.gov/pub/naif/generic_kernels/pck/earth_latest_high_prec.bpc
+        get -o earth_620120_250826.bpc https://naif.jpl.nasa.gov/pub/naif/generic_kernels/pck/earth_620120_250826.bpc
+        get -o earth_2025_250826_2125_predict.bpc https://naif.jpl.nasa.gov/pub/naif/generic_kernels/pck/earth_2025_250826_2125_predict.bpc
+        get -o moon_pa_de440_200625.bpc https://naif.jpl.nasa.gov/pub/naif/generic_kernels/pck/moon_pa_de440_200625.bpc
+        get -o sb441-n16.bsp https://ssd.jpl.nasa.gov/ftp/eph/small_bodies/asteroids_de441/sb441-n16.bsp
+        get -o linux_p1550p2650.440 https://ssd.jpl.nasa.gov/ftp/eph/planets/Linux/de440/linux_p1550p2650.440
+        # Observatory codes: vendored in-repo (MPC throttles Actions IPs).
+        gunzip -c "$GITHUB_WORKSPACE/empyrean-validation/assets/obscodes_extended.json.gz" > obscodes_extended.json
+    - name: Save empyrean data kernels
+      if: inputs.role == 'writer' && steps.cache-data.outputs.cache-hit != 'true'
+      uses: actions/cache/save@v4
+      with:
+        path: data
+        key: ${{ inputs.data-cache-key }}
+
+    # JPL Horizons + SBDB API responses. prep is the writer: it fetches every
+    # IC + reference vector once, so the fan-out legs restore a warm cache and
+    # never hammer JPL. Legs restore read-only for the same reason.
+    - name: Cache JPL API responses (writer)
+      if: inputs.role == 'writer'
+      uses: actions/cache@v4
+      with:
+        path: ~/.empyrean/cache
+        key: ${{ inputs.jpl-cache-key }}
+    - name: Restore JPL API responses (reader)
+      if: inputs.role != 'writer'
+      uses: actions/cache/restore@v4
+      with:
+        path: ~/.empyrean/cache
+        key: ${{ inputs.jpl-cache-key }}
+
+    - name: Cache cargo state
+      uses: actions/cache@v4
+      with:
+        path: |
+          ~/.cargo/registry
+          ~/.cargo/git
+          empyrean/target
+          empyrean-core/target
+          empyrean-validation/target
+        key: cargo-${{ hashFiles('**/Cargo.lock', '**/Cargo.toml') }}
+        restore-keys: cargo-
+
+    # ── OD fixtures (GCS snapshot pinned by fixtures/manifest.json) ────
+    # Same poison discipline as the data kernels: restore by snapshot key,
+    # ALWAYS run the fetch — on a cache hit it is a pure sha256 verify of every
+    # file, so a poisoned or truncated cache fails here instead of reaching a
+    # fit — and SAVE only on a miss, after a fully verified fetch. Plain public
+    # HTTPS (the data is public MPC astrometry): no gcloud, no credential, which
+    # is why every role may fetch these itself.
+    - name: Read fixture snapshot id
+      id: fixtures-key
+      shell: bash
+      working-directory: empyrean-validation
+      run: python3 -c "import json; print('id=' + json.load(open('fixtures/manifest.json'))['snapshot_id'])" >> "$GITHUB_OUTPUT"
+    - name: Restore OD fixtures
+      id: cache-fixtures
+      uses: actions/cache/restore@v4
+      with:
+        path: |
+          empyrean-validation/fixtures/psv/*.psv
+          empyrean-validation/fixtures/psv-radar/*.psv
+        key: fixtures-${{ steps.fixtures-key.outputs.id }}
+    - name: Fetch + verify OD fixtures
+      shell: bash
+      working-directory: empyrean-validation
+      run: make fixtures
+    - name: Save OD fixtures
+      if: steps.cache-fixtures.outputs.cache-hit != 'true'
+      uses: actions/cache/save@v4
+      with:
+        path: |
+          empyrean-validation/fixtures/psv/*.psv
+          empyrean-validation/fixtures/psv-radar/*.psv
+        key: fixtures-${{ steps.fixtures-key.outputs.id }}

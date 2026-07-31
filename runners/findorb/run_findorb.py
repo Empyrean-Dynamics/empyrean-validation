@@ -36,6 +36,10 @@ import urllib.request
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple
 
+# Local: ADES radar table -> MPC 80-column R/r records. find_orb reads 80-column
+# radar natively but cannot parse the ADES <radar> table at all.
+from radar_mpc80 import RadarConversionError, convert_radar_psv
+
 # ── Constants ───────────────────────────────────────────
 
 MJD_TO_JD = 2_400_000.5
@@ -200,10 +204,24 @@ def populate_fo_directory(working_dir: str, data_dir: Optional[pathlib.Path] = N
     # Based on: https://github.com/B612-Asteroid-Institute/adam_fo/blob/main/src/adam_fo/environ.dat.tpl
     lines = []
 
-    # JPL ephemeris path
+    # JPL ephemeris. Linked into the working directory and named RELATIVELY,
+    # never by absolute path: find_orb copies this string into a 94-byte buffer,
+    # and CI's workspace nests the checkout three deep, so the absolute path is
+    #   /home/runner/work/empyrean-validation/empyrean-validation/empyrean-validation/data/linux_p1550p2650.440
+    # — 103 characters, 9 over. On macOS that strlcpy overflow prints a warning
+    # and continues; on Linux, where the binary is built with _FORTIFY_SOURCE,
+    # it ABORTS, so `fo` died with SIGABRT (rc=134) on every single object and
+    # the channel fitted nothing. The runner already uses bare relative names
+    # elsewhere for exactly this reason; this was the last absolute path left.
+    #
+    # A symlink rather than a copy: the DE file is ~100 MB and this runs once
+    # per object.
     jpl_path = data_dir / "linux_p1550p2650.440" if data_dir else None
     if jpl_path and jpl_path.exists():
-        lines.append(f'LINUX_JPL_FILENAME={jpl_path.absolute()}')
+        link = os.path.join(working_dir, "jpl_de.440")
+        if not os.path.lexists(link):
+            os.symlink(jpl_path.absolute(), link)
+        lines.append("LINUX_JPL_FILENAME=jpl_de.440")
 
     # Perturbers: all planets + Pluto + Moon + asteroid perturbers (hex)
     lines.append('PERTURBERS=1007fe')
@@ -333,7 +351,31 @@ def run_findorb(
         fit_ms = (time.perf_counter() - t_fit0) * 1000.0
 
         if result.returncode != 0:
-            print(f"    find_orb failed (rc={result.returncode})")
+            # Surface find_orb's OWN diagnostics. Printing only the return code
+            # made a channel that failed on all 50 objects undiagnosable from
+            # CI: `capture_output=True` swallowed everything fo said about why,
+            # leaving `rc=134` and nothing else, which is not a cause. Signal
+            # deaths are decoded because 134 is the common one here (SIGABRT)
+            # and "rc=134" does not read as "the process was killed".
+            rc = result.returncode
+            how = f"rc={rc}"
+            if rc < 0:
+                how = f"killed by signal {-rc}"
+            elif rc > 128:
+                how = f"rc={rc} (killed by signal {rc - 128})"
+            print(f"    find_orb failed ({how})")
+            for stream, text in (("stdout", result.stdout), ("stderr", result.stderr)):
+                text = (text or "").strip()
+                if not text:
+                    continue
+                lines = text.splitlines()
+                shown = lines[-25:]
+                if len(lines) > len(shown):
+                    print(f"      [{stream}: last {len(shown)} of {len(lines)} lines]")
+                else:
+                    print(f"      [{stream}]")
+                for line in shown:
+                    print(f"        {line}")
             return None
 
         # Parse output files
@@ -566,9 +608,46 @@ def main() -> int:
         name = psv_path.stem  # filename without .psv
         print(f"{name}")
 
-        psv = sanitize_psv(psv_path.read_text())
-        n_obs = len(psv.strip().split("\n")) - 2  # subtract header lines
-        print(f"  {n_obs} observations")
+        # Split the fixture's optical and radar tables, converting the radar
+        # rows to MPC 80-column R/r records. find_orb's ADES reader cannot take
+        # our radar table at all — it aborts in _format_without_decimal even on
+        # fixtures our sanitizer never touches — but it reads 80-column radar
+        # natively, so the conversion is what makes this comparator possible.
+        try:
+            optical_psv, radar_lines = convert_radar_psv(name, psv_path.read_text())
+        except RadarConversionError as e:
+            print(f"  FAIL: radar conversion refused this fixture: {e}")
+            n_failed += 1
+            results.append(
+                {
+                    "object": name.replace("_", "/"),
+                    "test_type": args.test_type,
+                    "timestamp": timestamp,
+                    "source_version": source_version,
+                    "fo_error": f"radar conversion failed: {e}",
+                }
+            )
+            continue
+
+        # ORDER IS LOAD-BEARING. sanitize_psv is only correct on a SINGLE table:
+        # it takes the pos1/pos2/pos3 column indices from the optical header and
+        # applies them to every following line, so on a two-table fixture it
+        # rewrote the radar header's `com`/`frq` tags to `com.0`/`frq.0`,
+        # find_tag returned -1, and find_orb died on
+        #   ades2mpc.cpp:1252 check_for_psv_header: assert(psv_tags[n] > 0)
+        # — 51 mutated lines on Apophis alone. Sanitize the optical table FIRST,
+        # then append the 80-column radar records, which have no `|` and so are
+        # out of the sanitizer's reach entirely.
+        n_radar = len(radar_lines) // 2
+        psv = sanitize_psv(optical_psv)
+        if radar_lines:
+            psv = psv.rstrip("\n") + "\n" + "".join(ln + "\n" for ln in radar_lines)
+        n_optical = len(optical_psv.strip().split("\n")) - 2  # subtract header lines
+        n_obs = n_optical + n_radar
+        if n_radar:
+            print(f"  {n_optical} observations + {n_radar} radar")
+        else:
+            print(f"  {n_obs} observations")
 
         # Plan-driven ephemeris spec for this object (optical pass only).
         obj_name = name.replace("_", "/")
@@ -674,7 +753,18 @@ def main() -> int:
     output_path = pathlib.Path(args.output)
     output_path.parent.mkdir(parents=True, exist_ok=True)
     with open(output_path, "w") as f:
-        json.dump(results, f, indent=2, default=str)
+        try:
+            _payload = json.dumps(results, indent=2, default=str, allow_nan=False)
+        except ValueError as _e:
+            print(
+                f"ERROR: refusing to write non-finite values to {args.output}: {_e}\n"
+                "       Bare NaN/Infinity is invalid JSON — Rust's serde_json rejects it, so this\n"
+                "       whole channel would fail the reduce merge with a line number and no cause.\n"
+                "       A quantity that could not be computed must be null.",
+                file=sys.stderr,
+            )
+            raise
+        f.write(_payload)
 
     n_fits = len(psv_files) - n_failed
     print(f"{'=' * 80}")
