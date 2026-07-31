@@ -36,6 +36,10 @@ import urllib.request
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple
 
+# Local: ADES radar table -> MPC 80-column R/r records. find_orb reads 80-column
+# radar natively but cannot parse the ADES <radar> table at all.
+from radar_mpc80 import RadarConversionError, convert_radar_psv
+
 # ── Constants ───────────────────────────────────────────
 
 MJD_TO_JD = 2_400_000.5
@@ -604,9 +608,46 @@ def main() -> int:
         name = psv_path.stem  # filename without .psv
         print(f"{name}")
 
-        psv = sanitize_psv(psv_path.read_text())
-        n_obs = len(psv.strip().split("\n")) - 2  # subtract header lines
-        print(f"  {n_obs} observations")
+        # Split the fixture's optical and radar tables, converting the radar
+        # rows to MPC 80-column R/r records. find_orb's ADES reader cannot take
+        # our radar table at all — it aborts in _format_without_decimal even on
+        # fixtures our sanitizer never touches — but it reads 80-column radar
+        # natively, so the conversion is what makes this comparator possible.
+        try:
+            optical_psv, radar_lines = convert_radar_psv(name, psv_path.read_text())
+        except RadarConversionError as e:
+            print(f"  FAIL: radar conversion refused this fixture: {e}")
+            n_failed += 1
+            results.append(
+                {
+                    "object": name.replace("_", "/"),
+                    "test_type": args.test_type,
+                    "timestamp": timestamp,
+                    "source_version": source_version,
+                    "fo_error": f"radar conversion failed: {e}",
+                }
+            )
+            continue
+
+        # ORDER IS LOAD-BEARING. sanitize_psv is only correct on a SINGLE table:
+        # it takes the pos1/pos2/pos3 column indices from the optical header and
+        # applies them to every following line, so on a two-table fixture it
+        # rewrote the radar header's `com`/`frq` tags to `com.0`/`frq.0`,
+        # find_tag returned -1, and find_orb died on
+        #   ades2mpc.cpp:1252 check_for_psv_header: assert(psv_tags[n] > 0)
+        # — 51 mutated lines on Apophis alone. Sanitize the optical table FIRST,
+        # then append the 80-column radar records, which have no `|` and so are
+        # out of the sanitizer's reach entirely.
+        n_radar = len(radar_lines) // 2
+        psv = sanitize_psv(optical_psv)
+        if radar_lines:
+            psv = psv.rstrip("\n") + "\n" + "".join(ln + "\n" for ln in radar_lines)
+        n_optical = len(optical_psv.strip().split("\n")) - 2  # subtract header lines
+        n_obs = n_optical + n_radar
+        if n_radar:
+            print(f"  {n_optical} observations + {n_radar} radar")
+        else:
+            print(f"  {n_obs} observations")
 
         # Plan-driven ephemeris spec for this object (optical pass only).
         obj_name = name.replace("_", "/")
