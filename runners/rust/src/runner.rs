@@ -42,6 +42,75 @@ impl Default for ValidateConfig {
     }
 }
 
+// ── Observation-sensitivity row order ───────────────────────────────
+//
+// The engine's observation Jacobian is `[6][n_params]` row-major, and
+// its six output rows are the spherical topocentric observable in this
+// order. Every layer between the engine and this runner (empyrean-core,
+// the C ABI, the safe wrapper) marshals it through unreordered, so these
+// indices are the contract on both sides of the FFI boundary.
+//
+// The angle rows (RA, Dec, and their rates) arrive in degrees per input
+// unit; the range rows arrive in AU per input unit. Reading row 0 as RA
+// therefore yields neither the right observable nor the right unit
+// (empyrean-9666l: this runner published a range/RA covariance under the
+// `emp_radec_cov_arcsec2` name until the pin test below was added).
+//
+// Names mirror the constants the published wrapper exposes, so once this
+// runner's `empyrean` pin advances past 0.9.0 the locals can be dropped
+// in favour of the crate's own.
+// Named so the pin test can say "not this row" about the one that was
+// actually being read; the projection itself never touches it.
+#[allow(dead_code)]
+const SENSITIVITY_ROW_RANGE: usize = 0;
+const SENSITIVITY_ROW_RA: usize = 1;
+const SENSITIVITY_ROW_DEC: usize = 2;
+
+/// Project the input-state covariance onto the sky plane through the
+/// ephemeris Jacobian: \\(C_\text{radec} = J C_\text{in} J^\top\\) over
+/// the RA and Dec rows, returned as a 2×2 in arcsec² with the RA
+/// row/column scaled by cosδ so it matches `d_ra_arcsec`.
+///
+/// `jacobian` is the row-major `[6][n_params]` block as the wrapper
+/// hands it over; only the first six columns are projected, because
+/// `cin` is the 6×6 state covariance and the remaining columns (when a
+/// wide chain carried non-gravitational or other solved-for parameters)
+/// have no counterpart in it.
+///
+/// Returns `None` when the block is too short or too narrow to carry the
+/// rows this needs, rather than indexing past its end.
+fn project_sky_covariance(
+    jacobian: &[f64],
+    n_params: usize,
+    cin: &[[f64; 6]; 6],
+    dec_rad: f64,
+) -> Option<[[f64; 2]; 2]> {
+    if n_params < 6 || jacobian.len() < (SENSITIVITY_ROW_DEC + 1) * n_params {
+        return None;
+    }
+    // Row stride is n_params, and each row is truncated to its 6 state
+    // columns.
+    let state_row = |r: usize| &jacobian[r * n_params..r * n_params + 6];
+    let hra = state_row(SENSITIVITY_ROW_RA);
+    let hdec = state_row(SENSITIVITY_ROW_DEC);
+
+    let quad = |ha: &[f64], hb: &[f64]| {
+        let mut s = 0.0;
+        for i in 0..6 {
+            for j in 0..6 {
+                s += ha[i] * cin[i][j] * hb[j];
+            }
+        }
+        s
+    };
+    let cosd = dec_rad.cos();
+    let deg2_to_arcsec2 = 3600.0_f64 * 3600.0;
+    let c_ra_ra = quad(hra, hra) * cosd * cosd * deg2_to_arcsec2;
+    let c_ra_dec = quad(hra, hdec) * cosd * deg2_to_arcsec2;
+    let c_dec_dec = quad(hdec, hdec) * deg2_to_arcsec2;
+    Some([[c_ra_ra, c_ra_dec], [c_ra_dec, c_dec_dec]])
+}
+
 fn tier_from_str(s: &str) -> ForceModelTier {
     match s {
         "approximate" => ForceModelTier::Approximate,
@@ -673,40 +742,15 @@ pub fn run_propagation_validation(
                             let d_dec_arcsec = d_dec.to_degrees() * 3600.0;
 
                             // Sky-plane 2×2 covariance (arcsec², RA·cosδ) = the input
-                            // covariance mapped through the ephemeris Jacobian. Rows 0,1
-                            // of the [6][n_params] Jacobian are ∂RA,∂Dec (deg per input
-                            // unit); project only the 6 state columns (C_in is the 6×6
-                            // state covariance), scale RA by cosδ, convert deg→arcsec.
+                            // covariance mapped through the ephemeris Jacobian.
                             let emp_radec_cov: Option<[[f64; 2]; 2]> =
                                 match (&covariance, eph.sensitivity.first()) {
-                                    (Some(cin), Some(sens))
-                                        if sens.jacobian.len() >= 2 * (sens.n_params as usize) =>
-                                    {
-                                        let np = sens.n_params as usize;
-                                        let hra = &sens.jacobian[0..np];
-                                        let hdec = &sens.jacobian[np..2 * np];
-                                        let quad = |ha: &[f64], hb: &[f64]| {
-                                            let mut s = 0.0;
-                                            for i in 0..6 {
-                                                for j in 0..6 {
-                                                    s += ha[i] * cin[i][j] * hb[j];
-                                                }
-                                            }
-                                            s
-                                        };
-                                        let cosd = emp_dec_rad.cos();
-                                        let a2 = 3600.0_f64 * 3600.0;
-                                        Some([
-                                            [
-                                                quad(hra, hra) * cosd * cosd * a2,
-                                                quad(hra, hdec) * cosd * a2,
-                                            ],
-                                            [
-                                                quad(hra, hdec) * cosd * a2,
-                                                quad(hdec, hdec) * a2,
-                                            ],
-                                        ])
-                                    }
+                                    (Some(cin), Some(sens)) => project_sky_covariance(
+                                        &sens.jacobian,
+                                        sens.n_params as usize,
+                                        cin,
+                                        emp_dec_rad,
+                                    ),
                                     _ => None,
                                 };
 
@@ -2099,4 +2143,142 @@ fn capture_orbit(
         state_kep_ecliptic_sun: kep_sun.elements,
         cov_kep_ecliptic_sun_6x6: kep_sun.covariance,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A `[6][n_params]` block whose every row is a constant, distinct
+    /// value — row `r` is filled with `r + 1` — so the projection's
+    /// output identifies which rows it read. Columns at and beyond index
+    /// 6 (present only on wide chains) are poisoned: they have no
+    /// counterpart in the 6×6 state covariance and must never be
+    /// projected.
+    fn row_labelled_jacobian(n_params: usize) -> Vec<f64> {
+        const POISON: f64 = 1.0e6;
+        let mut j = vec![0.0; 6 * n_params];
+        for r in 0..6 {
+            for c in 0..n_params {
+                j[r * n_params + c] = if c < 6 { (r + 1) as f64 } else { POISON };
+            }
+        }
+        j
+    }
+
+    fn identity6() -> [[f64; 6]; 6] {
+        let mut c = [[0.0; 6]; 6];
+        for (i, row) in c.iter_mut().enumerate() {
+            row[i] = 1.0;
+        }
+        c
+    }
+
+    /// With C_in = I₆ and every entry of row `r` equal to `r + 1`, the
+    /// quadratic form over rows `a`, `b` is `6·(a+1)·(b+1)`. That makes
+    /// the expected 2×2 a closed-form function of WHICH rows were read,
+    /// which is the whole point of the fixture.
+    fn expect_from_rows(row_a: usize, row_b: usize, dec_rad: f64) -> [[f64; 2]; 2] {
+        let cosd = dec_rad.cos();
+        let a2 = 3600.0_f64 * 3600.0;
+        let q = |x: usize, y: usize| 6.0 * ((x + 1) as f64) * ((y + 1) as f64);
+        [
+            [
+                q(row_a, row_a) * cosd * cosd * a2,
+                q(row_a, row_b) * cosd * a2,
+            ],
+            [q(row_a, row_b) * cosd * a2, q(row_b, row_b) * a2],
+        ]
+    }
+
+    fn assert_close(got: [[f64; 2]; 2], want: [[f64; 2]; 2]) {
+        for i in 0..2 {
+            for j in 0..2 {
+                let rel = (got[i][j] - want[i][j]).abs() / want[i][j].abs().max(1.0);
+                assert!(
+                    rel < 1e-12,
+                    "[{i}][{j}]: got {}, want {}",
+                    got[i][j],
+                    want[i][j]
+                );
+            }
+        }
+    }
+
+    /// The contract this whole test module exists for (empyrean-9666l):
+    /// the six Jacobian rows are `[range, RA, Dec, v_range, v_RA, v_Dec]`,
+    /// so the sky-plane projection reads rows 1 and 2. Reading rows 0 and
+    /// 1 — the defect — publishes a range/RA covariance under the
+    /// `emp_radec_cov_arcsec2` name, in AU·deg rather than deg², and
+    /// nothing about the resulting number looks wrong on inspection.
+    #[test]
+    fn sky_covariance_projects_the_ra_and_dec_rows_not_range() {
+        let dec_rad = 0.4;
+        let j = row_labelled_jacobian(6);
+        let got = project_sky_covariance(&j, 6, &identity6(), dec_rad).expect("6-column block");
+
+        assert_close(
+            got,
+            expect_from_rows(SENSITIVITY_ROW_RA, SENSITIVITY_ROW_DEC, dec_rad),
+        );
+
+        // And explicitly NOT the rows the defect read.
+        let wrong = expect_from_rows(SENSITIVITY_ROW_RANGE, SENSITIVITY_ROW_RA, dec_rad);
+        assert!(
+            (got[0][0] - wrong[0][0]).abs() > 1.0,
+            "projection matched the (range, RA) rows — the empyrean-9666l defect is back"
+        );
+    }
+
+    /// A wide chain strides by `n_params`, not by 6. If the stride were
+    /// hard-coded the rows would silently shift, and the poisoned
+    /// non-state columns would land in the quadratic form.
+    #[test]
+    fn sky_covariance_strides_by_n_params_on_a_wide_chain() {
+        let dec_rad = -0.9;
+        for n_params in [6usize, 9, 12] {
+            let j = row_labelled_jacobian(n_params);
+            let got = project_sky_covariance(&j, n_params, &identity6(), dec_rad)
+                .unwrap_or_else(|| panic!("n_params={n_params} block"));
+            assert_close(
+                got,
+                expect_from_rows(SENSITIVITY_ROW_RA, SENSITIVITY_ROW_DEC, dec_rad),
+            );
+        }
+    }
+
+    /// Rows the projection does not read cannot influence it — the
+    /// range and rate rows are inert even when they dominate the block.
+    #[test]
+    fn sky_covariance_ignores_the_range_and_rate_rows() {
+        let dec_rad = 0.1;
+        let mut j = row_labelled_jacobian(6);
+        for r in [SENSITIVITY_ROW_RANGE, 3, 4, 5] {
+            for c in 0..6 {
+                j[r * 6 + c] = 1.0e9;
+            }
+        }
+        let got = project_sky_covariance(&j, 6, &identity6(), dec_rad).expect("6-column block");
+        assert_close(
+            got,
+            expect_from_rows(SENSITIVITY_ROW_RA, SENSITIVITY_ROW_DEC, dec_rad),
+        );
+    }
+
+    /// A block that cannot carry the Dec row is declined, not indexed
+    /// past the end.
+    #[test]
+    fn sky_covariance_declines_a_block_too_short_or_too_narrow() {
+        let dec_rad = 0.0;
+        let full = row_labelled_jacobian(6);
+
+        // Two rows only — enough for the old (rows 0,1) read, not for
+        // this one. Declining is the correct answer.
+        assert!(project_sky_covariance(&full[..12], 6, &identity6(), dec_rad).is_none());
+        // Fewer than 6 state columns: the quadratic form has no 6-vector
+        // to contract the covariance against.
+        assert!(
+            project_sky_covariance(&row_labelled_jacobian(5), 5, &identity6(), dec_rad).is_none()
+        );
+    }
 }
