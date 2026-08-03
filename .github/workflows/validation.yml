@@ -57,34 +57,91 @@ name: Validation Suite
 # responses, cargo, per-tool build trees) that `prep` populates, so the
 # expensive downloads/builds happen once and fan out warm.
 #
-# Triggers:
-#   - cron                — Monday 06:00 UTC weekly refresh
-#   - dispatch            — manual run with optional OBJECTS / TIER inputs
-#   - push                — any change to this repo's main (framework
-#                           / schema / external-runner code, the
-#                           orchestrator Makefile, or this workflow
-#                           itself)
-#   - repository_dispatch — fired by sibling repos when their main /
-#                           release lands (see "Cross-repo dispatch"
-#                           below).
+# Triggers
+# ──────────────────────────────────────────────────────────────────
+# This run costs ~55 jobs and hours of compute, so it fires only when
+# the thing it measures — the empyrean engine as the distribution
+# channels see it — has actually moved. That is exactly two moments:
+#
+#   - repository_dispatch — empyrean or empyrean-core pushed to main
+#                           (see "Cross-repo dispatch" below). The
+#                           engine changed under the channels.
+#   - push                — this repo's main bumped the empyrean pin
+#                           in its OWN dependencies (see "Pin-bump
+#                           push" below). The harness adopted a new
+#                           engine generation.
+#   - dispatch            — manual run with optional OBJECTS / TIER
+#                           inputs; the escape hatch for everything
+#                           the two triggers above deliberately no
+#                           longer cover.
+#
+# DELIBERATELY NOT TRIGGERS, each dropped with its coverage story:
+#
+#   - the weekly cron. It re-ran an unchanged stack against upstream
+#     comparators that mostly drift on their own schedule. What it
+#     did buy was drift detection on the four UNPINNED comparators
+#     (find_orb @ HEAD, kete / jorbit @ latest PyPI, OrbFit @
+#     :latest); that signal now comes from upstream-scan.yml's
+#     Monday 07:00 UTC report, which surfaces the drift without
+#     spending the suite on it. Consequence, stated plainly: a
+#     comparator can move and stay unexercised until the next
+#     empyrean change or a manual run.
+#
+#   - engine-repo tag pushes (nolan / villeneuve / scott). The
+#     `sibling-tag-push` event type and all three sender steps were
+#     removed together, so nothing dispatches into a type that is no
+#     longer accepted. NO COVERAGE IS LOST: an engine tag reaches
+#     this suite the moment empyrean-core bumps its pin to it, which
+#     is a push to empyrean-core's main and therefore a
+#     `sibling-main-push`. Validation now gates ADOPTION of an engine
+#     tag rather than its mere existence — the transition that
+#     actually reaches users.
+#
+#   - framework-only pushes (schema, report renderer, external-runner
+#     code, the orchestrator Makefile, or this workflow itself).
+#     Those still get this repo's own CI on every push and PR —
+#     build, clippy, unit tests, and `make lint-workflows`
+#     (actionlint), which is what catches the dangerous
+#     silently-skipped-job class in this file. End-to-end exercise of
+#     a framework change is a `workflow_dispatch` away.
+#
+# Pin-bump push
+# ──────────────────────────────────────────────────────────────────
+# The `paths` filter below lists the three manifests carrying the
+# exact empyrean pin: the harness, the rust runner, and the CLI
+# runner. `Cargo.lock` is deliberately NOT in that list. The pins are
+# exact (`empyrean = "=x.y.z"`), so the lock cannot move empyrean
+# without one of these three manifests moving too — listing the lock
+# would add nothing about empyrean while firing the whole suite on
+# every unrelated transitive bump (serde, clap, chrono).
+#
+# The filter is path-level, not diff-level: an unrelated edit to one
+# of these manifests (a harness version bump, a new dev-dependency)
+# also fires the suite. That is the accepted false-positive side of
+# the trade — these files change rarely, and a spurious full run is a
+# far better failure than a missed pin bump. If it ever becomes
+# noisy, the fix is a guard step that diffs the pin line, not a
+# narrower path list.
+#
+# The python / c / cli / core channels build from the SIBLING
+# empyrean checkout (Makefile: EMPYREAN_ROOT), not from a pin, so
+# they carry no manifest here and are covered entirely by the
+# `sibling-main-push` dispatch.
 #
 # Cross-repo dispatch
 # ──────────────────────────────────────────────────────────────────
-# Two event types are accepted:
+# One event type is accepted:
 #   - sibling-main-push : empyrean / empyrean-core push to main.
 #                         Fires immediately because every push to
 #                         either of those is the next release
-#                         candidate users will feel.
-#   - sibling-tag-push  : a private engine repo tags a release.
-#                         Pre-tag main pushes are not dispatched —
-#                         the tag is the moment the upstream commits
-#                         to "this is the version the rest of the
-#                         stack will adopt." Validation gates that
-#                         transition.
+#                         candidate users will feel. Both senders
+#                         gate the dispatch on their own build/test
+#                         jobs, so a red sibling CI never spends a
+#                         run here.
 #
 # `client_payload.source` carries the dispatching repo's full name
-# (`Empyrean-Dynamics/<repo>`) and `client_payload.sha` (or `tag` for
-# tag pushes) carries the commit / tag that triggered the run.
+# (`Empyrean-Dynamics/<repo>`) and `client_payload.sha` carries the
+# commit that triggered the run.
 # Senders need a fine-grained PAT scoped to this repo only with
 # `Contents: read and write` (the repository_dispatch endpoint's
 # fine-grained requirement — NOT `actions: write`, which is for the
@@ -92,8 +149,6 @@ name: Validation Suite
 # `VALIDATION_DISPATCH_TOKEN`.
 
 on:
-  schedule:
-    - cron: "0 6 * * 1"
   workflow_dispatch:
     inputs:
       objects:
@@ -106,12 +161,14 @@ on:
         default: "standard"
   push:
     branches: [main]
-    paths-ignore:
-      - "README.md"
-      - "docs/**"
-      - "**.md"
+    # The empyrean pin, and nothing else. See "Pin-bump push" above for why
+    # Cargo.lock is absent and why this is path-level rather than diff-level.
+    paths:
+      - "Cargo.toml"
+      - "runners/rust/Cargo.toml"
+      - "runners/cli/Cargo.toml"
   repository_dispatch:
-    types: [sibling-main-push, sibling-tag-push]
+    types: [sibling-main-push]
 
 # Default to read-only for EVERY job. id-token:write (which mints the GCP
 # OIDC token) is granted ONLY to the reduce job that publishes to GCS — never
@@ -209,7 +266,6 @@ jobs:
             echo "Dispatch type:    ${{ github.event.action }}"
             echo "Source repo:      ${{ github.event.client_payload.source }}"
             echo "Source sha:       ${{ github.event.client_payload.sha }}"
-            echo "Source tag:       ${{ github.event.client_payload.tag }}"
           fi
 
       # This repo must land before the composite action below can be resolved:
@@ -878,9 +934,9 @@ jobs:
 
       # ── GCS upload ─────────────────────────────────────────────
       # Publish on every real trigger INCLUDING repository_dispatch — a
-      # sibling-tag-push is exactly the moment the published dashboard must
-      # reflect the new engine tag's validation. (Omitting it left the bucket
-      # stale while the summary still claimed a publish.)
+      # sibling-main-push is exactly the moment the published dashboard must
+      # reflect the new engine commit's validation. (Omitting it left the
+      # bucket stale while the summary still claimed a publish.)
       #
       # But NOT from every ref, and NOT for every object set. `latest/` is the
       # published dashboard: whatever lands there is read as "this is Empyrean's
@@ -901,6 +957,11 @@ jobs:
         id: publish-gate
         run: |
           trigger=0
+          # `schedule` is inert while the weekly cron is off (see "Triggers"
+          # at the top) and is kept here ON PURPOSE, the same way the oorb
+          # re-enable path is kept below. This gate is the narrower of the two
+          # lists, so a cron restored in `on:` without a matching edit here
+          # would run the full suite and then silently decline to publish it.
           case "${{ github.event_name }}" in
             schedule|push|workflow_dispatch|repository_dispatch) trigger=1 ;;
           esac

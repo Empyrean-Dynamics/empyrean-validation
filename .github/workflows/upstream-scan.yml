@@ -23,9 +23,15 @@ name: Upstream Reference Scan
 # real up-to-date verdict.
 #
 # Triggers:
-#   - cron     — Monday 07:00 UTC, one hour after the validation suite's
-#                06:00 UTC weekly refresh (see validation.yml), so the scan
-#                reflects the same week's state without contending with it.
+#   - cron     — Monday 07:00 UTC. This used to sit one hour behind the
+#                validation suite's own 06:00 weekly refresh; that cron is
+#                gone (validation.yml now fires only on an empyrean /
+#                empyrean-core change or a pin bump), which makes this scan
+#                the ONLY standing weekly signal on comparator drift. The
+#                four unpinned tools above — find_orb, kete, jorbit, OrbFit
+#                — can now move without the suite exercising them until the
+#                next empyrean change, so this report is what surfaces that
+#                gap. Keep it weekly, and keep it report-only.
 #   - dispatch — manual run.
 #
 # Secrets/permissions: none beyond the default GITHUB_TOKEN (public-repo reads
