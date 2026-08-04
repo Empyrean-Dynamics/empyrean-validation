@@ -897,6 +897,651 @@ fn fidelity_summary_per_tt(rollups: &[ChannelRollup]) -> String {
     }
 }
 
+// ─────────────────────────────────────────────────────────────────────────
+// Convergence matrix (§09) — who converged on what, and who was never asked
+// ─────────────────────────────────────────────────────────────────────────
+
+/// Escape a string for use inside a double-quoted HTML attribute.
+///
+/// The matrix puts free-form text — a channel's `notes`, a tool's error
+/// string, an object name like `1I/'Oumuamua` — into `title=`, so a stray
+/// quote would end the attribute and a stray `<` would open a tag.
+fn attr_escape(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            '"' => out.push_str("&quot;"),
+            '\'' => out.push_str("&#39;"),
+            _ => out.push(c),
+        }
+    }
+    out
+}
+
+/// What one channel did with one object's arc.
+///
+/// The distinction between [`NotConverged`](ConvergenceCell::NotConverged)
+/// and [`NotAttempted`](ConvergenceCell::NotAttempted) is the entire point
+/// of the matrix: a tool must never be shown as failing on data it was
+/// never given. Every state that cannot be *proved* to be an attempt
+/// therefore resolves to `NotAttempted` — the matrix understates failures
+/// rather than inventing them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ConvergenceCell {
+    /// The channel fit this arc and the fit converged.
+    Converged,
+    /// The channel fit this arc and the fit did not converge. `reason` is
+    /// the channel's own explanation when its row carries one.
+    NotConverged { reason: Option<String> },
+    /// The channel was never given this arc — a capability or domain
+    /// exclusion. `reason` always names who excluded it and why.
+    NotAttempted { reason: String },
+}
+
+/// Which arcs an external comparator's runner actually fits.
+///
+/// A *static* property of each runner's contract, in the same spirit as the
+/// client-side `TOOL_AXES` registry. It cannot be derived from the merged
+/// rows: a tool that fits nothing folds no fields at all, which is
+/// byte-identical to a tool that was never invoked. Declaring the contract
+/// here is what lets an empty cell say "this tool does not do that" instead
+/// of "this tool failed".
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OdArcs {
+    /// The runner performs no differential correction in this harness. The
+    /// string says what it does instead.
+    NoFit(&'static str),
+    /// The runner fits optical arcs only. The string says why it has no
+    /// radar pass.
+    OpticalOnly(&'static str),
+    /// The runner fits optical arcs and runs a separate optical+radar pass.
+    OpticalAndRadar,
+}
+
+/// One external-comparator column of the convergence matrix.
+struct OdToolSpec {
+    /// Registry key — the name the rest of the report uses (the
+    /// client-side `TOOLS` registry, and the `<key>_*` field prefix on
+    /// [`ValidationResult`]).
+    key: &'static str,
+    /// Column header.
+    label: &'static str,
+    /// Header dot color; matches the client-side `TOOLS` palette.
+    color: &'static str,
+    /// Arcs this runner fits.
+    arcs: OdArcs,
+}
+
+/// The external comparators, in column order.
+///
+/// Propagation-only references (ASSIST, kete) are deliberately absent: they
+/// run no fit on any arc, have their own sections, and a column of
+/// exclusions for them would say nothing the sections do not. JPL is absent
+/// for a different reason — `ref_od_*` is a *published* SBDB solution, not a
+/// fit this harness ran, so it has no convergence outcome to report.
+const OD_TOOLS: [OdToolSpec; 6] = [
+    OdToolSpec {
+        key: "findorb",
+        label: "find_orb",
+        color: "#d05040",
+        arcs: OdArcs::OpticalAndRadar,
+    },
+    OdToolSpec {
+        key: "oorb",
+        label: "OpenOrb",
+        color: "#e8a040",
+        arcs: OdArcs::NoFit(
+            "OpenOrb's Ranging / LSL orbit fit is a multi-stage pipeline that does not fit \
+             this harness's per-row replay model, so its runner emits propagation and \
+             ephemeris rows only",
+        ),
+    },
+    OdToolSpec {
+        key: "layup",
+        label: "layup",
+        color: "#e07bc0",
+        arcs: OdArcs::OpticalOnly(
+            "the layup runner fits the optical arc only — it has no radar pass, so the \
+             optical+radar arc is never handed to it",
+        ),
+    },
+    OdToolSpec {
+        key: "orbfit",
+        label: "OrbFit",
+        color: "#7dd3c0",
+        arcs: OdArcs::OpticalOnly(
+            "the OrbFit runner fits the optical arc only — it has no radar pass, so the \
+             optical+radar arc is never handed to it",
+        ),
+    },
+    OdToolSpec {
+        key: "grss",
+        label: "GRSS",
+        color: "#8fbf5f",
+        arcs: OdArcs::OpticalAndRadar,
+    },
+    OdToolSpec {
+        key: "jorbit",
+        label: "jorbit",
+        color: "#8b9198",
+        arcs: OdArcs::NoFit(
+            "the jorbit runner folds per-row wall-clock timing only (`jorbit_time_ms`); it \
+             runs no differential correction in this harness",
+        ),
+    },
+];
+
+/// Channel names that are external comparators rather than Empyrean
+/// distribution channels. A results JSON handed to `report` may carry its
+/// tool's own rows (`channel: "oorb"`), which must not be mistaken for a
+/// distribution channel and given an Empyrean column.
+const EXTERNAL_CHANNEL_NAMES: [&str; 8] = [
+    "findorb", "oorb", "layup", "orbfit", "grss", "jorbit", "assist", "kete",
+];
+
+/// Does any row in the run carry evidence that this comparator ran at all?
+///
+/// Mirrors the client-side `TOOLS_PRESENT` probe, and scans every axis
+/// rather than just OD: the question is whether the comparator was part of
+/// *this invocation*, not whether it fit anything. A comparator whose JSON
+/// was never handed to `report` gets no column at all, rather than a column
+/// of exclusions that would imply it was considered and skipped.
+fn od_tool_present(key: &str, results: &[ValidationResult]) -> bool {
+    results.iter().any(|r| match key {
+        "findorb" => {
+            r.findorb_rms_residual.is_some()
+                || r.findorb_n_obs_used.is_some()
+                || r.findorb_vs_horizons_km.is_some()
+                || r.findorb_d_ra_arcsec.is_some()
+                || r.findorb_time_ms.is_some()
+        }
+        "oorb" => {
+            r.channel == "oorb"
+                || r.oorb_vs_horizons_km.is_some()
+                || r.oorb_separation_arcsec.is_some()
+                || r.oorb_time_ms.is_some()
+        }
+        "layup" => {
+            r.layup_converged.is_some()
+                || r.layup_reduced_chi2.is_some()
+                || r.layup_chi2.is_some()
+                || r.layup_n_obs_used.is_some()
+                || r.layup_time_ms.is_some()
+        }
+        "orbfit" => {
+            r.orbfit_rms_arcsec.is_some() || r.orbfit_error.is_some() || r.orbfit_time_ms.is_some()
+        }
+        "grss" => {
+            r.grss_rms_arcsec.is_some()
+                || r.grss_error.is_some()
+                || r.grss_converged.is_some()
+                || r.grss_vs_horizons_km.is_some()
+                || r.grss_separation_arcsec.is_some()
+                || r.grss_time_ms.is_some()
+        }
+        "jorbit" => r.jorbit_time_ms.is_some(),
+        _ => false,
+    })
+}
+
+/// find_orb's cell.
+///
+/// §09 already treats sub-50 % observation coverage as "effectively a
+/// convergence failure — find_orb has fallen back to its hard-coded
+/// placeholder orbit"; the matrix reads it the same way so the two panels
+/// cannot disagree about the same fit.
+///
+/// An OD row with no find_orb fields at all reads as *not attempted*.
+/// `merge_findorb` folds find_orb's numeric fit fields but not its
+/// `fo_error` marker, so "find_orb produced no solution" and "find_orb was
+/// never given this object" collapse to the same all-None row. Charging a
+/// tool with a failure that cannot be proved is precisely what this matrix
+/// exists to prevent, so the ambiguous state resolves to the exclusion and
+/// says so in its hover text.
+fn findorb_cell(r: &ValidationResult) -> ConvergenceCell {
+    if r.findorb_rms_residual.is_none() && r.findorb_n_obs_used.is_none() {
+        return ConvergenceCell::NotAttempted {
+            reason: "no find_orb fit folded onto this arc. The merge carries find_orb's fit \
+                     fields but not its failure marker, so a fit that produced no solution is \
+                     indistinguishable here from an object find_orb was never given — reported \
+                     as not attempted rather than charged as a failure."
+                .to_string(),
+        };
+    }
+    if let (Some(used), Some(rejected)) = (r.findorb_n_obs_used, r.findorb_n_obs_rejected) {
+        let total = used + rejected;
+        if total > 0 && f64::from(used) / f64::from(total) < 0.5 {
+            return ConvergenceCell::NotConverged {
+                reason: Some(format!(
+                    "find_orb used {used}/{total} observations ({:.1} %) — below the 50 % \
+                     coverage floor §09 reads as its placeholder-orbit fallback rather than a fit",
+                    100.0 * f64::from(used) / f64::from(total)
+                )),
+            };
+        }
+    }
+    ConvergenceCell::Converged
+}
+
+/// layup's cell, off `layup_converged` (orbitfit's `flag == 0`).
+///
+/// A record with layup numbers but no flag is a real attempt whose outcome
+/// could not be read — a failure, not an exclusion. No layup fields at all
+/// means the merge found no record for the object, which is the exclusion.
+fn layup_cell(r: &ValidationResult) -> ConvergenceCell {
+    match r.layup_converged {
+        Some(true) => ConvergenceCell::Converged,
+        Some(false) => ConvergenceCell::NotConverged {
+            reason: Some("layup's orbitfit returned flag ≠ 0".to_string()),
+        },
+        None => {
+            let produced_numbers = r.layup_chi2.is_some()
+                || r.layup_reduced_chi2.is_some()
+                || r.layup_n_obs_used.is_some()
+                || r.layup_time_ms.is_some();
+            if produced_numbers {
+                ConvergenceCell::NotConverged {
+                    reason: Some(
+                        "layup emitted a record for this object but no convergence flag — its \
+                         orbitfit output could not be read"
+                            .to_string(),
+                    ),
+                }
+            } else {
+                ConvergenceCell::NotAttempted {
+                    reason: "no layup record for this object in the merged input — outside the \
+                             fixture set layup was run over"
+                        .to_string(),
+                }
+            }
+        }
+    }
+}
+
+/// OrbFit's cell. `orbfit_error` is an explicit, merged failure marker, so
+/// an OrbFit failure is provable and renders as one.
+fn orbfit_cell(r: &ValidationResult) -> ConvergenceCell {
+    if let Some(e) = &r.orbfit_error {
+        return ConvergenceCell::NotConverged {
+            reason: Some(e.clone()),
+        };
+    }
+    if r.orbfit_rms_arcsec.is_some() || r.orbfit_n_obs_used.is_some() {
+        return ConvergenceCell::Converged;
+    }
+    ConvergenceCell::NotAttempted {
+        reason: "no OrbFit fit folded onto this arc and no OrbFit error either — the object was \
+                 not in the set OrbFit was run over"
+            .to_string(),
+    }
+}
+
+/// GRSS's cell. GRSS carries both an explicit convergence flag and an
+/// explicit error string, so both failure modes are provable.
+fn grss_cell(r: &ValidationResult) -> ConvergenceCell {
+    if let Some(e) = &r.grss_error {
+        return ConvergenceCell::NotConverged {
+            reason: Some(e.clone()),
+        };
+    }
+    match r.grss_converged {
+        Some(false) => ConvergenceCell::NotConverged {
+            reason: Some("GRSS's least-squares fit did not converge".to_string()),
+        },
+        Some(true) => ConvergenceCell::Converged,
+        None if r.grss_rms_arcsec.is_some() || r.grss_n_obs_used.is_some() => {
+            ConvergenceCell::Converged
+        }
+        None => ConvergenceCell::NotAttempted {
+            reason: "no GRSS fit folded onto this arc and no GRSS error either — the object was \
+                     not in the set GRSS was run over"
+                .to_string(),
+        },
+    }
+}
+
+/// Read an external comparator's cell for one arc off the reference
+/// channel's row. `row` is `None` when the reference channel has no row for
+/// that (object, test type) at all.
+fn od_tool_cell(spec: &OdToolSpec, row: Option<&ValidationResult>, radar: bool) -> ConvergenceCell {
+    // The cell's hover text already names the column, so these read as
+    // "<tool>: not attempted — <reason>" without repeating the label.
+    match spec.arcs {
+        OdArcs::NoFit(what) => {
+            return ConvergenceCell::NotAttempted {
+                reason: format!("{what}."),
+            };
+        }
+        OdArcs::OpticalOnly(why) if radar => {
+            return ConvergenceCell::NotAttempted {
+                reason: format!("{why}."),
+            };
+        }
+        _ => {}
+    }
+    let Some(r) = row else {
+        return ConvergenceCell::NotAttempted {
+            reason: format!(
+                "the reference channel has no row for this arc, so {} was never asked about it",
+                spec.label
+            ),
+        };
+    };
+    match spec.key {
+        "findorb" => findorb_cell(r),
+        "layup" => layup_cell(r),
+        "orbfit" => orbfit_cell(r),
+        "grss" => grss_cell(r),
+        // Unreachable for the registry above (every fitting tool is handled);
+        // a tool added without a reader must not silently render as failing.
+        _ => ConvergenceCell::NotAttempted {
+            reason: format!("{} folds no convergence field onto OD rows", spec.label),
+        },
+    }
+}
+
+/// An Empyrean distribution channel's cell, read off that channel's own row.
+fn empyrean_channel_cell(
+    channel: &str,
+    row: Option<&ValidationResult>,
+    radar: bool,
+) -> ConvergenceCell {
+    let Some(r) = row else {
+        if radar && channel != "rust" {
+            return ConvergenceCell::NotAttempted {
+                reason: format!(
+                    "`{}` is a rust-only plan axis (plan::PLAN_RUST_ONLY_TEST_TYPES), so the \
+                     {channel} channel is never handed the optical+radar arc",
+                    test_types::ORBIT_DETERMINATION_RADAR
+                ),
+            };
+        }
+        return ConvergenceCell::NotAttempted {
+            reason: format!("the {channel} channel emitted no row for this arc"),
+        };
+    };
+    match r.od_converged {
+        Some(true) => ConvergenceCell::Converged,
+        Some(false) => ConvergenceCell::NotConverged {
+            reason: (!r.notes.is_empty()).then(|| r.notes.clone()),
+        },
+        // A channel whose binding does not marshal `od_converged` still
+        // returns a fitted orbit when the fit landed, so read the outcome
+        // from the output rather than blanking a cell that has one.
+        None if r.od_rms_combined_arcsec.is_some() || r.emp_pos_au.is_some() => {
+            ConvergenceCell::Converged
+        }
+        None => ConvergenceCell::NotConverged {
+            reason: Some(
+                "the row carries neither a convergence flag nor a fitted orbit".to_string(),
+            ),
+        },
+    }
+}
+
+/// One row of the convergence matrix: an object on one arc.
+struct ConvergenceRowKey {
+    object: String,
+    population: String,
+    /// `orbit_determination` or `orbit_determination_radar`.
+    test_type: String,
+    /// Row label — the object name, suffixed `(+ radar)` on the radar arc.
+    label: String,
+}
+
+/// One column of the convergence matrix.
+struct ConvergenceColumn {
+    label: String,
+    color: String,
+    /// Cells, parallel to the row list.
+    cells: Vec<ConvergenceCell>,
+}
+
+/// Per-object convergence across every OD channel in the run.
+///
+/// Rows are one per object per arc, in the report's canonical object order
+/// (population, then name), with an object's optical+radar arc immediately
+/// after its optical one. Columns are the Empyrean distribution channels
+/// that produced OD rows, then every external comparator present in the
+/// inputs. Cells are ✓ / ✗ / — for converged / did-not-converge /
+/// not-attempted; the ✗-versus-— distinction is the point of the panel, so
+/// anything not provably an attempt renders as —.
+fn build_convergence_matrix_html(results: &[ValidationResult]) -> String {
+    // The two arcs the matrix covers. The other OD-family test types
+    // (non-grav / DT / photometry / thrust recovery) are separate solve-for
+    // configurations with their own sections, not a second fit of the same
+    // arc, so they are not rows here.
+    const OPTICAL: &str = test_types::ORBIT_DETERMINATION;
+    const RADAR: &str = test_types::ORBIT_DETERMINATION_RADAR;
+
+    let od_rows: Vec<&ValidationResult> = results
+        .iter()
+        .filter(|r| r.test_type == OPTICAL || r.test_type == RADAR)
+        .collect();
+    if od_rows.is_empty() {
+        return r#"<div class="section-desc" style="color:#8b9198">No orbit-determination rows in this report — nothing to tabulate. Run the OD subset to populate this panel.</div>"#
+            .to_string();
+    }
+
+    // Externals fold onto the reference channel's rows: `core` when the run
+    // has one, else `rust` (the Makefile's own fallback, and the same
+    // `row['core'] || rust` choice §09 makes client-side).
+    let reference_channel = if results.iter().any(|r| r.channel == "core") {
+        "core"
+    } else {
+        "rust"
+    };
+
+    // Empyrean distribution channels that produced OD rows, core first then
+    // alphabetical — the same ordering the rest of the report uses.
+    let mut empyrean_channels: Vec<&str> = od_rows
+        .iter()
+        .map(|r| r.channel.as_str())
+        .filter(|c| !EXTERNAL_CHANNEL_NAMES.contains(c))
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect();
+    empyrean_channels.sort_by(|a, b| match (*a == "core", *b == "core") {
+        (true, false) => std::cmp::Ordering::Less,
+        (false, true) => std::cmp::Ordering::Greater,
+        _ => a.cmp(b),
+    });
+
+    // Rows: one per (object, arc), canonical order.
+    let mut seen: BTreeSet<(String, String)> = BTreeSet::new();
+    let mut keys: Vec<ConvergenceRowKey> = Vec::new();
+    for r in &od_rows {
+        if !seen.insert((r.object.clone(), r.test_type.clone())) {
+            continue;
+        }
+        keys.push(ConvergenceRowKey {
+            object: r.object.clone(),
+            population: r.population.clone(),
+            test_type: r.test_type.clone(),
+            label: if r.test_type == RADAR {
+                format!("{} (+ radar)", r.object)
+            } else {
+                r.object.clone()
+            },
+        });
+    }
+    keys.sort_by(|a, b| {
+        a.population
+            .cmp(&b.population)
+            .then(a.object.cmp(&b.object))
+            // Optical arc first, then the radar arc for the same object.
+            .then(a.test_type.cmp(&b.test_type))
+    });
+
+    let mut by_key: HashMap<(&str, &str, &str), &ValidationResult> = HashMap::new();
+    for r in &od_rows {
+        by_key.insert(
+            (r.channel.as_str(), r.object.as_str(), r.test_type.as_str()),
+            r,
+        );
+    }
+
+    let mut columns: Vec<ConvergenceColumn> = Vec::new();
+    for ch in &empyrean_channels {
+        let cells = keys
+            .iter()
+            .map(|k| {
+                let row = by_key
+                    .get(&(ch, k.object.as_str(), k.test_type.as_str()))
+                    .copied();
+                empyrean_channel_cell(ch, row, k.test_type == RADAR)
+            })
+            .collect();
+        columns.push(ConvergenceColumn {
+            label: (*ch).to_string(),
+            color: channel_color(ch).to_string(),
+            cells,
+        });
+    }
+    for spec in &OD_TOOLS {
+        if !od_tool_present(spec.key, results) {
+            continue;
+        }
+        let cells = keys
+            .iter()
+            .map(|k| {
+                let row = by_key
+                    .get(&(reference_channel, k.object.as_str(), k.test_type.as_str()))
+                    .copied();
+                od_tool_cell(spec, row, k.test_type == RADAR)
+            })
+            .collect();
+        columns.push(ConvergenceColumn {
+            label: spec.label.to_string(),
+            color: spec.color.to_string(),
+            cells,
+        });
+    }
+
+    let mut html = String::new();
+    html.push_str(
+        r#"<div class="heatmap-container"><table class="heatmap" style="min-width:100%">"#,
+    );
+    html.push_str(r#"<thead><tr><th style="text-align:left">Object &middot; arc</th>"#);
+    for c in &columns {
+        html.push_str(&format!(
+            r#"<th><span class="pop-dot" style="background:{color}"></span>{label}</th>"#,
+            color = c.color,
+            label = attr_escape(&c.label),
+        ));
+    }
+    html.push_str("</tr></thead><tbody>");
+
+    for (i, k) in keys.iter().enumerate() {
+        html.push_str(&format!(
+            r#"<tr><td class="obj-name" title="{pop}">{label}</td>"#,
+            pop = attr_escape(&k.population),
+            label = attr_escape(&k.label),
+        ));
+        for c in &columns {
+            let (class, glyph, title) = match &c.cells[i] {
+                ConvergenceCell::Converged => ("conv-ok", "&#10003;", "converged".to_string()),
+                ConvergenceCell::NotConverged { reason } => (
+                    "conv-fail",
+                    "&#10007;",
+                    match reason {
+                        Some(r) => format!("did not converge — {r}"),
+                        None => "did not converge (no reason recorded on the row)".to_string(),
+                    },
+                ),
+                ConvergenceCell::NotAttempted { reason } => {
+                    ("conv-na", "&mdash;", format!("not attempted — {reason}"))
+                }
+            };
+            html.push_str(&format!(
+                r#"<td class="cell conv {class}" title="{label}: {title}">{glyph}</td>"#,
+                label = attr_escape(&c.label),
+                title = attr_escape(&title),
+            ));
+        }
+        html.push_str("</tr>");
+    }
+
+    // Per-column footer: converged / attempted, and how many cells were
+    // excluded rather than failed. Without the second number the first one
+    // reads as a score, and a tool fed one object would outrank a tool fed
+    // fifty.
+    html.push_str(r#"<tr class="conv-footer"><td class="obj-name">converged / attempted</td>"#);
+    for c in &columns {
+        let converged = c
+            .cells
+            .iter()
+            .filter(|x| matches!(x, ConvergenceCell::Converged))
+            .count();
+        let excluded = c
+            .cells
+            .iter()
+            .filter(|x| matches!(x, ConvergenceCell::NotAttempted { .. }))
+            .count();
+        let attempted = c.cells.len() - excluded;
+        let color = if attempted == 0 {
+            "#778096"
+        } else if converged == attempted {
+            "#3d9a6d"
+        } else {
+            "#e8a040"
+        };
+        html.push_str(&format!(
+            r#"<td style="color:{color}; line-height:1.4">{converged}/{attempted}<br/><span style="font-size:8px; opacity:0.75">{excluded} excluded</span></td>"#,
+        ));
+    }
+    html.push_str("</tr></tbody></table></div>");
+
+    html.push_str(
+        r#"<div class="legend" style="margin-top:12px;">
+    <div class="legend-item"><span class="conv-key conv-ok">&#10003;</span>converged</div>
+    <div class="legend-item"><span class="conv-key conv-fail">&#10007;</span>ran, did not converge (hover for the reason)</div>
+    <div class="legend-item"><span class="conv-key conv-na">&mdash;</span>not attempted &mdash; capability or domain exclusion (hover for who excluded it)</div>
+  </div>"#,
+    );
+
+    // Two absences the table itself cannot show, called out rather than left
+    // to be noticed: a distribution channel that ran but produced no OD at
+    // all has no column, and a radar-fixture object with no radar arc has no
+    // `(+ radar)` row.
+    let mut present_channels: Vec<&str> = results
+        .iter()
+        .map(|r| r.channel.as_str())
+        .filter(|c| !EXTERNAL_CHANNEL_NAMES.contains(c))
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect();
+    present_channels.retain(|c| !empyrean_channels.contains(c));
+    if !present_channels.is_empty() {
+        html.push_str(&format!(
+            r#"<div class="section-desc" style="margin-top:8px; color:#e8a040">Present in this run with no orbit-determination rows at all, so absent from the matrix: <b>{}</b>.</div>"#,
+            attr_escape(&present_channels.join(", ")),
+        ));
+    }
+    let radar_objects: BTreeSet<&str> = keys
+        .iter()
+        .filter(|k| k.test_type == RADAR)
+        .map(|k| k.object.as_str())
+        .collect();
+    let missing_radar: Vec<&str> = crate::catalog::RADAR_FIXTURE_OBJECTS
+        .iter()
+        .copied()
+        .filter(|o| !radar_objects.contains(o))
+        .collect();
+    if !missing_radar.is_empty() {
+        html.push_str(&format!(
+            r#"<div class="section-desc" style="margin-top:8px; color:#e8a040">Objects with a manifest-pinned radar fixture but no <code>{}</code> row in this run, so no <code>(+ radar)</code> arc: <b>{}</b>.</div>"#,
+            RADAR,
+            attr_escape(&missing_radar.join(", ")),
+        ));
+    }
+
+    html
+}
+
 /// Generate the interactive HTML validation report.
 ///
 /// `orbit_comparisons` is the optional sidecar from
@@ -1100,6 +1745,7 @@ pub fn generate_report(
     let channel_table_html = build_channel_table_html(&rollups);
     let per_tt_matrix_html = build_per_test_type_matrix_html(&rollups);
     let offenders_html = build_offenders_html(&rollups);
+    let convergence_matrix_html = build_convergence_matrix_html(results);
 
     // ── Hero "quality summary" line — features the cross-channel
     // pass counts and OD convergence rather than raw throughput. Built
@@ -1289,6 +1935,22 @@ pub fn generate_report(
   .od-table td.obj {{ text-align: left; color: var(--ed-text-primary); }}
   .od-table tr.diverged {{ background: rgba(208, 80, 64, 0.08); }}
 
+  /* Convergence matrix — three states, three glyphs, three classes. The
+     not-attempted hatch reuses the heatmap's `.cell.missing` fill so "we
+     have no number here" looks the same everywhere in the report. */
+  table.heatmap td.conv {{ font-size: 13px; line-height: 1.1; cursor: help; }}
+  table.heatmap td.conv-ok {{ color: #3d9a6d; }}
+  table.heatmap td.conv-fail {{ color: #e06252; background: rgba(208, 80, 64, 0.10); }}
+  table.heatmap td.conv-na {{
+    color: var(--ed-text-muted);
+    background: repeating-linear-gradient(45deg, #161c25, #161c25 4px, #1f2630 4px, #1f2630 8px);
+  }}
+  table.heatmap tr.conv-footer td {{ border-top: 1px solid var(--ed-border); padding-top: 8px; }}
+  .conv-key {{ font-size: 13px; margin-right: 4px; }}
+  .conv-key.conv-ok {{ color: #3d9a6d; }}
+  .conv-key.conv-fail {{ color: #e06252; }}
+  .conv-key.conv-na {{ color: var(--ed-text-muted); }}
+
   /* Tool-pair selector */
   #tool-selector select {{ background: var(--ed-input-bg); color: var(--ed-accent); border: 1px solid var(--ed-input-border); border-radius: var(--ed-radius-sm); padding: 5px 8px; font-family: var(--ed-font-mono); font-size: 13px; }}
   #tool-selector select:focus {{ outline: none; border-color: var(--ed-accent); box-shadow: 0 0 0 2px var(--ed-focus-ring); }}
@@ -1389,7 +2051,8 @@ pub fn generate_report(
     <a href="#s06" style="color:var(--ed-accent); text-decoration:none;">06 Ephemeris &mdash; Sky-plane Agreement</a><br/>
     <a href="#s07" style="color:var(--ed-accent); text-decoration:none;">07 Ephemeris &mdash; RA/Dec Offsets</a><br/>
     <a href="#s08" style="color:var(--ed-accent); text-decoration:none;">08 Ephemeris &mdash; Offset Growth</a><br/>
-    <a href="#s09" style="color:var(--ed-accent); text-decoration:none;">09 Orbit Determination &mdash; Diagnostics</a><br/>
+    <a href="#s08b" style="color:var(--ed-accent); text-decoration:none;">09 Orbit Determination &mdash; Convergence Matrix</a><br/>
+    <a href="#s09" style="color:var(--ed-accent); text-decoration:none;">10 Orbit Determination &mdash; Diagnostics</a><br/>
     <a href="#s13" style="color:var(--ed-accent); text-decoration:none;">Reproducibility &mdash; Provenance</a>
     <div style="margin-top:10px; color:var(--ed-text-muted); font-size:10px;">Empyrean Internals page → 01 Timing (empyrean vs ASSIST) · 02 Non-grav Recovery · 03 Channel Fidelity · 04 Uncertainty Cost (Jet1 vs f64) · 05 Fitted Orbit + Covariance</div>
   </div>
@@ -1596,8 +2259,18 @@ pub fn generate_report(
   </div>
 </div>
 
-<div class="section" id="s09" data-requires="empyrean">
+<div class="section" id="s08b">
   <div class="section-num">09</div>
+  <div class="section-title">Orbit Determination &mdash; Convergence Matrix</div>
+  <div class="section-desc">Who converged on what. One row per catalog object per arc &mdash; an object with radar astrometry gets a second <code>(+ radar)</code> row for the optical+radar fit &mdash; and one column per orbit-determination channel present in this run: the Empyrean distribution channels, then every external comparator whose JSON was merged in. Propagation-only references (ASSIST, kete) have no column; they run no fit and have their own sections.
+  <br/><br/>Three states, and the difference between the last two is the entire point of the panel: <b>&#10003;</b> the channel fit this arc and converged; <b>&#10007;</b> it fit this arc and did <i>not</i> converge; <b>&mdash;</b> it was never given this arc. A tool is never shown as failing on data it was never handed &mdash; <b>&mdash;</b> covers capability exclusions (OpenOrb runs no differential correction; layup and OrbFit have no radar pass; <code>orbit_determination_radar</code> is a rust-only plan axis), domain exclusions (an object outside the fixture set a tool was run over), and the case where the merged row cannot prove an attempt either way. That last case understates failures on purpose: where a comparator's failure marker is not carried through the merge (find_orb's is not), a blank row resolves to <b>&mdash;</b>, never to <b>&#10007;</b>. Hover any cell for the reason. The footer reads <i>converged / attempted</i> with the excluded count beneath, so a tool fed one object cannot outscore a tool fed fifty.</div>
+  <div id="conv-matrix">
+{convergence_matrix_html}
+  </div>
+</div>
+
+<div class="section" id="s09" data-requires="empyrean">
+  <div class="section-num">10</div>
   <div class="section-title">Orbit Determination &mdash; Diagnostics</div>
   <div class="section-desc">Do the fitters land in the same minimum? Post-fit RMS, reduced χ² = χ²/ν, and iteration count for Empyrean's OD (cross-channel bit-identical agreement lives on the Internals page). The external columns follow the second tool selected above — <b>JPL</b> (SBDB reduced χ² ≈ rms² + n_obs), <b>find_orb</b> (post-fit RMS), or <b>layup</b> (reduced χ²) — and are hidden when it carries no OD (e.g. ASSIST). JPL's rms is JPL's own weighting/debiasing over an arc that includes radar; find_orb's low-coverage fallback on short arcs (2 anchor obs) is greyed as &ldquo;rejection-mismatch.&rdquo; Neither is a like-for-like fit against Empyrean's optical-only weights.</div>
   <div id="od-empty" class="section-desc" style="display:none; color:#8b9198">No orbit-determination rows in this report. Run the OD subset to populate this section.</div>
@@ -4543,6 +5216,7 @@ try {{ wirePageNav(); }} catch (e) {{ console.error('wirePageNav failed', e); }}
         fidelity_threshold = FIDELITY_THRESHOLD,
         fidelity_summary = fidelity_summary,
         per_tt_matrix_html = per_tt_matrix_html,
+        convergence_matrix_html = convergence_matrix_html,
         channel_table_html = channel_table_html,
         offenders_html = offenders_html,
         quality_summary_html = quality_summary_html,
@@ -4754,6 +5428,7 @@ mod tests {
             "id=\"s06\"",
             "id=\"s07\"",
             "id=\"s08\"",
+            "id=\"s08b\"",
             "id=\"s09\"",
             "id=\"s09b\"",
             "id=\"s10\"",
@@ -4763,5 +5438,310 @@ mod tests {
         ] {
             assert!(html.contains(anchor), "missing section anchor: {anchor}");
         }
+    }
+
+    // ── Convergence matrix ───────────────────────────────────────────
+
+    /// A bare OD row on one channel, with nothing filled in beyond the
+    /// identity fields. Each test opts into exactly the fields whose
+    /// reading it is pinning, so a test can never pass on a field it did
+    /// not set.
+    fn conv_od_row(object: &str, channel: &str, test_type: &str) -> ValidationResult {
+        let mut r = ValidationResult::empty();
+        r.object = object.to_string();
+        r.population = "NEO".to_string();
+        r.epoch_mjd_tdb = 61000.0;
+        r.t_mjd_tdb = 61000.0;
+        r.force_model = "standard".to_string();
+        r.test_type = test_type.to_string();
+        r.channel = channel.to_string();
+        r.timestamp = "2026-08-04T00:00:00Z".to_string();
+        r
+    }
+
+    /// The `<td>` a given object row shows in a given column, as raw HTML.
+    /// Splitting on the row label keeps the assertion honest: an assertion
+    /// on the whole table would pass on a glyph that belongs to a
+    /// different object.
+    fn conv_cell_html(html: &str, row_label: &str, column_label: &str) -> String {
+        let row_start = html
+            .find(&format!(r#">{row_label}</td>"#))
+            .unwrap_or_else(|| panic!("no matrix row labelled {row_label:?}"));
+        let rest = &html[row_start..];
+        let row_end = rest.find("</tr>").expect("unterminated matrix row");
+        let row = &rest[..row_end];
+        let needle = format!(r#"title="{column_label}: "#);
+        let cell_start = row.find(&needle).unwrap_or_else(|| {
+            panic!("row {row_label:?} has no cell for column {column_label:?}: {row}")
+        });
+        // Walk back to this cell's opening `<td`.
+        let td_start = row[..cell_start].rfind("<td").expect("cell without a <td");
+        let td_end = row[td_start..].find("</td>").expect("unterminated cell") + td_start + 5;
+        row[td_start..td_end].to_string()
+    }
+
+    #[test]
+    fn convergence_matrix_renders_converged_failed_and_excluded_distinctly() {
+        // Three cells, three states, on one table:
+        //   Apophis / core   — converged        → ✓
+        //   Bennu   / core   — did not converge → ✗ carrying its `notes`
+        //   Bennu   / layup  — no layup record  → — (domain exclusion)
+        // The ✗-vs-— split is the panel's reason to exist, so the classes,
+        // the glyphs AND the hover reasons are all pinned.
+        let mut apophis = conv_od_row("Apophis", "core", "orbit_determination");
+        apophis.od_converged = Some(true);
+        apophis.od_rms_combined_arcsec = Some(0.31);
+        apophis.layup_converged = Some(true);
+
+        let mut bennu = conv_od_row("Bennu", "core", "orbit_determination");
+        bennu.od_converged = Some(false);
+        bennu.notes = "IOD seed diverged after 40 iterations".to_string();
+        // Deliberately no layup fields — layup has no record for Bennu.
+
+        let html = build_convergence_matrix_html(&[apophis, bennu]);
+
+        let ok = conv_cell_html(&html, "Apophis", "core");
+        assert!(ok.contains("conv-ok"), "converged cell missing class: {ok}");
+        assert!(ok.contains("&#10003;"), "converged cell missing ✓: {ok}");
+
+        let fail = conv_cell_html(&html, "Bennu", "core");
+        assert!(
+            fail.contains("conv-fail"),
+            "non-converged cell missing class: {fail}"
+        );
+        assert!(
+            fail.contains("&#10007;"),
+            "non-converged cell missing ✗: {fail}"
+        );
+        assert!(
+            fail.contains("IOD seed diverged after 40 iterations"),
+            "the row's own failure reason did not reach the hover text: {fail}"
+        );
+
+        let na = conv_cell_html(&html, "Bennu", "layup");
+        assert!(na.contains("conv-na"), "excluded cell missing class: {na}");
+        assert!(
+            na.contains("&mdash;"),
+            "excluded cell missing em-dash: {na}"
+        );
+        assert!(
+            na.contains("not attempted"),
+            "an excluded cell must say it was not attempted, not merely go blank: {na}"
+        );
+        assert!(
+            !na.contains("conv-fail"),
+            "layup was never given Bennu and must not be shown as failing on it: {na}"
+        );
+    }
+
+    #[test]
+    fn convergence_matrix_never_charges_a_tool_with_an_unprovable_failure() {
+        // find_orb ran in this invocation (it fit Apophis) but folded
+        // nothing onto Bennu. `merge_findorb` does not carry find_orb's
+        // failure marker, so "no solution" and "never asked" are the same
+        // all-None row — which must read as an exclusion, never a failure.
+        let mut apophis = conv_od_row("Apophis", "core", "orbit_determination");
+        apophis.od_converged = Some(true);
+        apophis.findorb_rms_residual = Some(0.35);
+        apophis.findorb_n_obs_used = Some(900);
+        apophis.findorb_n_obs_rejected = Some(20);
+
+        let mut bennu = conv_od_row("Bennu", "core", "orbit_determination");
+        bennu.od_converged = Some(true);
+
+        let html = build_convergence_matrix_html(&[apophis, bennu]);
+
+        let fit = conv_cell_html(&html, "Apophis", "find_orb");
+        assert!(
+            fit.contains("conv-ok"),
+            "find_orb's fit did not read as converged: {fit}"
+        );
+
+        let blank = conv_cell_html(&html, "Bennu", "find_orb");
+        assert!(
+            blank.contains("conv-na"),
+            "a find_orb-less row must read as not attempted: {blank}"
+        );
+        assert!(
+            !blank.contains("conv-fail"),
+            "find_orb was charged with a failure the merged row cannot prove: {blank}"
+        );
+    }
+
+    #[test]
+    fn convergence_matrix_reads_findorbs_low_coverage_fallback_as_a_failure() {
+        // §09 already treats sub-50 % coverage as find_orb falling back to
+        // its placeholder orbit. The matrix must agree with the section
+        // directly beneath it — this is a *provable* attempt that failed.
+        let mut r = conv_od_row("2008 TC3", "core", "orbit_determination");
+        r.od_converged = Some(true);
+        r.findorb_rms_residual = Some(0.02);
+        r.findorb_n_obs_used = Some(2);
+        r.findorb_n_obs_rejected = Some(98);
+
+        let html = build_convergence_matrix_html(&[r]);
+        let cell = conv_cell_html(&html, "2008 TC3", "find_orb");
+        assert!(
+            cell.contains("conv-fail"),
+            "find_orb's 2/100 placeholder-orbit fallback rendered as a fit: {cell}"
+        );
+        assert!(
+            cell.contains("2/100"),
+            "the coverage that drove the verdict is not in the hover text: {cell}"
+        );
+    }
+
+    #[test]
+    fn convergence_matrix_splits_the_radar_arc_onto_its_own_row() {
+        // An object fit on both arcs gets two rows, the radar one labelled
+        // and sorted directly after its optical sibling. Channels and tools
+        // without a radar pass are excluded on that row, not failed.
+        let mut optical = conv_od_row("Apophis", "rust", "orbit_determination");
+        optical.od_converged = Some(true);
+        optical.layup_converged = Some(true);
+        optical.findorb_rms_residual = Some(0.30);
+
+        let mut radar = conv_od_row("Apophis", "rust", "orbit_determination_radar");
+        radar.od_converged = Some(true);
+        radar.findorb_rms_residual = Some(0.11);
+
+        let mut python = conv_od_row("Apophis", "python", "orbit_determination");
+        python.od_converged = Some(true);
+
+        let html = build_convergence_matrix_html(&[optical, radar, python]);
+
+        assert!(
+            html.contains("Apophis (+ radar)"),
+            "the radar arc did not get its own row: {html}"
+        );
+        let optical_at = html.find(">Apophis</td>").expect("optical row");
+        let radar_at = html.find(">Apophis (+ radar)</td>").expect("radar row");
+        assert!(
+            optical_at < radar_at,
+            "the radar arc must sort directly after its optical sibling"
+        );
+
+        // find_orb runs a radar pass, so its radar cell is a real fit.
+        let fo_radar = conv_cell_html(&html, "Apophis (+ radar)", "find_orb");
+        assert!(
+            fo_radar.contains("conv-ok"),
+            "find_orb's radar fit was lost: {fo_radar}"
+        );
+
+        // layup has no radar pass — excluded, with the reason.
+        let layup_radar = conv_cell_html(&html, "Apophis (+ radar)", "layup");
+        assert!(
+            layup_radar.contains("conv-na"),
+            "layup has no radar pass and must not be shown as failing on it: {layup_radar}"
+        );
+        assert!(
+            layup_radar.contains("no radar pass"),
+            "the radar exclusion does not name its reason: {layup_radar}"
+        );
+
+        // `orbit_determination_radar` is a rust-only plan axis, so the
+        // python channel is excluded on that row rather than failed.
+        let py_radar = conv_cell_html(&html, "Apophis (+ radar)", "python");
+        assert!(
+            py_radar.contains("conv-na"),
+            "a rust-only axis must exclude the other channels, not fail them: {py_radar}"
+        );
+        assert!(
+            py_radar.contains("rust-only"),
+            "the rust-only exclusion does not name its reason: {py_radar}"
+        );
+    }
+
+    #[test]
+    fn convergence_matrix_omits_channels_absent_from_the_invocation() {
+        // `report` is invoked with varying channel sets. A comparator whose
+        // JSON was not handed in gets no column at all — a column of
+        // exclusions would imply it was considered and skipped.
+        let mut r = conv_od_row("Apophis", "core", "orbit_determination");
+        r.od_converged = Some(true);
+        r.layup_converged = Some(true);
+
+        let html = build_convergence_matrix_html(&[r]);
+
+        assert!(
+            html.contains(">layup</th>"),
+            "layup ran and must have a column"
+        );
+        for absent in [
+            ">GRSS</th>",
+            ">OrbFit</th>",
+            ">find_orb</th>",
+            ">jorbit</th>",
+        ] {
+            assert!(
+                !html.contains(absent),
+                "column {absent} rendered for a comparator absent from the inputs"
+            );
+        }
+        assert!(
+            !html.contains(">OpenOrb</th>"),
+            "OpenOrb rendered a column without appearing in the inputs"
+        );
+    }
+
+    #[test]
+    fn convergence_matrix_gives_a_non_fitting_tool_a_column_of_exclusions() {
+        // OpenOrb is in the run (it propagated) but performs no fit. Its
+        // column exists — that is how the reader learns OpenOrb was in the
+        // comparison and does no OD — and every cell is an exclusion.
+        let mut od = conv_od_row("Apophis", "core", "orbit_determination");
+        od.od_converged = Some(true);
+        let mut prop = conv_od_row("Apophis", "core", "propagation");
+        prop.oorb_vs_horizons_km = Some(12.0);
+
+        let html = build_convergence_matrix_html(&[od, prop]);
+        let cell = conv_cell_html(&html, "Apophis", "OpenOrb");
+        assert!(
+            cell.contains("conv-na"),
+            "OpenOrb runs no fit and must never render as failing one: {cell}"
+        );
+        assert!(
+            cell.contains("Ranging / LSL"),
+            "the no-fit exclusion does not name why OpenOrb has no OD: {cell}"
+        );
+    }
+
+    #[test]
+    fn convergence_matrix_footer_separates_excluded_from_attempted() {
+        // Two objects; layup fit one and was never given the other. The
+        // footer must read 1/1 with 1 excluded — not 1/2, which would
+        // charge layup with a failure, and not 2/2.
+        let mut a = conv_od_row("Apophis", "core", "orbit_determination");
+        a.od_converged = Some(true);
+        a.layup_converged = Some(true);
+        let mut b = conv_od_row("Bennu", "core", "orbit_determination");
+        b.od_converged = Some(false);
+
+        let html = build_convergence_matrix_html(&[a, b]);
+        let footer_at = html.find("converged / attempted").expect("footer row");
+        let footer = &html[footer_at..html[footer_at..].find("</tr>").unwrap() + footer_at];
+        assert!(
+            footer.contains("1/1") && footer.contains("1 excluded"),
+            "layup's footer must count the un-given object as excluded, not attempted: {footer}"
+        );
+        assert!(
+            footer.contains("1/2"),
+            "the core channel attempted both objects and converged on one: {footer}"
+        );
+    }
+
+    #[test]
+    fn convergence_matrix_says_so_when_there_is_nothing_to_tabulate() {
+        // A propagation-only run must produce an explicit "nothing here"
+        // note, not an empty table that reads as "everything failed".
+        let html = build_convergence_matrix_html(&[synthetic_rust_prop_row("Apophis", 0.0)]);
+        assert!(
+            html.contains("No orbit-determination rows"),
+            "an OD-less run rendered something other than an explicit note: {html}"
+        );
+        assert!(
+            !html.contains("<table"),
+            "an OD-less run rendered a table anyway"
+        );
     }
 }
