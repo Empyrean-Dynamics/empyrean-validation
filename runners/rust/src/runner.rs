@@ -56,15 +56,13 @@ impl Default for ValidateConfig {
 // (empyrean-9666l: this runner published a range/RA covariance under the
 // `emp_radec_cov_arcsec2` name until the pin test below was added).
 //
-// Names mirror the constants the published wrapper exposes, so once this
-// runner's `empyrean` pin advances past 0.9.0 the locals can be dropped
-// in favour of the crate's own.
-// Named so the pin test can say "not this row" about the one that was
-// actually being read; the projection itself never touches it.
-#[allow(dead_code)]
-const SENSITIVITY_ROW_RANGE: usize = 0;
-const SENSITIVITY_ROW_RA: usize = 1;
-const SENSITIVITY_ROW_DEC: usize = 2;
+// These were local copies while the pin sat at 0.9.0, whose wrapper did
+// not export them. It does now, so they come from the crate: the row
+// order is the FFI contract, and a local copy of a contract is a second
+// place for it to drift. (`SENSITIVITY_ROW_RANGE` is imported by the pin
+// test alone — it names the row that was being misread, and the
+// projection itself never touches it.)
+use empyrean::{SENSITIVITY_ROW_DEC, SENSITIVITY_ROW_RA};
 
 /// Project the input-state covariance onto the sky plane through the
 /// ephemeris Jacobian: \\(C_\text{radec} = J C_\text{in} J^\top\\) over
@@ -145,6 +143,11 @@ pub fn run_propagation_validation(
         name: String,
         population: String,
         notes: String,
+        /// NAIF ids this object must not be perturbed by — its own, for the
+        /// SB441-N16 self-perturbers. Derived from the catalog entry via
+        /// `plan::self_perturber_naif_ids` so the prop/eph rows and the plan
+        /// cannot disagree about the force model.
+        excluded_naif: Vec<i32>,
         epoch: f64,
         ic_pos: [f64; 3],
         ic_vel: [f64; 3],
@@ -281,6 +284,7 @@ pub fn run_propagation_validation(
             name: obj.name.to_string(),
             population: obj.population.to_string(),
             notes: obj.notes.to_string(),
+            excluded_naif: empyrean_validation::plan::self_perturber_naif_ids(obj),
             epoch,
             ic_pos: hor_pos,
             ic_vel: hor_vel,
@@ -443,6 +447,12 @@ pub fn run_propagation_validation(
                         data.ic_vel[2],
                     ],
                     covariance,
+                    // The synthetic IC covariance is state-only by
+                    // construction, so there is no state↔Marsden border to
+                    // carry. `None` and not a zero block: a zero block would
+                    // read downstream as a supplied zero correlation rather
+                    // than as the absence of one.
+                    non_grav_cross: None,
                     representation: Representation::Cartesian,
                     frame: Frame::ICRF,
                     origin: Origin::SSB,
@@ -470,8 +480,21 @@ pub fn run_propagation_validation(
                         };
                         let target = Epoch::from_mjd_tdb(data.epoch + dt);
 
+                        // Take the body out of its own perturber set. This
+                        // also takes the engine's ephemeris-overlap
+                        // short-circuit out of play, so the row measures a
+                        // real integration rather than a resample of the
+                        // body's own SPK — see `naif_to_origins`.
+                        let excluded = match naif_to_origins(&data.excluded_naif) {
+                            Ok(o) => o,
+                            Err(e) => {
+                                eprintln!("  {}: {tier_str} SKIP ({e})", data.name);
+                                continue;
+                            }
+                        };
                         let prop_config = PropagationConfig {
                             force_model: tier,
+                            excluded_perturbers: excluded,
                             uncertainty_method: axis.method.clone(),
                             frame: Frame::ICRF,
                             ..PropagationConfig::default()
@@ -613,7 +636,17 @@ pub fn run_propagation_validation(
                             od_photometry_reduced_chi2: None,
                             od_thrust_dv_m_per_s: Vec::new(),
                             od_thrust_dv_sigma_m_per_s: Vec::new(),
-                            excluded_perturbers_naif: Vec::new(),
+                            excluded_perturbers_naif: data.excluded_naif.clone(),
+                            // Prop / eph rows run no fit, so there is no
+                            // disposition to report. `None` reads as "not
+                            // applicable", never as "fixed".
+                            od_disposition_marsden: None,
+                            od_disposition_dt: None,
+                            od_disposition_amrat: None,
+                            od_solve_for_used: None,
+                            od_joint_covariance_width: None,
+                            od_disposition_thrust: Vec::new(),
+                            od_warnings: Vec::new(),
                             propagation_uncertainty: Some(uncertainty_tag.to_string()),
                             assist_vs_horizons_km: None,
                             emp_vs_assist_km: None,
@@ -700,7 +733,16 @@ pub fn run_propagation_validation(
                         (!hor.light_time_days.is_nan()).then_some(hor.light_time_days);
                     let target = Epoch::from_mjd_tdb(data.epoch + dt);
 
-                    let observers = match ctx.get_observers(&[obs_code], &[target]) {
+                    // (ICRF, SSB) is the construction basis — observers come
+                    // back exactly as built, untransformed, which is what
+                    // ephemeris generation requires and what this call got
+                    // implicitly before the basis became explicit.
+                    let observers = match ctx.get_observers(
+                        &[obs_code],
+                        &[target],
+                        Frame::ICRF,
+                        Origin::SSB,
+                    ) {
                         Ok(o) => o,
                         Err(e) => {
                             eprintln!("  {} dt={dt:+.0}d SKIP (observer: {e})", data.name);
@@ -711,7 +753,28 @@ pub fn run_propagation_validation(
                         continue;
                     }
 
-                    let eph_config = EphemerisConfig::with_force_model(ForceModelTier::Standard);
+                    let mut eph_config =
+                        EphemerisConfig::with_force_model(ForceModelTier::Standard);
+                    // Live as of the 0.10 ABI. This was inert through 0.9.x —
+                    // `empyrean-c::ephemeris::build_ephemeris_config_from_c`
+                    // read only {force_model, frame, uncertainty_method} off
+                    // the embedded propagation config and dropped the rest —
+                    // and it now carries `excluded_perturbers` through
+                    // field-by-field with no `..Default` tail.
+                    //
+                    // So the ephemeris rows for the Self-Perturber population
+                    // move at this release: the exclusion they always recorded
+                    // now actually takes effect, and the body stops both
+                    // pulling on itself and short-circuiting the integration
+                    // into a resample of its own SPK.
+                    eph_config.propagation.excluded_perturbers =
+                        match naif_to_origins(&data.excluded_naif) {
+                            Ok(o) => o,
+                            Err(e) => {
+                                eprintln!("  {} dt={dt:+.0}d SKIP ({e})", data.name);
+                                continue;
+                            }
+                        };
                     match ctx.generate_ephemeris(&[orbit.clone()], &observers, &eph_config) {
                         Ok(eph) => {
                             let Some(entry) = eph.entries.first() else {
@@ -842,7 +905,17 @@ pub fn run_propagation_validation(
                                 od_photometry_reduced_chi2: None,
                                 od_thrust_dv_m_per_s: Vec::new(),
                                 od_thrust_dv_sigma_m_per_s: Vec::new(),
-                                excluded_perturbers_naif: Vec::new(),
+                                excluded_perturbers_naif: data.excluded_naif.clone(),
+                                // Prop / eph rows run no fit, so there is no
+                                // disposition to report. `None` reads as "not
+                                // applicable", never as "fixed".
+                                od_disposition_marsden: None,
+                                od_disposition_dt: None,
+                                od_disposition_amrat: None,
+                                od_solve_for_used: None,
+                                od_joint_covariance_width: None,
+                                od_disposition_thrust: Vec::new(),
+                                od_warnings: Vec::new(),
                                 propagation_uncertainty: Some(uncertainty_tag.to_string()),
                                 assist_vs_horizons_km: None,
                                 emp_vs_assist_km: None,
@@ -934,6 +1007,81 @@ pub struct OdValidationOutput {
     /// Bidirectional comparisons: per (empyrean_od, reference) pair, one
     /// comparison at the fit epoch and one at the reference epoch.
     pub orbit_comparisons: Vec<OrbitComparison>,
+}
+
+/// The solve-for metadata a fit reports about itself, in the schema's
+/// wire shape.
+///
+/// Read off the *result*, never off the config: under
+/// `SolveForParams::Auto` the two differ by design, and the whole point of
+/// recording dispositions is to capture the width the fit actually ran at.
+struct SolveMetadata {
+    marsden: Option<String>,
+    dt: Option<String>,
+    amrat: Option<String>,
+    thrust: Vec<String>,
+    solve_for_used: Option<String>,
+    warnings: Vec<String>,
+    joint_width: Option<u32>,
+}
+
+impl SolveMetadata {
+    fn from_fit(dr: &empyrean::DetermineResult) -> Self {
+        let d = &dr.dispositions;
+        // Trailing all-fixed entries carry no information — every orbit
+        // declares MAX_THRUST_SEGMENTS slots whether or not it has burns —
+        // so trim to the last non-fixed entry. An orbit with no thrust at
+        // all reports an empty list rather than a run of "fixed".
+        let last_active = d
+            .thrust
+            .iter()
+            .rposition(|p| !matches!(p, empyrean::ParamDisposition::Fixed));
+        let thrust = match last_active {
+            Some(i) => d.thrust[..=i]
+                .iter()
+                .map(|p| p.as_tag().to_string())
+                .collect(),
+            None => Vec::new(),
+        };
+        let solve_for_used = Some(
+            match dr.solve_for_used {
+                empyrean::SolveForParams::StateOnly => "state_only",
+                empyrean::SolveForParams::StateAndNonGrav => "state_and_nongrav",
+                empyrean::SolveForParams::Auto => "auto",
+                empyrean::SolveForParams::Explicit(_) => "explicit",
+            }
+            .to_string(),
+        );
+        Self {
+            marsden: Some(d.marsden.as_tag().to_string()),
+            dt: Some(d.dt.as_tag().to_string()),
+            amrat: Some(d.amrat.as_tag().to_string()),
+            thrust,
+            solve_for_used,
+            warnings: dr.warnings.clone(),
+            // The go-forward joint. A state-only fit carries no
+            // `solved_covariance`, and its joint is the 6×6 — reported as
+            // width 6 rather than left absent, so "state-only fit" and
+            // "channel does not report a width" stay distinguishable.
+            joint_width: Some(dr.solved_covariance.as_ref().map_or(6, |c| c.width as u32)),
+        }
+    }
+}
+
+/// Resolve NAIF ids from a plan row's `excluded_perturbers_naif` into the
+/// origins the engine takes off the perturber set.
+///
+/// An id the engine does not recognise is an error, not a body to skip. The
+/// old OD path silently mapped an unparseable designation to "exclude
+/// nothing", which is the worst of the three outcomes: the object runs *with*
+/// the self-perturbation, and the row still reads as a self-perturber row.
+fn naif_to_origins(naif: &[i32]) -> Result<Vec<Origin>, String> {
+    naif.iter()
+        .map(|&id| {
+            Origin::from_naif_id(id)
+                .ok_or_else(|| format!("unknown NAIF id in excluded_perturbers_naif: {id}"))
+        })
+        .collect()
 }
 
 /// Build an OD **failure row**: a `ValidationResult` that records *why* no fit
@@ -1100,7 +1248,16 @@ fn run_radar_od(
         obs_r.radar_len()
     );
     let t0r = std::time::Instant::now();
-    let dr = match ctx.determine(&obs_r, None, od_config) {
+    // determine is batch-first: it groups the observations by ADES object
+    // identifier and returns one entry per group, so a fit that fails is a
+    // failed *entry* inside an `Ok` batch rather than an `Err` from the call.
+    // `into_single` collapses both hazards onto this row's existing failure
+    // path — it refuses a batch that is not exactly one delivered fit, naming
+    // the objects when a fixture grouped into several rather than picking one.
+    let dr = match ctx
+        .determine(&obs_r, None, od_config)
+        .and_then(|batch| batch.into_single())
+    {
         Ok(dr) => dr,
         Err(e) => {
             let ms_fail = t0r.elapsed().as_secs_f64() * 1000.0;
@@ -1131,6 +1288,7 @@ fn run_radar_od(
     };
     let ms_r = t0r.elapsed().as_secs_f64() * 1000.0;
     let orbit_r = dr.state();
+    let meta_r = SolveMetadata::from_fit(&dr);
     eprintln!(
         "    radar: converged={} rms_combined={:.4} ({:.0}ms)",
         dr.converged, dr.summary.rms_combined_arcsec, ms_r
@@ -1211,6 +1369,13 @@ fn run_radar_od(
         od_thrust_dv_m_per_s: Vec::new(),
         od_thrust_dv_sigma_m_per_s: Vec::new(),
         excluded_perturbers_naif: excluded_naif_r,
+        od_disposition_marsden: meta_r.marsden,
+        od_disposition_dt: meta_r.dt,
+        od_disposition_amrat: meta_r.amrat,
+        od_disposition_thrust: meta_r.thrust,
+        od_solve_for_used: meta_r.solve_for_used,
+        od_warnings: meta_r.warnings,
+        od_joint_covariance_width: meta_r.joint_width,
         propagation_uncertainty: None,
         assist_vs_horizons_km: None,
         emp_vs_assist_km: None,
@@ -1346,19 +1511,14 @@ pub fn run_od_validation(
             // Derived from the catalog entry alone, so it is hoisted above the
             // fixture load: a failure row for a fixture that never loaded still
             // records which perturber set the fit *would* have used.
-            let excluded_origins: Vec<Origin> = if obj.population == "Self-Perturber" {
-                match obj.mpc_designation.parse::<i32>() {
-                    Ok(n) => vec![Origin::Asteroid(n)],
-                    Err(_) => Vec::new(),
+            let excluded_naif = empyrean_validation::plan::self_perturber_naif_ids(obj);
+            let excluded_origins: Vec<Origin> = match naif_to_origins(&excluded_naif) {
+                Ok(o) => o,
+                Err(e) => {
+                    eprintln!("  {}: OD SKIP ({e})", obj.name);
+                    return (Vec::new(), Vec::new(), Vec::new());
                 }
-            } else {
-                Vec::new()
             };
-            let excluded_naif: Vec<i32> = excluded_origins
-                .iter()
-                .copied()
-                .map(Origin::naif_id)
-                .collect();
             // Fit configuration. Hoisted above both OD passes because it
             // depends only on the catalog entry — the radar pass below must be
             // able to build it without the optical fixture having loaded.
@@ -1481,7 +1641,12 @@ pub fn run_od_validation(
             );
 
             let t0 = std::time::Instant::now();
-            let determine_result = match ctx.determine(&observations, None, &od_config) {
+            // Batch-first determine collapsed to this fixture's single object;
+            // see the radar pass for why `into_single` and not `iter().next()`.
+            let determine_result = match ctx
+                .determine(&observations, None, &od_config)
+                .and_then(|batch| batch.into_single())
+            {
                 Ok(r) => r,
                 Err(e) => {
                     // empyrean-8l28: emit an explicit failure row so the
@@ -1518,6 +1683,7 @@ pub fn run_od_validation(
             // bare state snapshot (epoch/position/velocity/covariance/frame/
             // origin) the validation channel records.
             let orbit = determine_result.state();
+            let meta = SolveMetadata::from_fit(&determine_result);
 
             // Capture the fitted state + cov in three coordinate views
             // (native Cartesian, Sun-centered ICRF Cartesian, Sun-centered
@@ -1741,6 +1907,13 @@ pub fn run_od_validation(
                 od_thrust_dv_m_per_s: Vec::new(),
                 od_thrust_dv_sigma_m_per_s: Vec::new(),
                 excluded_perturbers_naif: excluded_naif,
+                od_disposition_marsden: meta.marsden,
+                od_disposition_dt: meta.dt,
+                od_disposition_amrat: meta.amrat,
+                od_disposition_thrust: meta.thrust,
+                od_solve_for_used: meta.solve_for_used,
+                od_warnings: meta.warnings,
+                od_joint_covariance_width: meta.joint_width,
                 propagation_uncertainty: None,
                 assist_vs_horizons_km: None,
                 emp_vs_assist_km: None,
@@ -1831,10 +2004,14 @@ pub fn run_od_validation(
                     ..od_config.clone()
                 };
                 let t0n = std::time::Instant::now();
-                match ctx.determine(&observations, None, &ng_config) {
+                match ctx
+                    .determine(&observations, None, &ng_config)
+                    .and_then(|batch| batch.into_single())
+                {
                     Ok(dr) => {
                         let ms_n = t0n.elapsed().as_secs_f64() * 1000.0;
                         let orbit_n = dr.state();
+                        let meta_n = SolveMetadata::from_fit(&dr);
                         // Per-axis sigma from the 9×9 covariance diagonal,
                         // present only when non-grav was actually solved.
                         // sqrt() of a non-finite / negative variance yields
@@ -1949,6 +2126,13 @@ pub fn run_od_validation(
                             od_thrust_dv_m_per_s: Vec::new(),
                             od_thrust_dv_sigma_m_per_s: Vec::new(),
                             excluded_perturbers_naif: excluded_naif_n,
+                            od_disposition_marsden: meta_n.marsden,
+                            od_disposition_dt: meta_n.dt,
+                            od_disposition_amrat: meta_n.amrat,
+                            od_disposition_thrust: meta_n.thrust,
+                            od_solve_for_used: meta_n.solve_for_used,
+                            od_warnings: meta_n.warnings,
+                            od_joint_covariance_width: meta_n.joint_width,
                             propagation_uncertainty: None,
                             assist_vs_horizons_km: None,
                             emp_vs_assist_km: None,
@@ -2063,6 +2247,9 @@ fn propagate_and_capture(
         code: -4,
         message: "propagation returned no states (AGM mixture-only return or empty result)"
             .to_string(),
+        // Only a strict-offline context construction populates this; a
+        // propagation that returned no states names no absent files.
+        missing_data_files: Vec::new(),
     })?;
     let propagated_coord = propagated_state_to_coord(propagated);
     capture_orbit(ctx, object, source, source_version, &propagated_coord)
@@ -2083,6 +2270,11 @@ fn propagated_state_to_coord(orbit: &empyrean::PropagatedState) -> CoordinateSta
             orbit.velocity[2],
         ],
         covariance: orbit.covariance,
+        // Carry the state↔Marsden border across with the 6×6 it borders.
+        // Dropping it here would hand the downstream transform a
+        // block-diagonal covariance — a different claim than the joint the
+        // propagator actually computed, and a tighter one.
+        non_grav_cross: orbit.joint.non_grav_cross,
         representation: Representation::Cartesian,
         frame: orbit.frame,
         origin: orbit.origin,
@@ -2117,11 +2309,18 @@ fn capture_orbit(
     .to_string();
     let native_origin_naif = native.origin.naif_id();
 
-    // Sun-centered ICRF Cartesian.
-    let cart_sun = ctx.transform(native, Representation::Cartesian, Frame::ICRF, Origin::SUN)?;
+    // Sun-centered ICRF Cartesian. `transform` split into a batch form and
+    // this single-state one at 0.10; one state at a time is what this
+    // per-object capture has, and the single form is the same computation.
+    let cart_sun = ctx.transform_coordinates_single(
+        native,
+        Representation::Cartesian,
+        Frame::ICRF,
+        Origin::SUN,
+    )?;
 
     // Sun-centered ecliptic-J2000 Keplerian.
-    let kep_sun = ctx.transform(
+    let kep_sun = ctx.transform_coordinates_single(
         native,
         Representation::Keplerian,
         Frame::EclipticJ2000,
@@ -2148,6 +2347,9 @@ fn capture_orbit(
 #[cfg(test)]
 mod tests {
     use super::*;
+    // Only the pin test reads this row constant; it names the row the
+    // projection must NOT read.
+    use empyrean::SENSITIVITY_ROW_RANGE;
 
     /// A `[6][n_params]` block whose every row is a constant, distinct
     /// value — row `r` is filled with `r + 1` — so the projection's

@@ -1075,8 +1075,14 @@ fn merge_findorb_ephem(
                 .iter()
                 .map(|&t| empyrean::Epoch::from_mjd_tdb(t))
                 .collect();
+            // (ICRF, SSB) is the wrapper's construction basis: the observers
+            // come back exactly as constructed, with no transform applied.
+            // That is what this conversion needs — find_orb's geocentric
+            // vectors are added to Earth's SSB position in the same frame the
+            // plan's `ref_pos_au` lives in — and it keeps the 0.9.0 numbers
+            // bit-for-bit, where the basis was implicit.
             let observers = ctx
-                .get_observers(&["500"], &eps)
+                .get_observers(&["500"], &eps, empyrean::Frame::ICRF, empyrean::Origin::SSB)
                 .map_err(|e| format!("merge --findorb: Earth (500) observer states: {e}"))?;
             for o in &observers {
                 let t = o

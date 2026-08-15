@@ -43,8 +43,11 @@ fn apophis_optical_plus_radar_converges_through_channel() {
     );
 
     // The fit must converge (it stalled before the optical-first seeding fix).
+    // determine is batch-first at 0.10; this fixture is one object, and
+    // `into_single` refuses anything else rather than picking a fit.
     let result = ctx
         .determine(&observations, None, &ODConfig::default())
+        .and_then(|batch| batch.into_single())
         .expect("optical+radar determine must converge through the channel");
     assert!(
         result.converged,
