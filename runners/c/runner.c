@@ -200,7 +200,13 @@ static int handle_eph(EmpyreanContext* ctx, const char* rest) {
     const char* code_ptr = obs_code;
     struct EmpyreanObserverResult obs_result;
     memset(&obs_result, 0, sizeof(obs_result));
-    int code = empyrean_get_observers(ctx, &code_ptr, 1, &target, 1, &obs_result);
+    /* Basis is explicit as of ABI 1000. (ICRF=0, SSB=0) is the construction
+     * basis — the observers come back exactly as built, with no transform —
+     * which is what ephemeris generation requires and what this call got
+     * implicitly before. */
+    int code = empyrean_get_observers(ctx, &code_ptr, 1, &target, 1,
+                                      0 /* Frame::ICRF */, 0 /* Origin::SSB */,
+                                      &obs_result);
     if (code != 0 || obs_result.num_observers < 1) {
         const char* err = empyrean_last_error();
         printf("fail get_observers: %s\n", err ? err : "no observer");
@@ -328,9 +334,10 @@ static int handle_od(EmpyreanContext* ctx, const char* rest, int solve_non_grav)
      * EmpyreanODConfig fields are read unconditionally on the FFI side,
      * so zero-init silently sets them to non-production values:
      *
-     *   - weighting.enabled = 0 → uniform 1″ (engine default: VFC17)
+     *   - weighting.enabled = 0 → uniform 1″ (engine default: VFCC2017)
      *   - debiasing.enabled = 0 → no catalog debiasing (engine: EFCC2020)
-     *   - use_stm_cache = 0 → STM cache off (engine default: on)
+     *   - allow_arc_truncation = 0 → truncation FORBIDDEN (engine: allowed)
+     *   - coorbital_enabled = 0 → co-orbital IOD lane OFF (engine: enabled)
      *   - solve_for = 0 → STATE_ONLY (engine default: Auto)
      *   - rejection.enabled = 0 → no outlier rejection (engine: Adaptive)
      *   - rejection.lambda = 0 → 0.0 information weight (engine: 1.0;
@@ -341,7 +348,9 @@ static int handle_od(EmpyreanContext* ctx, const char* rest, int solve_non_grav)
      * comets (67P / 2I/Borisov / etc.) because non-grav coefficients
      * are NOT fit, leaving thousands of km of unmodeled radial drift. */
     cfg.weighting.enabled = 1;
-    cfg.weighting.preset = EMPYREAN_WEIGHTING_PRESET_VFC17;
+    /* Renamed from EMPYREAN_WEIGHTING_PRESET_VFC17 at ABI 1000; same
+     * value (1), same scheme — Vereš, Farnocchia, Chesley et al. (2017). */
+    cfg.weighting.preset = EMPYREAN_WEIGHTING_PRESET_VFCC2017;
     cfg.weighting.sigma_policy = -1; /* use preset's policy */
     struct EmpyreanWeightingLayer nightly;
     memset(&nightly, 0, sizeof(nightly));
@@ -355,7 +364,14 @@ static int handle_od(EmpyreanContext* ctx, const char* rest, int solve_non_grav)
     cfg.debiasing.resolution = EMPYREAN_DEBIASING_RESOLUTION_STANDARD;
     cfg.debiasing.bias_dat_path = NULL; /* DataManager default location */
 
-    cfg.use_stm_cache = 1;
+    /* `use_stm_cache` is gone at ABI 1000 — it was a control that did
+     * nothing engine-side, and its slot is now these two axes. Both are
+     * tri-state with NEGATIVE meaning "engine default", so the memset(0)
+     * above does NOT leave them defaulted: it reads as truncation
+     * FORBIDDEN and the co-orbital IOD lane FORCED OFF. Set both to -1 so
+     * this channel fits under the same policy as the core reference. */
+    cfg.allow_arc_truncation = -1;
+    cfg.coorbital_enabled = -1;
     /* Optical-only OD leaves solve_for = Auto (the engine default); the
      * non-grav-recovery pass explicitly forces StateAndNonGrav so the fit
      * solves the full (state, A1, A2, A3) parameter set and populates the
@@ -383,24 +399,51 @@ static int handle_od(EmpyreanContext* ctx, const char* rest, int solve_non_grav)
      * rejection.chi2_base (0 = use 9.21), rejection.max_threshold
      * (0 = use 100.0). */
 
-    struct EmpyreanODResult result;
-    memset(&result, 0, sizeof(result));
+    /* determine is batch-first: it groups the observations by ADES object
+     * identifier and returns one slot per group. These fixtures are one
+     * object each, so the batch must hold exactly one delivered slot —
+     * anything else is a fixture or engine problem this row must report,
+     * never paper over by picking a slot. */
+    struct EmpyreanDetermineResults batch;
+    memset(&batch, 0, sizeof(batch));
     double t0 = now_ms();
     /* radar = NULL, 0 (optical-only fixtures) and no DC seed orbits
      * (NULL, 0 → let the IOD pipeline produce its own seeds). */
     rc = empyrean_determine(ctx, observations, num_observations,
-                             radar, num_radar, NULL, 0, &cfg, &result);
+                             radar, num_radar, NULL, 0, &cfg, &batch);
     double ms = now_ms() - t0;
 
     empyrean_observations_free(observations, num_observations);
     empyrean_radar_observations_free(radar, num_radar);
 
-    if (rc != 0) {
+    /* 0 = at least one object delivered; -4 = the batch ran and every
+     * object failed. Both populate the table and both must be freed. Any
+     * other code left it untouched. */
+    if (rc != 0 && rc != EMPYREAN_DETERMINE_NONE_DELIVERED) {
         const char* err = empyrean_last_error();
         printf("fail determine: %s\n", err ? err : "");
-        empyrean_od_result_free(&result);
+        empyrean_determine_results_free(&batch);
         return 0;
     }
+    if (batch.num_objects != 1) {
+        /* Zero groups (no identifiable rows) or several (a fixture carrying
+         * more than one object). Naming the count keeps this from reading as
+         * a fit failure, which it is not. */
+        printf("fail determine_grouped_%zu_objects_expected_1\n",
+               (size_t)batch.num_objects);
+        empyrean_determine_results_free(&batch);
+        return 0;
+    }
+    const struct EmpyreanODObjectResult* slot = &batch.objects[0];
+    if (!slot->delivered) {
+        /* This object's fit failed. `slot->result` is NaN-poisoned, so
+         * reading it would emit plausible-looking garbage; report the
+         * engine's own message instead. */
+        printf("fail determine: %s\n", slot->error ? slot->error : "");
+        empyrean_determine_results_free(&batch);
+        return 0;
+    }
+    const struct EmpyreanODResult result = slot->result;
 
     if (solve_non_grav) {
         /* Non-grav recovery: emit the fitted A1/A2/A3 (AU/day²) and their 1σ
@@ -453,12 +496,43 @@ static int handle_od(EmpyreanContext* ctx, const char* rest, int solve_non_grav)
                (unsigned)result.iterations, ms,
                result.summary.rms_combined_arcsec);
     }
-    empyrean_od_result_free(&result);
+    /* `result` is a copy of the slot's fit; the storage belongs to the
+     * batch table and is released with it. */
+    empyrean_determine_results_free(&batch);
     return 0;
 }
 
 int main(int argc, char** argv) {
     const char* data_dir = (argc >= 2) ? argv[1] : NULL;
+
+    /* ABI handshake, before the first call that reads a struct.
+     *
+     * This runner is compiled against `empyrean.h` and linked against
+     * whichever `libempyrean` DYLD_LIBRARY_PATH resolves to at run time —
+     * two artifacts that can disagree. `EMPYREAN_ABI_VERSION` is the
+     * header's compile-time constant and `empyrean_abi_version()` reads the
+     * loaded library's, and the contract is equality: the versions encode
+     * struct layout, so a mismatch is not a degraded run but a
+     * reinterpretation of every struct this file passes across the
+     * boundary. Left unchecked it surfaces as a segfault at best and as
+     * plausible wrong numbers at worst — a validation channel silently
+     * measuring a different library than the one it claims.
+     *
+     * Checked here rather than per row: it cannot change mid-process. */
+    uint32_t loaded_abi = empyrean_abi_version();
+    if (loaded_abi != EMPYREAN_ABI_VERSION) {
+        fprintf(stderr,
+                "fatal: empyrean ABI mismatch — runner compiled against "
+                "version %u, loaded libempyrean reports %u.\n"
+                "       The header and the library come from different "
+                "releases; struct layouts do not match and no result from "
+                "this process would be trustworthy.\n"
+                "       Rebuild libempyrean from the empyrean checkout this "
+                "harness validates (see EMPYREAN_ROOT in the Makefile) and "
+                "re-run `make build-empyrean-c build-c`.\n",
+                (unsigned)EMPYREAN_ABI_VERSION, (unsigned)loaded_abi);
+        return 1;
+    }
 
     EmpyreanContext* ctx = empyrean_context_from_data_dir(data_dir);
     if (!ctx) {

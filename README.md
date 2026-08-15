@@ -5,7 +5,7 @@ Cross-channel and external-reference validation for the empyrean astrodynamics s
 
 <a href="https://github.com/Empyrean-Dynamics/empyrean-validation/actions/workflows/rust.yml"><img src="https://github.com/Empyrean-Dynamics/empyrean-validation/actions/workflows/rust.yml/badge.svg" alt="CI"></a>
 <a href="https://github.com/Empyrean-Dynamics/empyrean-validation/actions/workflows/validation.yml"><img src="https://github.com/Empyrean-Dynamics/empyrean-validation/actions/workflows/validation.yml/badge.svg" alt="Validation Suite"></a>
-<a href="https://github.com/Empyrean-Dynamics/empyrean/releases/tag/v0.9.0"><img src="https://img.shields.io/badge/validates-empyrean%200.9.0-1a1a2e?style=flat-square" alt="validates empyrean 0.9.0"></a>
+<a href="https://github.com/Empyrean-Dynamics/empyrean/releases/tag/v0.10.0-rc.0"><img src="https://img.shields.io/badge/validates-empyrean%200.10.0--rc.0-1a1a2e?style=flat-square" alt="validates empyrean 0.10.0-rc.0"></a>
 <br>
 <a href="LICENSE"><img src="https://img.shields.io/badge/license-BSD--3--Clause-blue.svg?style=flat-square" alt="License"></a>
 <a href="https://doi.org/10.5281/zenodo.21315119"><img src="https://zenodo.org/badge/1225313390.svg" alt="DOI"></a>
@@ -129,3 +129,27 @@ Note that Cargo honors `[patch]` only from the build-root manifest, and a
 path patch to a missing sibling breaks every cargo command in that
 checkout — keep overrides scoped to the manifest you are actually
 building from, and revert them before committing.
+
+### What the current pins validate
+
+The committed manifests pin **empyrean `0.10.0-rc.0`** (crates.io and
+PyPI) and **hyperjet `1.13.0`**, against the **empyrean-core `0.10.1`**
+reference channel. Two things about that generation change how a run is
+set up:
+
+- **The C ABI is distribution-versioned and the load handshake is an
+  equality check** — `EMPYREAN_ABI_VERSION` is `1000`. The C-channel
+  runner now asserts it at startup against the loaded `libempyrean` and
+  refuses to run on a mismatch, because the versions encode struct
+  layout: a stale library is not a degraded run but a reinterpretation of
+  every struct crossing the boundary. The dylib, header, and wheel come
+  from the sibling `../empyrean` checkout (`EMPYREAN_ROOT` in the
+  Makefile), so that checkout has to be on the same release the manifests
+  pin. It is not automatic — point `EMPYREAN_ROOT` at a checkout of the
+  release under test, or the handshake will stop the run.
+- **`determine` is batch-first.** It groups observations by ADES object
+  identifier and returns one entry per group, so a failed fit arrives as
+  a non-delivered *entry* rather than as a raised error. Every channel
+  runner reduces that to the single fit its per-object fixture asks for
+  and refuses anything else — zero groups, several groups, or a failed
+  one — rather than choosing an entry.

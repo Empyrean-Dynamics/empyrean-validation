@@ -5,7 +5,12 @@
 #   make
 # The binary lands at ./runner.
 
-EMPYREAN_ROOT := ../../../empyrean
+# Overridable so the top-level Makefile's EMPYREAN_ROOT propagates here.
+# It was `:=` against a hardcoded relative path, which meant this file
+# carried a second, independent spelling of where the engine lives: a run
+# invoked with EMPYREAN_ROOT pointed elsewhere still compiled against the
+# default checkout, silently.
+EMPYREAN_ROOT ?= ../../../empyrean
 INCLUDE_DIR := $(EMPYREAN_ROOT)/include
 LIB_DIR := $(EMPYREAN_ROOT)/target/release
 

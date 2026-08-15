@@ -275,10 +275,59 @@ build-reference: build-empyrean-c build-rust build-empyrean-validation
 
 .PHONY: build-reference
 
+# Which empyrean release the committed manifests pin. Read from the rust
+# runner's manifest rather than spelled again here: two spellings of one
+# fact are two facts that can disagree, and this one decides which engine
+# the whole run measures.
+PINNED_EMPYREAN := $(shell sed -n 's/^empyrean = "=\(.*\)"/\1/p' $(EMPYREAN_RUNNERS)/rust/Cargo.toml)
+# The version of the sibling checkout the c / python channels build from.
+SIBLING_EMPYREAN := $(shell sed -n '1,10s/^version = "\(.*\)"/\1/p' $(EMPYREAN_ROOT)/empyrean-c/Cargo.toml 2>/dev/null)
+
+# Assert the sibling checkout is the release the manifests pin.
+#
+# The channels do NOT all get their engine the same way, and the split is
+# invisible at run time:
+#
+#   - rust / cli link `empyrean` from crates.io, whose `empyrean-sys`
+#     resolves a CHECKSUM-PINNED prebuilt engine for exactly the pinned
+#     version (downloaded into ~/.cache/empyrean). They measure the
+#     published artifact no matter what this checkout contains.
+#   - c / python build from $(EMPYREAN_ROOT) — this checkout's header,
+#     dylib and wheel.
+#
+# So a sibling checkout on a different release does not fail; it quietly
+# makes half the channels measure a different engine than the other half,
+# and every cross-channel fidelity diff in the report then attributes an
+# engine difference to binding drift. The C runner's ABI handshake catches
+# the subset where the ABI version also moved, but two builds of the SAME
+# ABI with different physics pass it. Check the version here, where the
+# fix is one `git checkout` away.
+.PHONY: check-engine-version
+check-engine-version:
+	@test -n "$(PINNED_EMPYREAN)" || { \
+	    echo "ERROR: could not read the pinned empyrean version from $(EMPYREAN_RUNNERS)/rust/Cargo.toml."; \
+	    exit 1; }
+	@test -n "$(SIBLING_EMPYREAN)" || { \
+	    echo "ERROR: no empyrean checkout at $(EMPYREAN_ROOT) (looked for empyrean-c/Cargo.toml)."; \
+	    echo "       The c and python channels build their header, dylib and wheel from it."; \
+	    exit 1; }
+	@test "$(PINNED_EMPYREAN)" = "$(SIBLING_EMPYREAN)" || { \
+	    echo "ERROR: engine version mismatch."; \
+	    echo "       manifests pin:            $(PINNED_EMPYREAN)"; \
+	    echo "       $(EMPYREAN_ROOT) is: $(SIBLING_EMPYREAN)"; \
+	    echo "       The rust and cli channels use the checksum-pinned $(PINNED_EMPYREAN)"; \
+	    echo "       engine; the c and python channels would build $(SIBLING_EMPYREAN) from"; \
+	    echo "       that checkout. The run would compare two different engines and read"; \
+	    echo "       the difference as binding drift."; \
+	    echo "       Check out v$(PINNED_EMPYREAN) in $(EMPYREAN_ROOT), or point"; \
+	    echo "       EMPYREAN_ROOT at a checkout of it."; \
+	    exit 1; }
+	@echo "engine version OK: $(PINNED_EMPYREAN) (pinned == $(EMPYREAN_ROOT))"
+
 # PHONY: cargo's incremental build is cheap when nothing changed and
 # this is the only way to guarantee `libempyrean.dylib` matches the
 # header that bindgen was compiled against.
-build-empyrean-c:
+build-empyrean-c: check-engine-version
 	@echo "──── Building empyrean-c (libempyrean.dylib) ───────────"
 	@cd $(EMPYREAN_ROOT) && cargo build --release -p empyrean-c
 
@@ -291,9 +340,13 @@ build-rust:
 	@echo "──── Building rust runner ──────────────────────────────"
 	@cd $(EMPYREAN_RUNNERS)/rust && cargo build --release
 
-build-c:
+# Gated on the version check: this compiles against $(EMPYREAN_ROOT)'s
+# empyrean.h and links its dylib, so a mismatched checkout produces a wall
+# of struct / signature errors whose cause is one line of `make` output
+# away. Fail with the cause instead.
+build-c: check-engine-version
 	@echo "──── Building C runner ─────────────────────────────────"
-	@cd $(EMPYREAN_RUNNERS)/c && $(MAKE)
+	@cd $(EMPYREAN_RUNNERS)/c && $(MAKE) EMPYREAN_ROOT="$(EMPYREAN_ROOT)"
 
 build-cli:
 	@echo "──── Building CLI runner ───────────────────────────────"
@@ -308,7 +361,10 @@ $(WHEEL_VENV)/bin/maturin:
 	@python3 -m venv $(WHEEL_VENV)
 	@$(WHEEL_PY) -m pip install --quiet --upgrade pip maturin
 
-build-wheel: $(WHEEL_VENV)/bin/maturin
+# Same gate as build-c: the wheel is compiled from $(EMPYREAN_ROOT)'s
+# empyrean-py, so a mismatched checkout ships the python channel a
+# different engine than the rust and cli channels resolve.
+build-wheel: check-engine-version $(WHEEL_VENV)/bin/maturin
 	@echo "──── Building empyrean-py wheel ────────────────────────"
 	@# Build the wheel and pip-install it, rather than `maturin develop`.
 	@# develop resolves the project's dev dependency-groups (which include

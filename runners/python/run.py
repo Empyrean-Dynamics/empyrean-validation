@@ -37,6 +37,8 @@ _TIER_TO_INT = {"approximate": 0, "basic": 1, "standard": 2}
 
 # Frame integer mirrors empyrean wrapper: ICRF=0, EclipticJ2000=1.
 _FRAME_ICRF = 0
+# Origin is a NAIF id on the wire; 0 = Solar System Barycenter.
+_ORIGIN_SSB = 0
 _REP_CARTESIAN = 0
 _AU_KM = 149_597_870.700
 
@@ -204,8 +206,15 @@ def _ephemeris_one(
     if tier is None:
         return None
 
+    # The observer basis is an explicit request as of the 0.10 ABI.
+    # (Frame::ICRF, Origin::SSB) is the construction basis — the states come
+    # back exactly as built, untransformed — which is what ephemeris
+    # generation requires and what this call received implicitly before.
     obs_states = _get_observers(
-        [obs_code], np.array([target_t_mjd_tdb], dtype=np.float64)
+        [obs_code],
+        np.array([target_t_mjd_tdb], dtype=np.float64),
+        _FRAME_ICRF,
+        _ORIGIN_SSB,
     )
     if len(obs_states.get("x", [])) == 0:
         return None
@@ -305,6 +314,45 @@ def _ephemeris_one(
     return math.radians(ra_deg), math.radians(dec_deg), rho_au, lt_d
 
 
+def _single_fit(batch: dict, object_id: str, what: str) -> dict:
+    """Reduce a batch ``_determine`` result to this fixture's one fit.
+
+    ``_determine`` is batch-first: it groups the observations by ADES object
+    identifier and returns ``{"objects": [...]}`` with one entry per group,
+    where a failed fit is an entry carrying ``delivered = False`` and an
+    ``error`` rather than a missing entry or a raised exception.
+
+    Both of those are silent hazards for a per-fixture runner. Indexing
+    ``[0]`` blindly would fit whichever object sorted first if a fixture ever
+    grouped into several, and reading a non-delivered entry's fit fields
+    would harvest absent keys as if they were results. So: exactly one
+    delivered entry, or raise with which of the two went wrong.
+
+    Mirrors the rust channel's ``DetermineResults::into_single`` so the two
+    channels fail on the same conditions with the same reasons.
+    """
+    objects = batch.get("objects")
+    if objects is None:
+        raise ValueError(
+            f"{object_id} {what}: determine returned no `objects` table "
+            "(expected the batch-first result shape)"
+        )
+    if len(objects) != 1:
+        ids = ", ".join(str(o.get("object_id")) for o in objects)
+        raise ValueError(
+            f"{object_id} {what}: observations grouped into {len(objects)} "
+            f"objects ({ids}); this fixture must carry exactly one"
+        )
+    entry = objects[0]
+    if not entry.get("delivered"):
+        raise ValueError(
+            f"{object_id} {what}: fit failed for "
+            f"{entry.get('object_id')} — {entry.get('error')} "
+            f"[{entry.get('error_kind')}]"
+        )
+    return entry
+
+
 def _determine_one(
     object_id: str,
     psv_text: str,
@@ -333,11 +381,12 @@ def _determine_one(
         config_dict["excluded_perturbers_naif"] = list(excluded_perturbers_naif)
     t0 = time.perf_counter()
     try:
-        result = _determine(
+        batch = _determine(
             obs_dict=obs_dict,
             config_dict=config_dict,
             initial_orbits_dict=None,
         )
+        result = _single_fit(batch, object_id, "OD")
     except Exception as e:  # noqa: BLE001
         print(f"  {object_id} OD: FAIL {e}", file=sys.stderr)
         return None
@@ -374,11 +423,12 @@ def _determine_nongrav_one(
         config_dict["excluded_perturbers_naif"] = list(excluded_perturbers_naif)
     t0 = time.perf_counter()
     try:
-        result = _determine(
+        batch = _determine(
             obs_dict=obs_dict,
             config_dict=config_dict,
             initial_orbits_dict=None,
         )
+        result = _single_fit(batch, object_id, "non-grav OD")
     except Exception as e:  # noqa: BLE001
         print(f"  {object_id} non-grav OD: FAIL {e}", file=sys.stderr)
         return None
@@ -386,6 +436,63 @@ def _determine_nongrav_one(
 
     pos = [float(result["orbit_x"]), float(result["orbit_y"]), float(result["orbit_z"])]
     return pos, result, ms
+
+
+def _solve_metadata(raw: dict) -> dict:
+    """Solve-for dispositions + warnings from a fit, in the schema's shape.
+
+    Read off the *result*, never off the config: under ``solve_for=auto``
+    the request and the outcome differ by design, and what the report needs
+    is the width the fit actually ran at.
+
+    The disposition matters for reading the σ that comes with it — a
+    *considered* axis already has its uncertainty inside the delivered
+    covariance, a *fixed* one contributed nothing — so a cross-channel σ
+    comparison is only meaningful when the dispositions agree. Missing keys
+    stay absent rather than defaulting to ``"fixed"``, which would assert a
+    partition the fit never reported.
+    """
+    # Every key is written on every call, cleared first. A python row is
+    # built as a copy of the input row, so a key left untouched here would
+    # let the *input* channel's dispositions ride out under this channel's
+    # name — one channel's fit metadata attributed to another's fit.
+    out: dict = {
+        "od_disposition_marsden": None,
+        "od_disposition_dt": None,
+        "od_disposition_amrat": None,
+        "od_disposition_thrust": [],
+        "od_solve_for_used": None,
+        "od_warnings": [],
+        "od_joint_covariance_width": None,
+    }
+    disp = raw.get("dispositions") or {}
+    for axis in ("marsden", "dt", "amrat"):
+        v = disp.get(axis)
+        if v is not None:
+            out[f"od_disposition_{axis}"] = str(v)
+    # Trailing all-fixed thrust entries carry no information (every orbit
+    # declares the full segment budget); trim to the last active one.
+    thrust = list(disp.get("thrust") or [])
+    last = -1
+    for i, t in enumerate(thrust):
+        if str(t) != "fixed":
+            last = i
+    if last >= 0:
+        out["od_disposition_thrust"] = [str(t) for t in thrust[: last + 1]]
+    if raw.get("solve_for_used") is not None:
+        out["od_solve_for_used"] = str(raw["solve_for_used"])
+    warnings = raw.get("warnings") or []
+    if warnings:
+        out["od_warnings"] = [str(w) for w in warnings]
+    # Width of the go-forward joint. A state-only fit reports no
+    # `solved_covariance` and its joint is the 6×6 — width 6, not absent,
+    # so "state-only" stays distinct from "channel reported nothing".
+    solved = raw.get("solved_covariance")
+    if isinstance(solved, dict) and solved.get("width") is not None:
+        out["od_joint_covariance_width"] = int(solved["width"])
+    else:
+        out["od_joint_covariance_width"] = 6
+    return out
 
 
 def _read_fitted_non_grav(raw: dict) -> tuple[list[float | None], list[float | None]]:
@@ -585,6 +692,7 @@ def main() -> int:
             new["od_reduced_chi2"] = float(
                 raw.get("summary_reduced_chi2", float("nan"))
             )
+            new.update(_solve_metadata(raw))
 
             # ── Second OD: state + non-grav recovery ──────────────────────
             # For objects whose JPL SBDB reference carries a non-grav signal
@@ -633,6 +741,10 @@ def main() -> int:
                     ng_row["od_reduced_chi2"] = float(
                         raw_ng.get("summary_reduced_chi2", float("nan"))
                     )
+                    # The non-grav pass's own dispositions — this is the row
+                    # where a silent fall-back to a state-only solve shows up
+                    # as `marsden: fixed` despite the request.
+                    ng_row.update(_solve_metadata(raw_ng))
                     # Fitted Marsden coefficients ± 1σ. None (never 0 / NaN)
                     # when the fit did not actually recover non-grav.
                     ng_row["od_a1"], ng_row["od_a2"], ng_row["od_a3"] = a_out
