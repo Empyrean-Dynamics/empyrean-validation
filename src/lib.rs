@@ -31,7 +31,12 @@
 
 pub mod catalog;
 pub mod compare;
+pub mod debias;
 pub mod orbit_compare;
 pub mod plan;
+pub mod predict_compare;
+pub mod predict_schema;
 pub mod report;
 pub mod schema;
+pub mod weights;
+pub mod windows;

@@ -455,6 +455,33 @@ $(RUST_PROPEPH): $(RUST_BIN)
 RUST_OD_ORBITS := $(RESULTS_DIR)/validation_rust_od_orbits.jsonl
 RUST_OD_COMPARE := $(RESULTS_DIR)/validation_rust_od_compare.jsonl
 
+# ── Covariance realism (walk-forward family) — LOCAL-ONLY for now ────────
+# Expanding per-night windows; predictions scored vs their predicted covariance. Profiles:
+# full (the surface run) / ci (iteration + config sweeps) / ladder (smoke).
+# The window manifest is the single source every runner consumes; regenerate
+# it only against the fixture snapshot on disk.
+WALK_PROFILE ?= ci
+WALK_MANIFEST := $(ROOT)/fixtures/windows.json
+WALK := $(RESULTS_DIR)/validation_rust_walk.json
+WALK_WINDOWS := $(RESULTS_DIR)/validation_rust_walk_windows.jsonl
+WALK_PREDICTIONS := $(RESULTS_DIR)/validation_rust_walk_predictions.jsonl
+WALK_SCORED := $(RESULTS_DIR)/validation_predict_scored.jsonl
+WALK_AGG := $(RESULTS_DIR)/validation_predict_agg.json
+
+.PHONY: walk-manifest walk walk-score
+walk-manifest: | fixtures
+	@echo "──── Covariance realism: window manifest ───────────────"
+	@cargo run --release --bin empyrean-validation -- windows 	    --fixtures-dir $(FIXTURES_PSV) --output $(WALK_MANIFEST) 	    --debias-dir $(DATA_DIR)
+
+walk: $(RUST_BIN) | fixtures
+	@echo "──── Covariance realism: rust walk ($(WALK_PROFILE)) ───"
+	@test -f $(WALK_MANIFEST) || { 	    echo "ERROR: no window manifest at $(WALK_MANIFEST) — run 'make walk-manifest'."; 	    exit 1; }
+	@$(DYLD) $(RUST_BIN) walk --manifest $(WALK_MANIFEST) 	    --profile $(WALK_PROFILE) 	    --fixtures-dir $(FIXTURES_PSV) --data-dir $(DATA_DIR) 	    --output $(WALK)
+
+walk-score:
+	@echo "──── Covariance realism: scoring ───────────────────────"
+	@cargo run --release --bin empyrean-validation -- score-predictions 	    --manifest $(WALK_MANIFEST) 	    --predictions $(WALK_PREDICTIONS) --windows $(WALK_WINDOWS) 	    --out-scored $(WALK_SCORED) --out-agg $(WALK_AGG)
+
 $(RUST_OD): $(RUST_BIN) | fixtures
 	@echo "──── Rust channel: orbit determination ─────────────────"
 	@$(DYLD) $(RUST_BIN) od $(ONLY_FLAG) --tier $(TIERS) \
@@ -736,7 +763,7 @@ export ASSEMBLE_SHARDS
 # `non_grav_recovery` rows satisfied the old form while carrying not one row
 # of the axis this assertion protects. So both halves are asserted: some OD
 # row must exist, and `orbit_determination` itself must be among them.
-OD_TEST_TYPES := orbit_determination,orbit_determination_radar,non_grav_recovery,dt_recovery,photometry_recovery,thrust_recovery
+OD_TEST_TYPES := orbit_determination,orbit_determination_radar,non_grav_recovery,dt_recovery,photometry_recovery,thrust_recovery,covariance_realism
 define ASSERT_PLAN_HAS_OD
 import json, sys
 from collections import Counter

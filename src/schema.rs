@@ -160,6 +160,15 @@ pub mod test_types {
     /// and core-reference replay exist, but there is no maneuvering-object
     /// fixture yet, so no channel emits these rows today.
     pub const THRUST_RECOVERY: &str = "thrust_recovery";
+    /// Walk-forward covariance-realism family: fit an expanding window of an
+    /// object's observations, predict the held-out observations' sky-plane
+    /// position and uncertainty, extend the window by a night, repeat. One
+    /// thin row per (object, window) on the `ci` profile carries the fit
+    /// scalars (`dt_days` holds the **window index** — an ordinal, not days;
+    /// `t_mjd_tdb` the cut instant); everything per-prediction lives in the
+    /// prediction sidecars, never on rows. It backs the walk-forward covariance-
+    /// realism family: per-night windows, predictions scored vs their covariance.
+    pub const COVARIANCE_REALISM: &str = "covariance_realism";
 
     /// Every canonical test type, in declaration order.
     ///
@@ -168,7 +177,7 @@ pub mod test_types {
     /// flag. A name checked for syntax but never for membership turns a typo
     /// into "that axis was never exercised", which reads as a dead channel
     /// when the truth is a misspelling.
-    pub const ALL: [&str; 8] = [
+    pub const ALL: [&str; 9] = [
         PROPAGATION,
         EPHEMERIS,
         ORBIT_DETERMINATION,
@@ -177,6 +186,7 @@ pub mod test_types {
         DT_RECOVERY,
         PHOTOMETRY_RECOVERY,
         THRUST_RECOVERY,
+        COVARIANCE_REALISM,
     ];
 
     /// The orbit-determination family: every test type whose row comes from a
@@ -188,13 +198,14 @@ pub mod test_types {
     /// counts a *typo* as OD, so an assertion built on it can be satisfied by
     /// rows that are not orbit determination at all. Enumerate instead — a new
     /// test type then has to declare which side it is on.
-    pub const ORBIT_DETERMINATION_FAMILY: [&str; 6] = [
+    pub const ORBIT_DETERMINATION_FAMILY: [&str; 7] = [
         ORBIT_DETERMINATION,
         ORBIT_DETERMINATION_RADAR,
         NON_GRAV_RECOVERY,
         DT_RECOVERY,
         PHOTOMETRY_RECOVERY,
         THRUST_RECOVERY,
+        COVARIANCE_REALISM,
     ];
 
     /// Is this the name of an orbit-determination test type?

@@ -597,7 +597,15 @@ pub const PLAN_UNCERTAINTY_AXES: [&str; 2] = [
 /// the plan and fails loudly in the channels that cannot yet run it, instead of
 /// silently vanishing from the plan and taking a whole test axis with it. That
 /// silent-axis-deletion is the exact defect this branch exists to kill.
-pub const PLAN_RUST_ONLY_TEST_TYPES: [&str; 1] = [test_types::ORBIT_DETERMINATION_RADAR];
+///
+/// `covariance_realism` follows the same precedent deliberately (not as debt):
+/// the walk-forward family is reference-channel-only by design in v1 — its
+/// windows are driven by the window manifest, not by plan rows, and no replay
+/// channel has a walk arm.
+pub const PLAN_RUST_ONLY_TEST_TYPES: [&str; 2] = [
+    test_types::ORBIT_DETERMINATION_RADAR,
+    test_types::COVARIANCE_REALISM,
+];
 
 /// Why a channel-result row was excluded from the plan.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
