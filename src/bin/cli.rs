@@ -35,7 +35,8 @@ use empyrean_validation::{
         RADAR_FIXTURE_OBJECTS, ValidationObject, all_objects, filter_by_name, filter_by_population,
     },
     plan::{PlanConfig, build_plan},
-    report::{SUMMARY_TEST_TYPES, generate_report},
+    predict_schema::PredictAggregates,
+    report::{SUMMARY_TEST_TYPES, generate_report, merge_predict_aggregates},
     schema::{OrbitComparison, ValidationResult, channels, test_types},
 };
 
@@ -64,6 +65,55 @@ enum Command {
     CiCheck(CiCheckArgs),
     /// List the catalog objects a run would cover, with CI-safe slugs.
     ListObjects(ListObjectsArgs),
+    /// Generate the walk-forward window manifest from the pinned fixtures.
+    Windows(WindowsArgs),
+    /// Score walk-forward prediction sidecars against the window manifest.
+    ScorePredictions(ScorePredictionsArgs),
+}
+
+#[derive(Parser, Debug)]
+struct WindowsArgs {
+    /// Optical PSV fixture directory (sibling `manifest.json` supplies the
+    /// snapshot id).
+    #[arg(long, default_value = "fixtures/psv")]
+    fixtures_dir: PathBuf,
+    /// Output manifest path.
+    #[arg(short, long, default_value = "fixtures/windows.json")]
+    output: PathBuf,
+    /// Nights per walk step in the base schedule.
+    #[arg(long, default_value_t = 1)]
+    bundle_nights: u32,
+    /// EFCC2020 debias table directory. Required unless --no-debias.
+    #[arg(long)]
+    debias_dir: Option<PathBuf>,
+    /// Generate without debias corrections — an explicit, loud choice.
+    #[arg(long, default_value_t = false)]
+    no_debias: bool,
+}
+
+#[derive(Parser, Debug)]
+struct ScorePredictionsArgs {
+    /// Window manifest path.
+    #[arg(long, default_value = "fixtures/windows.json")]
+    manifest: PathBuf,
+    /// Prediction sidecar JSONL path(s) (`*_predictions.jsonl`, `.gz` ok).
+    #[arg(long, required = true)]
+    predictions: Vec<PathBuf>,
+    /// Window-record sidecar JSONL path(s) (`*_windows.jsonl`).
+    #[arg(long)]
+    windows: Vec<PathBuf>,
+    /// Scored-prediction JSONL output.
+    #[arg(long, default_value = "results/validation_predict_scored.jsonl")]
+    out_scored: PathBuf,
+    /// Surface-aggregate JSON output (what the report embeds).
+    #[arg(long, default_value = "results/validation_predict_agg.json")]
+    out_agg: PathBuf,
+    /// Which σ table scores this pass.
+    #[arg(long, default_value = "pinned")]
+    sigma_table: String,
+    /// Score against raw (undebiased) positions — the sensitivity arm.
+    #[arg(long, default_value_t = false)]
+    raw_positions: bool,
 }
 
 #[derive(Parser, Debug)]
@@ -193,6 +243,16 @@ struct ReportArgs {
     /// Use `ci-check` to gate a CI workflow on the contents.
     #[arg(long)]
     summary: Option<PathBuf>,
+    /// Walk-forward prediction aggregates (`score-predictions`'
+    /// `--out-agg` output) for §14. Repeat the flag or comma-separate.
+    ///
+    /// Multiple files are treated as disjoint runs of ONE walk and are
+    /// merged by concatenating their surface cells and per-object
+    /// summaries; aggregates whose `snapshot_id` values differ are refused
+    /// rather than pooled. Aggregates only — the per-prediction JSONL
+    /// stays off the page.
+    #[arg(long, value_delimiter = ',')]
+    predict_agg: Vec<PathBuf>,
 }
 
 #[derive(Parser, Debug)]
@@ -257,6 +317,28 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         Command::Report(args) => report(args),
         Command::CiCheck(args) => ci_check(args),
         Command::ListObjects(args) => list_objects(args),
+        Command::Windows(args) => empyrean_validation::windows::run(
+            &args.fixtures_dir,
+            &args.output,
+            &empyrean_validation::windows::WindowsOptions {
+                bundle_nights: args.bundle_nights,
+                debias_dir: args.debias_dir.clone(),
+                no_debias: args.no_debias,
+            },
+        )
+        .map_err(Into::into),
+        Command::ScorePredictions(args) => empyrean_validation::predict_compare::run(
+            &args.manifest,
+            &args.predictions,
+            &args.windows,
+            &args.out_scored,
+            &args.out_agg,
+            &empyrean_validation::predict_compare::ScoreOptions {
+                sigma_table: args.sigma_table.clone(),
+                apply_debias: !args.raw_positions,
+            },
+        )
+        .map_err(Into::into),
     }
 }
 
@@ -884,7 +966,15 @@ fn merge_grss(
                     eph_idx.insert((name.to_string(), dt, obs.to_string()), g);
                 }
             }
-            Some(tt) if empyrean_validation::schema::test_types::is_orbit_determination(tt) => {
+            // Exact-string exclusion of `covariance_realism`, not a family
+            // test: this index is one-record-per-(object, test_type), so a
+            // walk family record here would collapse every window onto the
+            // last one, silently. Walk predictions merge through their own
+            // per-(object, window) sidecar path instead.
+            Some(tt)
+                if empyrean_validation::schema::test_types::is_orbit_determination(tt)
+                    && tt != empyrean_validation::schema::test_types::COVARIANCE_REALISM =>
+            {
                 od_idx.insert((name.to_string(), tt.to_string()), g);
             }
             _ => {}
@@ -900,7 +990,9 @@ fn merge_grss(
                 };
                 eph_idx.get(&(r.object.clone(), r.dt_days as i64, obs.to_string()))
             }
-            tt if empyrean_validation::schema::test_types::is_orbit_determination(tt) => {
+            tt if empyrean_validation::schema::test_types::is_orbit_determination(tt)
+                && tt != empyrean_validation::schema::test_types::COVARIANCE_REALISM =>
+            {
                 od_idx.get(&(r.object.clone(), r.test_type.clone()))
             }
             _ => continue,
@@ -1353,11 +1445,37 @@ fn report(args: ReportArgs) -> Result<(), Box<dyn std::error::Error>> {
                 .into(),
         );
     }
+    // Walk-forward aggregates for §14. Each file is one `predict-compare`
+    // run; they merge only when they agree on the fixture snapshot.
+    let mut aggregates: Vec<PredictAggregates> = Vec::new();
+    for path in &args.predict_agg {
+        let raw =
+            std::fs::read_to_string(path).map_err(|e| format!("read {}: {e}", path.display()))?;
+        let agg: PredictAggregates =
+            serde_json::from_str(&raw).map_err(|e| format!("parse {}: {e}", path.display()))?;
+        eprintln!(
+            "Loaded {} surface cells, {} per-object walk summaries, {} walk timelines and \
+             {} reduced-χ² histograms from {} (snapshot {})",
+            agg.cells.len(),
+            agg.per_object.len(),
+            agg.per_window.len(),
+            agg.reduced_chi2.len(),
+            path.display(),
+            agg.snapshot_id
+        );
+        if let Some(note) = &agg.per_window_note {
+            eprintln!("  {note}");
+        }
+        aggregates.push(agg);
+    }
+    let predict_agg = merge_predict_aggregates(aggregates)?;
+
     generate_report(
         &all,
         &orbit_comparisons,
         &args.output,
         args.summary.as_deref(),
+        predict_agg.as_ref(),
     )
     .map_err(|e| format!("report: {e}"))?;
     eprintln!("Wrote report to {}", args.output.display());
@@ -1369,8 +1487,14 @@ fn report(args: ReportArgs) -> Result<(), Box<dyn std::error::Error>> {
 
 /// Is this an orbit-determination row — i.e. a row produced by a
 /// differential-correction fit rather than a propagate / ephemeris call?
+///
+/// `covariance_realism` is in the OD *family* (its rows come from DC fits)
+/// but is excluded here on purpose: the walk family's data travels in the
+/// prediction sidecars, not the orbit-comparison sidecar, so a walk-only
+/// results file must not demand a `*_compare.jsonl` it never produces.
 fn is_od_row(r: &ValidationResult) -> bool {
     test_types::is_orbit_determination(&r.test_type)
+        && r.test_type != test_types::COVARIANCE_REALISM
 }
 
 /// Candidate sidecar paths for the orbit-comparison data associated
@@ -2209,6 +2333,7 @@ mod tests {
             results: vec![results],
             output: dir.path().join("report.html"),
             summary: None,
+            predict_agg: vec![],
         })
         .expect_err("absent sidecar must fail");
         let msg = err.to_string();
@@ -2230,6 +2355,7 @@ mod tests {
             results: vec![results],
             output: dir.path().join("report.html"),
             summary: None,
+            predict_agg: vec![],
         })
         .expect("staged sidecar");
     }
@@ -2248,8 +2374,88 @@ mod tests {
             results: vec![results],
             output: dir.path().join("report.html"),
             summary: None,
+            predict_agg: vec![],
         })
         .expect("prop-only run needs no sidecar");
+    }
+
+    /// A minimal walk aggregate on a named snapshot, written to disk.
+    fn write_predict_agg(dir: &std::path::Path, name: &str, snapshot: &str) -> PathBuf {
+        let agg = PredictAggregates {
+            snapshot_id: snapshot.to_string(),
+            cells: vec![],
+            per_object: vec![empyrean_validation::predict_schema::ObjectWalkSummary {
+                object: "Holman".into(),
+                class: "MainBelt".into(),
+                tool: "rust".into(),
+                config_arm: "default".into(),
+                n_windows_expected: 4,
+                n_windows_converged: 4,
+                n_windows_failed: 0,
+                n_predictions: 16,
+                med_d2_norm: Some(0.76),
+                med_sep_arcsec: Some(0.77),
+            }],
+            d2_histograms: Vec::new(),
+            per_window: Vec::new(),
+            reduced_chi2: Vec::new(),
+            per_window_note: None,
+        };
+        let p = dir.join(name);
+        std::fs::write(&p, serde_json::to_string(&agg).unwrap()).unwrap();
+        p
+    }
+
+    fn rust_walk_rows() -> Vec<ValidationResult> {
+        let mut r = ValidationResult::empty();
+        r.object = "Holman".into();
+        r.channel = "rust".into();
+        r.test_type = test_types::COVARIANCE_REALISM.into();
+        vec![r]
+    }
+
+    #[test]
+    fn report_merges_predict_aggregates_from_several_files() {
+        // Separate `predict-compare` runs of one walk are disjoint slices of
+        // the same snapshot and pool into one §14.
+        let dir = tempfile::tempdir().unwrap();
+        let results = write_results(dir.path(), "validation_rust.json", &rust_walk_rows());
+        let a = write_predict_agg(dir.path(), "a_agg.json", "snap-1");
+        let b = write_predict_agg(dir.path(), "b_agg.json", "snap-1");
+        let out = dir.path().join("report.html");
+        report(ReportArgs {
+            results: vec![results],
+            output: out.clone(),
+            summary: None,
+            predict_agg: vec![a, b],
+        })
+        .expect("two aggregates on one snapshot must merge");
+        let html = std::fs::read_to_string(&out).unwrap();
+        assert!(
+            html.matches(r#""object":"Holman""#).count() >= 2,
+            "both aggregates' per-object rows should reach the page"
+        );
+    }
+
+    #[test]
+    fn report_refuses_predict_aggregates_from_different_snapshots() {
+        // Two snapshots describe different observations; pooling them would
+        // publish a surface no run ever produced. Loud failure, both ids named.
+        let dir = tempfile::tempdir().unwrap();
+        let results = write_results(dir.path(), "validation_rust.json", &rust_walk_rows());
+        let a = write_predict_agg(dir.path(), "a_agg.json", "2026-07-29-75ab459bc8b2");
+        let b = write_predict_agg(dir.path(), "b_agg.json", "2026-08-14-deadbeefcafe");
+        let err = report(ReportArgs {
+            results: vec![results],
+            output: dir.path().join("report.html"),
+            summary: None,
+            predict_agg: vec![a, b],
+        })
+        .expect_err("mismatched snapshots must fail");
+        let msg = err.to_string();
+        assert!(msg.contains("snapshot_id"), "{msg}");
+        assert!(msg.contains("2026-07-29-75ab459bc8b2"), "{msg}");
+        assert!(msg.contains("2026-08-14-deadbeefcafe"), "{msg}");
     }
 
     #[test]

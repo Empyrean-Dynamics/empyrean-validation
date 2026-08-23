@@ -119,12 +119,13 @@ const BRAND_TOKENS_CSS: &str = include_str!("../assets/empyrean-tokens.css");
 /// not in the report, and — the load-bearing consequence — not in
 /// `validation_summary.json`, which is what `ci-check` gates on. An axis the
 /// gate cannot see is an axis the gate cannot enforce a floor for.
-pub const SUMMARY_TEST_TYPES: [&str; 5] = [
+pub const SUMMARY_TEST_TYPES: [&str; 6] = [
     test_types::PROPAGATION,
     test_types::EPHEMERIS,
     test_types::ORBIT_DETERMINATION,
     test_types::ORBIT_DETERMINATION_RADAR,
     test_types::NON_GRAV_RECOVERY,
+    test_types::COVARIANCE_REALISM,
 ];
 
 /// Format a numerical diff value in a friendly units string.
@@ -1542,17 +1543,74 @@ fn build_convergence_matrix_html(results: &[ValidationResult]) -> String {
     html
 }
 
+/// Merge the `--predict-agg` aggregate files into one embeddable artifact.
+///
+/// Multiple files are disjoint runs of the same walk — different objects,
+/// classes or config arms of one snapshot — so merging is a concatenation of
+/// their `cells` and `per_object` vectors. What is *not* mergeable is a
+/// snapshot mismatch: aggregates computed against different fixture
+/// snapshots describe different observations, and silently pooling them
+/// would publish a surface no single run ever produced. That is a hard
+/// error naming both ids, never a warning.
+///
+/// Returns `None` for an empty input (no `--predict-agg` was passed) so the
+/// caller can embed a literal `null` and let §14 render its empty state.
+pub fn merge_predict_aggregates(
+    aggregates: Vec<crate::predict_schema::PredictAggregates>,
+) -> Result<Option<crate::predict_schema::PredictAggregates>, String> {
+    let mut it = aggregates.into_iter();
+    let Some(mut merged) = it.next() else {
+        return Ok(None);
+    };
+    for next in it {
+        if next.snapshot_id != merged.snapshot_id {
+            return Err(format!(
+                "--predict-agg files disagree on snapshot_id: {:?} vs {:?}. Aggregates from \
+                 different fixture snapshots describe different observations and cannot be \
+                 pooled — regenerate every walk against one snapshot, or pass them to \
+                 separate reports.",
+                merged.snapshot_id, next.snapshot_id
+            ));
+        }
+        merged.cells.extend(next.cells);
+        merged.per_object.extend(next.per_object);
+        merged.d2_histograms.extend(next.d2_histograms);
+        merged.per_window.extend(next.per_window);
+        merged.reduced_chi2.extend(next.reduced_chi2);
+        // A budget note from any input describes the merged family too — the
+        // reduction already happened upstream and cannot be undone here.
+        if let Some(note) = next.per_window_note {
+            match merged.per_window_note.as_mut() {
+                Some(existing) if !existing.contains(&note) => {
+                    existing.push_str("  ");
+                    existing.push_str(&note);
+                }
+                Some(_) => {}
+                None => merged.per_window_note = Some(note),
+            }
+        }
+    }
+    Ok(Some(merged))
+}
+
 /// Generate the interactive HTML validation report.
 ///
 /// `orbit_comparisons` is the optional sidecar from
 /// `validate od`'s `_compare.jsonl` output — empty slice when no
 /// orbit-comparison data is available (e.g., CI runs that skip the
 /// SBDB / find_orb queries).
+///
+/// `predict_agg` is the walk-forward covariance-realism aggregate
+/// (`score-predictions --out-agg`, merged by
+/// [`merge_predict_aggregates`]) — `None` when no walk was loaded, which
+/// renders §14's empty state. Aggregates only: per-prediction rows stay in
+/// the scoring sidecars and never reach the page.
 pub fn generate_report(
     results: &[ValidationResult],
     orbit_comparisons: &[crate::schema::OrbitComparison],
     output: &Path,
     summary: Option<&Path>,
+    predict_agg: Option<&crate::predict_schema::PredictAggregates>,
 ) -> Result<(), String> {
     let core_results: Vec<&ValidationResult> =
         results.iter().filter(|r| r.channel == "core").collect();
@@ -1648,6 +1706,15 @@ pub fn generate_report(
     // Embed the orbit-comparison sidecar (Mahalanobis distances etc.)
     // for the "Fitted orbit + covariance vs references" panel.
     let orbit_comparisons_json = serde_json::to_string(&orbit_comparisons).unwrap_or_default();
+    // Embed the walk-forward aggregate for §14. Aggregates only — the
+    // per-prediction JSONL stays off the page. Absent walk → literal `null`,
+    // which §14's JS reads as its empty state.
+    let predict_agg_json = match predict_agg {
+        Some(agg) => {
+            serde_json::to_string(agg).map_err(|e| format!("serialize predict aggregates: {e}"))?
+        }
+        None => "null".to_string(),
+    };
 
     let n_prop = prop_results.len();
     let n_eph = eph_results.len();
@@ -1956,6 +2023,66 @@ pub fn generate_report(
   #tool-selector select:focus {{ outline: none; border-color: var(--ed-accent); box-shadow: 0 0 0 2px var(--ed-focus-ring); }}
   #tool-swap {{ background: var(--ed-input-bg); color: var(--ed-text-secondary); border: 1px solid var(--ed-input-border); border-radius: var(--ed-radius-sm); padding: 5px 9px; cursor: pointer; font-family: var(--ed-font-mono); }}
   #tool-swap:hover {{ color: var(--ed-accent); border-color: var(--ed-accent); }}
+  /* §14 series selector — the config grid is 36 rust arms plus the external
+     tools, so the section renders only what is explicitly selected. */
+  .pw-select {{ background: var(--ed-surface); border: 1px solid var(--ed-border); border-radius: var(--ed-radius-md); padding: 14px 16px; margin-bottom: 24px; }}
+  .pw-select-head {{ display: flex; align-items: center; gap: 10px; flex-wrap: wrap; margin-bottom: 12px; }}
+  .pw-select-label {{ font-family: var(--ed-font-mono); font-size: 10px; letter-spacing: 2px; text-transform: uppercase; color: var(--ed-text-secondary); }}
+  .pw-quick {{ display: inline-flex; flex-wrap: wrap; gap: 6px; }}
+  .pw-quick button {{ background: var(--ed-input-bg); border: 1px solid var(--ed-input-border); border-radius: var(--ed-radius-sm); color: var(--ed-text-secondary); padding: 4px 10px; cursor: pointer; font-family: var(--ed-font-mono); font-size: 10px; }}
+  .pw-quick button:hover {{ color: var(--ed-text-primary); border-color: var(--ed-accent); }}
+  .pw-quick button.active {{ color: var(--ed-text-primary); border-color: var(--ed-accent); background: var(--ed-surface-raised); }}
+  .pw-select-count {{ font-family: var(--ed-font-mono); font-size: 10px; color: var(--ed-text-muted); margin-left: auto; }}
+  .pw-groups {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(230px, 1fr)); gap: 12px 20px; }}
+  .pw-group-title {{ font-family: var(--ed-font-mono); font-size: 9px; letter-spacing: 1.5px; text-transform: uppercase; color: var(--ed-text-muted); margin-bottom: 5px; }}
+  .pw-opt {{ display: flex; align-items: center; gap: 7px; font-family: var(--ed-font-mono); font-size: 10px; color: var(--ed-text-secondary); padding: 2px 0; cursor: pointer; }}
+  .pw-opt:hover {{ color: var(--ed-text-primary); }}
+  .pw-opt input {{ accent-color: var(--ed-accent); margin: 0; flex: 0 0 auto; }}
+  /* The swatch carries colour AND dash, so the selector reads as the legend. */
+  .pw-swatch {{ display: inline-block; width: 20px; height: 3px; border-radius: 2px; flex: 0 0 20px; }}
+  .pw-note {{ font-family: var(--ed-font-mono); font-size: 10px; color: var(--ed-text-muted); margin-top: 12px; line-height: 1.8; }}
+  /* Per-object timeline: one object picker above the stacked subplots. */
+  .pw-timeline-head {{ display: flex; align-items: center; gap: 10px; flex-wrap: wrap; margin: 10px 0 4px; }}
+  .pw-timeline-head select {{ background: var(--ed-input-bg); color: var(--ed-accent); border: 1px solid var(--ed-input-border); border-radius: var(--ed-radius-sm); padding: 5px 8px; font-family: var(--ed-font-mono); font-size: 12px; max-width: 320px; }}
+  .pw-timeline-head select:focus {{ outline: none; border-color: var(--ed-accent); box-shadow: 0 0 0 2px var(--ed-focus-ring); }}
+  .pw-timeline-head .pw-select-count {{ margin-left: 0; }}
+  /* Factorial matrices: the two 6x6 tile grids, side by side on one screen. */
+  .pw-matrix-row {{ display: flex; gap: 14px; flex-wrap: wrap; align-items: flex-start; }}
+  .pw-matrix-cell {{ flex: 1 1 420px; min-width: 380px; }}
+  .pw-matrix-wide {{ flex: 1 1 520px; min-width: 460px; }}
+  /* Main-effects strips: four small panels per metric row. */
+  .pw-effect-row {{ display: grid; grid-template-columns: repeat(4, 1fr); gap: 6px; margin-top: 6px; }}
+  .pw-effect-cell {{ min-width: 0; }}
+  @media (max-width: 900px) {{ .pw-effect-row {{ grid-template-columns: repeat(2, 1fr); }} }}
+  .pw-marginal-row {{ display: flex; gap: 16px; flex-wrap: wrap; }}
+  .pw-marginal-cell {{ flex: 1 1 460px; min-width: 420px; height: 420px; }}
+  /* The 39-checkbox farm folds away: the matrices are the primary selector. */
+  .pw-disclosure {{ margin-top: 4px; }}
+  .pw-disclosure > summary {{ cursor: pointer; font-family: var(--ed-font-mono); font-size: 10px; letter-spacing: 1px; text-transform: uppercase; color: var(--ed-text-muted); padding: 4px 0; list-style-position: outside; }}
+  .pw-disclosure > summary:hover {{ color: var(--ed-text-primary); }}
+  .pw-disclosure[open] > summary {{ margin-bottom: 10px; }}
+  /* Class tab strip over the surfaces: one class on screen at a time. */
+  .pw-tabs {{ display: flex; flex-wrap: wrap; gap: 6px; margin: 10px 0 12px; }}
+  .pw-tabs button {{ background: var(--ed-input-bg); border: 1px solid var(--ed-input-border); border-bottom-width: 2px; border-radius: var(--ed-radius-sm); color: var(--ed-text-secondary); padding: 5px 12px; cursor: pointer; font-family: var(--ed-font-mono); font-size: 11px; }}
+  .pw-tabs button:hover {{ color: var(--ed-text-primary); }}
+  .pw-tabs button.active {{ color: var(--ed-text-primary); border-color: var(--ed-accent); background: var(--ed-surface-raised); }}
+  .pw-block {{ margin-bottom: 18px; }}
+  .pw-block-title {{ font-family: var(--ed-font-mono); font-size: 11px; letter-spacing: 1px; color: var(--ed-text-secondary); margin-bottom: 6px; }}
+  .pw-surface-row {{ display: flex; gap: 6px; flex-wrap: wrap; align-items: flex-start; }}
+  .pw-surface-cell {{ flex: 1 1 300px; min-width: 250px; }}
+  .pw-surface-name {{ display: flex; align-items: center; gap: 7px; font-family: var(--ed-font-mono); font-size: 10px; color: var(--ed-text-secondary); padding-left: 4px; }}
+  .pw-surface-plot {{ height: 300px; }}
+  /* Worst offenders: the objects driving the pooled statistic, named. */
+  .pw-worst-head {{ font-family: var(--ed-font-mono); font-size: 10px; letter-spacing: 1px; text-transform: uppercase; color: var(--ed-text-muted); margin: 14px 0 6px; }}
+  .pw-worst-row {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 8px; }}
+  .pw-worst-chip {{ background: var(--ed-surface); border: 1px solid var(--ed-border); border-radius: var(--ed-radius-sm); padding: 8px 10px; }}
+  .pw-worst-obj {{ font-family: var(--ed-font-mono); font-size: 11px; color: var(--ed-text-primary); }}
+  .pw-worst-val {{ font-family: var(--ed-font-mono); font-size: 18px; margin-top: 2px; }}
+  .pw-worst-sub {{ font-family: var(--ed-font-mono); font-size: 9px; color: var(--ed-text-muted); margin-top: 2px; }}
+  /* Per-object table: sortable headers and class banding. */
+  .pw-sortable {{ cursor: pointer; user-select: none; }}
+  .pw-sortable:hover {{ color: var(--ed-text-primary); }}
+  .pw-object-table tr.pw-band td {{ background: rgba(255, 255, 255, 0.022); }}
   /* Capability pillar band (Overview) */
   .pillar-band {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(250px, 1fr)); gap: 12px; margin-top: 14px; }}
   .pillar {{ background: var(--ed-surface); border: 1px solid var(--ed-border); border-left-width: 3px; border-radius: var(--ed-radius-sm); padding: 14px 16px; display: flex; flex-direction: column; gap: 7px; }}
@@ -2054,7 +2181,7 @@ pub fn generate_report(
     <a href="#s08b" style="color:var(--ed-accent); text-decoration:none;">09 Orbit Determination &mdash; Convergence Matrix</a><br/>
     <a href="#s09" style="color:var(--ed-accent); text-decoration:none;">10 Orbit Determination &mdash; Diagnostics</a><br/>
     <a href="#s13" style="color:var(--ed-accent); text-decoration:none;">Reproducibility &mdash; Provenance</a>
-    <div style="margin-top:10px; color:var(--ed-text-muted); font-size:10px;">Empyrean Internals page → 01 Timing (empyrean vs ASSIST) · 02 Non-grav Recovery · 03 Channel Fidelity · 04 Uncertainty Cost (Jet1 vs f64) · 05 Fitted Orbit + Covariance</div>
+    <div style="margin-top:10px; color:var(--ed-text-muted); font-size:10px;">Empyrean Internals page → 01 Timing (empyrean vs ASSIST) · 02 Non-grav Recovery · 03 Channel Fidelity · 04 Uncertainty Cost (Jet1 vs f64) · 05 Fitted Orbit + Covariance · <a href="#s14" onclick="showPage('empyrean')" style="color:var(--ed-accent); text-decoration:none;">06 Prediction &mdash; Accuracy &amp; Covariance Realism</a></div>
   </div>
 </div>
 
@@ -2481,6 +2608,94 @@ pub fn generate_report(
       </table>
     </div>
     <div class="section-desc" style="font-size:0.85em; margin-top:0.8em">Every pair references the JPL SBDB solution, propagated to the common epoch via the fitted-covariance STM (the per-row epoch source is shown in the table above). Where an object's reference covariance is non-SPD at the common epoch, the Mahalanobis metric is undefined (the Cholesky factor does not exist), so that row is blanked (—); no regularisation is applied.</div>
+  </div>
+</div>
+
+<div class="section" id="s14" data-page="empyrean">
+  <div class="section-num">06</div>
+  <div class="section-title">Prediction &mdash; Accuracy and Covariance Realism</div>
+  <div class="section-desc">
+    Walk-forward prediction: fit a leading window of an object's astrometry, predict the sky-plane
+    position <em>and its uncertainty</em> for held-out observations, score both against what was
+    actually observed, then extend the window by a night and repeat. The published statistic is
+    median(d&sup2;)&thinsp;/&thinsp;(2&nbsp;ln&nbsp;2), so a <b>calibrated covariance sits at
+    exactly 1</b> and anything above it is <b>over-confident</b> &mdash; the unsafe direction.
+    The object is the independent unit everywhere in this section; flagged rows (encounter-tagged,
+    unknown-catalog, same-night continuations, non-PSD covariances) are excluded from every panel
+    and counted in the scoring sidecars. Each (tool, config arm) pair is a <b>series</b>,
+    named by <b>how it differs from the shipping reference</b> &mdash; hover any mark for its arm code.
+  </div>
+  <div id="pw-empty" class="section-desc" style="display:none; color:#8b9198">no walk aggregates loaded &mdash; pass <code>--predict-agg &lt;path&gt;</code> to <code>empyrean-validation report</code> (repeatable; <code>score-predictions --out-agg</code> writes one aggregate file per run).</div>
+  <div id="pw-content">
+
+    <div class="panel-title">The configuration grid &mdash; every arm on one screen</div>
+    <div class="section-desc" style="font-size:0.85em">The full factorial: rows are rejection &times; nightly de-weighting, columns are debias &times; uncertainty transport with <b>debias as the outer group</b>, because it is the largest main effect and the grid should split visibly left of the divider from right. Left tiles are the pooled median d&sup2;<sub>n</sub>; right tiles are the share of held-out rows beyond the &chi;&sup2;&#8322; 99% point. <b>Click any tile to make that arm the selection</b> for every panel below; the arms currently selected are stroked white. A coloured tile border on the left matrix marks a configuration whose windows failed to converge, weighted by how many.</div>
+    <div class="pw-matrix-row">
+      <div id="pw-matrix-med" class="pw-matrix-cell pw-matrix-wide"></div>
+      <div id="pw-matrix-tail" class="pw-matrix-cell"></div>
+    </div>
+    <div id="pw-matrix-note" class="section-desc" style="font-size:0.85em; margin-top:0.6em"></div>
+    <div id="pw-worst"></div>
+
+    <div class="panel-title">Main effects &mdash; one factor at a time</div>
+    <div class="section-desc" style="font-size:0.85em">Each factor swept with the other three held at every combination (faint lines) and the marginal over them (heavy line). Top row: pooled median d&sup2;<sub>n</sub>. Bottom row: the &chi;&sup2;&#8322;-99% tail rate. Both rows share one y range per metric, so a slope in one panel is comparable to a slope in another. Where the two rows <b>disagree</b> about a factor, no setting of it is simply better &mdash; the verdict below is read off the marginals, not asserted.</div>
+    <div id="pw-effects-med" class="pw-effect-row"></div>
+    <div id="pw-effects-tail" class="pw-effect-row"></div>
+    <div id="pw-effects-note" class="section-desc" style="font-size:0.85em; margin-top:0.6em"></div>
+
+    <div class="summary-grid" id="pw-chips"></div>
+
+    <div class="pw-select" id="pw-series-select">
+      <div class="pw-select-head">
+        <span class="pw-select-label">Series</span>
+        <div id="pw-quick" class="pw-quick"></div>
+        <span id="pw-select-count" class="pw-select-count" aria-live="polite" aria-atomic="true"></span>
+      </div>
+      <details class="pw-disclosure">
+        <summary>Pick series individually</summary>
+        <div id="pw-series-groups" class="pw-groups"></div>
+      </details>
+      <div id="pw-select-note" class="pw-note" aria-live="polite"></div>
+    </div>
+
+    <div class="panel-title">Calibration marginals &mdash; d&sup2; survival and coverage residual</div>
+    <div class="section-desc" style="font-size:0.85em">Both panels use the <b>&Sigma;<sub>pred</sub>-dominated subset</b> (tr&nbsp;&Sigma;<sub>pred</sub>&nbsp;&ge;&nbsp;tr&nbsp;&Sigma;<sub>obs</sub>) &mdash; where observation noise dominates, d&sup2; measures the scoring table, not the tool. Left: the survival function P(d&sup2;&nbsp;&gt;&nbsp;x) against the calibrated &chi;&sup2;&#8322; survival e<sup>&minus;x/2</sup>, log&ndash;log to d&sup2;&nbsp;=&nbsp;10&sup3; so the tail is resolved rather than collapsed into one overflow count. Right: coverage as a <b>residual</b> &mdash; empirical minus nominal, against &sigma;-level &mdash; so the departure occupies the whole panel instead of a few pixels beside a diagonal.</div>
+    <div class="pw-marginal-row">
+      <div id="pw-d2hist" class="pw-marginal-cell"></div>
+      <div id="pw-reliability" class="pw-marginal-cell"></div>
+    </div>
+    <div id="pw-d2-note" class="section-desc" style="font-size:0.85em; margin-top:0.6em"></div>
+
+    <div class="panel-title">Fit quality &mdash; reduced &chi;&sup2; per configuration</div>
+    <div class="section-desc" style="font-size:0.85em">Distribution of the fit's own reduced &chi;&sup2; over every <b>converged</b> window &mdash; the in-sample counterpart to the held-out realism above. A fit can sit at 1 here and still publish a covariance that is nowhere near honest out of sample. The grey band is where reduced &chi;&sup2; would fall if every fit were correct, given the degrees of freedom the drawn windows actually have; <b>rejection-on arms sit below it</b> because the residuals that would have pushed them up were removed before the statistic was formed, and the rejection-off control ships in the default selection so that claim is checkable here.</div>
+    <div id="pw-rchi2" style="height:400px"></div>
+    <div id="pw-rchi2-note" class="section-desc" style="font-size:0.85em; margin-top:0.6em"></div>
+
+    <div class="panel-title">Per-object walk timeline</div>
+    <div class="section-desc" style="font-size:0.85em">One object, one point per fit window, as its arc grows night by night &mdash; the surfaces below are this view marginalized over every object. Top: that window's median normalized d&sup2;, against the calibrated line at 1 and the &chi;&sup2;&#8322; bands (where a single calibrated night's statistic falls, 50% and 95% central intervals). Bottom: that window's median separation. A break is a window that failed or delivered no held-out statistic, and the curve is cut rather than drawn through an apparition gap; a point beyond the default view is drawn as a &#9650;/&#9660; on the boundary carrying its true value, never clipped away.</div>
+    <div class="pw-timeline-head">
+      <label class="pw-select-label" for="pw-timeline-object">Object</label>
+      <select id="pw-timeline-object"></select>
+      <span id="pw-timeline-count" class="pw-select-count"></span>
+    </div>
+    <div id="pw-timeline" style="height:520px"></div>
+    <div id="pw-timeline-note" class="section-desc" style="font-size:0.85em; margin-top:0.6em"></div>
+
+    <div class="panel-title" id="pw-surface-title">Predictive-power surfaces &mdash; accuracy and realism</div>
+    <div class="section-desc" style="font-size:0.85em">Where each regime lives, over (input arc &times; prediction horizon). One class at a time &mdash; pick it below &mdash; with the drawn series across the columns on one shared colour range per block. Scoring &sigma; and debias tables are pinned and identical across arms, so arms differ only in what they fit and publish, never in how they are scored. Long horizons are only reachable from early cuts, so the support is triangular by construction.</div>
+    <div id="pw-class-tabs" class="pw-tabs"></div>
+    <div id="pw-surfaces"></div>
+    <div id="pw-surface-note" class="section-desc" style="font-size:0.85em; margin-top:0.6em"></div>
+
+    <div class="panel-title">Per-object walk &mdash; delivered / failed</div>
+    <div class="section-desc" style="font-size:0.85em">Windows converged / windows expected per object, one column per selected series (uncapped &mdash; a series whose windows all failed is exactly what this table exists to show), with that object's median normalized d&sup2; on the same realism ramp the surfaces use and its median separation. Click a column header to sort by |log&sub2;&nbsp;d&sup2;<sub>n</sub>|. Non-convergence is a first-class outcome, never a dropped window: a partially-failed walk is amber, an object no window converged on is red.</div>
+    <div class="heatmap-container">
+      <table class="od-table pw-object-table">
+        <thead><tr id="pw-object-head"></tr></thead>
+        <tbody id="pw-object-tbody"></tbody>
+      </table>
+    </div>
+    <div class="section-desc" style="font-size:0.85em; margin-top:0.8em">d&sup2;<sub>n</sub> = median(d&sup2;)/(2&nbsp;ln&nbsp;2) over that object's unflagged predictions; sep is its median gnomonic separation. The report embeds aggregates only &mdash; per-prediction rows stay in the scoring sidecars.</div>
   </div>
 </div>
 
@@ -4958,6 +5173,2122 @@ if (!orbitComparisons.length) {{
     }});
 }}
 
+// ─────────── Section 14: walk-forward prediction (accuracy + realism) ───────────
+// Everything in this section is derived client-side from ONE embedded
+// aggregate object (surface cells + per-object walk summaries). Per-prediction
+// rows never reach the page — they stay in the scoring sidecars.
+const predictAgg = PREDICT_AGG_JSON;
+
+// Composite Map keys join their fields with a control character no tool,
+// arm, class or object name can contain. It is built from a char code rather
+// than written as a string literal on purpose: the byte then survives every
+// editor, template and escaping pass intact, and a key that silently loses
+// its separator matches nothing while throwing nothing.
+const PW_SEP = String.fromCharCode(1);
+function pwKey() {{ return Array.prototype.join.call(arguments, PW_SEP); }}
+
+// Cells with fewer contributing objects than this are hatched and carry no
+// verdict (design §3.1 — the object is the independent unit). Their VALUE
+// still renders at full saturation: a low-n cell is uncertain, not dim.
+const PW_MIN_OBJECTS = 3;
+// Simultaneously drawn series ceiling, applied to every plotted panel:
+// past this the curves stop being separable and the surfaces stop being
+// comparable side by side. Which eight get drawn is a balanced contrast
+// (pwDrawn), never the first eight in enumeration order. The overflow is
+// announced and left undrawn — never silently truncated. The per-object
+// table is deliberately exempt: a table column costs no legibility.
+const PW_MAX_DRAWN_SERIES = 8;
+// Robust percentile clip for every heat range. One broken cell (a layup
+// MainBelt window publishing d²ₙ = 2.1e-31, log₂ = −102) would otherwise
+// set the range for data that spans ±6, flattening every real difference
+// to one indistinguishable mid-tone. Clipped cells get an over-range
+// chevron and keep their true value in the hover.
+const PW_RANGE_PCT = [0.02, 0.98];
+// χ²₂ upper-tail reference points. The 99% point is where the headline
+// tail statistic is read; a calibrated sample leaves 1% beyond it.
+const PW_CHI2_2_P99 = 9.210340371976184;
+
+// ── series model ───────────────────────────────────────────────────────
+// A series is (tool, config_arm). Rust config-grid arms name three fit-side
+// axes plus an uncertainty-transport suffix:
+//     {{efcc|nodeb}}.{{adap|cmc|norej}}.{{vfc|nonight}}[+sp|+so|+mc]
+// The pre-grid arm names carry the same semantics, so they are parsed onto
+// the same axes and older aggregates keep rendering. Nothing is renamed:
+// `arm` is always the name the aggregate shipped.
+const PW_LEGACY_AXES = {{
+    'default':      {{ debias: 'efcc', rejection: 'adap',  nightly: 'vfc' }},
+    'no-rejection': {{ debias: 'efcc', rejection: 'norej', nightly: 'vfc' }},
+    'no-nightly':   {{ debias: 'efcc', rejection: 'adap',  nightly: 'nonight' }},
+}};
+const PW_DEBIAS = ['efcc', 'nodeb'];
+const PW_REJECTION = ['adap', 'cmc', 'norej'];
+const PW_NIGHTLY = ['vfc', 'nonight'];
+const PW_TRANSPORT = ['linear', 'sp', 'so', 'mc'];
+const PW_DEBIAS_LABEL = {{ efcc: 'EFCC catalog debias', nodeb: 'fit-side debias off' }};
+const PW_REJECTION_LABEL = {{ adap: 'adaptive rejection', cmc: 'CMC2003 rejection', norej: 'rejection off' }};
+const PW_NIGHTLY_LABEL = {{ vfc: 'VFC2017 nightly de-weighting', nonight: 'nightly de-weighting off' }};
+const PW_TRANSPORT_LABEL = {{ linear: 'linear transport', sp: 'sigma-point transport', so: 'second-order transport', mc: 'Monte-Carlo transport' }};
+// Axis-level names for the factorial matrix headers and the main-effects
+// strips, where the column is already titled by its axis.
+const PW_LEVEL_SHORT = {{
+    efcc: 'EFCC debias', nodeb: 'debias off',
+    adap: 'adaptive', cmc: 'CMC2003', norej: 'none',
+    vfc: 'nightly on', nonight: 'nightly off',
+    linear: 'linear', sp: 'σ-point', so: '2nd order', mc: 'Monte Carlo',
+}};
+const PW_AXIS_TITLE = {{ debias: 'debias', rejection: 'rejection', nightly: 'nightly de-weighting', transport: 'transport' }};
+const PW_AXIS_LEVELS = {{ debias: PW_DEBIAS, rejection: PW_REJECTION, nightly: PW_NIGHTLY, transport: PW_TRANSPORT }};
+
+function pwParseArm(tool, arm) {{
+    let base = arm, transport = 'linear';
+    const plus = arm.lastIndexOf('+');
+    if (plus > 0) {{
+        const suffix = arm.slice(plus + 1);
+        if (PW_TRANSPORT.indexOf(suffix) > 0) {{ transport = suffix; base = arm.slice(0, plus); }}
+    }}
+    let axes = null;
+    if (tool === 'rust') {{
+        const legacy = PW_LEGACY_AXES[base];
+        if (legacy) {{
+            axes = legacy;
+        }} else {{
+            const p = base.split('.');
+            if (p.length === 3 && PW_DEBIAS.indexOf(p[0]) >= 0
+                && PW_REJECTION.indexOf(p[1]) >= 0 && PW_NIGHTLY.indexOf(p[2]) >= 0) {{
+                axes = {{ debias: p[0], rejection: p[1], nightly: p[2] }};
+            }}
+        }}
+    }}
+    return {{
+        tool: tool, arm: arm, base: base, transport: transport, axes: axes,
+        key: pwKey(tool, arm),
+        // Colour identity: the fit config, transport-independent — the
+        // transport variants ride the same hue with a different dash.
+        colorKey: axes ? axes.debias + '.' + axes.rejection + '.' + axes.nightly : tool + ':' + base,
+    }};
+}}
+
+// Base-arm colours. Twelve equally-weighted hues cannot be separated on one
+// ring: at the chroma sRGB allows at a single lightness the ring is ~0.97
+// long in OKLab, so 12 arms plus the two tool identities average 0.07 apart
+// — below what reads as two different lines. The palette therefore encodes
+// the grid's own factorial structure on two channels instead of cramming
+// one: hue carries (rejection × nightly), lightness carries debias
+// (saturated = debias on, pale = off), and transport rides the dash style.
+// The six hues were placed to maximise the minimum OKLab distance against
+// the pinned reference blue and the two fixed tool colours; every entry
+// clears WCAG 4.5:1 on the #151b23 panel and the closest pair sits at 0.094,
+// the floor set by the pre-existing #5598e7 / layup pairing.
+const PW_BASE_COLORS = {{
+    'efcc.adap.vfc':      '#5598e7', 'nodeb.adap.vfc':      '#a7cefe',
+    'efcc.adap.nonight':  '#d66d9a', 'nodeb.adap.nonight':  '#feb0ce',
+    'efcc.cmc.vfc':       '#c48809', 'nodeb.cmc.vfc':       '#fabf61',
+    'efcc.cmc.nonight':   '#8ca12c', 'nodeb.cmc.nonight':   '#c1d771',
+    'efcc.norej.vfc':     '#21af79', 'nodeb.norej.vfc':     '#73e5b0',
+    'efcc.norej.nonight': '#0da8b8', 'nodeb.norej.nonight': '#41e2f5',
+}};
+// External tools keep fixed identities across every panel of the report.
+const PW_TOOL_COLORS = {{ layup: '#9d85dd', findorb: '#ef8a5c' }};
+const PW_FALLBACK_COLOR = '#9aa3ad';
+const PW_DASH = {{ linear: 'solid', sp: 'dash', so: 'dashdot', mc: 'dot' }};
+
+function pwColor(s) {{
+    if (s.axes) return PW_BASE_COLORS[s.colorKey] || PW_FALLBACK_COLOR;
+    return PW_TOOL_COLORS[s.tool] || PW_FALLBACK_COLOR;
+}}
+function pwDash(s) {{ return PW_DASH[s.transport] || 'solid'; }}
+
+// ── human names ────────────────────────────────────────────────────────
+// A series is named by how it DIFFERS from the shipping reference, never by
+// its arm code: "debias off · CMC2003 rejection" is the reference with those
+// two changes, and an arm with nothing to differ IS the reference. The raw
+// code survives in exactly one place — the hover, beside the full axis
+// decomposition — so a curve can still be traced back to the arm that
+// produced it.
+const PW_REFERENCE_LABEL = 'reference (shipping defaults)';
+const PW_DEVIATION = {{
+    debias:    {{ nodeb: 'debias off' }},
+    rejection: {{ cmc: 'CMC2003 rejection', norej: 'rejection off' }},
+    nightly:   {{ nonight: 'nightly off' }},
+    transport: {{ sp: 'sigma points', so: 'second order', mc: 'Monte Carlo' }},
+}};
+// External arms are named by what the tool actually delivers. find_orb runs
+// two channels off one fit: its own 1-D σ + position angle, and a 2×2 built
+// by sampling variant orbits — "default" and "default+mc" say nothing.
+const PW_TOOL_ARM_LABEL = {{
+    [pwKey('layup', 'default')]: 'layup',
+    [pwKey('findorb', 'default')]: 'find_orb (its own σ)',
+    [pwKey('findorb', 'default+mc')]: 'find_orb (sampled 2×2)',
+}};
+const PW_TOOL_NAME = {{ rust: 'Empyrean', core: 'Empyrean (core)', layup: 'layup', findorb: 'find_orb' }};
+function pwToolName(t) {{ return PW_TOOL_NAME[t] || t; }}
+function pwDeviations(s) {{
+    const out = [];
+    if (!s.axes) return out;
+    for (const axis of ['debias', 'rejection', 'nightly']) {{
+        const d = PW_DEVIATION[axis][s.axes[axis]];
+        if (d) out.push(d);
+    }}
+    const t = PW_DEVIATION.transport[s.transport];
+    if (t) out.push(t);
+    return out;
+}}
+function pwLabel(s) {{
+    const fixed = PW_TOOL_ARM_LABEL[s.key];
+    if (fixed) return fixed;
+    if (s.axes) {{
+        const dev = pwDeviations(s);
+        return dev.length ? dev.join(' · ') : PW_REFERENCE_LABEL;
+    }}
+    // No parsed axes means no deviation to name. Showing the arm is the
+    // honest outcome — inventing a friendly name for a configuration we
+    // cannot decompose would be a lie about what was run.
+    return pwToolName(s.tool) + ' · ' + s.arm;
+}}
+// The full fit-axis chain, spelled out. Hover-only.
+function pwAxisChain(s) {{
+    if (!s.axes) return PW_TRANSPORT_LABEL[s.transport] || s.transport;
+    return [PW_DEBIAS_LABEL[s.axes.debias], PW_REJECTION_LABEL[s.axes.rejection],
+            PW_NIGHTLY_LABEL[s.axes.nightly], PW_TRANSPORT_LABEL[s.transport]].join(' · ');
+}}
+// Two-line hover identity: the human name, then the raw arm code and its
+// decomposition. This is the ONLY surface in §14 that shows an arm code.
+function pwHoverLabel(s) {{
+    return `<b>${{pwLabel(s)}}</b><br><span style="color:#8b9198">${{s.tool}} · ${{s.arm}} — ${{pwAxisChain(s)}}</span>`;
+}}
+// Same identity for a `title=` attribute, which takes no markup.
+function pwHoverTitle(s) {{
+    return `${{pwLabel(s)}} — ${{pwArmNote(s)}} · arm ${{s.tool}} · ${{s.arm}}`;
+}}
+// A swatch that shows the line's colour AND its dash, so the selector reads
+// as the legend the plots use.
+function pwSwatch(s) {{
+    const c = pwColor(s);
+    const bg = {{
+        solid: c,
+        dash: 'repeating-linear-gradient(90deg, ' + c + ' 0 6px, transparent 6px 10px)',
+        dot: 'repeating-linear-gradient(90deg, ' + c + ' 0 2px, transparent 2px 6px)',
+        dashdot: 'repeating-linear-gradient(90deg, ' + c + ' 0 6px, transparent 6px 9px, ' + c + ' 9px 11px, transparent 11px 14px)',
+    }}[pwDash(s)];
+    return '<span class="pw-swatch" style="background:' + bg + '"></span>';
+}}
+// What this arm changed, in words. Deliberately quotes no per-arm target
+// band: the paired on/off measurement (see PW_PAIRED_NOTE) found rejection
+// does not deflate the published σ on this corpus, so naming a band here
+// would be asserting an effect the data refutes.
+function pwArmNote(s) {{
+    if (!s.axes) {{
+        return s.tool === 'rust' ? 'exploration arm — axes not parsed from the name'
+            : 'external tool · ' + (PW_TRANSPORT_LABEL[s.transport] || s.transport);
+    }}
+    const bits = [PW_REJECTION_LABEL[s.axes.rejection]];
+    if (s.axes.debias === 'nodeb') bits.push(PW_DEBIAS_LABEL.nodeb);
+    if (s.axes.nightly === 'nonight') bits.push(PW_NIGHTLY_LABEL.nonight);
+    if (s.transport !== 'linear') bits.push(PW_TRANSPORT_LABEL[s.transport] || s.transport);
+    return bits.join(' · ');
+}}
+function pwSeriesOrder(a, b) {{
+    const rank = t => (t === 'rust' ? 0 : 1);
+    if (rank(a.tool) !== rank(b.tool)) return rank(a.tool) - rank(b.tool);
+    if (a.tool !== b.tool) return a.tool.localeCompare(b.tool);
+    if (!!a.axes !== !!b.axes) return a.axes ? -1 : 1;
+    if (a.axes && b.axes) {{
+        const axisOrder = [['debias', PW_DEBIAS], ['rejection', PW_REJECTION], ['nightly', PW_NIGHTLY]];
+        for (const pair of axisOrder) {{
+            const d = pair[1].indexOf(a.axes[pair[0]]) - pair[1].indexOf(b.axes[pair[0]]);
+            if (d) return d;
+        }}
+        const t = PW_TRANSPORT.indexOf(a.transport) - PW_TRANSPORT.indexOf(b.transport);
+        if (t) return t;
+    }}
+    return a.arm.localeCompare(b.arm);
+}}
+
+function buildPredictWalk() {{
+    const empty = document.getElementById('pw-empty');
+    const content = document.getElementById('pw-content');
+    if (!empty || !content) return;
+    const cells = (predictAgg && predictAgg.cells) || [];
+    const perObject = (predictAgg && predictAgg.per_object) || [];
+    if (!cells.length && !perObject.length) {{
+        // Loud empty states, split: nothing passed vs passed-but-empty. An
+        // aggregate that scored nothing is a different failure from an
+        // aggregate that was never handed in, and must not read the same.
+        if (predictAgg) {{
+            empty.innerHTML = `walk aggregates loaded but EMPTY — snapshot <code>${{predictAgg.snapshot_id || '?'}}</code> carries no surface cells and no per-object summaries. `
+                + `Re-run <code>score-predictions</code>: an empty aggregate means the kernel scored nothing, not that everything passed.`;
+        }}
+        empty.style.display = '';
+        content.style.display = 'none';
+        return;
+    }}
+    empty.style.display = 'none';
+    content.style.display = '';
+
+    const slug = s => String(s).replace(/[^A-Za-z0-9]+/g, '-').toLowerCase();
+    const fmtN = (v, d) => (v == null || !isFinite(v)) ? '—' : v.toFixed(d);
+    const fmtPct = v => (v == null || !isFinite(v)) ? '—' : (100 * v).toFixed(0) + '%';
+    const pickFirst = (values, preferred) => {{
+        for (const p of preferred) if (values.indexOf(p) >= 0) return p;
+        return values[0];
+    }};
+    const loud = msg => `<div class="section-desc" style="color:var(--ed-warning-text); margin:0">${{msg}}</div>`;
+    const purgeIn = el => {{
+        if (!el || !window.Plotly) return;
+        el.querySelectorAll('.js-plotly-plot').forEach(d => {{ try {{ Plotly.purge(d); }} catch (e) {{ /* already gone */ }} }});
+    }};
+    const sortedNums = xs => xs.filter(v => v != null && isFinite(v)).slice().sort((a, b) => a - b);
+    const pctOf = (sorted, p) => {{
+        if (!sorted.length) return null;
+        const i = (sorted.length - 1) * p;
+        const lo = Math.floor(i), hi = Math.ceil(i);
+        return sorted[lo] + (sorted[hi] - sorted[lo]) * (i - lo);
+    }};
+    const medOf = xs => {{ const v = sortedNums(xs); return v.length ? pctOf(v, 0.5) : null; }};
+
+    const sigmaTables = uniq(cells.map(c => c.sigma_table)).sort();
+    const PW_SIGMA = pickFirst(sigmaTables, ['pinned']);
+
+    // ── every (tool, arm) the aggregates carry, parsed onto the grid axes ──
+    const seriesByKey = new Map();
+    const addSeries = (tool, arm) => {{
+        const k = pwKey(tool, arm);
+        if (!seriesByKey.has(k)) seriesByKey.set(k, pwParseArm(tool, arm));
+        return seriesByKey.get(k);
+    }};
+    for (const c of cells) if (c.sigma_table === PW_SIGMA) addSeries(c.tool, c.config_arm);
+    for (const p of perObject) addSeries(p.tool, p.config_arm);
+    const seriesList = [...seriesByKey.values()].sort(pwSeriesOrder);
+    const rustSeries = seriesList.filter(s => s.tool === 'rust');
+    const toolSeries = seriesList.filter(s => s.tool !== 'rust');
+
+    // ── the primary series: the reference channel's production config. The
+    // 36-arm grid has no arm literally named 'default', so the reference is
+    // named explicitly — alphabetical order would otherwise hand the chips a
+    // nightly-off control.
+    const byArm = (tool, arm) => seriesList.find(s => s.tool === tool && s.arm === arm);
+    const primary = byArm('rust', 'default') || byArm('rust', 'efcc.adap.vfc')
+        || rustSeries[0] || seriesList[0];
+    const refRust = (primary && primary.tool === 'rust' && primary.axes) ? primary
+        : rustSeries.find(s => s.axes && s.colorKey === 'efcc.adap.vfc')
+        || rustSeries.find(s => s.axes) || null;
+
+    // ── axes: every (arc, dt) bin present anywhere in the aggregates, so every
+    // class and every series is drawn on one comparable grid.
+    const binKey = (lo, hi) => lo + ':' + hi;
+    const arcBins = [], dtBins = [];
+    const seenArc = new Set(), seenDt = new Set();
+    for (const c of cells) {{
+        const ak = binKey(c.arc_lo_days, c.arc_hi_days);
+        const dk = binKey(c.dt_lo_days, c.dt_hi_days);
+        if (!seenArc.has(ak)) {{ seenArc.add(ak); arcBins.push([c.arc_lo_days, c.arc_hi_days]); }}
+        if (!seenDt.has(dk)) {{ seenDt.add(dk); dtBins.push([c.dt_lo_days, c.dt_hi_days]); }}
+    }}
+    arcBins.sort((a, b) => a[0] - b[0]);
+    dtBins.sort((a, b) => a[0] - b[0]);
+    const binLabel = b => `${{b[0]}}-${{b[1]}}d`;
+    const compact = v => (v >= 1000 ? (v / 1000) + 'k' : String(v));
+    const binShort = b => `${{compact(b[0])}}–${{compact(b[1])}}`;
+    const arcLabels = arcBins.map(binShort), dtLabels = dtBins.map(binShort);
+    // The full "lo-hi days" form still names every cell in its hover.
+    const arcFull = arcBins.map(binLabel), dtFull = dtBins.map(binLabel);
+    // Heat axes are NUMERIC indices with array ticks, not Plotly categories:
+    // overlay markers (hatch, over-range chevrons, selection strokes) need
+    // fractional cell-relative coordinates, and a category axis has none.
+    const arcIx = arcBins.map((b, i) => i), dtIx = dtBins.map((b, i) => i);
+    const arcIdx = new Map(arcBins.map((b, i) => [binKey(b[0], b[1]), i]));
+    const dtIdx = new Map(dtBins.map((b, i) => [binKey(b[0], b[1]), i]));
+
+    const ck = (cls, tool, arm, ai, di) => pwKey(cls, tool, arm, ai, di);
+    const cellAt = new Map();
+    for (const c of cells) {{
+        if (c.sigma_table !== PW_SIGMA) continue;
+        cellAt.set(ck(c.class, c.tool, c.config_arm,
+                      arcIdx.get(binKey(c.arc_lo_days, c.arc_hi_days)),
+                      dtIdx.get(binKey(c.dt_lo_days, c.dt_hi_days))), c);
+    }}
+
+    // ── which classes each series actually delivered. A series that ran but
+    // scored nothing keeps its cells at n_objects = 0; drawing an all-null
+    // heatmap for it would read as a rendering gap rather than as the runner
+    // outcome it is, so those are named instead of plotted.
+    const seriesInfo = new Map();
+    for (const s of seriesList) seriesInfo.set(s.key, {{ classes: [], nCells: 0, nPopulated: 0 }});
+    for (const c of cells) {{
+        if (c.sigma_table !== PW_SIGMA) continue;
+        const info = seriesInfo.get(pwKey(c.tool, c.config_arm));
+        if (!info) continue;
+        info.nCells++;
+        if (c.n_objects > 0 && (c.med_sep_arcsec != null || c.med_d2_norm != null)) {{
+            info.nPopulated++;
+            if (info.classes.indexOf(c.class) < 0) info.classes.push(c.class);
+        }}
+    }}
+    for (const info of seriesInfo.values()) info.classes.sort();
+
+    // ── pooled d² histograms, keyed by series. Absence is meaningful: a
+    // sigma1d-only sidecar carries no held-out d² at all.
+    const histByKey = new Map();
+    for (const h of ((predictAgg && predictAgg.d2_histograms) || [])) {{
+        if (h.class !== 'all' || h.sigma_table !== PW_SIGMA || !h.n) continue;
+        histByKey.set(pwKey(h.tool, h.config_arm), h);
+    }}
+    // ── reduced-χ² histograms, keyed by series. A series whose runner reports
+    // no reduced χ² is named as "not reported" — never drawn as a flat zero.
+    const rchi2ByKey = new Map();
+    for (const h of ((predictAgg && predictAgg.reduced_chi2) || [])) {{
+        rchi2ByKey.set(pwKey(h.tool, h.config_arm), h);
+    }}
+    // ── per-object walk timelines, keyed by (series, object) ──
+    const timelines = (predictAgg && predictAgg.per_window) || [];
+    const tlByKey = new Map();
+    const tlObjects = [];
+    {{
+        const seen = new Set();
+        for (const t of timelines) {{
+            tlByKey.set(pwKey(t.tool, t.config_arm, t.object), t);
+            if (!seen.has(t.object)) {{ seen.add(t.object); tlObjects.push({{ object: t.object, cls: t.class }}); }}
+        }}
+        tlObjects.sort((a, b) => a.cls.localeCompare(b.cls) || a.object.localeCompare(b.object));
+    }}
+    // Default object: a near-Earth asteroid a reader will recognise, since the
+    // panel exists to make one orbit's walk legible. Falls through to any NEA,
+    // then to whatever the family carries.
+    const TL_PREFERRED = ['Apophis', 'Bennu', 'Didymos', '2024 YR4', 'Eros'];
+    let tlObject = null;
+    for (const p of TL_PREFERRED) if (tlObjects.some(o => o.object === p)) {{ tlObject = p; break; }}
+    if (!tlObject) {{
+        const nea = tlObjects.find(o => o.cls === 'NEA');
+        tlObject = nea ? nea.object : (tlObjects.length ? tlObjects[0].object : null);
+    }}
+
+    // ── per-object summaries, indexed ──
+    const poByKey = new Map();
+    for (const p of perObject) poByKey.set(pwKey(p.object, p.tool, p.config_arm), p);
+    const poByArm = new Map();
+    for (const p of perObject) {{
+        const k = pwKey(p.tool, p.config_arm);
+        if (!poByArm.has(k)) poByArm.set(k, []);
+        poByArm.get(k).push(p);
+    }}
+
+    // χ²₂ quantiles on the published scale (median(d²)/(2 ln 2) = 1 when
+    // calibrated): where a single calibrated night's statistic falls.
+    const chi2q = p => -2 * Math.log(1 - p) / (2 * Math.LN2);
+    // Plotly labels a log axis' minor ticks with the mantissa alone, so 0.5
+    // reads as "5" directly under a real 5. Label 1-2-5 per decade (decades
+    // only once the span is wide) with the full value spelled out.
+    const logTicks = r => {{
+        if (!r) return {{}};
+        const d0 = Math.floor(r[0]), d1 = Math.ceil(r[1]);
+        const mant = (d1 - d0) <= 3 ? [1, 2, 5] : [1];
+        const step = (d1 - d0) <= 8 ? 1 : Math.ceil((d1 - d0) / 8);
+        const tickvals = [], ticktext = [];
+        for (let d = d0; d <= d1; d += step) for (const m of mant) {{
+            const l = d + Math.log10(m);
+            if (l < r[0] || l > r[1]) continue;
+            const v = m * Math.pow(10, d);
+            // `range` on a log axis is in log₁₀ units but `tickvals` is in
+            // data units — Plotly takes the log itself. Mixing the two puts
+            // every tick in the wrong place.
+            tickvals.push(v);
+            ticktext.push((v >= 10000 || v < 0.001)
+                ? v.toExponential(0).replace('e+', 'e')
+                : String(Number(v.toPrecision(3))));
+        }}
+        return {{ tickmode: 'array', tickvals: tickvals, ticktext: ticktext }};
+    }};
+
+    // ── colour ramps ───────────────────────────────────────────────────
+    // Accuracy is a magnitude, so it gets a genuine single-hue sequential
+    // ramp (the old blues→orange scale read as diverging and implied a
+    // neutral point that median separation does not have). Every stop is
+    // held above a lightness floor: the darkest measures 4.1:1 against the
+    // #151b23 panel, so an accurate cell reads as a cell and not as a hole
+    // in the support. Monotone in OKLab L across the ramp.
+    const PW_ACC_SCALE = [[0, '#4c8396'], [0.25, '#579cae'], [0.5, '#61b7c5'], [0.75, '#6dd1db'], [1, '#7aedf0']];
+    // Diverging (realism), centered on 0 = calibrated. Hot = over-confident.
+    const PW_REAL_SCALE = [[0, '#1d4f8c'], [0.25, '#5b9bd5'], [0.5, '#e8e8ec'], [0.75, '#e08a5a'], [1, '#d05040']];
+    // The factorial matrices: cool → hot over a magnitude with no neutral
+    // point in range. Perceptually ordered violet → peach, monotone in
+    // OKLab L, every stop ≥ 3.9:1 on the panel so the printed value stays
+    // legible in dark ink on every tile.
+    const PW_MATRIX_SCALE = [[0, '#8b6fba'], [0.25, '#be79b8'], [0.5, '#ea88a7'], [0.75, '#fda799'], [1, '#fdcca6']];
+    // Ink for a value printed on a matrix tile. Every ramp stop clears 3.9:1
+    // against this, so one ink works across the whole scale.
+    const PW_TILE_INK = '#151b23';
+    const PW_HATCH_COLOR = 'rgba(232,232,236,0.55)';
+
+    // Range from VERDICT-ELIGIBLE cells only (n_objects ≥ PW_MIN_OBJECTS),
+    // clipped to robust percentiles of the data actually drawn. Absolute
+    // extremes are exactly the wrong anchor here: one layup MainBelt cell
+    // publishing d²ₙ = 2.1e-31 (log₂ = −102) on two objects would set every
+    // realism range in the block for data that spans ±6.
+    function heatRange(grids, diverging, floor) {{
+        const elig = [], all = [];
+        for (const g of grids) for (const e of g.flat) {{ all.push(e.v); if (e.elig) elig.push(e.v); }}
+        const src = sortedNums(elig.length >= 4 ? elig : all);
+        if (!src.length) return diverging ? [-floor, floor] : [0, 1];
+        let lo = pctOf(src, PW_RANGE_PCT[0]), hi = pctOf(src, PW_RANGE_PCT[1]);
+        if (diverging) {{
+            lo = Math.min(lo, -floor); hi = Math.max(hi, floor);
+        }} else if (hi - lo < 0.5) {{
+            // A single distinct value would otherwise sit exactly on zmin and
+            // render as one end of the scale with nothing to compare it to.
+            const pad = (0.5 - (hi - lo)) / 2; lo -= pad; hi += pad;
+        }}
+        return [lo, hi];
+    }}
+
+    function cellState(c, v) {{
+        if (!c || c.n_objects === 0) return 'unsupported';
+        if (v == null || !isFinite(v)) return 'valueless';
+        return c.n_objects < PW_MIN_OBJECTS ? 'lown' : 'ok';
+    }}
+    function hoverFor(c, ai, di, v, range) {{
+        if (!c) return '';
+        const s = seriesByKey.get(pwKey(c.tool, c.config_arm));
+        const st = cellState(c, v);
+        const clipped = range && v != null && isFinite(v) && (v < range[0] || v > range[1]);
+        return `<b>${{c.class}}</b> · ${{s ? pwHoverLabel(s) : c.tool + ' · ' + c.config_arm}}<br>`
+            + `arc ${{arcFull[ai]}} · Δt ${{dtFull[di]}}<br>`
+            + `med sep ${{fmtN(c.med_sep_arcsec, 3)}}″ · med d²ₙ ${{fmtN(c.med_d2_norm, 2)}}<br>`
+            + `n_objects ${{c.n_objects}} · n_windows ${{c.n_windows}} · n_pred ${{c.n_predictions}}<br>`
+            + `delivered ${{fmtPct(c.delivered_fraction)}} · cov 1σ ${{fmtN(c.cov_1s, 2)}} (0.394) · 2σ ${{fmtN(c.cov_2s, 2)}} (0.865)`
+            + (st === 'lown' ? `<br><b>hatched: low n (${{c.n_objects}} < ${{PW_MIN_OBJECTS}} objects) — excluded from verdicts and from the colour range</b>` : '')
+            + (st === 'valueless' ? '<br><b>no realism statistic — this cell has predictions but no Σ_pred-dominated held-out d²</b>' : '')
+            + (clipped ? `<br><b>beyond the shared colour range — true value ${{v.toFixed(2)}}, tile drawn at the clipped end</b>` : '');
+    }}
+
+    // One value plane at full saturation, plus the marks that say what kind
+    // of cell each one is. Three states are drawn differently and never
+    // conflated: unsupported (no fill, never annotated), low-n (hatched, its
+    // value fully rendered), and value-less (has predictions but no realism
+    // statistic — an open dot, no fill).
+    function grid(cls, tool, arm, valueOf, range) {{
+        const z = [], text = [], flat = [];
+        const hatch = {{ x: [], y: [] }}, vless = {{ x: [], y: [] }}, over = {{ x: [], y: [], t: [] }};
+        for (let di = 0; di < dtBins.length; di++) {{
+            const rz = [], rt = [];
+            for (let ai = 0; ai < arcBins.length; ai++) {{
+                const c = cellAt.get(ck(cls, tool, arm, ai, di));
+                const v = c ? valueOf(c) : null;
+                const st = cellState(c, v);
+                const ok = st === 'ok' || st === 'lown';
+                rz.push(ok ? v : null);
+                rt.push(hoverFor(c, ai, di, v, range));
+                if (ok) {{
+                    flat.push({{ v: v, elig: st === 'ok' }});
+                    if (st === 'lown') {{ hatch.x.push(ai); hatch.y.push(di); }}
+                    if (range && (v < range[0] || v > range[1])) {{
+                        over.x.push(ai); over.y.push(di); over.t.push(v > range[1] ? 1 : -1);
+                    }}
+                }} else if (st === 'valueless') {{
+                    vless.x.push(ai); vless.y.push(di);
+                }}
+            }}
+            z.push(rz); text.push(rt);
+        }}
+        return {{ z: z, text: text, flat: flat, hatch: hatch, vless: vless, over: over }};
+    }}
+
+    const accOf = c => (c.med_sep_arcsec != null && c.med_sep_arcsec > 0) ? Math.log10(c.med_sep_arcsec) : null;
+    const realOf = c => (c.med_d2_norm != null && c.med_d2_norm > 0) ? Math.log2(c.med_d2_norm) : null;
+
+    // Overlay marks. Plotly has no hatch fill, so low-n is drawn as a pair of
+    // offset diagonal line glyphs per cell — it reads as hatching at cell
+    // size and, unlike the old 0.3 opacity, does not make a calibrated cell
+    // the most visible thing on the panel by compositing toward the ground.
+    function markTraces(g) {{
+        const out = [];
+        const mk = (pts, marker, name, hover) => ({{
+            type: 'scatter', mode: 'markers', x: pts.x, y: pts.y,
+            marker: marker, name: name, showlegend: false,
+            hovertemplate: hover, hoverlabel: {{ bgcolor: '#151b23' }},
+        }});
+        for (const dx of [-0.17, 0.17]) {{
+            if (!g.hatch.x.length) break;
+            out.push(mk({{ x: g.hatch.x.map(v => v + dx), y: g.hatch.y }},
+                {{ symbol: 'line-ne-open', size: 15, angle: 0, color: PW_HATCH_COLOR,
+                  line: {{ color: PW_HATCH_COLOR, width: 1.4 }} }},
+                'low n', '<extra></extra>'));
+        }}
+        if (g.vless.x.length) {{
+            out.push(mk(g.vless,
+                {{ symbol: 'circle-open', size: 5, color: 'rgba(160,168,178,0.9)',
+                  line: {{ color: 'rgba(160,168,178,0.9)', width: 1.2 }} }},
+                'no statistic', '<extra></extra>'));
+        }}
+        if (g.over.x.length) {{
+            const up = {{ x: [], y: [] }}, dn = {{ x: [], y: [] }};
+            g.over.x.forEach((x, i) => {{
+                (g.over.t[i] > 0 ? up : dn).x.push(x + 0.33);
+                (g.over.t[i] > 0 ? up : dn).y.push(g.over.y[i] + 0.3);
+            }});
+            if (up.x.length) out.push(mk(up, {{ symbol: 'triangle-up', size: 6, color: '#f2f4f7' }}, 'over range', '<extra></extra>'));
+            if (dn.x.length) out.push(mk(dn, {{ symbol: 'triangle-down', size: 6, color: '#f2f4f7' }}, 'under range', '<extra></extra>'));
+        }}
+        return out;
+    }}
+
+    function heatTraces(g, scale, zmin, zmax, zmid, showscale, cbTitle) {{
+        const heat = {{
+            type: 'heatmap', x: arcIx, y: dtIx, z: g.z, text: g.text,
+            colorscale: scale, zmin: zmin, zmax: zmax, xgap: 1, ygap: 1,
+            hoverongaps: false, hovertemplate: '%{{text}}<extra></extra>',
+            showscale: showscale,
+            colorbar: {{ title: {{ text: cbTitle, font: {{ size: 9 }} }}, thickness: 10, len: 0.92, tickfont: {{ size: 8 }} }},
+        }};
+        if (zmid != null) heat.zmid = zmid;
+        return [heat].concat(markTraces(g));
+    }}
+    function heatLayout(title, height, opts) {{
+        const o = opts || {{}};
+        return Object.assign({{}}, baseLayout, {{
+            title: title ? {{ text: title, font: {{ size: 11, color: '#8b9198' }}, x: 0, xanchor: 'left' }} : undefined,
+            margin: {{ l: o.left == null ? 78 : o.left, r: o.right == null ? 76 : o.right, t: o.top == null ? 52 : o.top, b: 26 }},
+            height: height,
+            // Labels on top: the reader arrives at a surface from the caption
+            // above it, and a bottom axis puts the units furthest from where
+            // the eye enters.
+            xaxis: Object.assign(ax('input arc (days)'), {{
+                title: {{ text: 'input arc (days)', font: {{ size: 10 }}, standoff: 6 }},
+                tickmode: 'array', tickvals: arcIx, ticktext: arcLabels, side: 'top', tickangle: 0,
+                range: [-0.5, arcBins.length - 0.5], tickfont: {{ size: 8 }}, showgrid: false, zeroline: false,
+            }}),
+            yaxis: Object.assign(ax(o.yTitle === null ? '' : 'horizon Δt (days)'), {{
+                tickmode: 'array', tickvals: dtIx, ticktext: o.yTicks === false ? dtIx.map(() => '') : dtLabels,
+                range: [-0.5, dtBins.length - 0.5], tickfont: {{ size: 8 }}, showgrid: false, zeroline: false,
+            }}),
+            showlegend: false,
+        }});
+    }}
+    const PW_PLOT_CFG = {{ responsive: true, displayModeBar: 'hover', modeBarButtonsToRemove: ['select2d', 'lasso2d', 'autoScale2d', 'toggleSpikelines'] }};
+    const TL_PLOT_CFG = {{ responsive: true, displayModeBar: 'hover', modeBarButtonsToRemove: ['select2d', 'lasso2d', 'toggleSpikelines'] }};
+
+    // ══ the factorial matrices ══════════════════════════════════════════
+    // The whole 36-arm grid on one screen, twice: pooled median d²ₙ and the
+    // χ²₂-99% tail rate. Rows are rejection × nightly, columns are
+    // debias × transport with debias as the OUTER group, because debias is
+    // the largest main effect and the matrix has to split visibly left/right
+    // for that to be readable at a glance.
+    const mxTransports = PW_TRANSPORT.filter(t => rustSeries.some(s => s.axes && s.transport === t));
+    const mxRows = [];
+    for (const rej of PW_REJECTION) for (const ni of PW_NIGHTLY) {{
+        if (rustSeries.some(s => s.axes && s.axes.rejection === rej && s.axes.nightly === ni)) mxRows.push({{ rej: rej, ni: ni }});
+    }}
+    const mxCols = [];
+    for (const db of PW_DEBIAS) for (const tr of mxTransports) {{
+        if (rustSeries.some(s => s.axes && s.axes.debias === db && s.transport === tr)) mxCols.push({{ db: db, tr: tr }});
+    }}
+    const mxAt = (r, c) => rustSeries.find(s => s.axes && s.axes.rejection === r.rej && s.axes.nightly === r.ni
+        && s.axes.debias === c.db && s.transport === c.tr) || null;
+
+    // Survival P(d² > x) from the log-spaced companion bins, interpolating
+    // linearly in log₁₀ inside the straddling bin. Falls back to the linear
+    // family for aggregates written before the survival bins existed — an
+    // older file then answers only at its own domain edge, which is honest
+    // and is exactly what the caption says.
+    function survivalAt(h, x) {{
+        if (!h || !h.n) return null;
+        if (h.log_counts && h.log_counts.length) {{
+            const nb = h.log_counts.length, w = (h.log10_hi - h.log10_lo) / nb, l = Math.log10(x);
+            if (l >= h.log10_hi) return h.log_overflow / h.n;
+            let above = h.log_overflow;
+            for (let i = nb - 1; i >= 0; i--) {{
+                const e0 = h.log10_lo + i * w;
+                if (e0 >= l) {{ above += h.log_counts[i]; continue; }}
+                if (e0 + w > l) above += h.log_counts[i] * (e0 + w - l) / w;
+                break;
+            }}
+            return above / h.n;
+        }}
+        if (x >= h.domain_max) return h.overflow / h.n;
+        const w = h.domain_max / h.counts.length;
+        let above = h.overflow;
+        for (let i = h.counts.length - 1; i >= 0; i--) {{
+            const e0 = i * w;
+            if (e0 >= x) {{ above += h.counts[i]; continue; }}
+            if (e0 + w > x) above += h.counts[i] * (e0 + w - x) / w;
+            break;
+        }}
+        return above / h.n;
+    }}
+    const CAL_TAIL = Math.exp(-PW_CHI2_2_P99 / 2);
+    // Object-equal-weight pooled median: the object is the independent unit
+    // everywhere else in this section, so the matrix uses the same unit.
+    const armMedian = s => s ? medOf((poByArm.get(s.key) || []).map(p => p.med_d2_norm)) : null;
+    const armTail = s => s ? survivalAt(histByKey.get(s.key), PW_CHI2_2_P99) : null;
+    const armFail = s => {{
+        const rows = s ? (poByArm.get(s.key) || []) : [];
+        let exp = 0, fail = 0;
+        for (const p of rows) {{ exp += p.n_windows_expected || 0; fail += p.n_windows_failed || 0; }}
+        return exp ? fail / exp : null;
+    }};
+    const armNObj = s => s ? (poByArm.get(s.key) || []).filter(p => p.med_d2_norm != null).length : 0;
+
+    // The measured statement that replaces the section's old claim that a
+    // rejection-on arm should land near 2.6-4.0. That was an assertion; the
+    // paired per-object on/off ratio is a measurement, and it came back at
+    // parity, so the assertion does not survive anywhere on the page.
+    function pairedRejectionRatio() {{
+        if (!refRust) return null;
+        const off = rustSeries.find(s => s.axes && s.transport === refRust.transport
+            && s.axes.debias === refRust.axes.debias && s.axes.nightly === refRust.axes.nightly
+            && s.axes.rejection === 'norej');
+        if (!off) return null;
+        const ratios = [];
+        for (const p of (poByArm.get(refRust.key) || [])) {{
+            const q = poByKey.get(pwKey(p.object, off.tool, off.arm));
+            if (p.med_d2_norm > 0 && q && q.med_d2_norm > 0) ratios.push(p.med_d2_norm / q.med_d2_norm);
+        }}
+        return ratios.length ? {{ ratio: medOf(ratios), n: ratios.length }} : null;
+    }}
+    const PAIRED = pairedRejectionRatio();
+    const PW_PAIRED_NOTE = PAIRED
+        ? `paired per-object rejection on/off ratio: <b>${{PAIRED.ratio.toFixed(2)}}×</b> over n = ${{PAIRED.n}} objects — selection does not measurably deflate published σ on this corpus.`
+        : 'the paired rejection on/off control is not in this selection of aggregates, so no deflation factor is measured here.';
+
+    function matrixFigure(el, valueOf, fmt, cbTitle, opts) {{
+        const o = opts || {{}};
+        const z = [], text = [], ann = [], shapes = [], flat = [];
+        let divider = null;
+        const custom = [];
+        for (let ri = 0; ri < mxRows.length; ri++) {{
+            const rz = [], rt = [], rc = [];
+            for (let ci = 0; ci < mxCols.length; ci++) {{
+                const s = mxAt(mxRows[ri], mxCols[ci]);
+                const v = s ? valueOf(s) : null;
+                const ok = v != null && isFinite(v);
+                rz.push(ok ? v : null);
+                rc.push(s ? s.arm : '');
+                if (ok) flat.push(v);
+                rt.push(s ? `${{pwHoverLabel(s)}}<br>${{cbTitle}} <b>${{fmt(v)}}</b><br>`
+                    + `objects with a statistic ${{armNObj(s)}} · windows failed ${{fmtPct(armFail(s))}}`
+                    + '<br><span style="color:#8b9198">click to select this arm below</span>' : '');
+            }}
+            z.push(rz); text.push(rt); custom.push(rc);
+        }}
+        const src = sortedNums(flat);
+        const zmin = src.length ? pctOf(src, PW_RANGE_PCT[0]) : 0;
+        const zmax = src.length ? pctOf(src, PW_RANGE_PCT[1]) : 1;
+        // Values are printed in every tile at 12px mono. This is a
+        // deliberate, owner-approved exception to the minimal-text rule:
+        // 36 numbers on a 36-cell grid ARE the data, not a caption on it.
+        for (let ri = 0; ri < mxRows.length; ri++) for (let ci = 0; ci < mxCols.length; ci++) {{
+            const v = z[ri][ci];
+            if (v == null) continue;
+            ann.push({{
+                x: ci, y: ri, text: fmt(v), showarrow: false,
+                font: {{ size: 12, color: PW_TILE_INK, family: 'JetBrains Mono' }},
+            }});
+        }}
+        // Group headers and the debias split. The divider is what makes the
+        // largest main effect visible before a single number is read.
+        const nTr = mxTransports.length;
+        for (let gi = 0; gi * nTr < mxCols.length; gi++) {{
+            const c0 = gi * nTr, c1 = Math.min(mxCols.length, c0 + nTr) - 1;
+            ann.push({{
+                x: (c0 + c1) / 2, y: 1.0, xref: 'x', yref: 'paper', yanchor: 'bottom', yshift: 26,
+                text: '<b>' + PW_DEBIAS_LABEL[mxCols[c0].db] + '</b>', showarrow: false,
+                font: {{ size: 11, color: '#c9d4e0' }},
+            }});
+            shapes.push({{
+                type: 'line', xref: 'x', yref: 'paper', x0: c0 - 0.42, x1: c1 + 0.42, y0: 1, y1: 1,
+                yshift: 22, line: {{ color: '#3a4550', width: 1 }},
+            }});
+            if (c1 + 1 < mxCols.length) {{
+                // Pushed last, below, so the non-convergence borders cannot
+                // paint over the one line that carries the biggest effect.
+                divider = {{
+                    type: 'line', xref: 'x', yref: 'paper', x0: c1 + 0.5, x1: c1 + 0.5, y0: 0, y1: 1,
+                    line: {{ color: '#8b9198', width: 2 }}, layer: 'above',
+                }};
+            }}
+        }}
+        // Non-convergence border. Every arm on this corpus loses SOME windows
+        // (6-11%), so keying the border on "any failure" draws it on all 36
+        // tiles, and a box round every tile is gridlines, not a warning. Only
+        // the worst third of the observed spread is marked — the border says
+        // "this arm loses more windows than its siblings" — with an absolute
+        // red above 20% so a genuinely broken walk still shouts. The floor
+        // and the span are named in the caption, so an unbordered tile is
+        // never read as a walk that lost nothing.
+        const BORDER_FROM = 0.6;
+        let borderSpan = null;
+        if (o.borderBy) {{
+            const fs = sortedNums(mxRows.flatMap(r => mxCols.map(c => {{
+                const s = mxAt(r, c);
+                return s ? o.borderBy(s) : null;
+            }})));
+            if (fs.length) borderSpan = [fs[0], fs[fs.length - 1]];
+            for (let ri = 0; ri < mxRows.length; ri++) for (let ci = 0; ci < mxCols.length; ci++) {{
+                const s = mxAt(mxRows[ri], mxCols[ci]);
+                const f = s ? o.borderBy(s) : null;
+                if (f == null) continue;
+                const span = borderSpan[1] - borderSpan[0];
+                const t = span > 0 ? (f - borderSpan[0]) / span : 0;
+                if (f < 0.2 && t < BORDER_FROM) continue;
+                shapes.push({{
+                    type: 'rect', x0: ci - 0.48, x1: ci + 0.48, y0: ri - 0.48, y1: ri + 0.48,
+                    line: {{ color: f >= 0.2 ? '#d05040' : '#e8a040', width: 1.0 + 1.4 * t }},
+                    fillcolor: 'rgba(0,0,0,0)', layer: 'above',
+                }});
+            }}
+        }}
+        // The currently selected arms are stroked white, so the matrix reads
+        // as the primary selector it now is: what is highlighted here is
+        // exactly what every panel below is drawing.
+        for (let ri = 0; ri < mxRows.length; ri++) for (let ci = 0; ci < mxCols.length; ci++) {{
+            const s = mxAt(mxRows[ri], mxCols[ci]);
+            if (!s || !selected.has(s.key)) continue;
+            shapes.push({{
+                type: 'rect', x0: ci - 0.5, x1: ci + 0.5, y0: ri - 0.5, y1: ri + 0.5,
+                line: {{ color: '#ffffff', width: 1.6 }}, fillcolor: 'rgba(0,0,0,0)', layer: 'above',
+            }});
+        }}
+        // The calibrated point is marked at the colour bar's LOW EDGE, not
+        // inside it: on this corpus every arm sits above d²ₙ = 1, so 1.0 is
+        // off the bottom of the scale and drawing it as a tick inside the
+        // bar would put it somewhere it is not.
+        if (o.calibratedAt != null && src.length) {{
+            ann.push({{
+                xref: 'paper', yref: 'paper', x: 1.012, y: 0.02, xanchor: 'left', yanchor: 'middle',
+                text: `▼ calibrated ${{o.calibratedAt}}`, showarrow: false,
+                font: {{ size: 8, color: '#c9d4e0' }},
+            }});
+        }}
+        if (divider) shapes.push(divider);
+        const layout = Object.assign({{}}, baseLayout, {{
+            title: {{ text: o.title, font: {{ size: 12, color: '#c9d4e0' }}, x: 0, xanchor: 'left', y: 0.985, yanchor: 'top' }},
+            margin: {{ l: o.left, r: o.right, t: 96, b: 16 }},
+            height: 46 * mxRows.length + 130,
+            xaxis: {{
+                tickmode: 'array', tickvals: mxCols.map((c, i) => i), side: 'top',
+                ticktext: mxCols.map(c => PW_LEVEL_SHORT[c.tr]),
+                range: [-0.5, mxCols.length - 0.5], showgrid: false, zeroline: false,
+                tickfont: {{ size: 9, color: '#8b9198' }}, color: '#8b9198',
+            }},
+            yaxis: {{
+                tickmode: 'array', tickvals: mxRows.map((r, i) => i),
+                ticktext: mxRows.map(r => o.yTicks === false ? '' : PW_LEVEL_SHORT[r.rej] + ' · ' + PW_LEVEL_SHORT[r.ni]),
+                range: [mxRows.length - 0.5, -0.5], showgrid: false, zeroline: false,
+                tickfont: {{ size: 9, color: '#c9d4e0' }}, color: '#8b9198',
+            }},
+            annotations: ann, shapes: shapes, showlegend: false,
+        }});
+        const trace = {{
+            type: 'heatmap', x: mxCols.map((c, i) => i), y: mxRows.map((r, i) => i),
+            z: z, text: text, customdata: custom, colorscale: PW_MATRIX_SCALE,
+            zmin: zmin, zmax: zmax, xgap: 3, ygap: 3, hoverongaps: false,
+            hovertemplate: '%{{text}}<extra></extra>',
+            colorbar: {{ title: {{ text: cbTitle, font: {{ size: 9 }} }}, thickness: 10, len: 0.8, y: 0.42, tickfont: {{ size: 8 }} }},
+        }};
+        Plotly.newPlot(el, [trace], layout, PW_PLOT_CFG);
+        return {{ zmin: zmin, zmax: zmax, values: flat, borderSpan: borderSpan }};
+    }}
+
+    const mxBest = valueOf => {{
+        let best = null, bv = Infinity;
+        for (const r of mxRows) for (const c of mxCols) {{
+            const s = mxAt(r, c); if (!s) continue;
+            const v = valueOf(s);
+            if (v != null && isFinite(v) && v < bv) {{ bv = v; best = s; }}
+        }}
+        return best;
+    }};
+
+    function renderMatrices() {{
+        const medEl = document.getElementById('pw-matrix-med');
+        const tailEl = document.getElementById('pw-matrix-tail');
+        const noteEl = document.getElementById('pw-matrix-note');
+        if (!medEl || !tailEl) return;
+        purgeIn(medEl); purgeIn(tailEl);
+        if (!mxRows.length || !mxCols.length) {{
+            medEl.innerHTML = loud('these aggregates carry no arms with a parsed (debias × rejection × nightly × transport) decomposition, so the factorial matrix has no grid to draw. The per-series panels below are unaffected.');
+            tailEl.innerHTML = '';
+            return;
+        }}
+        // Plot into a fresh child node each time. Plotly's event emitter
+        // lives on the plot element, so re-plotting the same node would stack
+        // a new plotly_click handler on every re-render and one click would
+        // fire the selection N times.
+        medEl.innerHTML = '<div></div>'; tailEl.innerHTML = '<div></div>';
+        const medPlot = medEl.firstChild, tailPlot = tailEl.firstChild;
+        const med = matrixFigure(medPlot, armMedian, v => v.toFixed(2), 'median d²ₙ', {{
+            title: 'pooled median d²ₙ — object-equal-weight', left: 132, right: 84,
+            borderBy: armFail, calibratedAt: '1.00',
+        }});
+        const tail = matrixFigure(tailPlot, armTail, v => (100 * v).toFixed(1) + '%', 'tail rate', {{
+            title: `beyond χ²₂-99% (d² > ${{PW_CHI2_2_P99.toFixed(2)}})`,
+            left: 16, right: 88, yTicks: false, calibratedAt: (100 * CAL_TAIL).toFixed(1) + '%',
+        }});
+        mxStats = {{ med: med, tail: tail }};
+        for (const el of [medPlot, tailPlot]) {{
+            if (!el.on) continue;
+            el.on('plotly_click', ev => {{
+                const pt = ev && ev.points && ev.points[0];
+                const arm = pt && pt.customdata;
+                if (!arm) return;
+                const s = byArm('rust', arm);
+                if (!s) return;
+                setSelection([s]);
+                syncInputs();
+                pwRenderAll();
+                const target = document.getElementById('pw-surfaces');
+                if (target && target.scrollIntoView) target.scrollIntoView({{ behavior: 'smooth', block: 'start' }});
+            }});
+        }}
+        if (noteEl) {{
+            const bits = [];
+            if (med.values.length) {{
+                const lo = Math.min.apply(null, med.values), hi = Math.max.apply(null, med.values);
+                const bestMed = mxBest(armMedian), bestTail = mxBest(armTail);
+                bits.push(`Every arm sits above the calibrated 1.00 — the median spans ${{lo.toFixed(2)}}–${{hi.toFixed(2)}} and the colour range is clipped to the 2nd/98th percentile of those ${{med.values.length}} numbers, so the scale resolves differences of a few hundredths.`);
+                if (bestMed && bestTail && bestMed.key !== bestTail.key) {{
+                    bits.push(`<b>The two matrices disagree, and that is the finding.</b> Lowest median d²ₙ is <b>${{pwLabel(bestMed)}}</b> (${{armMedian(bestMed).toFixed(2)}}, tail ${{(100 * armTail(bestMed)).toFixed(1)}}%); lowest tail is <b>${{pwLabel(bestTail)}}</b> (${{(100 * armTail(bestTail)).toFixed(1)}}%, median ${{armMedian(bestTail).toFixed(2)}}). No single arm is best on both; the main-effects panels below separate how much of that is a real tradeoff and how much is an interaction.`);
+                }}
+            }}
+            if (med.borderSpan) {{
+                bits.push(`Tile borders scale with how many windows a configuration lost, and mark only the worst third of the ${{(100 * med.borderSpan[0]).toFixed(1)}}%–${{(100 * med.borderSpan[1]).toFixed(1)}}% these arms actually span. <b>Every arm loses some windows</b> — an unbordered tile is the lower end of that range, never a clean walk. Amber is relative to its siblings; red would be an absolute 20% or worse, which no arm here reaches.`);
+            }}
+            bits.push(PW_PAIRED_NOTE);
+            noteEl.innerHTML = bits.join('<br>');
+        }}
+    }}
+
+    // ── worst offenders: the objects driving the pooled statistic ──
+    function renderWorst() {{
+        const el = document.getElementById('pw-worst');
+        if (!el) return;
+        const arm = currentSeries().find(s => s.axes) || currentSeries()[0] || refRust;
+        if (!arm) {{ el.innerHTML = ''; return; }}
+        const rows = (poByArm.get(arm.key) || [])
+            .filter(p => p.med_d2_norm != null && p.med_d2_norm > 0)
+            .map(p => ({{ p: p, l2: Math.log2(p.med_d2_norm) }}))
+            .sort((a, b) => Math.abs(b.l2) - Math.abs(a.l2))
+            .slice(0, 6);
+        if (!rows.length) {{ el.innerHTML = ''; return; }}
+        el.innerHTML = `<div class="pw-worst-head">Worst offenders · ${{pwLabel(arm)}} — the six objects furthest from calibrated, by |log₂ d²ₙ|</div>`
+            + '<div class="pw-worst-row">' + rows.map(r =>
+                `<div class="pw-worst-chip" title="${{r.p.n_windows_converged}}/${{r.p.n_windows_expected}} windows converged · median separation ${{fmtN(r.p.med_sep_arcsec, 2)}}″">`
+                + `<div class="pw-worst-obj">${{r.p.object}}</div>`
+                + `<div class="pw-worst-val" style="color:${{r.l2 > 0 ? 'var(--ed-error-text)' : 'var(--ed-info-text, #5b9bd5)'}}">${{r.p.med_d2_norm >= 100 ? r.p.med_d2_norm.toPrecision(3) : r.p.med_d2_norm.toFixed(2)}}</div>`
+                + `<div class="pw-worst-sub">${{r.p.class}} · log₂ ${{r.l2 > 0 ? '+' : ''}}${{r.l2.toFixed(1)}} · ${{r.p.n_windows_converged}}/${{r.p.n_windows_expected}} win</div>`
+                + '</div>').join('') + '</div>';
+    }}
+
+    // ── main-effects strips ────────────────────────────────────────────
+    // One panel per factor: every combination of the other three as a faint
+    // line, the marginal as the heavy one. Drawn twice — median above, tail
+    // below — because the slopes invert between them, and that inversion is
+    // the reason no single arm wins.
+    const EFFECT_AXES = ['debias', 'rejection', 'nightly', 'transport'];
+    const axisLevels = axis => (axis === 'transport' ? mxTransports : PW_AXIS_LEVELS[axis])
+        .filter(l => rustSeries.some(s => s.axes && (axis === 'transport' ? s.transport : s.axes[axis]) === l));
+    const armFor = spec => rustSeries.find(s => s.axes && s.axes.debias === spec.debias
+        && s.axes.rejection === spec.rejection && s.axes.nightly === spec.nightly && s.transport === spec.transport) || null;
+
+    // Which factors the two metrics agree about, read off the marginals
+    // rather than asserted. A blanket "the slopes invert" would be wrong on
+    // this corpus: debias and nightly move BOTH metrics the same way, only
+    // rejection disagrees, and transport moves neither.
+    function effectsVerdict() {{
+        const marg = (axis, level, valueOf) => {{
+            const vs = [];
+            for (const s of rustSeries) {{
+                if (!s.axes) continue;
+                const at = axis === 'transport' ? s.transport : s.axes[axis];
+                if (at !== level) continue;
+                const v = valueOf(s);
+                if (v != null && isFinite(v)) vs.push(v);
+            }}
+            return vs.length ? medOf(vs) : null;
+        }};
+        const agree = [], disagree = [], inert = [];
+        for (const axis of EFFECT_AXES) {{
+            const levels = axisLevels(axis);
+            if (levels.length < 2) continue;
+            const m = levels.map(l => marg(axis, l, armMedian));
+            const t = levels.map(l => marg(axis, l, armTail));
+            if (m.some(v => v == null) || t.some(v => v == null)) continue;
+            const spanM = Math.max.apply(null, m) - Math.min.apply(null, m);
+            const spanT = Math.max.apply(null, t) - Math.min.apply(null, t);
+            // "Inert" is a real answer: a factor whose marginal moves the
+            // median by under a hundredth and the tail by under half a point
+            // is not a knob, and saying so is more useful than ranking noise.
+            if (spanM < 0.01 && spanT < 0.005) {{ inert.push({{ axis: axis, spanM: spanM, spanT: spanT }}); continue; }}
+            const bestM = levels[m.indexOf(Math.min.apply(null, m))];
+            const bestT = levels[t.indexOf(Math.min.apply(null, t))];
+            (bestM === bestT ? agree : disagree).push({{ axis: axis, levels: levels, bestM: bestM, bestT: bestT, m: m, t: t }});
+        }}
+        return {{ agree: agree, disagree: disagree, inert: inert }};
+    }}
+    function renderEffectsNote() {{
+        const el = document.getElementById('pw-effects-note');
+        if (!el) return;
+        const v = effectsVerdict();
+        const nameL = l => PW_LEVEL_SHORT[l] || l;
+        const andList = xs => xs.length < 2 ? (xs[0] || '')
+            : xs.slice(0, -1).join(', ') + ' and ' + xs[xs.length - 1];
+        const bits = [];
+        if (v.agree.length) {{
+            bits.push('<b>Both metrics agree</b> on ' + andList(v.agree.map(a =>
+                `${{PW_AXIS_TITLE[a.axis]}} (<b>${{nameL(a.bestM)}}</b> wins the median and the tail)`)) + '.');
+        }}
+        if (v.disagree.length) {{
+            bits.push('<b>They disagree</b> on ' + v.disagree.map(a =>
+                `${{PW_AXIS_TITLE[a.axis]}}: <b>${{nameL(a.bestM)}}</b> has the lowest median d²ₙ (${{Math.min.apply(null, a.m).toFixed(2)}}) but <b>${{nameL(a.bestT)}}</b> has the lowest tail (${{(100 * Math.min.apply(null, a.t)).toFixed(1)}}%)`).join('; ')
+                + ' — that is the axis where a choice actually costs something.');
+        }}
+        if (v.inert.length) {{
+            bits.push(v.inert.map(a =>
+                `<b>${{PW_AXIS_TITLE[a.axis]}} moves neither</b> (median across levels varies by ${{a.spanM.toFixed(3)}}, tail by ${{(100 * a.spanT).toFixed(2)}} points)`
+                + (a.axis === 'transport'
+                    ? ' — <b>on non-encounter geometry</b>, which is all this section scores: encounter-flagged rows are excluded from every panel by construction, and non-linear transport is exactly what they exist for. This is not evidence that sigma points and Monte Carlo buy nothing during an encounter.'
+                    : ' — on this corpus it is not a knob.')).join(' '));
+        }}
+        // The main effects agreeing while the two MATRICES pick different
+        // single arms is an interaction, not a contradiction — and the arm
+        // built from the marginal winners is the one a reader should be
+        // handed, so it is named with both its numbers beside the two
+        // single-metric champions.
+        const spec = {{ debias: null, rejection: null, nightly: null, transport: 'linear' }};
+        for (const a of v.agree) spec[a.axis] = a.bestM;
+        for (const axis of EFFECT_AXES) {{
+            if (spec[axis] == null) spec[axis] = (axisLevels(axis) || [])[0];
+        }}
+        const marginalArm = armFor(spec);
+        const bestM = mxBest(armMedian), bestT = mxBest(armTail);
+        if (marginalArm && bestM && bestT && (bestM.key !== bestT.key)) {{
+            const f = (m, t) => `${{m == null ? '—' : m.toFixed(2)}} / ${{t == null ? '—' : (100 * t).toFixed(1) + '%'}}`;
+            bits.push(`The two matrices above still pick <i>different single arms</i> — that is an interaction, not a main effect. Stacking the marginal winners gives <b>${{pwLabel(marginalArm)}}</b> at ${{f(armMedian(marginalArm), armTail(marginalArm))}} (median / tail), against ${{f(armMedian(bestM), armTail(bestM))}} for the best-median arm and ${{f(armMedian(bestT), armTail(bestT))}} for the best-tail arm.`);
+        }}
+        el.innerHTML = bits.join('<br>');
+    }}
+    function renderEffects(mountId, valueOf, yTitle, fmtY) {{
+        const host = document.getElementById(mountId);
+        if (!host) return;
+        purgeIn(host);
+        host.innerHTML = EFFECT_AXES.map(a => `<div id="${{mountId}}-${{a}}" class="pw-effect-cell"></div>`).join('');
+        // One y range across all four panels. Each panel is its own Plotly
+        // figure, so autoscaling would give every factor its own scale and a
+        // steep-looking slope on a narrow one would mean nothing next to a
+        // shallow-looking slope on a wide one — which is precisely the
+        // comparison these four panels exist to make.
+        const every = [];
+        for (const s2 of rustSeries) if (s2.axes) {{ const v = valueOf(s2); if (v != null && isFinite(v)) every.push(v); }}
+        let yRange;
+        {{
+            const lo = Math.min.apply(null, every), hi = Math.max.apply(null, every);
+            const pad = (hi - lo) * 0.12 || Math.abs(hi) * 0.1 || 1;
+            yRange = every.length ? [lo - pad, hi + pad] : undefined;
+        }}
+        EFFECT_AXES.forEach((axis, ai) => {{
+            const levels = axisLevels(axis);
+            const others = EFFECT_AXES.filter(a => a !== axis);
+            let pool = [[]];
+            for (const o of others) {{
+                const next = [];
+                for (const base of pool) for (const l of axisLevels(o)) next.push(base.concat([[o, l]]));
+                pool = next;
+            }}
+            const traces = [];
+            const perLevel = levels.map(() => []);
+            for (const combo of pool) {{
+                const xs = [], ys = [];
+                levels.forEach((l, li) => {{
+                    const spec = {{ debias: null, rejection: null, nightly: null, transport: null }};
+                    for (const kv of combo) spec[kv[0]] = kv[1];
+                    spec[axis] = l;
+                    const v = valueOf(armFor(spec));
+                    if (v == null || !isFinite(v)) return;
+                    xs.push(li); ys.push(v); perLevel[li].push(v);
+                }});
+                if (xs.length > 1) traces.push({{
+                    x: xs, y: ys, mode: 'lines', line: {{ color: 'rgba(139,145,152,0.30)', width: 1 }},
+                    hoverinfo: 'skip', showlegend: false,
+                }});
+            }}
+            const mx = [], my = [];
+            perLevel.forEach((vs, li) => {{ const m = medOf(vs); if (m != null) {{ mx.push(li); my.push(m); }} }});
+            traces.push({{
+                x: mx, y: my, mode: 'lines+markers',
+                line: {{ color: '#e8e8ec', width: 2.4 }}, marker: {{ size: 7, color: '#e8e8ec' }},
+                name: 'marginal', showlegend: false,
+                hovertemplate: `${{PW_AXIS_TITLE[axis]}} %{{text}}<br>marginal ${{yTitle}} <b>%{{y}}</b><extra></extra>`,
+                text: mx.map(i => PW_LEVEL_SHORT[levels[i]]),
+            }});
+            Plotly.newPlot(`${{mountId}}-${{axis}}`, traces, Object.assign({{}}, baseLayout, {{
+                title: {{ text: PW_AXIS_TITLE[axis], font: {{ size: 10, color: '#c9d4e0' }}, x: 0.5, xanchor: 'center' }},
+                margin: {{ l: ai === 0 ? 52 : 14, r: 8, t: 26, b: 34 }},
+                height: 168,
+                xaxis: {{
+                    tickmode: 'array', tickvals: levels.map((l, i) => i), ticktext: levels.map(l => PW_LEVEL_SHORT[l]),
+                    range: [-0.4, levels.length - 0.6], tickfont: {{ size: 9 }}, color: '#8b9198',
+                    gridcolor: 'rgba(91,155,213,0.10)', zeroline: false,
+                }},
+                yaxis: Object.assign(ax(ai === 0 ? yTitle : ''), {{
+                    showticklabels: ai === 0, tickfont: {{ size: 9 }}, tickformat: fmtY,
+                    range: yRange,
+                }}),
+                showlegend: false,
+            }}), {{ displayModeBar: false, responsive: true }});
+        }});
+    }}
+
+    // ── section-local summary chips (primary series) ──
+    const nWalked = uniq(perObject.map(p => p.object)).length;
+    const classesAll = uniq(cells.filter(c => c.sigma_table === PW_SIGMA).map(c => c.class)).sort();
+    if (primary) {{
+        const primaryObjs = poByArm.get(primary.key) || [];
+        const sum = (rows, f) => rows.reduce((a, p) => a + (f(p) || 0), 0);
+        const winFit = sum(primaryObjs, p => p.n_windows_converged);
+        const winFail = sum(primaryObjs, p => p.n_windows_failed);
+        const nScored = sum(primaryObjs, p => p.n_predictions);
+        const pooledVals = primaryObjs.map(p => p.med_d2_norm).filter(v => v != null && isFinite(v));
+        const pooled = pooledVals.length ? median(pooledVals) : null;
+        const hPrim = histByKey.get(primary.key);
+        const tail = survivalAt(hPrim, PW_CHI2_2_P99);
+        // Realism is only testable where the prediction's own covariance
+        // dominates the observation noise. That subset is a first-class
+        // number, not a footnote: a headline computed on 60% of the
+        // predictions must say so where the headline is.
+        const nTestable = pooledVals.length;
+        const predShare = (hPrim && nScored) ? hPrim.n / nScored : null;
+        const chips = document.getElementById('pw-chips');
+        if (chips) {{
+            const sub = t => `<div style="font-size:10px; color:var(--ed-text-muted); margin-top:6px">${{t}}</div>`;
+            chips.innerHTML =
+                `<div class="summary-card"><div class="value">${{nWalked}}</div><div class="label">Objects walked</div>${{sub(`${{classesAll.length}} class${{classesAll.length === 1 ? '' : 'es'}} · ${{seriesList.length}} series · fits solve for state + non-gravs (<code>solve_for = auto</code>)`)}}</div>`
+                + `<div class="summary-card"><div class="value">${{winFit}}<span style="font-size:16px; color:${{winFail ? 'var(--ed-warning)' : 'var(--ed-text-muted)'}}"> / ${{winFail}} failed</span></div><div class="label">Windows fit &middot; ${{pwLabel(primary)}}</div>${{sub('non-convergence is recorded, never dropped')}}</div>`
+                + `<div class="summary-card"><div class="value">${{nTestable}}<span style="font-size:16px; color:var(--ed-text-muted)"> of ${{nWalked}}</span></div><div class="label">Objects realism is testable on</div>${{sub(predShare == null ? `${{nScored.toLocaleString()}} predictions scored` : `&Sigma;<sub>pred</sub> dominates on ${{(100 * predShare).toFixed(0)}}% of ${{nScored.toLocaleString()}} scored predictions — elsewhere d² measures the σ table, not the tool`)}}</div>`
+                + `<div class="summary-card"><div class="value">${{pooled == null ? '—' : pooled.toFixed(2)}}<span style="font-size:16px; color:${{tail != null && tail > 5 * CAL_TAIL ? 'var(--ed-error-text)' : 'var(--ed-text-muted)'}}"> · ${{tail == null ? '—' : (100 * tail).toFixed(0) + '% tail'}}</span></div><div class="label">Pooled med d²ₙ &middot; tail &middot; ${{pwLabel(primary)}}</div>${{sub(tail == null ? `equal-weight-per-object over n = ${{pooledVals.length}}` : `equal-weight-per-object over n = ${{pooledVals.length}} · ${{(100 * tail).toFixed(0)}}% of rows beyond χ²₂-99% where a calibrated sample leaves ${{(100 * CAL_TAIL).toFixed(0)}}%`)}}</div>`;
+        }}
+    }}
+
+    // ── series selection ───────────────────────────────────────────────
+    // Explicit, aggregate-driven, and the single source of truth for every
+    // panel below. Quick-sets are resolved against the series that are
+    // actually present — a set that resolves to nothing is not offered.
+    const toolPick = (tool, prefs) => {{
+        for (const p of prefs) {{ const s = byArm(tool, p); if (s) return s; }}
+        return seriesList.find(s => s.tool === tool) || null;
+    }};
+    const FIT_AXES = ['debias', 'rejection', 'nightly'];
+    // Everything on the reference's fit config except `axis`, linear transport.
+    const varyAxis = axis => (refRust ? rustSeries.filter(s => s.axes && s.transport === 'linear'
+        && FIT_AXES.every(k => k === axis || s.axes[k] === refRust.axes[k])) : []);
+    // The rejection-off counterpart of the reference — the control the
+    // fit-quality caption's claim is checked against, so it ships in the
+    // default set rather than waiting to be found in the checkbox farm.
+    const refNoRej = refRust ? rustSeries.find(s => s.axes && s.transport === refRust.transport
+        && s.axes.debias === refRust.axes.debias && s.axes.nightly === refRust.axes.nightly
+        && s.axes.rejection === 'norej') : null;
+    const quickSets = [
+        {{ id: 'ref-tools', label: 'Reference + rejection off + external tools', pick: () => [refRust, refNoRej, toolPick('layup', ['default']), toolPick('findorb', ['default+mc', 'default'])] }},
+        {{ id: 'rejection', label: 'Rejection sweep', pick: () => varyAxis('rejection') }},
+        {{ id: 'debias', label: 'Debias pair', pick: () => varyAxis('debias') }},
+        {{ id: 'nightly', label: 'Nightly pair', pick: () => varyAxis('nightly') }},
+        {{ id: 'transport', label: 'Transport sweep', pick: () => (refRust ? rustSeries.filter(s => s.axes && FIT_AXES.every(k => s.axes[k] === refRust.axes[k])) : []) }},
+        {{ id: 'all-rust', label: 'All Empyrean arms', pick: () => rustSeries }},
+        {{ id: 'tools', label: 'External tools', pick: () => toolSeries }},
+    ];
+    const resolved = new Map();
+    for (const q of quickSets) {{
+        const list = [];
+        for (const s of q.pick()) if (s && list.indexOf(s) < 0) list.push(s);
+        if (list.length) resolved.set(q.id, list);
+    }}
+
+    const selected = new Set();
+    const setSelection = list => {{ selected.clear(); for (const s of list) if (s) selected.add(s.key); }};
+    const currentSeries = () => seriesList.filter(s => selected.has(s.key));
+    const defaultSet = resolved.get('ref-tools') || resolved.get('all-rust') || seriesList.slice(0, 1);
+    setSelection(defaultSet);
+
+    // Which of an over-cap selection actually gets drawn. Enumeration order
+    // hands the panels eight arms that differ on three axes at once, which
+    // is unreadable; a BALANCED CONTRAST keeps the reference and then takes
+    // one arm per level of each factor with the others held at reference, so
+    // the eight curves on screen differ one axis at a time.
+    function pwDrawn(sel) {{
+        if (sel.length <= PW_MAX_DRAWN_SERIES) return sel.slice();
+        const picked = [], seen = new Set();
+        const take = s => {{
+            if (!s || seen.has(s.key) || picked.length >= PW_MAX_DRAWN_SERIES) return;
+            seen.add(s.key); picked.push(s);
+        }};
+        const inSel = new Set(sel.map(s => s.key));
+        if (refRust && inSel.has(refRust.key)) take(refRust);
+        if (refRust) {{
+            for (const axis of FIT_AXES) {{
+                for (const s of sel) {{
+                    if (s.axes && s.transport === refRust.transport
+                        && FIT_AXES.every(k => k === axis || s.axes[k] === refRust.axes[k])) take(s);
+                }}
+            }}
+            for (const s of sel) if (s.axes && FIT_AXES.every(k => s.axes[k] === refRust.axes[k])) take(s);
+        }}
+        for (const s of sel) if (!s.axes) take(s);
+        for (const s of sel) take(s);
+        return picked.sort(pwSeriesOrder);
+    }}
+
+    const groupsEl = document.getElementById('pw-series-groups');
+    const quickEl = document.getElementById('pw-quick');
+    const countEl = document.getElementById('pw-select-count');
+    const noteEl = document.getElementById('pw-select-note');
+
+    if (quickEl) {{
+        quickEl.innerHTML = quickSets.filter(q => resolved.has(q.id))
+            .map(q => `<button type="button" data-quick="${{q.id}}">${{q.label}}</button>`).join('');
+        quickEl.addEventListener('click', e => {{
+            const btn = e.target.closest('button[data-quick]');
+            if (!btn) return;
+            setSelection(resolved.get(btn.getAttribute('data-quick')) || []);
+            syncInputs();
+            pwRenderAll();
+        }});
+    }}
+    if (groupsEl) {{
+        const groups = [];
+        for (const rej of PW_REJECTION) {{
+            const items = rustSeries.filter(s => s.axes && s.axes.rejection === rej);
+            if (items.length) groups.push({{ title: 'Empyrean · ' + PW_REJECTION_LABEL[rej], items: items }});
+        }}
+        const rustOther = rustSeries.filter(s => !s.axes);
+        if (rustOther.length) groups.push({{ title: 'Empyrean · unparsed arms', items: rustOther }});
+        for (const t of uniq(toolSeries.map(s => s.tool)).sort()) {{
+            groups.push({{ title: pwToolName(t), items: toolSeries.filter(s => s.tool === t) }});
+        }}
+        groupsEl.innerHTML = groups.map(g =>
+            `<div><div class="pw-group-title">${{g.title}}</div>`
+            + g.items.map(s =>
+                `<label class="pw-opt" title="${{pwHoverTitle(s)}}"><input type="checkbox" data-series="${{s.key}}">`
+                + `${{pwSwatch(s)}}<span>${{pwLabel(s)}}</span></label>`).join('')
+            + `</div>`).join('');
+        groupsEl.addEventListener('change', e => {{
+            const box = e.target.closest('input[data-series]');
+            if (!box) return;
+            if (box.checked) selected.add(box.getAttribute('data-series'));
+            else selected.delete(box.getAttribute('data-series'));
+            pwRenderAll();
+        }});
+    }}
+    function syncInputs() {{
+        if (!groupsEl) return;
+        groupsEl.querySelectorAll('input[data-series]').forEach(box => {{
+            box.checked = selected.has(box.getAttribute('data-series'));
+        }});
+    }}
+
+    // ── calibration marginals: d² survival vs χ²₂ + coverage residual ──
+    // Rendered from the aggregate's fixed-bin histograms — scored rows never
+    // reach the page. The survival curve reads off the log-spaced companion
+    // bins, which run to d² = 10³ so the tail is resolved instead of being
+    // collapsed into a single overflow integer.
+    function renderMarginals(sel) {{
+        const survEl = document.getElementById('pw-d2hist');
+        const relEl = document.getElementById('pw-reliability');
+        const tailEl = document.getElementById('pw-d2-note');
+        if (!survEl || !relEl) return;
+        purgeIn(survEl); purgeIn(relEl);
+        const drawn = pwDrawn(sel);
+        const withHist = drawn.filter(s => histByKey.has(s.key));
+        const without = drawn.filter(s => !histByKey.has(s.key));
+        if (!withHist.length) {{
+            survEl.innerHTML = loud(drawn.length
+                ? 'none of the selected series carries a d² histogram — these sidecars scored no held-out d² (a sigma1d-only runner delivers no 2×2 covariance). Their accuracy surfaces below are unaffected.'
+                : 'no series selected — pick at least one above.');
+            relEl.innerHTML = '';
+            relEl.style.display = 'none';
+            if (tailEl) tailEl.innerHTML = '';
+            return;
+        }}
+        survEl.innerHTML = ''; relEl.innerHTML = ''; relEl.style.display = '';
+        const hasLog = withHist.some(s => {{ const h = histByKey.get(s.key); return h.log_counts && h.log_counts.length; }});
+        const xLo = -2, xHi = hasLog
+            ? Math.max.apply(null, withHist.map(s => histByKey.get(s.key).log10_hi || 1))
+            : Math.log10(Math.max.apply(null, withHist.map(s => histByKey.get(s.key).domain_max)));
+        // Calibrated χ²₂ survival, S(x) = exp(−x/2), on the same log grid.
+        const calXs = [], calYs = [];
+        for (let i = 0; i <= 300; i++) {{
+            const x = Math.pow(10, xLo + (xHi - xLo) * i / 300);
+            calXs.push(x); calYs.push(Math.exp(-x / 2));
+        }}
+        const traces = [{{
+            x: calXs, y: calYs, mode: 'lines',
+            line: {{ color: '#c9d4e0', width: 1.6, dash: 'dash' }},
+            name: 'calibrated χ²₂',
+            hovertemplate: 'calibrated χ²₂<br>d² %{{x:.3g}} · P(d² > x) %{{y:.4f}}<extra></extra>',
+        }}];
+        let yFloor = 1;
+        const tailNotes = [];
+        for (const s of withHist) {{
+            const h = histByKey.get(s.key);
+            const xs = [], ys = [];
+            if (h.log_counts && h.log_counts.length) {{
+                const nb = h.log_counts.length, w = (h.log10_hi - h.log10_lo) / nb;
+                let above = h.log_overflow;
+                const pts = [];
+                for (let i = nb - 1; i >= 0; i--) {{
+                    above += h.log_counts[i];
+                    pts.push([Math.pow(10, h.log10_lo + i * w), above / h.n]);
+                }}
+                pts.reverse();
+                for (const p of pts) {{ xs.push(p[0]); ys.push(p[1]); }}
+            }} else {{
+                const w = h.domain_max / h.counts.length;
+                let above = h.overflow;
+                const pts = [];
+                for (let i = h.counts.length - 1; i >= 0; i--) {{
+                    above += h.counts[i];
+                    pts.push([i * w, above / h.n]);
+                }}
+                pts.reverse();
+                for (const p of pts) if (p[0] > 0) {{ xs.push(p[0]); ys.push(p[1]); }}
+            }}
+            for (const y of ys) if (y > 0) yFloor = Math.min(yFloor, y);
+            traces.push({{
+                x: xs, y: ys, mode: 'lines',
+                line: {{ color: pwColor(s), width: 2, dash: pwDash(s) }},
+                name: pwLabel(s),
+                hovertemplate: `${{pwHoverLabel(s)}}<br>d² %{{x:.3g}} · P(d² > x) %{{y:.4f}}<extra></extra>`,
+            }});
+            const t = survivalAt(h, PW_CHI2_2_P99);
+            if (t != null) tailNotes.push({{ s: s, t: t }});
+        }}
+        const yLo = Math.max(-4, Math.log10(Math.max(yFloor, 1e-4)) - 0.2);
+        // The gap at the χ²₂-99% point, drawn ON the marks. The tail share is
+        // the section's headline; leaving it in a caption under the panel is
+        // what buried it.
+        const shapes = [{{
+            type: 'line', xref: 'x', yref: 'paper', x0: PW_CHI2_2_P99, x1: PW_CHI2_2_P99,
+            y0: 0, y1: 1, line: {{ color: '#5c6773', width: 1, dash: 'dot' }},
+        }}];
+        const annotations = [{{
+            xref: 'x', x: Math.log10(PW_CHI2_2_P99), yref: 'paper', y: 1.0, yanchor: 'bottom', yshift: 3,
+            text: 'χ²₂ 99%', showarrow: false, font: {{ size: 9, color: '#8b9198' }}, xanchor: 'center',
+        }}];
+        const lead = tailNotes.find(t => t.s === refRust) || tailNotes[0];
+        if (lead) {{
+            shapes.push({{
+                type: 'line', xref: 'x', yref: 'y', x0: PW_CHI2_2_P99, x1: PW_CHI2_2_P99,
+                y0: CAL_TAIL, y1: lead.t, line: {{ color: '#e8e8ec', width: 3 }},
+            }});
+            annotations.push({{
+                xref: 'x', x: Math.log10(PW_CHI2_2_P99), yref: 'y',
+                y: Math.log10(Math.sqrt(Math.max(CAL_TAIL, 1e-6) * lead.t)),
+                text: `<b>${{(100 * lead.t).toFixed(0)}}%</b> vs ${{(100 * CAL_TAIL).toFixed(0)}}%`,
+                showarrow: true, arrowhead: 0, arrowcolor: '#e8e8ec', arrowwidth: 1, ax: 40, ay: 0,
+                font: {{ size: 11, color: '#e8e8ec' }}, xanchor: 'left', bgcolor: 'rgba(21,27,35,0.85)',
+            }});
+        }}
+        Plotly.newPlot(survEl, traces, Object.assign({{}}, baseLayout, {{
+            title: {{ text: 'Held-out d² survival — P(d² > x) vs χ²₂, Σ_pred-dominated', font: {{ size: 12, color: '#c9d4e0' }} }},
+            xaxis: Object.assign(ax('Mahalanobis d² (2-D, prediction + observation σ)'), {{
+                type: 'log', range: [xLo, xHi], ...logTicks([xLo, xHi]),
+            }}),
+            yaxis: Object.assign(ax('P(d² > x)'), {{ type: 'log', range: [yLo, 0], ...logTicks([yLo, 0]) }}),
+            showlegend: true,
+            // Legend inside the panel, in the empty lower-left the survival
+            // curves leave behind — not 90px below where it stops being a
+            // legend and becomes a separate list to cross-reference.
+            legend: {{ ...baseLayout.legend, x: 0.02, y: 0.03, xanchor: 'left', yanchor: 'bottom', bgcolor: 'rgba(21,27,35,0.78)' }},
+            margin: {{ l: 62, r: 18, t: 52, b: 46 }},
+            shapes: shapes, annotations: annotations,
+        }}), {{ displayModeBar: false, responsive: true }});
+
+        // ── coverage as a RESIDUAL against nominal ──
+        // The diagonal form wastes the whole panel proving that a monotone
+        // curve is monotone. What matters is the departure, which on the
+        // diagonal is a few pixels wide; here it is the entire y axis.
+        const sigmas = [];
+        for (let k = 0.5; k <= 3.001; k += 0.125) sigmas.push(k);
+        const nominalAt = k => 1 - Math.exp(-k * k / 2);
+        const relTraces = [{{
+            x: sigmas, y: sigmas.map(() => 0), mode: 'lines',
+            line: {{ color: '#c9d4e0', width: 1.4, dash: 'dash' }},
+            name: 'calibrated', hoverinfo: 'skip',
+        }}];
+        // Binomial 95% band at the nominal rate. Rows are not independent
+        // (many per object), so this is a floor on the uncertainty, not the
+        // whole of it — the caption says so.
+        const nMax = Math.max.apply(null, withHist.map(s => histByKey.get(s.key).n));
+        const bandHi = sigmas.map(k => {{ const p = nominalAt(k); return 1.96 * Math.sqrt(p * (1 - p) / nMax); }});
+        relTraces.push({{
+            x: sigmas.concat(sigmas.slice().reverse()),
+            y: bandHi.concat(bandHi.map(v => -v).reverse()),
+            fill: 'toself', fillcolor: 'rgba(139,145,152,0.18)', mode: 'lines',
+            line: {{ width: 0 }}, name: 'binomial 95%', hoverinfo: 'skip',
+        }});
+        for (const s of withHist) {{
+            const h = histByKey.get(s.key);
+            const ys = sigmas.map(k => {{
+                const surv = survivalAt(h, k * k);
+                return surv == null ? null : (1 - surv) - nominalAt(k);
+            }});
+            relTraces.push({{
+                x: sigmas, y: ys, mode: 'lines',
+                line: {{ color: pwColor(s), width: 2, dash: pwDash(s) }},
+                name: pwLabel(s),
+                hovertemplate: `${{pwHoverLabel(s)}}<br>%{{x:.2f}}σ · empirical − nominal %{{y:+.3f}}<extra></extra>`,
+            }});
+        }}
+        Plotly.newPlot(relEl, relTraces, Object.assign({{}}, baseLayout, {{
+            title: {{ text: 'Coverage residual — empirical minus nominal, Σ_pred-dominated', font: {{ size: 12, color: '#c9d4e0' }} }},
+            xaxis: Object.assign(ax('prediction-ellipse level (σ, 2 dof)'), {{
+                range: [0.5, 3.05], tickmode: 'array', tickvals: [1, 2, 3], ticktext: ['1σ', '2σ', '3σ'],
+            }}),
+            yaxis: ax('empirical − nominal coverage'),
+            showlegend: true,
+            legend: {{ ...baseLayout.legend, x: 0.02, y: 0.03, xanchor: 'left', yanchor: 'bottom', bgcolor: 'rgba(21,27,35,0.78)' }},
+            margin: {{ l: 62, r: 18, t: 52, b: 46 }},
+            shapes: [{{ type: 'line', xref: 'paper', x0: 0, x1: 1, yref: 'y', y0: 0, y1: 0, line: {{ color: '#5c6773', width: 1 }} }}],
+            // Both legends hang off the zero line itself rather than off the
+            // panel corners: the curves run deep into the lower half here, and
+            // a corner-anchored label lands on top of them.
+            annotations: [
+                {{ text: 'above = over-conservative', xref: 'paper', x: 0.99, yref: 'y', y: 0, yshift: 9,
+                  showarrow: false, font: {{ size: 9, color: '#8b9198' }}, xanchor: 'right', yanchor: 'bottom' }},
+                {{ text: 'below = over-confident', xref: 'paper', x: 0.99, yref: 'y', y: 0, yshift: -9,
+                  showarrow: false, font: {{ size: 9, color: '#8b9198' }}, xanchor: 'right', yanchor: 'top' }},
+            ],
+        }}), {{ displayModeBar: false, responsive: true }});
+
+        if (tailEl) {{
+            const bits = [];
+            if (!hasLog) {{
+                bits.push('<b style="color:var(--ed-warning-text)">these aggregates predate the log-spaced survival bins</b>, so each curve stops at its linear domain edge and the far tail is one overflow count. Re-run <code>score-predictions</code> to resolve it.');
+            }}
+            bits.push('Binomial 95% band assumes independent rows; predictions cluster by object, so the true band is wider.');
+            if (without.length) {{
+                bits.push(`no d² histogram for ${{without.map(s => '<b>' + pwLabel(s) + '</b>').join(', ')}} — those sidecars carry no held-out d², so the series is absent here and present in the accuracy surfaces below.`);
+            }}
+            tailEl.innerHTML = bits.join('<br>');
+        }}
+    }}
+
+    // ── fit quality: reduced χ² per configuration ──
+    // The in-sample counterpart to the held-out realism above. A reduced χ²
+    // of 1 is only the EXPECTATION; the scatter around it is set by ν, and a
+    // walk's early windows sit at ν of order 2-10 where χ²_ν/ν is enormously
+    // wide. The grey band is the central 90% of χ²ᵣ under the ν the drawn
+    // windows actually have, so "below 1" can be read as a real departure
+    // rather than as short arcs.
+    function lnGamma(x) {{
+        // Lanczos, g = 7, n = 9 — good to ~15 digits over the range ν/2
+        // reaches here.
+        const g = [0.99999999999980993, 676.5203681218851, -1259.1392167224028,
+                   771.32342877765313, -176.61502916214059, 12.507343278686905,
+                   -0.13857109526572012, 9.9843695780195716e-6, 1.5056327351493116e-7];
+        if (x < 0.5) return Math.log(Math.PI / Math.sin(Math.PI * x)) - lnGamma(1 - x);
+        x -= 1;
+        let a = g[0];
+        const t = x + 7.5;
+        for (let i = 1; i < 9; i++) a += g[i] / (x + i);
+        return 0.5 * Math.log(2 * Math.PI) + (x + 0.5) * Math.log(t) - t + Math.log(a);
+    }}
+    // Density of r = χ²_ν / ν, per unit r.
+    function chi2rPdf(r, nu) {{
+        if (!(r > 0) || !(nu > 0)) return 0;
+        const y = nu * r;
+        const ln = Math.log(nu) + (nu / 2 - 1) * Math.log(y) - y / 2
+            - (nu / 2) * Math.LN2 - lnGamma(nu / 2);
+        return Math.exp(ln);
+    }}
+    function renderReducedChi2(sel) {{
+        const el = document.getElementById('pw-rchi2');
+        const rnoteEl = document.getElementById('pw-rchi2-note');
+        if (!el) return;
+        purgeIn(el);
+        const drawn = pwDrawn(sel);
+        const binnedOf = h => h.counts.reduce((a, c) => a + c, 0) + h.underflow + h.overflow;
+        const withH = drawn.filter(s => {{ const h = rchi2ByKey.get(s.key); return h && binnedOf(h) > 0; }});
+        const without = drawn.filter(s => withH.indexOf(s) < 0);
+        if (!withH.length) {{
+            el.innerHTML = loud(drawn.length
+                ? 'no selected series reports a reduced χ² over its converged windows — these runners converge without publishing one.'
+                : 'no series selected — pick at least one above.');
+            if (rnoteEl) rnoteEl.innerHTML = '';
+            return;
+        }}
+        el.innerHTML = '';
+        // Trim the domain to where the windows actually are. Trimming to the
+        // outermost OCCUPIED bin is not enough: a handful of windows in a far
+        // bin holds a whole empty decade open and squeezes every curve's body
+        // into the middle third of the panel. Trim to the bins that carry the
+        // central 99.7% of each series' mass instead, then take the union.
+        const EDGE = 0.0015;
+        let bLo = Infinity, bHi = -Infinity;
+        for (const s of withH) {{
+            const h = rchi2ByKey.get(s.key);
+            const w = (h.log10_hi - h.log10_lo) / h.counts.length;
+            const tot = h.counts.reduce((a, c) => a + c, 0);
+            if (!tot) continue;
+            let acc = 0, lo = null, hi = null;
+            for (let i = 0; i < h.counts.length; i++) {{
+                acc += h.counts[i];
+                if (lo === null && acc >= EDGE * tot) lo = h.log10_lo + i * w;
+                if (acc <= (1 - EDGE) * tot) hi = h.log10_lo + (i + 1) * w;
+            }}
+            if (lo !== null) bLo = Math.min(bLo, lo);
+            if (hi !== null) bHi = Math.max(bHi, hi);
+        }}
+        if (!isFinite(bLo) || !isFinite(bHi) || bHi <= bLo) {{
+            bLo = Math.min.apply(null, withH.map(s => rchi2ByKey.get(s.key).log10_lo));
+            bHi = Math.max.apply(null, withH.map(s => rchi2ByKey.get(s.key).log10_hi));
+        }}
+        // Keep rχ² = 1 in view — it is the reference the whole panel is read
+        // against, and trimming it off would be a crop, not a trim.
+        bLo = Math.min(bLo, -0.15); bHi = Math.max(bHi, 0.15);
+        const traces = [], notes = [];
+        // Pooled ν over the drawn series, and the χ²ᵣ spread it implies.
+        const dofTally = new Map();
+        let dofTotal = 0;
+        for (const s of withH) {{
+            for (const d of (rchi2ByKey.get(s.key).dof || [])) {{
+                dofTally.set(d.ndof, (dofTally.get(d.ndof) || 0) + d.n);
+                dofTotal += d.n;
+            }}
+        }}
+        // The envelope is drawn as the central INTERVAL of χ²ᵣ under the ν
+        // mixture, not as its density. Most windows here carry a large ν, so
+        // the mixture density is a near-delta spike at 1 whose peak is an
+        // order of magnitude above every measured curve — plotting it would
+        // set the y axis and flatten the data the panel exists to show. A
+        // shaded x-band answers the actual question ("could a correct fit
+        // land here?") and leaves the y axis to the measurements.
+        let envelope = null;
+        if (dofTotal > 0) {{
+            // Mixture CDF by trapezoid over a fine log grid, then inverted.
+            const N = 800, gLo = -3, gHi = 3, step = (gHi - gLo) / N;
+            const xs = [], pdf = [];
+            for (let i = 0; i <= N; i++) {{
+                const lx = gLo + i * step, r = Math.pow(10, lx);
+                let dens = 0;
+                for (const [nu, n] of dofTally) dens += (n / dofTotal) * chi2rPdf(r, nu);
+                xs.push(lx); pdf.push(dens * r * Math.LN10);
+            }}
+            const cdf = [0];
+            for (let i = 1; i <= N; i++) cdf.push(cdf[i - 1] + 0.5 * (pdf[i] + pdf[i - 1]) * step);
+            const total = cdf[N];
+            const qAt = p => {{
+                const target = p * total;
+                for (let i = 1; i <= N; i++) {{
+                    if (cdf[i] >= target) {{
+                        const f = (target - cdf[i - 1]) / ((cdf[i] - cdf[i - 1]) || 1);
+                        return Math.pow(10, xs[i - 1] + f * step);
+                    }}
+                }}
+                return Math.pow(10, gHi);
+            }};
+            if (total > 0.5) envelope = [qAt(0.05), qAt(0.95)];
+        }}
+        for (const s of withH) {{
+            const h = rchi2ByKey.get(s.key);
+            const w = (h.log10_hi - h.log10_lo) / h.counts.length;
+            const binned = binnedOf(h);
+            const xs = [], ys = [];
+            for (let i = 0; i < h.counts.length; i++) {{
+                xs.push(Math.pow(10, h.log10_lo + i * w));
+                ys.push(h.counts[i] / (binned * w));
+            }}
+            xs.push(Math.pow(10, h.log10_hi));
+            ys.push(ys[ys.length - 1]);
+            traces.push({{
+                x: xs, y: ys, mode: 'lines',
+                line: {{ color: pwColor(s), width: 2, shape: 'hv', dash: pwDash(s) }},
+                name: pwLabel(s),
+                hovertemplate: `${{pwHoverLabel(s)}}<br>reduced χ² %{{x:.3g}} · density %{{y:.3f}} per dex<extra></extra>`,
+            }});
+            // Count AND share: a single window out of 2,291 rounds to 0.0%,
+            // and "0.0%" next to a real outlier reads as none.
+            const tail = (n, edge, dir) => `${{n}} (${{(100 * n / binned).toFixed(1)}}%) ${{dir}} ${{edge}}`;
+            const tails = [];
+            if (h.underflow) tails.push(tail(h.underflow, Math.pow(10, h.log10_lo), 'below'));
+            if (h.overflow) tails.push(tail(h.overflow, Math.pow(10, h.log10_hi), 'above'));
+            if (h.n_nonpositive) tails.push(`${{h.n_nonpositive}} non-positive`);
+            if (h.n_without) tails.push(`${{h.n_without}} not reported`);
+            notes.push(`<b>${{pwLabel(s)}}</b> n = ${{binned.toLocaleString()}}` + (tails.length ? ` (${{tails.join(', ')}})` : ''));
+        }}
+        if (envelope) {{
+            bLo = Math.min(bLo, Math.log10(envelope[0]) - 0.1);
+            bHi = Math.max(bHi, Math.log10(envelope[1]) + 0.1);
+        }}
+        Plotly.newPlot(el, traces, Object.assign({{}}, baseLayout, {{
+            title: {{ text: 'Reduced χ² over converged windows', font: {{ size: 12, color: '#c9d4e0' }} }},
+            xaxis: Object.assign(ax('fit reduced χ²'), {{ type: 'log', range: [bLo, bHi], ...logTicks([bLo, bHi]) }}),
+            yaxis: ax('fraction of windows per dex'),
+            showlegend: true,
+            legend: {{ ...baseLayout.legend, x: 0.015, y: 0.98, xanchor: 'left', yanchor: 'top', bgcolor: 'rgba(21,27,35,0.78)' }},
+            margin: {{ l: 62, r: 20, t: 46, b: 44 }},
+            // On a log axis Plotly reads shape coordinates as DATA units but
+            // annotation coordinates as log₁₀ units. Same value, two
+            // spellings: the line at rχ² = 1 is x0 = 1, its label is x = 0.
+            shapes: (envelope ? [{{
+                type: 'rect', xref: 'x', x0: envelope[0], x1: envelope[1], yref: 'paper', y0: 0, y1: 1,
+                fillcolor: 'rgba(139,145,152,0.20)', line: {{ width: 0 }}, layer: 'below',
+            }}] : []).concat([{{ type: 'line', xref: 'x', yref: 'paper', x0: 1, x1: 1, y0: 0, y1: 1,
+                       line: {{ color: '#8b9198', width: 1, dash: 'dash' }} }}]),
+            annotations: [{{ text: 'reduced χ² = 1', xref: 'x', x: 0, yref: 'paper', y: 1.02,
+                            showarrow: false, font: {{ size: 9, color: '#8b9198' }}, xanchor: 'left' }}]
+                .concat(envelope ? [{{
+                    // Set vertically INSIDE the band: horizontally it is only
+                    // ~0.2 dex wide, so a horizontal label spills across the
+                    // curves and collides with the rχ² = 1 tick label.
+                    text: 'expected at these ν · central 90%', textangle: -90,
+                    xref: 'x', x: Math.log10(Math.sqrt(envelope[0] * envelope[1])), yref: 'paper', y: 0.5,
+                    showarrow: false, font: {{ size: 9, color: '#c9d4e0' }},
+                    xanchor: 'center', yanchor: 'middle',
+                }}] : []),
+        }}), {{ displayModeBar: false, responsive: true }});
+        if (rnoteEl) {{
+            const bits = [];
+            if (dofTotal > 0) {{
+                const nus = [...dofTally.keys()].sort((a, b) => a - b);
+                const cum = [];
+                let acc = 0;
+                for (const nu of nus) {{ acc += dofTally.get(nu); cum.push([nu, acc / dofTotal]); }}
+                const qq = p => (cum.find(c => c[1] >= p) || cum[cum.length - 1])[0];
+                bits.push(`Grey band: where reduced χ² would fall 90% of the time if every fit were correct, under the ν actually present in the ${{dofTotal.toLocaleString()}} drawn windows (ν median ${{qq(0.5)}}, 10–90% ${{qq(0.1)}}–${{qq(0.9)}})`
+                    + (envelope ? ` — that is ${{envelope[0].toFixed(2)}} to ${{envelope[1].toFixed(2)}}` : '')
+                    + `. Mass piled to the LEFT of the band is not a better fit; it is a fit whose residuals were removed before the statistic was formed.`);
+            }}
+            bits.push(notes.join(' · '));
+            if (without.length) {{
+                bits.push(`reduced χ² <b>not reported</b> by ${{without.map(s => '<b>' + pwLabel(s) + '</b>').join(', ')}} — absent from the panel, never folded into a zero bin.`);
+            }}
+            rnoteEl.innerHTML = bits.join('<br>');
+        }}
+    }}
+
+    // ── per-object walk timeline ──
+    // One object, one point per window, arc on the x axis (always log — the
+    // arcs span decades on every object, and switching axis type per object
+    // made two objects incomparable). A break in a curve is a window that
+    // failed or delivered no statistic; a break is never interpolated, and a
+    // point outside the default view is drawn as a chevron on the boundary
+    // rather than left to an autoscale button.
+    function renderTimeline(sel) {{
+        const el = document.getElementById('pw-timeline');
+        const tnoteEl = document.getElementById('pw-timeline-note');
+        const cntEl = document.getElementById('pw-timeline-count');
+        if (!el) return;
+        purgeIn(el);
+        if (tnoteEl) tnoteEl.innerHTML = '';
+        if (cntEl) cntEl.textContent = '';
+        if (!timelines.length) {{
+            el.innerHTML = loud('these aggregates carry no per-window family — re-run <code>score-predictions</code> to write one. Every other panel here is unaffected.');
+            return;
+        }}
+        const drawn = pwDrawn(sel);
+        const walks = [];
+        for (const s of drawn) {{
+            const t = tlByKey.get(pwKey(s.tool, s.arm, tlObject));
+            if (t) walks.push({{ s: s, t: t }});
+        }}
+        if (cntEl) cntEl.textContent = `${{walks.length}} of ${{drawn.length}} drawn series walked this object`;
+        if (!walks.length) {{
+            el.innerHTML = loud(drawn.length
+                ? `no selected series walked <b>${{tlObject}}</b> — pick another object, or another series.`
+                : 'no series selected — pick at least one above.');
+            return;
+        }}
+        el.innerHTML = '';
+        // Where the arc jumps — an apparition gap, not a night — the curve is
+        // cut. Joining across a multi-thousand-day hole draws a trend through
+        // time the walk never observed. The threshold adapts to the object:
+        // a jump many times the typical step, and large in absolute days.
+        function segments(xs, ys, cds) {{
+            const gaps = [];
+            for (let i = 1; i < xs.length; i++) if (xs[i] > 0 && xs[i - 1] > 0) gaps.push(xs[i] - xs[i - 1]);
+            const g = sortedNums(gaps);
+            const typ = g.length ? pctOf(g, 0.5) : 0;
+            const cut = Math.max(6 * typ, 30);
+            const ox = [], oy = [], oc = [];
+            for (let i = 0; i < xs.length; i++) {{
+                if (i && xs[i] - xs[i - 1] > cut) {{ ox.push(null); oy.push(null); oc.push(null); }}
+                ox.push(xs[i]); oy.push(ys[i]); oc.push(cds[i]);
+            }}
+            return {{ x: ox, y: oy, cd: oc }};
+        }}
+        // A series with only a window or two on this object has no curve to
+        // draw — just isolated points — and at the 4px used for a dense walk
+        // they are invisible among a neighbour's hundred. 67P is the case
+        // that matters: the reference arm scores exactly ONE of its 82
+        // windows (d²ₙ = 18,578), and that single point is the whole of what
+        // this section knows about 67P's published covariance. Sparse series
+        // are drawn at marker size 9 and named in the caption.
+        const SPARSE_MAX = 3;
+        const traces = [], sparse = [];
+        for (const w of walks) {{
+            const s = w.s, t = w.t;
+            const cd = t.window_index.map((wi, i) => [wi, t.n_preds[i], t.converged[i] ? 'converged' : 'FIT FAILED']);
+            const stroke = {{ color: pwColor(s), width: 2, dash: pwDash(s) }};
+            const nD2 = t.med_d2_norm.filter(v => v != null).length;
+            const nSep = t.med_sep_arcsec.filter(v => v != null).length;
+            const dotFor = n => ({{
+                size: n <= SPARSE_MAX ? 9 : 4, color: pwColor(s),
+                line: n <= SPARSE_MAX ? {{ color: '#151b23', width: 1 }} : undefined,
+            }});
+            if (nD2) {{
+                if (nD2 <= SPARSE_MAX) sparse.push({{ label: pwLabel(s), n: nD2, total: t.arc_days.length }});
+                const seg = segments(t.arc_days, t.med_d2_norm, cd);
+                traces.push({{
+                    x: seg.x, y: seg.y, customdata: seg.cd, mode: 'lines+markers', connectgaps: false,
+                    marker: dotFor(nD2), line: stroke, name: pwLabel(s), legendgroup: s.key,
+                    hovertemplate: `${{pwHoverLabel(s)}}<br>window %{{customdata[0]}} · arc %{{x:.3g}} d<br>med d²ₙ %{{y:.4g}} · n_pred %{{customdata[1]}} · %{{customdata[2]}}<extra></extra>`,
+                }});
+            }}
+            if (nSep) {{
+                const seg = segments(t.arc_days, t.med_sep_arcsec, cd);
+                traces.push({{
+                    x: seg.x, y: seg.y, customdata: seg.cd, mode: 'lines+markers', connectgaps: false,
+                    marker: dotFor(nSep), line: stroke, name: pwLabel(s), legendgroup: s.key, yaxis: 'y2', showlegend: !nD2,
+                    hovertemplate: `${{pwHoverLabel(s)}}<br>window %{{customdata[0]}} · arc %{{x:.3g}} d<br>med sep %{{y:.3g}}″ · n_pred %{{customdata[1]}} · %{{customdata[2]}}<extra></extra>`,
+                }});
+            }}
+        }}
+        if (!traces.length) {{
+            el.innerHTML = loud(`every selected series walked <b>${{tlObject}}</b> but none delivered a scored window — every fit failed. The per-object table below carries the counts.`);
+            return;
+        }}
+        // Central 96% of the drawn points, padded, with `anchor` (the
+        // calibration furniture) always in view and the total span capped: a
+        // tool that publishes a covariance 25 orders of magnitude too wide on
+        // six windows would otherwise stretch the axis until every other
+        // curve is a flat line. Points outside are NOT dropped — they are
+        // drawn as chevrons on the boundary carrying their true value.
+        const TL_MAX_DECADES = 6;
+        const logRange = (values, anchor) => {{
+            const v = sortedNums(values.filter(x => x != null && x > 0));
+            if (!v.length) return null;
+            let lo = Math.log10(pctOf(v, 0.02)), hi = Math.log10(pctOf(v, 0.98));
+            let aLo = lo, aHi = hi;
+            if (anchor && anchor.length) {{
+                aLo = Math.min.apply(null, anchor.map(Math.log10));
+                aHi = Math.max.apply(null, anchor.map(Math.log10));
+                lo = Math.min(lo, aLo); hi = Math.max(hi, aHi);
+            }}
+            if (hi - lo > TL_MAX_DECADES) {{
+                // Spend what is left of the budget on each side in proportion
+                // to how far the data reaches there.
+                const budget = Math.max(0, TL_MAX_DECADES - (aHi - aLo));
+                const below = aLo - lo, above = hi - aHi;
+                const total = below + above || 1;
+                lo = aLo - budget * below / total;
+                hi = aHi + budget * above / total;
+            }}
+            if (hi - lo < 0.6) {{ const pad = (0.6 - (hi - lo)) / 2; lo -= pad; hi += pad; }}
+            return [lo - 0.25, hi + 0.25];
+        }};
+        const d2Vals = [].concat(...walks.map(w => w.t.med_d2_norm));
+        const sepVals = [].concat(...walks.map(w => w.t.med_sep_arcsec));
+        const d2Range = logRange(d2Vals, [1, chi2q(0.025), chi2q(0.975)]);
+        const sepRange = logRange(sepVals, null);
+        const arcVals = [].concat(...walks.map(w => w.t.arc_days)).filter(v => v > 0 && isFinite(v));
+        const arcRange = arcVals.length
+            ? [Math.log10(Math.min.apply(null, arcVals)) - 0.04, Math.log10(Math.max.apply(null, arcVals)) + 0.04]
+            : null;
+        // Over-range chevrons, one trace per panel. Clipping data out of a
+        // default view and mentioning it in a footnote is how 67P's only
+        // realism point — d²ₙ = 18,578 on one window of 82 — went missing
+        // from this panel entirely.
+        let nOver = 0;
+        const overTrace = (axisName, range, pick) => {{
+            const xs = [], ys = [], cds = [], syms = [];
+            for (const w of walks) {{
+                const vals = pick(w.t);
+                for (let i = 0; i < vals.length; i++) {{
+                    const v = vals[i];
+                    if (v == null || !(v > 0) || !isFinite(v) || !range) continue;
+                    const l = Math.log10(v);
+                    if (l >= range[0] && l <= range[1]) continue;
+                    const hiSide = l > range[1];
+                    xs.push(w.t.arc_days[i]);
+                    ys.push(Math.pow(10, hiSide ? range[1] : range[0]));
+                    cds.push([pwLabel(w.s), v, w.t.window_index[i]]);
+                    syms.push(hiSide ? 'triangle-up' : 'triangle-down');
+                    nOver++;
+                }}
+            }}
+            if (!xs.length) return null;
+            return {{
+                x: xs, y: ys, customdata: cds, mode: 'markers', yaxis: axisName,
+                marker: {{ symbol: syms, size: 9, color: '#f2f4f7', line: {{ color: '#151b23', width: 1 }} }},
+                name: 'beyond the view', showlegend: false,
+                hovertemplate: '%{{customdata[0]}}<br>window %{{customdata[2]}} · arc %{{x:.3g}} d'
+                    + '<br><b>%{{customdata[1]:.4g}}</b> — beyond the default view, drawn on the boundary<extra></extra>',
+            }};
+        }};
+        const ov1 = overTrace('y', d2Range, t => t.med_d2_norm);
+        const ov2 = overTrace('y2', sepRange, t => t.med_sep_arcsec);
+        if (ov1) traces.push(ov1);
+        if (ov2) traces.push(ov2);
+
+        // Shape coordinates on a log axis are DATA units — Plotly takes the
+        // log itself. (Only `range` is given in log₁₀.) Passing logs here
+        // silently parks every band at ~1e-27, off the bottom of the panel.
+        const band = (q0, q1, fill) => ({{
+            type: 'rect', xref: 'paper', x0: 0, x1: 1, yref: 'y',
+            y0: chi2q(q0), y1: chi2q(q1),
+            fillcolor: fill, line: {{ width: 0 }}, layer: 'below',
+        }});
+        const shapes = [
+            band(0.025, 0.975, 'rgba(139,145,152,0.16)'),
+            band(0.25, 0.75, 'rgba(139,145,152,0.30)'),
+            {{ type: 'line', xref: 'paper', x0: 0, x1: 1, yref: 'y', y0: 1, y1: 1,
+              line: {{ color: '#c9d4e0', width: 1.2, dash: 'dash' }} }},
+        ];
+        // Where the prediction's own covariance does not dominate the
+        // observation noise, d² measures the σ table rather than the tool —
+        // there is nothing to be right or wrong about. Those windows carry
+        // predictions but no realism statistic, and the arc region they
+        // occupy is shaded and named rather than left as an unexplained gap.
+        const lead = walks.find(w => w.s === refRust) || walks[0];
+        const untested = [];
+        {{
+            const t = lead.t;
+            let run = null;
+            for (let i = 0; i < t.arc_days.length; i++) {{
+                const dead = t.n_preds[i] > 0 && t.med_d2_norm[i] == null;
+                if (dead) {{ if (!run) run = [t.arc_days[i], t.arc_days[i]]; else run[1] = t.arc_days[i]; }}
+                else if (run) {{ untested.push(run); run = null; }}
+            }}
+            if (run) untested.push(run);
+        }}
+        const annotations = [];
+        for (const r of untested) {{
+            if (!(r[0] > 0) || !(r[1] > 0)) continue;
+            shapes.push({{
+                type: 'rect', xref: 'x', x0: r[0], x1: Math.max(r[1], r[0] * 1.01), yref: 'paper',
+                y0: 0.56, y1: 1, fillcolor: 'rgba(93,103,115,0.20)', line: {{ width: 0 }}, layer: 'below',
+            }});
+        }}
+        if (untested.length) {{
+            const widest = untested.slice().sort((a, b) => (b[1] / b[0]) - (a[1] / a[0]))[0];
+            annotations.push({{
+                xref: 'x', x: Math.log10(Math.sqrt(widest[0] * Math.max(widest[1], widest[0] * 1.01))),
+                yref: 'paper', y: 0.985, yanchor: 'top',
+                text: 'realism untestable — measurement noise dominates', showarrow: false,
+                font: {{ size: 9, color: '#a7b0ba' }}, xanchor: 'center', bgcolor: 'rgba(21,27,35,0.75)',
+            }});
+        }}
+        const obj = tlObjects.find(o => o.object === tlObject);
+        Plotly.newPlot(el, traces, Object.assign({{}}, baseLayout, {{
+            title: {{ text: `${{tlObject}}${{obj ? ' · ' + obj.cls : ''}} — realism and accuracy as the arc grows`,
+                     font: {{ size: 12, color: '#c9d4e0' }} }},
+            xaxis: Object.assign(ax('fit arc (days)'), {{ type: 'log', anchor: 'y2',
+                     range: arcRange || undefined, ...logTicks(arcRange) }}),
+            yaxis: Object.assign(ax('med d²ₙ'), {{ type: 'log', domain: [0.55, 1],
+                     range: d2Range || undefined, ...logTicks(d2Range) }}),
+            yaxis2: Object.assign(ax('med sep (″)'), {{ type: 'log', domain: [0, 0.45],
+                      range: sepRange || undefined, ...logTicks(sepRange) }}),
+            showlegend: true,
+            // Legend inside the upper panel: 90px of dead margin below the
+            // plot was 45% of this figure's vertical budget.
+            legend: {{ ...baseLayout.legend, x: 0.015, y: 0.995, xanchor: 'left', yanchor: 'top',
+                      bgcolor: 'rgba(21,27,35,0.80)', orientation: 'v' }},
+            margin: {{ l: 66, r: 20, t: 40, b: 44 }},
+            shapes: shapes, annotations: annotations,
+        }}), TL_PLOT_CFG);
+        if (tnoteEl) {{
+            const bits = [];
+            if (predictAgg && predictAgg.per_window_note) {{
+                bits.push(`<b style="color:var(--ed-warning-text)">${{predictAgg.per_window_note}}</b>`);
+            }}
+            const nameList = xs => xs.map(n => '<b>' + n + '</b>').join(', ');
+            // Three different silences, and they must not read the same: a
+            // series that delivered nothing at all on this object, one that
+            // delivered positions but no held-out d², and one that drew.
+            const nothing = walks.filter(w => !w.t.n_preds.some(n => n > 0)).map(w => pwLabel(w.s));
+            const noD2 = walks.filter(w => w.t.n_preds.some(n => n > 0) && !w.t.med_d2_norm.some(v => v != null))
+                .map(w => pwLabel(w.s));
+            if (nothing.length) {{
+                bits.push(`${{nameList(nothing)}} delivered nothing on this object — no curve in either panel.`);
+            }}
+            if (noD2.length) {{
+                bits.push(`no held-out d² on this object for ${{nameList(noD2)}} — those series draw in the separation panel only.`);
+            }}
+            if (sparse.length) {{
+                bits.push(`enlarged markers, not curves: ${{sparse.map(x => `<b>${{x.label}}</b> scored ${{x.n}} of ${{x.total}} window${{x.total === 1 ? '' : 's'}}`).join(' · ')}} — everything this section knows about that series on this object is those points.`);
+            }}
+            const failed = walks.map(w => ({{ label: pwLabel(w.s), n: w.t.converged.filter(c => !c).length, total: w.t.converged.length }}))
+                .filter(x => x.n);
+            if (failed.length) {{
+                bits.push(`windows that did not converge: ${{failed.map(x => `<b>${{x.label}}</b> ${{x.n}}/${{x.total}}`).join(' · ')}} — the named failures are in the walk sidecars.`);
+            }}
+            if (nOver) {{
+                bits.push(`▲▼ ${{nOver}} point${{nOver === 1 ? '' : 's'}} beyond the default view, drawn on the boundary — hover for the true value.`);
+            }}
+            if (sel.length > drawn.length) {{
+                bits.push(`${{sel.length - drawn.length}} further selected series sit above the ${{PW_MAX_DRAWN_SERIES}}-curve cap and are undrawn here.`);
+            }}
+            tnoteEl.innerHTML = bits.join('<br>');
+        }}
+    }}
+
+    // ── per-class surfaces (realism for every drawn series, accuracy once) ──
+    // Class-major behind a tab strip: one class on screen, the drawn series
+    // across the columns. The aggregates for every class are already in the
+    // page, so the tabs cost nothing and replace a scroll through six times
+    // as many panels as anyone reads.
+    let surfClass = null;
+    function rampColor(scale, t) {{
+        const u = Math.max(0, Math.min(1, t));
+        let a = scale[0], b = scale[scale.length - 1];
+        for (let i = 0; i < scale.length - 1; i++) {{
+            if (u >= scale[i][0] && u <= scale[i + 1][0]) {{ a = scale[i]; b = scale[i + 1]; break; }}
+        }}
+        const span = (b[0] - a[0]) || 1, f = (u - a[0]) / span;
+        const hx = h => [1, 3, 5].map(i => parseInt(h.substr(i, 2), 16));
+        const ca = hx(a[1]), cb = hx(b[1]);
+        return 'rgb(' + ca.map((v, i) => Math.round(v + (cb[i] - v) * f)).join(',') + ')';
+    }}
+    function renderSurfaces(sel) {{
+        const el = document.getElementById('pw-surfaces');
+        const titleEl = document.getElementById('pw-surface-title');
+        const tabsEl = document.getElementById('pw-class-tabs');
+        const noteSurf = document.getElementById('pw-surface-note');
+        if (!el) return;
+        purgeIn(el);
+        const shown = pwDrawn(sel);
+        if (titleEl) {{
+            titleEl.textContent = `Predictive-power surfaces — ${{shown.length}} of ${{seriesList.length}} series · σ table ${{PW_SIGMA}}`;
+        }}
+        if (!shown.length) {{
+            el.innerHTML = loud('no series selected — nothing to draw.');
+            if (tabsEl) tabsEl.innerHTML = '';
+            if (noteSurf) noteSurf.innerHTML = '';
+            return;
+        }}
+        const classes = uniq([].concat.apply([], shown.map(s => seriesInfo.get(s.key).classes))).sort();
+        if (!classes.length) {{
+            el.innerHTML = loud('no selected series has a populated cell in any class — every cell sits at n_objects = 0. That is a runner outcome, not a missing panel.');
+            if (tabsEl) tabsEl.innerHTML = '';
+            if (noteSurf) noteSurf.innerHTML = '';
+            return;
+        }}
+        if (classes.indexOf(surfClass) < 0) {{
+            const eligible = cls => shown.reduce((a, s) => a + grid(cls, s.tool, s.arm, realOf, null)
+                .flat.filter(e => e.elig).length, 0);
+            surfClass = classes.slice().sort((a, b) => eligible(b) - eligible(a))[0];
+        }}
+        if (tabsEl) {{
+            tabsEl.innerHTML = classes.map(c =>
+                `<button type="button" data-class="${{c}}" class="${{c === surfClass ? 'active' : ''}}">${{c}}</button>`).join('');
+        }}
+        // Accuracy is a property of the fit, not of the covariance the fit
+        // publishes; between-arm accuracy differences are nil, so it is drawn
+        // once for the reference and for each external tool rather than
+        // thirty-six times.
+        const accSeries = shown.filter(s => s === refRust || !s.axes);
+        const realSeries = shown.filter(s => seriesInfo.get(s.key).classes.indexOf(surfClass) >= 0);
+        const accShown = accSeries.filter(s => seriesInfo.get(s.key).classes.indexOf(surfClass) >= 0);
+        // Ranges are computed once per block, from the verdict-eligible cells
+        // of the panels actually drawn, and clipped to the 2nd/98th
+        // percentile — exactly what the caption claims.
+        const realGrids = realSeries.map(s => grid(surfClass, s.tool, s.arm, realOf, null));
+        const realRange = heatRange(realGrids, true, 0.5);
+        const accGrids = accShown.map(s => grid(surfClass, s.tool, s.arm, accOf, null));
+        const accRange = heatRange(accGrids, false, 0);
+        const panel = (pre, s) =>
+            `<div class="pw-surface-cell"><div class="pw-surface-name">${{pwSwatch(s)}}<span>${{pwLabel(s)}}</span></div>`
+            + `<div id="${{pre}}-${{slug(s.key)}}" class="pw-surface-plot"></div></div>`;
+        el.innerHTML =
+            `<div class="pw-block"><div class="pw-block-title">realism &mdash; signed log<sub>2</sub> med d&sup2;<sub>n</sub> (0 = calibrated, hot = over-confident) &middot; ${{surfClass}}</div>`
+            + `<div class="pw-surface-row">${{realSeries.map(s => panel('pw-real', s)).join('')}}</div></div>`
+            + (accShown.length
+                ? `<div class="pw-block"><div class="pw-block-title">accuracy &mdash; median separation, log<sub>10</sub> arcsec &middot; ${{surfClass}}</div>`
+                  + `<div class="pw-surface-row">${{accShown.map(s => panel('pw-acc', s)).join('')}}</div></div>`
+                : '');
+        realSeries.forEach((s, i) => {{
+            const g = grid(surfClass, s.tool, s.arm, realOf, realRange);
+            Plotly.newPlot(`pw-real-${{slug(s.key)}}`,
+                heatTraces(g, PW_REAL_SCALE, realRange[0], realRange[1], 0, i === realSeries.length - 1, 'log₂ d²ₙ'),
+                heatLayout(null, 300, {{ left: i === 0 ? 78 : 16, right: i === realSeries.length - 1 ? 70 : 8,
+                                        yTicks: i === 0, yTitle: i === 0 ? undefined : null }}),
+                PW_PLOT_CFG);
+        }});
+        accShown.forEach((s, i) => {{
+            const g = grid(surfClass, s.tool, s.arm, accOf, accRange);
+            Plotly.newPlot(`pw-acc-${{slug(s.key)}}`,
+                heatTraces(g, PW_ACC_SCALE, accRange[0], accRange[1], null, i === accShown.length - 1, 'log₁₀ sep (″)'),
+                heatLayout(null, 300, {{ left: i === 0 ? 78 : 16, right: i === accShown.length - 1 ? 70 : 8,
+                                        yTicks: i === 0, yTitle: i === 0 ? undefined : null }}),
+                PW_PLOT_CFG);
+        }});
+        if (noteSurf) {{
+            const bits = [
+                `One colour range per block, shared across every panel in it, computed from the verdict-eligible cells (n_objects &ge; ${{PW_MIN_OBJECTS}}) of the panels drawn here and clipped to their 2nd&ndash;98th percentile: realism ${{realRange[0].toFixed(2)}} to ${{realRange[1].toFixed(2)}} log<sub>2</sub>, accuracy ${{accRange[0].toFixed(2)}} to ${{accRange[1].toFixed(2)}} log<sub>10</sub>. Cells outside carry a &#9650;/&#9660; and their true value in the hover.`,
+                `Hatched = fewer than ${{PW_MIN_OBJECTS}} objects (value shown, excluded from verdicts and from the range) &middot; open dot = predictions delivered but no &Sigma;<sub>pred</sub>-dominated d&sup2; &middot; blank = the (arc &times; &Delta;t) combination is unreachable, not a failure.`,
+            ];
+            if (accShown.length < realSeries.length) {{
+                bits.push('Accuracy is drawn once for the reference and for each external tool: the arms differ in the covariance they publish, not in where they put the object, so the remaining copies would be identical panels.');
+            }}
+            noteSurf.innerHTML = bits.join('<br>');
+        }}
+    }}
+
+    // ── delivered / failed matrix: object × selected series ──
+    // Columns follow the selection uncapped: a column is cheap and a series
+    // whose windows all failed is exactly what this table exists to show.
+    let objSort = {{ key: 'class', dir: 1 }};
+    function renderObjectTable(sel) {{
+        const head = document.getElementById('pw-object-head');
+        const tbody = document.getElementById('pw-object-tbody');
+        if (!head || !tbody) return;
+        const objects = [];
+        const seenObj = new Set();
+        for (const p of perObject) if (!seenObj.has(p.object)) {{ seenObj.add(p.object); objects.push({{ object: p.object, cls: p.class }}); }}
+        const sortKey = objSort.key;
+        const seriesL2 = (o, s) => {{
+            const p = poByKey.get(pwKey(o.object, s.tool, s.arm));
+            return p && p.med_d2_norm > 0 ? Math.log2(p.med_d2_norm) : null;
+        }};
+        const sortSeries = sortKey.indexOf('series:') === 0
+            ? sel.find(s => s.key === sortKey.slice(7)) : null;
+        objects.sort((a, b) => {{
+            if (sortSeries) {{
+                const va = seriesL2(a, sortSeries), vb = seriesL2(b, sortSeries);
+                const aa = va == null ? -Infinity : Math.abs(va), bb = vb == null ? -Infinity : Math.abs(vb);
+                if (aa !== bb) return objSort.dir * (bb - aa);
+            }} else if (sortKey === 'object') {{
+                const d = a.object.localeCompare(b.object);
+                if (d) return objSort.dir * d;
+            }}
+            return a.cls.localeCompare(b.cls) || a.object.localeCompare(b.object);
+        }});
+        const arrow = k => sortKey === k ? (objSort.dir > 0 ? ' ▾' : ' ▴') : '';
+        head.innerHTML = `<th class="obj pw-sortable" data-sort="object" style="text-align:left">Object${{arrow('object')}}</th>`
+            + `<th class="pw-sortable" data-sort="class" style="text-align:left">Class${{arrow('class')}}</th>`
+            + sel.map(s => `<th class="pw-sortable" data-sort="series:${{s.key}}" title="${{pwHoverTitle(s)}} — click to sort by |log₂ d²ₙ|">${{pwSwatch(s)}}<br>${{pwLabel(s)}}${{arrow('series:' + s.key)}}</th>`).join('');
+        if (!sel.length) {{
+            tbody.innerHTML = `<tr><td class="obj" colspan="2" style="color:var(--ed-warning-text)">no series selected — pick at least one above.</td></tr>`;
+            return;
+        }}
+        // Cell backgrounds ride the same diverging ramp the realism surfaces
+        // use, on a fixed ±4 log₂ span so a value means the same colour in
+        // every row of the table and in every rendering of the page.
+        const TBL_SPAN = 4;
+        let band = 0, lastCls = null;
+        tbody.innerHTML = objects.map(o => {{
+            if (o.cls !== lastCls) {{ band ^= 1; lastCls = o.cls; }}
+            return `<tr class="${{band ? 'pw-band' : ''}}"><td class="obj">${{o.object}}</td>`
+            + `<td class="obj" style="color:var(--ed-text-secondary)">${{o.cls}}</td>`
+            + sel.map(s => {{
+                const p = poByKey.get(pwKey(o.object, s.tool, s.arm));
+                if (!p) return '<td style="color:var(--ed-text-muted)">—</td>';
+                const color = p.n_windows_expected === 0 ? 'var(--ed-text-muted)'
+                    : p.n_windows_converged === 0 ? 'var(--ed-error-text)'
+                    : p.n_windows_failed > 0 ? 'var(--ed-warning-text)'
+                    : 'var(--ed-text-primary)';
+                const l2 = p.med_d2_norm > 0 ? Math.log2(p.med_d2_norm) : null;
+                const bg = l2 == null ? '' :
+                    `background:${{rampColor(PW_REAL_SCALE, (Math.max(-TBL_SPAN, Math.min(TBL_SPAN, l2)) + TBL_SPAN) / (2 * TBL_SPAN))}};`;
+                const ink = l2 == null ? 'var(--ed-text-muted)' : '#151b23';
+                return `<td title="${{p.n_predictions}} predictions scored${{l2 == null ? '' : ' · log₂ d²ₙ ' + (l2 > 0 ? '+' : '') + l2.toFixed(2)}}">`
+                    + `<div style="color:${{color}}; font-weight:600">${{p.n_windows_converged}}/${{p.n_windows_expected}}</div>`
+                    + `<div style="${{bg}} color:${{ink}}; font-size:9px; border-radius:2px; padding:1px 3px; margin-top:2px">`
+                    + `d²ₙ ${{fmtN(p.med_d2_norm, 2)}} · ${{fmtN(p.med_sep_arcsec, 2)}}″</div></td>`;
+            }}).join('')
+            + '</tr>';
+        }}).join('');
+        if (!objects.length) {{
+            tbody.innerHTML = `<tr><td class="obj" colspan="${{sel.length + 2}}" style="color:#8b9198">no per-object walk summaries in these aggregates.</td></tr>`;
+        }}
+    }}
+
+    function renderNote(sel) {{
+        const drawn = pwDrawn(sel);
+        if (countEl) countEl.textContent = `${{sel.length}} selected · ${{drawn.length}} drawn`;
+        if (quickEl) {{
+            const keys = new Set(sel.map(s => s.key));
+            quickEl.querySelectorAll('button[data-quick]').forEach(btn => {{
+                const list = resolved.get(btn.getAttribute('data-quick')) || [];
+                const same = list.length === keys.size && list.every(s => keys.has(s.key));
+                btn.classList.toggle('active', same);
+            }});
+        }}
+        if (!noteEl) return;
+        const bits = [];
+        if (!sel.length) {{
+            bits.push('<b style="color:var(--ed-warning-text)">no series selected</b> — every panel below is empty until one is picked.');
+        }}
+        if (sel.length > drawn.length) {{
+            const narrow = quickSets.filter(q => resolved.has(q.id) && resolved.get(q.id).length <= PW_MAX_DRAWN_SERIES)
+                .slice(0, 2).map(q => `<b>${{q.label}}</b>`);
+            bits.push(`<b style="color:var(--ed-warning-text)">${{sel.length - drawn.length}} of ${{sel.length}} selected series are not drawn</b> — the ${{PW_MAX_DRAWN_SERIES}} on screen are a balanced contrast (reference, then one arm per level of each factor). `
+                + (narrow.length ? `Narrow with ${{narrow.join(' or ')}}.` : 'Narrow the selection to choose the eight yourself.')
+                + ' Every selected series still holds a column in the per-object table.');
+        }}
+        bits.push('hue = rejection × nightly · pale = debias off · dashed = sigma points, dotted = Monte Carlo. Hover any curve or cell for the raw arm code.');
+        noteEl.innerHTML = bits.join('<br>');
+    }}
+
+    // ── object picker for the timeline panel ──
+    // Built once: which objects were walked does not depend on the series
+    // selection, only on what the aggregates carry.
+    const tlSelectEl = document.getElementById('pw-timeline-object');
+    if (tlSelectEl) {{
+        if (!tlObjects.length) {{
+            tlSelectEl.style.display = 'none';
+        }} else {{
+            tlSelectEl.innerHTML = uniq(tlObjects.map(o => o.cls)).sort().map(cls =>
+                `<optgroup label="${{cls}}">`
+                + tlObjects.filter(o => o.cls === cls).map(o =>
+                    `<option value="${{o.object}}"${{o.object === tlObject ? ' selected' : ''}}>${{o.object}}</option>`).join('')
+                + `</optgroup>`).join('');
+            tlSelectEl.addEventListener('change', () => {{
+                tlObject = tlSelectEl.value;
+                renderTimeline(currentSeries());
+            }});
+        }}
+    }}
+    const tabsHost = document.getElementById('pw-class-tabs');
+    if (tabsHost) {{
+        tabsHost.addEventListener('click', e => {{
+            const btn = e.target.closest('button[data-class]');
+            if (!btn) return;
+            surfClass = btn.getAttribute('data-class');
+            renderSurfaces(currentSeries());
+        }});
+    }}
+    const objHead = document.getElementById('pw-object-head');
+    if (objHead) {{
+        objHead.addEventListener('click', e => {{
+            const th = e.target.closest('th[data-sort]');
+            if (!th) return;
+            const k = th.getAttribute('data-sort');
+            objSort = {{ key: k, dir: objSort.key === k ? -objSort.dir : 1 }};
+            renderObjectTable(currentSeries());
+        }});
+    }}
+
+    function pwRenderAll() {{
+        const sel = currentSeries();
+        renderNote(sel);
+        renderMatrices();
+        renderWorst();
+        renderMarginals(sel);
+        renderReducedChi2(sel);
+        renderTimeline(sel);
+        renderSurfaces(sel);
+        renderObjectTable(sel);
+    }}
+
+    syncInputs();
+    // The main-effects strips read the whole 36-arm grid, not the selection,
+    // so they are drawn once rather than on every checkbox change.
+    renderEffects('pw-effects-med', armMedian, 'median d²ₙ', '.2f');
+    renderEffects('pw-effects-tail', armTail, 'tail rate', '.0%');
+    renderEffectsNote();
+    pwRenderAll();
+}}
+try {{ buildPredictWalk(); }} catch (e) {{ console.error('buildPredictWalk failed', e); }}
+
 // ─────────── Performance strip (Overview + Advanced) ───────────
 // Median wall clock per row per tool, per axis, as log-scaled bars. Absolute
 // per-tool numbers — independent of the selected pair, built once.
@@ -5228,6 +7559,7 @@ try {{ wirePageNav(); }} catch (e) {{ console.error('wirePageNav failed', e); }}
     let html = html.replace("POP_COLORS_JSON", &pop_colors_json);
     let html = html.replace("CHANNEL_COLORS_JSON", &channel_colors_json);
     let html = html.replace("ORBIT_COMPARISONS_JSON", &orbit_comparisons_json);
+    let html = html.replace("PREDICT_AGG_JSON", &predict_agg_json);
 
     if let Some(parent) = output.parent() {
         std::fs::create_dir_all(parent)
@@ -5289,7 +7621,7 @@ mod tests {
         ];
         let dir = tempfile::tempdir().unwrap();
         let out = dir.path().join("report.html");
-        let result = generate_report(&rows, &[], &out, None);
+        let result = generate_report(&rows, &[], &out, None, None);
         assert!(result.is_ok(), "generate_report failed: {result:?}");
         let html = std::fs::read_to_string(&out).unwrap();
         assert!(html.contains("EMPYREAN"), "missing brand title");
@@ -5305,7 +7637,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let html = dir.path().join("report.html");
         let summary = dir.path().join("summary.json");
-        let result = generate_report(&rows, &[], &html, Some(&summary));
+        let result = generate_report(&rows, &[], &html, Some(&summary), None);
         assert!(result.is_ok());
         let summary_json = std::fs::read_to_string(&summary).unwrap();
         let v: serde_json::Value = serde_json::from_str(&summary_json).unwrap();
@@ -5343,7 +7675,7 @@ mod tests {
         }];
         let dir = tempfile::tempdir().unwrap();
         let out = dir.path().join("report.html");
-        generate_report(&rows, &comps, &out, None).unwrap();
+        generate_report(&rows, &comps, &out, None, None).unwrap();
         let html = std::fs::read_to_string(&out).unwrap();
         assert!(
             html.contains("Fitted Orbit and Covariance"),
@@ -5402,7 +7734,7 @@ mod tests {
         ];
         let dir = tempfile::tempdir().unwrap();
         let out = dir.path().join("report.html");
-        generate_report(&rows, &[], &out, None).unwrap();
+        generate_report(&rows, &[], &out, None, None).unwrap();
         let html = std::fs::read_to_string(&out).unwrap();
 
         // (1) verbatim embed — the exact serialization appears in the page.
@@ -5436,9 +7768,753 @@ mod tests {
             "id=\"s11\"",
             "id=\"s12\"",
             "id=\"s13\"",
+            "id=\"s14\"",
         ] {
             assert!(html.contains(anchor), "missing section anchor: {anchor}");
         }
+    }
+
+    // ── §14: walk-forward prediction aggregates ──────────────────────
+
+    fn synthetic_surface_cell(
+        arm: &str,
+        arc: (f64, f64),
+        dt: (f64, f64),
+        n_objects: u32,
+    ) -> crate::predict_schema::SurfaceCell {
+        crate::predict_schema::SurfaceCell {
+            class: "MainBelt".to_string(),
+            tool: "rust".to_string(),
+            config_arm: arm.to_string(),
+            sigma_table: "pinned".to_string(),
+            arc_lo_days: arc.0,
+            arc_hi_days: arc.1,
+            dt_lo_days: dt.0,
+            dt_hi_days: dt.1,
+            n_objects,
+            n_windows: 12,
+            n_predictions: 48,
+            delivered_fraction: 0.96,
+            med_sep_arcsec: Some(0.774_759_910_180_190_2),
+            med_d2_norm: Some(3.125_5),
+            cov_1s: Some(0.31),
+            cov_2s: Some(0.82),
+        }
+    }
+
+    fn synthetic_predict_aggregates(snapshot: &str) -> crate::predict_schema::PredictAggregates {
+        crate::predict_schema::PredictAggregates {
+            snapshot_id: snapshot.to_string(),
+            cells: vec![
+                synthetic_surface_cell("default", (3000.0, 30000.0), (3.0, 10.0), 5),
+                // Below the 3-object floor: dimmed, verdict-free.
+                synthetic_surface_cell("default", (3000.0, 30000.0), (10.0, 30.0), 2),
+                synthetic_surface_cell("no-rejection", (3000.0, 30000.0), (3.0, 10.0), 5),
+            ],
+            per_object: vec![
+                crate::predict_schema::ObjectWalkSummary {
+                    object: "Holman".to_string(),
+                    class: "MainBelt".to_string(),
+                    tool: "rust".to_string(),
+                    config_arm: "default".to_string(),
+                    n_windows_expected: 4,
+                    n_windows_converged: 3,
+                    n_windows_failed: 1,
+                    n_predictions: 16,
+                    med_d2_norm: Some(3.125_5),
+                    med_sep_arcsec: Some(0.77),
+                },
+                crate::predict_schema::ObjectWalkSummary {
+                    object: "Holman".to_string(),
+                    class: "MainBelt".to_string(),
+                    tool: "rust".to_string(),
+                    config_arm: "no-rejection".to_string(),
+                    n_windows_expected: 4,
+                    n_windows_converged: 4,
+                    n_windows_failed: 0,
+                    n_predictions: 16,
+                    med_d2_norm: Some(1.02),
+                    med_sep_arcsec: Some(0.79),
+                },
+            ],
+            d2_histograms: vec![
+                synthetic_d2hist("rust", "default"),
+                synthetic_d2hist("rust", "no-rejection"),
+            ],
+            per_window: vec![
+                synthetic_timeline("default", "Holman", "MainBelt"),
+                synthetic_timeline("no-rejection", "Holman", "MainBelt"),
+                synthetic_timeline("default", "Apophis", "NEA"),
+            ],
+            reduced_chi2: vec![
+                synthetic_rchi2("rust", "default", 900, 0),
+                // A runner that converges without publishing a reduced χ²:
+                // must read as "not reported", never as zero.
+                synthetic_rchi2("layup", "default", 0, 640),
+            ],
+            per_window_note: None,
+        }
+    }
+
+    fn synthetic_timeline(
+        arm: &str,
+        object: &str,
+        class: &str,
+    ) -> crate::predict_schema::WalkTimeline {
+        crate::predict_schema::WalkTimeline {
+            tool: "rust".to_string(),
+            config_arm: arm.to_string(),
+            object: object.to_string(),
+            class: class.to_string(),
+            window_index: vec![0, 1, 2, 3],
+            arc_days: vec![3.0, 7.0, 21.0, 64.0],
+            // Window 2 failed: a break in the curve, not a missing point.
+            converged: vec![true, true, false, true],
+            med_d2_norm: vec![Some(4.2), Some(2.8), None, Some(1.4)],
+            med_sep_arcsec: vec![Some(1.9), Some(0.94), None, Some(0.41)],
+            n_preds: vec![12, 18, 0, 26],
+        }
+    }
+
+    fn synthetic_rchi2(
+        tool: &str,
+        arm: &str,
+        n_with: u32,
+        n_without: u32,
+    ) -> crate::predict_schema::ReducedChi2Histogram {
+        let mut counts = vec![0u32; crate::predict_compare::RCHI2_HIST_BINS];
+        if n_with > 0 {
+            counts[20] = n_with / 3;
+            counts[30] = n_with - n_with / 3;
+        }
+        crate::predict_schema::ReducedChi2Histogram {
+            tool: tool.to_string(),
+            config_arm: arm.to_string(),
+            log10_lo: crate::predict_compare::RCHI2_LOG10_LO,
+            log10_hi: crate::predict_compare::RCHI2_LOG10_HI,
+            counts,
+            underflow: 0,
+            overflow: 0,
+            n_with,
+            n_without,
+            n_nonpositive: 0,
+            // The ν mixture behind the fit-quality envelope. Two small ν, so
+            // the expected χ²ᵣ spread is wide and visibly not a spike at 1.
+            dof: if n_with > 0 {
+                vec![
+                    crate::predict_schema::DofBin {
+                        ndof: 8,
+                        n: n_with / 3,
+                    },
+                    crate::predict_schema::DofBin {
+                        ndof: 40,
+                        n: n_with - n_with / 3,
+                    },
+                ]
+            } else {
+                Vec::new()
+            },
+        }
+    }
+
+    /// A d² histogram carrying both families: the fine linear body the
+    /// coverage residual reads, and the log-spaced survival bins the survival
+    /// curve reads out to d² = 10³.
+    fn synthetic_d2hist(tool: &str, arm: &str) -> crate::predict_schema::D2Histogram {
+        let mut counts = vec![0u32; crate::predict_compare::D2_HIST_BINS];
+        for (i, c) in counts.iter_mut().enumerate() {
+            *c = (60 - i) as u32;
+        }
+        let binned: u32 = counts.iter().sum();
+        let mut log_counts = vec![0u32; crate::predict_compare::D2_LOG_BINS];
+        // A body around d² ~ 1 plus a deliberate fat tail past the χ²₂ 99%
+        // point, so the survival curve has a visible gap to draw.
+        log_counts[60] = binned / 2;
+        log_counts[80] = binned / 4;
+        log_counts[100] = binned - binned / 2 - binned / 4;
+        crate::predict_schema::D2Histogram {
+            tool: tool.to_string(),
+            config_arm: arm.to_string(),
+            sigma_table: "pinned".to_string(),
+            class: "all".to_string(),
+            domain_max: crate::predict_compare::D2_HIST_DOMAIN,
+            counts,
+            overflow: 220,
+            n: binned + 220,
+            log_counts,
+            log10_lo: crate::predict_compare::D2_LOG_LO,
+            log10_hi: crate::predict_compare::D2_LOG_HI,
+            log_underflow: 0,
+            log_overflow: 220,
+            log_zero: 0,
+        }
+    }
+
+    #[test]
+    fn report_embeds_predict_aggregates_verbatim_and_renders_s14() {
+        // Same contract tripwire as RESULTS_JSON: §14 renders entirely from
+        // the ONE embedded aggregate, so the embed must be byte-for-byte the
+        // serde serialization — a renderer change must never silently
+        // reshape what the page is fed.
+        let rows = vec![synthetic_rust_prop_row("Apophis", 0.0)];
+        let agg = synthetic_predict_aggregates("2026-07-29-75ab459bc8b2");
+        let dir = tempfile::tempdir().unwrap();
+        let out = dir.path().join("report.html");
+        generate_report(&rows, &[], &out, None, Some(&agg)).unwrap();
+        let html = std::fs::read_to_string(&out).unwrap();
+
+        let expected = serde_json::to_string(&agg).unwrap();
+        assert!(
+            html.contains(&expected),
+            "PREDICT_AGG_JSON is not the verbatim serde serialization of the aggregates",
+        );
+        // The statistics the panels read must survive to the client.
+        for field in [
+            r#""med_d2_norm":3.1255"#,
+            r#""n_objects":2"#,
+            r#""config_arm":"no-rejection""#,
+            r#""n_windows_failed":1"#,
+        ] {
+            assert!(html.contains(field), "aggregate field {field} not embedded");
+        }
+        // Section shell + every panel mount point.
+        assert!(html.contains("id=\"s14\""), "missing §14 anchor");
+        assert!(
+            html.contains("Prediction &mdash; Accuracy and Covariance Realism"),
+            "missing §14 title"
+        );
+        for mount in [
+            "id=\"pw-chips\"",
+            "id=\"pw-surfaces\"",
+            "id=\"pw-surface-note\"",
+            "id=\"pw-class-tabs\"",
+            "id=\"pw-matrix-med\"",
+            "id=\"pw-matrix-tail\"",
+            "id=\"pw-matrix-note\"",
+            "id=\"pw-worst\"",
+            "id=\"pw-effects-med\"",
+            "id=\"pw-effects-tail\"",
+            "id=\"pw-object-tbody\"",
+            "id=\"pw-empty\"",
+            "id=\"pw-series-select\"",
+            "id=\"pw-quick\"",
+            "id=\"pw-series-groups\"",
+            "id=\"pw-select-note\"",
+            "id=\"pw-d2-note\"",
+            "id=\"pw-rchi2\"",
+            "id=\"pw-rchi2-note\"",
+            "id=\"pw-timeline-object\"",
+            "id=\"pw-timeline\"",
+            "id=\"pw-timeline-note\"",
+        ] {
+            assert!(html.contains(mount), "missing §14 mount point: {mount}");
+        }
+        // The new families reach the client with their statistics intact —
+        // the timeline and fit-quality panels render from these alone.
+        for field in [
+            r#""med_d2_norm":[4.2,2.8,null,1.4]"#,
+            r#""converged":[true,true,false,true]"#,
+            r#""arc_days":[3.0,7.0,21.0,64.0]"#,
+            r#""object":"Apophis""#,
+            r#""n_without":640"#,
+        ] {
+            assert!(
+                html.contains(field),
+                "per-window / reduced-χ² field {field} not embedded"
+            );
+        }
+        // The section used to assert an "honest target 2.6–4.0 with rejection
+        // on". That band was an assertion, and the paired per-object on/off
+        // ratio measured on this corpus refutes it (1.00×, twice
+        // independently). The measurement replaces the assertion, and the
+        // assertion must not survive anywhere on the page.
+        for banned in [
+            "2.6&ndash;4.0",
+            "Do not tune toward 1",
+            "honest target",
+            "PW_REJECTION_BAND",
+        ] {
+            assert!(
+                !html.contains(banned),
+                "§14 still carries the refuted rejection band: {banned}"
+            );
+        }
+        assert!(
+            html.contains("paired per-object rejection on/off ratio")
+                && html.contains("does not measurably deflate published σ on this corpus"),
+            "§14 must state the MEASURED rejection on/off ratio in place of the band"
+        );
+    }
+
+    #[test]
+    fn s14_handles_the_config_grid_series_without_renaming_or_guessing() {
+        // The 36-arm config grid has no arm literally named "default", so the
+        // §14 series machinery must (a) parse the grid names onto their axes,
+        // (b) keep the pre-grid names working, (c) name the primary series
+        // explicitly rather than letting alphabetical order hand the chips a
+        // nightly-off control, and (d) never rename an arm on the way through.
+        let rows = vec![synthetic_rust_prop_row("Apophis", 0.0)];
+        let agg = crate::predict_schema::PredictAggregates {
+            snapshot_id: "2026-08-18-gridseries".to_string(),
+            cells: vec![
+                synthetic_surface_cell("efcc.adap.vfc", (3000.0, 30000.0), (3.0, 10.0), 5),
+                synthetic_surface_cell("nodeb.cmc.vfc+mc", (3000.0, 30000.0), (3.0, 10.0), 5),
+                synthetic_surface_cell("default", (3000.0, 30000.0), (3.0, 10.0), 4),
+            ],
+            per_object: Vec::new(),
+            d2_histograms: Vec::new(),
+            per_window: Vec::new(),
+            reduced_chi2: Vec::new(),
+            per_window_note: None,
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let out = dir.path().join("report.html");
+        generate_report(&rows, &[], &out, None, Some(&agg)).unwrap();
+        let html = std::fs::read_to_string(&out).unwrap();
+
+        // Arms reach the client under the names the aggregate shipped.
+        for arm in ["efcc.adap.vfc", "nodeb.cmc.vfc+mc", "default"] {
+            assert!(
+                html.contains(&format!(r#""config_arm":"{arm}""#)),
+                "arm {arm} was renamed or dropped on the way to the page"
+            );
+        }
+        // Primary-series resolution, in order: an arm literally named
+        // "default", else the grid's reference cell, else the first rust
+        // series. Alphabetical order must never decide this.
+        assert!(
+            html.contains("byArm('rust', 'default') || byArm('rust', 'efcc.adap.vfc')"),
+            "§14 lost the explicit primary-series chain — alphabetical order \
+             would hand the chips a nightly-off control"
+        );
+        // Grid-name parsing and the legacy fallbacks.
+        for token in [
+            "const PW_DEBIAS = ['efcc', 'nodeb'];",
+            "const PW_REJECTION = ['adap', 'cmc', 'norej'];",
+            "const PW_NIGHTLY = ['vfc', 'nonight'];",
+            "const PW_TRANSPORT = ['linear', 'sp', 'so', 'mc'];",
+            "'no-rejection':",
+            "'no-nightly':",
+        ] {
+            assert!(html.contains(token), "§14 lost grid-name parsing: {token}");
+        }
+        // The selector shell, its quick-sets, and manual control.
+        for (id, label) in [
+            ("ref-tools", "Reference + rejection off + external tools"),
+            ("rejection", "Rejection sweep"),
+            ("debias", "Debias pair"),
+            ("nightly", "Nightly pair"),
+            ("transport", "Transport sweep"),
+            ("all-rust", "All Empyrean arms"),
+            ("tools", "External tools"),
+        ] {
+            assert!(
+                html.contains(&format!("id: '{id}', label: '{label}'")),
+                "§14 selector lost the {label:?} quick-set"
+            );
+        }
+        assert!(
+            html.contains(r#"<input type=\"checkbox\" data-series="#)
+                || html.contains(r#"<input type="checkbox" data-series="#),
+            "§14 selector lost its per-series checkboxes"
+        );
+        // Every one of the 12 base-arm colours must be assigned: a grid arm
+        // falling through to the fallback gray is the bug this replaced.
+        for hex in [
+            "#5598e7", "#a7cefe", "#d66d9a", "#feb0ce", "#c48809", "#fabf61", "#8ca12c", "#c1d771",
+            "#21af79", "#73e5b0", "#0da8b8", "#41e2f5",
+        ] {
+            assert!(html.contains(hex), "§14 palette lost base-arm colour {hex}");
+        }
+        for (tool, hex) in [("layup", "#9d85dd"), ("findorb", "#ef8a5c")] {
+            assert!(
+                html.contains(&format!("{tool}: '{hex}'")),
+                "§14 lost the fixed {tool} identity {hex}"
+            );
+        }
+        // The cap is announced, never silent — and which eight get drawn is
+        // a balanced contrast, not enumeration order.
+        assert!(
+            html.contains("const PW_MAX_DRAWN_SERIES = 8;")
+                && html.contains("function pwDrawn(sel)")
+                && html.contains("selected series are not drawn")
+                && html.contains(
+                    "balanced contrast (reference, then one arm per level of each factor)"
+                ),
+            "§14 must cap drawn series loudly and fill the cap by balanced contrast"
+        );
+        // The old note dumped every undrawn series' name into the page.
+        assert!(
+            !html.contains("slice(PW_MAX_DRAWN_SERIES).map(s => pwLabel(s)).join"),
+            "§14 still dumps the undrawn series names into the overflow note"
+        );
+    }
+
+    #[test]
+    fn s14_factorial_matrices_are_the_primary_selector() {
+        // The centrepiece: the whole arm grid on one screen, twice, with the
+        // median and the tail disagreeing. It has to be built from the
+        // aggregate alone, split visibly on the largest main effect, print
+        // its numbers, and act as the selector for everything below it.
+        let rows = vec![synthetic_rust_prop_row("Apophis", 0.0)];
+        let agg = synthetic_predict_aggregates("2026-08-22-matrices");
+        let dir = tempfile::tempdir().unwrap();
+        let out = dir.path().join("report.html");
+        generate_report(&rows, &[], &out, None, Some(&agg)).unwrap();
+        let html = std::fs::read_to_string(&out).unwrap();
+
+        for token in [
+            "function matrixFigure(el, valueOf, fmt, cbTitle, opts)",
+            "function renderMatrices()",
+            // Rows are rejection × nightly; columns are debias × transport
+            // with debias OUTER, so the biggest effect splits left/right.
+            "for (const rej of PW_REJECTION) for (const ni of PW_NIGHTLY)",
+            "for (const db of PW_DEBIAS) for (const tr of mxTransports)",
+            // Two-tier headers on top kill the 45° tick rotation.
+            "side: 'top'",
+            "PW_DEBIAS_LABEL[mxCols[c0].db]",
+            // The value is printed in every tile: data, not a caption.
+            "font: { size: 12, color: PW_TILE_INK, family: 'JetBrains Mono' }",
+            "xgap: 3, ygap: 3",
+            // Left tiles carry a non-convergence border; both accept clicks.
+            "if (o.borderBy)",
+            "borderBy: armFail",
+            "el.on('plotly_click', ev => {",
+            "target.scrollIntoView(",
+            "line: { color: '#ffffff', width: 1.6 }",
+            // The right matrix is the tail rate, off the survival bins.
+            "function survivalAt(h, x)",
+            "const armTail = s => s ? survivalAt(histByKey.get(s.key), PW_CHI2_2_P99) : null;",
+            // Main-effects strips, both metrics.
+            "function renderEffects(mountId, valueOf, yTitle, fmtY)",
+            "renderEffects('pw-effects-med', armMedian, 'median d²ₙ', '.2f');",
+            "renderEffects('pw-effects-tail', armTail, 'tail rate', '.0%');",
+            // All four factor panels share one y range; per-panel autoscale
+            // would make their slopes incomparable.
+            "range: yRange,",
+            // Worst offenders, just under the matrices.
+            "function renderWorst()",
+        ] {
+            assert!(html.contains(token), "§14 lost matrix machinery: {token}");
+        }
+        // Calibrated d²ₙ = 1 is marked at the colour bar's LOW EDGE, because
+        // on this corpus it sits below every arm; drawing it inside the bar
+        // would put it somewhere it is not.
+        assert!(
+            html.contains("calibratedAt: '1.00'")
+                && html.contains("▼ calibrated ${o.calibratedAt}"),
+            "§14 median matrix lost the calibrated marker at the colour bar's low edge"
+        );
+        // The 39-checkbox farm is behind a disclosure now.
+        assert!(
+            html.contains("<details class=\"pw-disclosure\">"),
+            "§14 must fold the per-series checkboxes into a disclosure"
+        );
+    }
+
+    #[test]
+    fn s14_low_n_is_hatched_never_dimmed_and_never_annotated_per_cell() {
+        // The old treatment composited a 0.3-opacity fill toward the panel
+        // ground — which made calibrated cells the MOST visible and extremes
+        // vanish — and printed an 8px "low n" string into as many as thirty
+        // cells per panel. Now: full-saturation value, a hatch overlay, and
+        // one caption key.
+        let rows = vec![synthetic_rust_prop_row("Apophis", 0.0)];
+        let agg = synthetic_predict_aggregates("2026-08-22-lown");
+        let dir = tempfile::tempdir().unwrap();
+        let out = dir.path().join("report.html");
+        generate_report(&rows, &[], &out, None, Some(&agg)).unwrap();
+        let html = std::fs::read_to_string(&out).unwrap();
+
+        assert!(
+            !html.contains("text: 'low n'") && !html.contains("opacity: 0.3"),
+            "§14 still dims low-n cells or prints a per-cell low-n label"
+        );
+        for token in [
+            // Three states, drawn three ways, and an empty cell is never
+            // annotated at all.
+            "function cellState(c, v)",
+            "return 'unsupported';",
+            "return c.n_objects < PW_MIN_OBJECTS ? 'lown' : 'ok';",
+            "symbol: 'line-ne-open'",
+            "symbol: 'circle-open'",
+            "function markTraces(g)",
+            // Ranges come from verdict-eligible cells, clipped to robust
+            // percentiles, with over-range cells marked rather than clamped
+            // silently.
+            "const PW_RANGE_PCT = [0.02, 0.98];",
+            "function heatRange(grids, diverging, floor)",
+            // Verdict-eligible cells set the range; low-n values are drawn
+            // but never allowed to define the scale.
+            "for (const g of grids) for (const e of g.flat) { all.push(e.v); if (e.elig) elig.push(e.v); }",
+            "flat.push({ v: v, elig: st === 'ok' });",
+            "symbol: 'triangle-up'",
+            "beyond the shared colour range — true value",
+        ] {
+            assert!(
+                html.contains(token),
+                "§14 lost the low-n / range machinery: {token}"
+            );
+        }
+        // Accuracy gets a true single-hue sequential ramp with a lightness
+        // floor: every stop clears 3:1 on the #151b23 panel, so an accurate
+        // cell reads as a cell and not as a hole in the support.
+        assert!(
+            html.contains(
+                "const PW_ACC_SCALE = [[0, '#4c8396'], [0.25, '#579cae'], \
+[0.5, '#61b7c5'], [0.75, '#6dd1db'], [1, '#7aedf0']];"
+            ),
+            "§14 accuracy scale is not the contrast-floored sequential ramp"
+        );
+        assert!(
+            !html.contains("[0, '#173453'], [0.25, '#1d5f9c']"),
+            "§14 still ships the old fake-diverging accuracy scale"
+        );
+        // The realism surfaces stay diverging and centred on calibrated.
+        assert!(
+            html.contains("if (zmid != null) heat.zmid = zmid;"),
+            "§14 realism surfaces lost their calibrated-centred midpoint"
+        );
+    }
+
+    #[test]
+    fn s14_marginals_are_a_survival_curve_and_a_coverage_residual() {
+        let rows = vec![synthetic_rust_prop_row("Apophis", 0.0)];
+        let agg = synthetic_predict_aggregates("2026-08-22-marginals");
+        let dir = tempfile::tempdir().unwrap();
+        let out = dir.path().join("report.html");
+        generate_report(&rows, &[], &out, None, Some(&agg)).unwrap();
+        let html = std::fs::read_to_string(&out).unwrap();
+
+        // The survival bins must reach the client.
+        assert!(
+            html.contains(r#""log10_hi":3.0"#) && html.contains(r#""log_overflow":220"#),
+            "§14 never received the log-spaced survival bins"
+        );
+        for token in [
+            // Log-log survival against exp(−x/2), not a capped histogram.
+            "P(d² > x)",
+            "name: 'calibrated χ²₂'",
+            "Math.exp(-x / 2)",
+            // The headline tail is annotated ON the marks.
+            "const PW_CHI2_2_P99 = 9.210340371976184;",
+            "const CAL_TAIL = Math.exp(-PW_CHI2_2_P99 / 2);",
+            "text: 'χ²₂ 99%'",
+            // Coverage as a residual on σ-spaced x, with a binomial band.
+            "ax('empirical − nominal coverage')",
+            "ticktext: ['1σ', '2σ', '3σ']",
+            "name: 'binomial 95%'",
+            "const nominalAt = k => 1 - Math.exp(-k * k / 2);",
+            // The expected-scatter envelope for χ²ᵣ under the real ν mixture.
+            "function lnGamma(x)",
+            "function chi2rPdf(r, nu)",
+            "const dofTally = new Map();",
+            // The envelope is a central-interval BAND, not a density: the ν
+            // mixture is dominated by large ν, so its density is a spike at 1
+            // that would set the y axis and flatten every measured curve.
+            "envelope = [qAt(0.05), qAt(0.95)]",
+            "text: 'expected at these ν · central 90%', textangle: -90,",
+        ] {
+            assert!(html.contains(token), "§14 lost marginal machinery: {token}");
+        }
+        // The old capped-histogram panel is gone.
+        assert!(
+            !html.contains("Held-out d² vs χ² (2 dof)") && !html.contains("0.5 * Math.exp(-x / 2)"),
+            "§14 still draws the capped d² density histogram"
+        );
+        // Legends sit beside their plots, not in 90-108px of dead margin.
+        assert!(
+            !html.contains("margin: { l: 60, r: 20, t: 50, b: 108 }"),
+            "§14 still parks a legend ~100px below its panel"
+        );
+    }
+
+    #[test]
+    fn s14_names_series_by_deviation_from_the_reference_not_by_arm_code() {
+        // The arm codes are unreadable to anyone who has not memorised the
+        // grid. Every user-facing label names a series by how it DIFFERS
+        // from the shipping reference; the code survives only in hovers.
+        let rows = vec![synthetic_rust_prop_row("Apophis", 0.0)];
+        let agg = synthetic_predict_aggregates("2026-08-22-humanized");
+        let dir = tempfile::tempdir().unwrap();
+        let out = dir.path().join("report.html");
+        generate_report(&rows, &[], &out, None, Some(&agg)).unwrap();
+        let html = std::fs::read_to_string(&out).unwrap();
+
+        // The deviation vocabulary, exactly as the owner named it.
+        for token in [
+            "const PW_REFERENCE_LABEL = 'reference (shipping defaults)';",
+            "nodeb: 'debias off'",
+            "cmc: 'CMC2003 rejection'",
+            "norej: 'rejection off'",
+            "nonight: 'nightly off'",
+            "sp: 'sigma points'",
+            "mc: 'Monte Carlo'",
+            "'find_orb (its own σ)'",
+            "'find_orb (sampled 2×2)'",
+        ] {
+            assert!(html.contains(token), "§14 lost the human name: {token}");
+        }
+        // The old label function returned the raw arm for every rust series.
+        assert!(
+            !html.contains("function pwLabel(s) { return s.tool === 'rust' ? s.arm"),
+            "§14 still labels rust series with their raw arm code"
+        );
+        // Every visible-text call site goes through pwLabel; the raw code has
+        // exactly two hover-only carriers.
+        assert!(
+            html.contains("function pwHoverLabel(s)") && html.contains("function pwHoverTitle(s)"),
+            "§14 lost the hover-only carriers for the raw arm code"
+        );
+        assert!(
+            html.contains("<span>${pwLabel(s)}</span>")
+                && html.contains(r#"title="${pwHoverTitle(s)}""#),
+            "the selector must show the human name and hide the code in its title"
+        );
+        // Selector group headers are named, not coded.
+        assert!(
+            html.contains("'Empyrean · ' + PW_REJECTION_LABEL[rej]")
+                && !html.contains("'rust · ' + PW_REJECTION_LABEL[rej]"),
+            "§14 selector group headers still carry the tool id / axis code"
+        );
+        // The section prose no longer teaches the reader to parse arm codes.
+        assert!(
+            !html.contains("{debias}.{rejection}.{nightly}"),
+            "§14 prose still explains the raw arm-code grammar"
+        );
+        assert!(
+            html.contains("named by <b>how it differs from the shipping"),
+            "§14 prose must say how series are named"
+        );
+    }
+
+    #[test]
+    fn s14_timeline_and_fit_quality_panels_render_from_the_new_families() {
+        // The two panels the (arc × Δt) heatmaps could not give: one object's
+        // walk in time, and the fit's own reduced χ² per configuration.
+        let rows = vec![synthetic_rust_prop_row("Apophis", 0.0)];
+        let agg = synthetic_predict_aggregates("2026-08-22-panels");
+        let dir = tempfile::tempdir().unwrap();
+        let out = dir.path().join("report.html");
+        generate_report(&rows, &[], &out, None, Some(&agg)).unwrap();
+        let html = std::fs::read_to_string(&out).unwrap();
+
+        for token in [
+            "function renderTimeline(sel)",
+            "function renderReducedChi2(sel)",
+            "renderReducedChi2(sel);",
+            "renderTimeline(sel);",
+            // Stacked subplots sharing one log arc axis.
+            "ax('med d²ₙ'), { type: 'log', domain: [0.55, 1]",
+            "ax('med sep (″)'), { type: 'log', domain: [0, 0.45]",
+            "ax('fit arc (days)'), { type: 'log', anchor: 'y2'",
+            // Log minor ticks label the bare mantissa; 0.5 must not read "5".
+            "const logTicks = r => {",
+            "...logTicks(d2Range)",
+            // A log axis handed an all-null trace autoranges to nonsense, and
+            // an unbounded default view makes the panel unreadable.
+            "const logRange = (values, anchor) => {",
+            "const TL_MAX_DECADES = 6;",
+            // Out-of-range points are drawn on the boundary, never left to a
+            // footnote pointing at the autoscale button.
+            "beyond the default view, drawn on the boundary",
+            "const overTrace = (axisName, range, pick) => {",
+            "const TL_PLOT_CFG = { responsive: true, displayModeBar: 'hover', \
+modeBarButtonsToRemove: ['select2d', 'lasso2d', 'toggleSpikelines'] };",
+            // Calibration furniture: the =1 line and the χ²₂ bands.
+            "const chi2q = p => -2 * Math.log(1 - p) / (2 * Math.LN2);",
+            // Log-axis shapes take data units; logs here park the bands at 1e-27.
+            "y0: chi2q(q0), y1: chi2q(q1),",
+            "yref: 'y', y0: 1, y1: 1,",
+            "band(0.025, 0.975,",
+            "band(0.25, 0.75,",
+            // A failed or empty window breaks the curve; it is never bridged.
+            "connectgaps: false",
+            // Fit quality: log axis, reference at 1, honest "not reported".
+            "ax('fit reduced χ²'), { type: 'log', range: [bLo, bHi]",
+            "text: 'reduced χ² = 1'",
+            "not reported",
+        ] {
+            assert!(html.contains(token), "§14 lost panel machinery: {token}");
+        }
+        // The object picker defaults to something a reader recognises.
+        assert!(
+            html.contains(
+                "const TL_PREFERRED = ['Apophis', 'Bennu', 'Didymos', '2024 YR4', 'Eros'];"
+            ),
+            "§14 timeline lost its default-object preference chain"
+        );
+        // Rejection-on arms sitting below 1 is expected, and the caption must
+        // say so — otherwise the panel reads as a failure.
+        assert!(
+            html.contains("rejection-on arms sit below it</b>")
+                && html.contains("removed before the statistic was formed"),
+            "§14 fit-quality caption lost the post-selection note"
+        );
+    }
+
+    #[test]
+    fn report_without_predict_aggregates_embeds_null_and_keeps_the_shell() {
+        // §14 is always rendered (the s12 pattern) — a conditionally-emitted
+        // section would fail the anchor gate. With no walk loaded the JS
+        // reads a literal `null` and shows the empty state, naming the flag.
+        let rows = vec![synthetic_rust_prop_row("Apophis", 0.0)];
+        let dir = tempfile::tempdir().unwrap();
+        let out = dir.path().join("report.html");
+        generate_report(&rows, &[], &out, None, None).unwrap();
+        let html = std::fs::read_to_string(&out).unwrap();
+        assert!(
+            html.contains("const predictAgg = null;"),
+            "an absent walk must embed a literal null, not an empty object"
+        );
+        assert!(html.contains("id=\"s14\""), "§14 shell must render anyway");
+        assert!(
+            html.contains("no walk aggregates loaded") && html.contains("--predict-agg"),
+            "the empty state must name the flag that fills it"
+        );
+    }
+
+    #[test]
+    fn merge_predict_aggregates_concatenates_disjoint_runs() {
+        // Two runs of one walk (different arms / objects) pool into one
+        // artifact — cells and per-object rows both concatenate.
+        let a = synthetic_predict_aggregates("snap-1");
+        let mut b = synthetic_predict_aggregates("snap-1");
+        b.cells[0].class = "NEA".to_string();
+        b.per_object[0].object = "Apophis".to_string();
+        let n_cells = a.cells.len() + b.cells.len();
+        let n_objs = a.per_object.len() + b.per_object.len();
+
+        let merged = merge_predict_aggregates(vec![a, b]).unwrap().unwrap();
+        assert_eq!(merged.snapshot_id, "snap-1");
+        assert_eq!(merged.cells.len(), n_cells);
+        assert_eq!(merged.per_object.len(), n_objs);
+        assert!(
+            merged.cells.iter().any(|c| c.class == "NEA"),
+            "the second run's cells were dropped"
+        );
+        assert!(
+            merged.per_object.iter().any(|p| p.object == "Apophis"),
+            "the second run's per-object rows were dropped"
+        );
+    }
+
+    #[test]
+    fn merge_predict_aggregates_refuses_a_snapshot_mismatch() {
+        // Aggregates from two fixture snapshots describe different
+        // observations. Pooling them would publish a surface no run ever
+        // produced, so the mismatch is a hard error naming both ids.
+        let a = synthetic_predict_aggregates("2026-07-29-75ab459bc8b2");
+        let b = synthetic_predict_aggregates("2026-08-14-deadbeefcafe");
+        let err = merge_predict_aggregates(vec![a, b]).expect_err("mismatch must fail");
+        assert!(err.contains("snapshot_id"), "{err}");
+        assert!(err.contains("2026-07-29-75ab459bc8b2"), "{err}");
+        assert!(err.contains("2026-08-14-deadbeefcafe"), "{err}");
+    }
+
+    #[test]
+    fn merge_predict_aggregates_of_nothing_is_none() {
+        assert!(merge_predict_aggregates(vec![]).unwrap().is_none());
     }
 
     // ── Convergence matrix ───────────────────────────────────────────
