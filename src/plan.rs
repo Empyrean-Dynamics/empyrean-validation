@@ -75,8 +75,12 @@ impl Default for PlanConfig {
 ///    dt != 0)`. When `config.uncertainty_axis` is true, every prop+eph
 ///    row is doubled across both modes.
 /// 5. For objects with `skip_od == false`, emit one OD plan row per
-///    tier with `excluded_perturbers_naif` populated for self-perturbers
-///    (NAIF id = 2_000_000 + asteroid number).
+///    tier.
+///
+/// Every row type carries `excluded_perturbers_naif` populated for
+/// self-perturbers (NAIF id = 2_000_000 + asteroid number). A body must not
+/// perturb itself whichever question the row asks — see
+/// [`self_perturber_naif_ids`].
 ///
 /// Network errors on individual objects are logged to stderr and skip
 /// that object — the plan continues with whatever objects responded.
@@ -344,6 +348,7 @@ fn propagation_plan_row(
     r.ref_vel_au_d = Some(ref_vel);
     r.ref_sun_pos_au = sun.map(|(p, _)| p);
     r.ref_sun_vel_au_d = sun.map(|(_, v)| v);
+    r.excluded_perturbers_naif = self_perturber_naif_ids(obj);
     r.propagation_uncertainty = uncertainty.map(|s| s.to_string());
     r.timestamp = timestamp.to_string();
     r.notes = obj.notes.to_string();
@@ -392,6 +397,7 @@ fn ephemeris_plan_row(
     // The wrapper reports light time as a plain f64 with NaN for
     // unavailable; preserve the Option semantics of the plan schema.
     r.ref_light_time_d = (!hor.light_time_days.is_nan()).then_some(hor.light_time_days);
+    r.excluded_perturbers_naif = self_perturber_naif_ids(obj);
     r.propagation_uncertainty = uncertainty.map(|s| s.to_string());
     r.timestamp = timestamp.to_string();
     r.notes = obj.notes.to_string();
@@ -415,12 +421,23 @@ fn od_plan_row(obj: &ValidationObject, tier: &str, timestamp: &str) -> Validatio
     r
 }
 
-/// Return the NAIF IDs to exclude from the perturber set when running
-/// OD on this object. For SB441-N16 self-perturbers (population
+/// Return the NAIF IDs to exclude from the perturber set for this object,
+/// whatever the row measures. For SB441-N16 self-perturbers (population
 /// `"Self-Perturber"`), this is the body's own NAIF id (asteroid id =
 /// 2_000_000 + IAU number, as encoded in `mpc_designation`). For other
 /// objects, empty.
-fn self_perturber_naif_ids(obj: &ValidationObject) -> Vec<i32> {
+///
+/// This was applied to OD rows only, on the reasoning that self-pull is a
+/// fitting problem — it converges the fit to junk fixed points (Pallas RMS
+/// 8000″, Iris RMS 149″). It is not: a body cannot perturb itself in any
+/// calculation. On a propagation or ephemeris row, leaving the body in its
+/// own perturber set puts the engine's ephemeris-overlap short-circuit in
+/// play, and that short-circuit resamples the body's own SPK instead of
+/// integrating. So those rows never measured propagation at all.
+///
+/// Shared with the rust runner so the plan and the channel that fills it in
+/// cannot disagree about which bodies come out of the force model.
+pub fn self_perturber_naif_ids(obj: &ValidationObject) -> Vec<i32> {
     if obj.population != "Self-Perturber" {
         return Vec::new();
     }
@@ -766,6 +783,84 @@ mod tests {
         let r = od_plan_row(pallas, "standard", "ts");
         assert_eq!(r.test_type, "orbit_determination");
         assert_eq!(r.excluded_perturbers_naif, vec![2_000_002]);
+    }
+
+    /// A body must not perturb itself on a propagation row either. Before
+    /// this, prop/eph rows carried an empty exclusion set, which left the
+    /// engine's ephemeris-overlap short-circuit in play and made the row a
+    /// resample of the body's own SPK rather than an integration.
+    #[test]
+    fn propagation_plan_row_marks_self_perturbers() {
+        let pallas = catalog::filter_by_name(&["Pallas"])[0];
+        let r = propagation_plan_row(
+            pallas,
+            61000.0,
+            30.0,
+            "standard",
+            [1.0, 0.0, 0.0],
+            [0.0, 0.017, 0.0],
+            (0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, None),
+            [1.0, 0.0, 0.0],
+            [0.0, 0.017, 0.0],
+            None,
+            Some(uncertainty_modes::F64_NO_COV),
+            "ts",
+        );
+        assert_eq!(r.excluded_perturbers_naif, vec![2_000_002]);
+    }
+
+    #[test]
+    fn ephemeris_plan_row_marks_self_perturbers() {
+        let pallas = catalog::filter_by_name(&["Pallas"])[0];
+        // `EphemerisEntry` has no `Default`; the plan row only reads
+        // ra/dec/rho/light-time, the rest is filler.
+        let hor = EphemerisEntry {
+            orbit_id: "Pallas".to_string(),
+            epoch: empyrean::Epoch::from_mjd_tdb(61030.0),
+            ra_deg: 10.0,
+            dec_deg: -5.0,
+            rho_au: 1.5,
+            vrho_au_day: 0.0,
+            vra_deg_day: 0.0,
+            vdec_deg_day: 0.0,
+            light_time_days: 0.01,
+            phase_angle_deg: 0.0,
+            elongation_deg: 0.0,
+            heliocentric_distance_au: 2.5,
+            mag: 9.0,
+            mag_sigma: 0.0,
+            zenith_angle_deg: 0.0,
+            azimuth_deg: 0.0,
+            hour_angle_deg: 0.0,
+            lunar_elongation_deg: 0.0,
+            position_angle_deg: 0.0,
+            sky_rate_deg_day: 0.0,
+            obs_code: "W84".to_string(),
+            covariance: None,
+            aberrated_state: [0.0; 6],
+            aberrated_covariance: None,
+        };
+        let r = ephemeris_plan_row(
+            pallas,
+            61000.0,
+            30.0,
+            "W84",
+            [1.0, 0.0, 0.0],
+            [0.0, 0.017, 0.0],
+            (0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, None),
+            &hor,
+            Some(uncertainty_modes::F64_NO_COV),
+            "ts",
+        );
+        assert_eq!(r.excluded_perturbers_naif, vec![2_000_002]);
+    }
+
+    /// Objects that are not SB441-N16 perturbers keep the full force model
+    /// on every row type.
+    #[test]
+    fn non_self_perturbers_exclude_nothing_on_any_row_type() {
+        let apophis = catalog::filter_by_name(&["Apophis"])[0];
+        assert!(self_perturber_naif_ids(apophis).is_empty());
     }
 
     // ── Plan contract ───────────────────────────────────────────────

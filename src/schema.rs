@@ -489,6 +489,66 @@ pub struct ValidationResult {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub excluded_perturbers_naif: Vec<i32>,
 
+    // ── Solve-for dispositions (0.10 engine line) ───────────────────
+    //
+    // What the fit *did* with each parameter axis, not what was asked of
+    // it. Under `solve_for = Auto` the request and the outcome differ by
+    // design, so a channel that recorded only its config could not tell a
+    // fit that escalated to non-grav from one that did not.
+    //
+    // The distinction these carry is not cosmetic: an axis the fit
+    // **considered** already has its uncertainty inside the delivered
+    // covariance, while an axis held **fixed** contributed nothing. The
+    // same covariance means different things under the two, so a σ
+    // compared across channels is only comparable when the dispositions
+    // match. Cross-channel disagreement here is a real finding even when
+    // every number agrees.
+    //
+    // Each is `"fixed"`, `"solved"`, or `"considered"`; `None` on rows
+    // from a channel that does not marshal dispositions, which reads as
+    // "not reported" rather than as "fixed".
+    /// Disposition of the Marsden A1/A2/A3 block.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub od_disposition_marsden: Option<String>,
+    /// Disposition of the non-grav time delay DT.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub od_disposition_dt: Option<String>,
+    /// Disposition of the SRP AMRAT.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub od_disposition_amrat: Option<String>,
+    /// Disposition of each **declared** thrust Δv segment, positional
+    /// with the orbit's declared segments. Empty when the fit declared
+    /// none.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub od_disposition_thrust: Vec<String>,
+    /// The solve-for parameter set the fit ran at, as the engine
+    /// resolved it (`"state_only"` / `"state_and_nongrav"` / `"auto"` /
+    /// `"explicit"`). Under `Auto` this is the width actually used, not
+    /// the width requested.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub od_solve_for_used: Option<String>,
+
+    /// Non-fatal conditions the fit reported about itself — chiefly
+    /// supplied covariance it deliberately did not use.
+    ///
+    /// Carried as the engine's own strings rather than a count, because
+    /// the content is what matters: a dropped prior cross term changes
+    /// how the σ for that slot should be read. Empty on a fit that used
+    /// everything it was given, which is the common case.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub od_warnings: Vec<String>,
+
+    /// Width of the fitted joint covariance, i.e. the `6+P` of the
+    /// \\((6+P) \times (6+P)\\) the fit delivered. `None` when the
+    /// channel reported no joint; `6` for a state-only fit.
+    ///
+    /// The shape is validated, not the entries: this records that the
+    /// joint crossed the boundary at the width the dispositions imply,
+    /// which is the property that silently regresses when a marshaling
+    /// layer drops a block.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub od_joint_covariance_width: Option<u32>,
+
     // ── Test-configuration axis ─────────────────────────────────────
     /// Tag distinguishing prop+eph rows by uncertainty-propagation mode.
     /// One of [`uncertainty_modes::FIRST_ORDER_WITH_COV`] or
@@ -857,6 +917,13 @@ impl ValidationResult {
             od_thrust_dv_m_per_s: Vec::new(),
             od_thrust_dv_sigma_m_per_s: Vec::new(),
             excluded_perturbers_naif: Vec::new(),
+            od_disposition_marsden: None,
+            od_disposition_dt: None,
+            od_disposition_amrat: None,
+            od_disposition_thrust: Vec::new(),
+            od_solve_for_used: None,
+            od_warnings: Vec::new(),
+            od_joint_covariance_width: None,
             propagation_uncertainty: None,
             assist_vs_horizons_km: None,
             emp_vs_assist_km: None,
@@ -1327,5 +1394,87 @@ mod tests {
         assert_eq!(channels::FINDORB, "findorb");
         assert_eq!(channels::KETE, "kete");
         assert_eq!(channels::PLAN, "plan");
+    }
+
+    // ── Solve-for dispositions (0.10 engine line) ───────────────────
+
+    /// A row from before these fields existed must still deserialize.
+    ///
+    /// Every archived channel JSON in `results/` predates them, and the
+    /// report reads those files with the current schema. `deny_unknown_fields`
+    /// makes the reverse direction strict, so the `#[serde(default)]` on
+    /// each new field is the only thing keeping old runs readable.
+    #[test]
+    fn rows_without_solve_metadata_still_deserialize() {
+        let mut row = ValidationResult::empty();
+        row.object = "Apophis".to_string();
+        row.test_type = test_types::ORBIT_DETERMINATION.to_string();
+        let json = serde_json::to_string(&row).unwrap();
+        // Absent from the wire entirely, not present-and-null.
+        assert!(
+            !json.contains("od_disposition_marsden"),
+            "an unset disposition must not be serialized: {json}"
+        );
+        assert!(!json.contains("od_warnings"), "{json}");
+        assert!(!json.contains("od_joint_covariance_width"), "{json}");
+        let back: ValidationResult = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.od_disposition_marsden, None);
+        assert_eq!(back.od_joint_covariance_width, None);
+        assert!(back.od_warnings.is_empty());
+    }
+
+    /// Populated dispositions round-trip by value, including the
+    /// three-state distinction the fields exist to carry.
+    #[test]
+    fn solve_metadata_round_trips() {
+        let mut row = ValidationResult::empty();
+        row.od_disposition_marsden = Some("solved".to_string());
+        row.od_disposition_dt = Some("considered".to_string());
+        row.od_disposition_amrat = Some("fixed".to_string());
+        row.od_disposition_thrust = vec!["solved".to_string(), "considered".to_string()];
+        row.od_solve_for_used = Some("state_and_nongrav".to_string());
+        row.od_warnings = vec!["dropped a supplied prior cross term".to_string()];
+        row.od_joint_covariance_width = Some(9);
+
+        let json = serde_json::to_string(&row).unwrap();
+        let back: ValidationResult = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.od_disposition_marsden.as_deref(), Some("solved"));
+        // `considered` must survive as itself: collapsing it to either
+        // `solved` or `fixed` would change what the row's σ means.
+        assert_eq!(back.od_disposition_dt.as_deref(), Some("considered"));
+        assert_eq!(back.od_disposition_amrat.as_deref(), Some("fixed"));
+        assert_eq!(back.od_disposition_thrust, vec!["solved", "considered"]);
+        assert_eq!(back.od_solve_for_used.as_deref(), Some("state_and_nongrav"));
+        assert_eq!(back.od_warnings.len(), 1);
+        assert_eq!(back.od_joint_covariance_width, Some(9));
+    }
+
+    /// The new fields must stay out of the plan contract.
+    ///
+    /// `empyrean-core` pins an older schema and deserializes the plan with
+    /// `deny_unknown_fields`; a field that reached a plan row would break
+    /// the reference channel outright. The whitelist is what prevents it,
+    /// so assert the exclusion rather than trusting it.
+    #[test]
+    fn solve_metadata_is_not_carried_into_the_plan() {
+        for key in [
+            "od_disposition_marsden",
+            "od_disposition_dt",
+            "od_disposition_amrat",
+            "od_disposition_thrust",
+            "od_solve_for_used",
+            "od_warnings",
+            "od_joint_covariance_width",
+        ] {
+            assert!(
+                !crate::plan::PLAN_CARRIED_KEYS.contains(&key),
+                "{key} must not be in the plan contract — empyrean-core pins \
+                 an older schema and denies unknown fields"
+            );
+            assert!(
+                !crate::plan::PLAN_CLEARED_KEYS.contains(&key),
+                "{key} must not be a cleared plan key either"
+            );
+        }
     }
 }
