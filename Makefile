@@ -482,6 +482,55 @@ walk-score:
 	@echo "──── Covariance realism: scoring ───────────────────────"
 	@cargo run --release --bin empyrean-validation -- score-predictions 	    --manifest $(WALK_MANIFEST) 	    --predictions $(WALK_PREDICTIONS) --windows $(WALK_WINDOWS) 	    --out-scored $(WALK_SCORED) --out-agg $(WALK_AGG)
 
+# ── Synthetic (perfect-model) lane of the covariance-realism family ──────
+# One truth fit + truth ephemeris per object, then per noise law a fixture
+# set whose rows carry the injected σ as rmsRA/rmsDec (astCat=Gaia2 so the
+# EFCC debias is identically zero). Fits run sigma_policy=reported so the
+# 0.2″ fiducial is not floored by the VFCC2017 preset. Local-only, like
+# the rest of the family; results/ is ignored.
+SYNTH_ROOT := $(RESULTS_DIR)/synthetic
+SYNTH_LAWS ?= gaussian,student-t
+SYNTH_NU ?= 4
+SYNTH_SEED ?= 1
+SYNTH_FIDUCIAL ?= 0.2
+# The lane a walk / score targets (a law tag: gaussian | t$(SYNTH_NU)).
+SYNTH_LANE ?= gaussian
+SYNTH_DIR := $(SYNTH_ROOT)/$(SYNTH_LANE)
+SYNTH_WALK := $(SYNTH_DIR)/validation_rust_walk_synthetic.json
+SYNTH_WINDOWS := $(SYNTH_DIR)/validation_rust_walk_synthetic_windows.jsonl
+SYNTH_PREDICTIONS := $(SYNTH_DIR)/validation_rust_walk_synthetic_predictions.jsonl
+SYNTH_SCORED := $(SYNTH_DIR)/validation_predict_scored_synthetic.jsonl
+SYNTH_AGG := $(SYNTH_DIR)/validation_predict_agg_synthetic.json
+# Debias is inert on Gaia2 rows, so the grid collapses to rejection × nightly.
+SYNTH_ARMS ?= efcc.adap.vfc,efcc.adap.nonight,efcc.cmc.vfc,efcc.cmc.nonight,efcc.norej.vfc,efcc.norej.nonight
+SYNTH_MODES ?= first-order,sigma-points
+
+.PHONY: synth synth-walk synth-score
+synth: $(RUST_BIN) | fixtures
+	@echo "──── Covariance realism: synthetic fixtures ($(SYNTH_LAWS)) ───"
+	@$(DYLD) $(RUST_BIN) synthesize --out-root $(SYNTH_ROOT) \
+	    --noise $(SYNTH_LAWS) --nu $(SYNTH_NU) --seed $(SYNTH_SEED) \
+	    --fiducial-sigma-arcsec $(SYNTH_FIDUCIAL) \
+	    --fixtures-dir $(FIXTURES_PSV) --debias-dir $(DATA_DIR) --data-dir $(DATA_DIR)
+
+synth-walk: $(RUST_BIN)
+	@echo "──── Covariance realism: synthetic walk [$(SYNTH_LANE)] ($(WALK_PROFILE)) ───"
+	@test -f $(SYNTH_DIR)/windows.json || { \
+	    echo "ERROR: no synthetic manifest at $(SYNTH_DIR)/windows.json — run 'make synth'."; \
+	    exit 1; }
+	@$(DYLD) $(RUST_BIN) walk --manifest $(SYNTH_DIR)/windows.json \
+	    --profile $(WALK_PROFILE) --grid --arms $(SYNTH_ARMS) \
+	    --sigma-policy reported --uncertainty-modes $(SYNTH_MODES) \
+	    --fixtures-dir $(SYNTH_DIR)/psv --data-dir $(DATA_DIR) \
+	    --output $(SYNTH_WALK)
+
+synth-score:
+	@echo "──── Covariance realism: synthetic scoring [$(SYNTH_LANE)] ───"
+	@cargo run --release --bin empyrean-validation -- score-predictions \
+	    --manifest $(SYNTH_DIR)/windows.json \
+	    --predictions $(SYNTH_PREDICTIONS) --windows $(SYNTH_WINDOWS) \
+	    --out-scored $(SYNTH_SCORED) --out-agg $(SYNTH_AGG)
+
 $(RUST_OD): $(RUST_BIN) | fixtures
 	@echo "──── Rust channel: orbit determination ─────────────────"
 	@$(DYLD) $(RUST_BIN) od $(ONLY_FLAG) --tier $(TIERS) \
