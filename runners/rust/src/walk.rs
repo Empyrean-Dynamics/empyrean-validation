@@ -313,9 +313,17 @@ pub struct ArmSpec {
     /// The pinned SCORING debias never varies with this axis.
     #[serde(default = "default_debias")]
     pub debias: String,
-    /// `"auto"` (engine default) or `"state"` (6-parameter control).
+    /// `"auto"` (engine default), `"state"` (6-parameter control), or
+    /// `"state-and-nongrav"` (always solve A1..A3 — the oracle for objects
+    /// whose truth carries non-gravitational parameters).
     #[serde(default = "default_solve_for")]
     pub solve_for: String,
+    /// σ policy: `"preset"` (default — the engine's VFCC2017 floor:
+    /// max(reported, station floor), 1″ default floor) | `"reported"`
+    /// (the rows' own rmsRA/rmsDec verbatim; station values only fill
+    /// rows that report none). The synthetic lane runs `reported`.
+    #[serde(default = "default_sigma_policy")]
+    pub sigma_policy: String,
 }
 
 fn default_rejection() -> String {
@@ -330,6 +338,9 @@ fn default_debias() -> String {
 fn default_solve_for() -> String {
     "auto".into()
 }
+fn default_sigma_policy() -> String {
+    "preset".into()
+}
 
 impl ArmSpec {
     /// Is this the canonical default fit config (every axis at its
@@ -339,6 +350,7 @@ impl ArmSpec {
             && self.nightly == "vfc2017"
             && self.debias == "efcc"
             && self.solve_for == "auto"
+            && self.sigma_policy == "preset"
     }
 
     /// Validate axis values, refusing engine-gated ones by name.
@@ -367,6 +379,24 @@ impl ArmSpec {
             "efcc" | "off" => {}
             other => return Err(format!("arm {:?}: unknown debias {other:?}", self.name)),
         }
+        match self.solve_for.as_str() {
+            "auto" | "state" | "state-and-nongrav" => {}
+            other => {
+                return Err(format!(
+                    "arm {:?}: unknown solve_for {other:?} (auto | state | state-and-nongrav)",
+                    self.name
+                ));
+            }
+        }
+        match self.sigma_policy.as_str() {
+            "preset" | "reported" => {}
+            other => {
+                return Err(format!(
+                    "arm {:?}: unknown sigma_policy {other:?} (preset | reported)",
+                    self.name
+                ));
+            }
+        }
         Ok(())
     }
 }
@@ -386,6 +416,7 @@ pub fn grid_arms() -> Vec<ArmSpec> {
                     nightly: nightly.into(),
                     debias: debias.into(),
                     solve_for: "auto".into(),
+                    sigma_policy: "preset".into(),
                 });
             }
         }
@@ -404,6 +435,7 @@ pub fn builtin_arms() -> Vec<ArmSpec> {
             nightly: "vfc2017".into(),
             debias: "efcc".into(),
             solve_for: "auto".into(),
+            sigma_policy: "preset".into(),
         },
         ArmSpec {
             name: "no-rejection".into(),
@@ -411,6 +443,7 @@ pub fn builtin_arms() -> Vec<ArmSpec> {
             nightly: "vfc2017".into(),
             debias: "efcc".into(),
             solve_for: "auto".into(),
+            sigma_policy: "preset".into(),
         },
         ArmSpec {
             name: "no-nightly".into(),
@@ -418,6 +451,7 @@ pub fn builtin_arms() -> Vec<ArmSpec> {
             nightly: "off".into(),
             debias: "efcc".into(),
             solve_for: "auto".into(),
+            sigma_policy: "preset".into(),
         },
     ]
 }
@@ -488,8 +522,13 @@ fn arm_config(
     if arm.debias == "off" {
         cfg.debiasing.enabled = false;
     }
-    if arm.solve_for == "state" {
-        cfg.solve_for = empyrean::SolveForParams::StateOnly;
+    match arm.solve_for.as_str() {
+        "state" => cfg.solve_for = empyrean::SolveForParams::StateOnly,
+        "state-and-nongrav" => cfg.solve_for = empyrean::SolveForParams::StateAndNonGrav,
+        _ => {}
+    }
+    if arm.sigma_policy == "reported" {
+        cfg.weighting.sigma_policy = Some(empyrean::SigmaPolicy::DefaultOnly);
     }
     cfg
 }
@@ -514,6 +553,10 @@ pub struct WalkArgsResolved<'a> {
     pub modes: Vec<UncertaintyMode>,
     /// Monte-Carlo draws per window for the `monte-carlo` mode.
     pub mc_samples: usize,
+    /// Objects whose fits always solve for non-gravitational parameters
+    /// regardless of the arm's `solve_for` — the synthetic lane's oracle
+    /// (read from a lane's provenance: truths that carry non-gravs).
+    pub nongrav_objects: Vec<String>,
 }
 
 /// Streaming sidecar sink: each shard task's window records and
@@ -660,10 +703,20 @@ pub fn run_walk(
     let outputs: Vec<Result<Slim, String>> = tasks
         .par_iter()
         .map(|t| {
+            let arm_for_obj;
+            let arm: &ArmSpec = if args.nongrav_objects.iter().any(|n| n == &t.obj.object) {
+                arm_for_obj = ArmSpec {
+                    solve_for: "state-and-nongrav".into(),
+                    ..t.arm.clone()
+                };
+                &arm_for_obj
+            } else {
+                t.arm
+            };
             let s = run_shard(
                 ctx,
                 t.obj,
-                t.arm,
+                arm,
                 &t.window_idx[t.shard.clone()],
                 &per_object[t.obj.object.as_str()],
                 &excluded[t.obj.object.as_str()],
@@ -1304,6 +1357,7 @@ mod tests {
             nightly: "vfc2017".into(),
             debias: "efcc".into(),
             solve_for: "auto".into(),
+            sigma_policy: "preset".into(),
         };
         assert!(gated.validate().unwrap_err().contains("engine-gated"));
         assert!(

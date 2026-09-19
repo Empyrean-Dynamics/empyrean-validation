@@ -139,6 +139,23 @@ struct WalkArgs {
     /// --uncertainty-modes for the prediction axis. --arms still filters.
     #[arg(long, default_value_t = false)]
     grid: bool,
+    /// Override every arm's σ policy: preset (the engine default — the
+    /// VFCC2017 floor) | reported (the rows' own rmsRA/rmsDec verbatim).
+    /// The synthetic lane runs `reported`: its rows carry the true noise σ,
+    /// and the 0.2″ fiducial sits below the preset's 1″ default floor.
+    #[arg(long)]
+    sigma_policy: Option<String>,
+    /// Synthetic-lane provenance (`synthetic.json`): every object whose
+    /// truth solved for non-gravitational parameters is fit with
+    /// solve_for = state-and-nongrav in every arm (the oracle model), so
+    /// the estimator's covariance can be measured with the right model
+    /// separately from the auto-escalation gate.
+    #[arg(long)]
+    nongrav_from: Option<PathBuf>,
+    /// Tag appended to every arm name (`<arm>.<tag>`), so a rerun under a
+    /// different policy can be scored beside the original series.
+    #[arg(long)]
+    arm_tag: Option<String>,
 }
 
 #[derive(Parser, Debug)]
@@ -298,10 +315,41 @@ fn walk_cmd(args: WalkArgs) -> Result<(), Box<dyn std::error::Error>> {
         (None, true) => walk::grid_arms(),
         (None, false) => walk::builtin_arms(),
     };
+    if let Some(policy) = &args.sigma_policy {
+        for arm in &mut arms {
+            arm.sigma_policy = policy.clone();
+        }
+    }
+    let nongrav_objects: Vec<String> = match &args.nongrav_from {
+        None => Vec::new(),
+        Some(p) => {
+            let prov: empyrean_validation::synthetic::SyntheticProvenance =
+                serde_json::from_str(&std::fs::read_to_string(p)?)
+                    .map_err(|e| format!("parse provenance {}: {e}", p.display()))?;
+            let v: Vec<String> = prov
+                .objects
+                .iter()
+                .filter(|o| o.truth.as_ref().is_some_and(|t| t.n_solve_for > 6))
+                .map(|o| o.object.clone())
+                .collect();
+            eprintln!(
+                "walk: oracle solve-for (state-and-nongrav) for {} objects from {}: {:?}",
+                v.len(),
+                p.display(),
+                v
+            );
+            v
+        }
+    };
     if !args.arms.is_empty() {
         arms.retain(|a| args.arms.iter().any(|n| n == &a.name));
         if arms.is_empty() {
             return Err("no arms match the --arms filter".into());
+        }
+    }
+    if let Some(tag) = &args.arm_tag {
+        for arm in &mut arms {
+            arm.name = format!("{}.{tag}", arm.name);
         }
     }
     let tier = match args.tier.as_str() {
@@ -329,6 +377,7 @@ fn walk_cmd(args: WalkArgs) -> Result<(), Box<dyn std::error::Error>> {
         tier,
         modes,
         mc_samples: args.mc_samples,
+        nongrav_objects,
     };
     if let Some(parent) = args.output.parent() {
         std::fs::create_dir_all(parent)?;
@@ -337,6 +386,9 @@ fn walk_cmd(args: WalkArgs) -> Result<(), Box<dyn std::error::Error>> {
     // config axes, so downstream visualization can treat the grid as a
     // grid rather than a flat list of arm strings. Written before the walk
     // starts — it is static, and mid-run scoring needs it.
+    let arm_tag_meta = args.arm_tag.clone();
+    let nongrav_meta = resolved.nongrav_objects.clone();
+    let (arm_tag_ref, nongrav_ref) = (&arm_tag_meta, &nongrav_meta);
     let grid_meta: Vec<serde_json::Value> = resolved
         .arms
         .iter()
@@ -357,6 +409,21 @@ fn walk_cmd(args: WalkArgs) -> Result<(), Box<dyn std::error::Error>> {
                     "debias": arm.debias,
                     "rejection": arm.rejection,
                     "nightly": arm.nightly,
+                    "sigma_policy": arm.sigma_policy,
+                    "solve_for": arm.solve_for,
+                    // The oracle overrides solve_for per object at run time;
+                    // record it here so the grid file never claims an
+                    // ordinary auto run for a series that was not one.
+                    "solve_for_override": if nongrav_ref.is_empty() {
+                        serde_json::Value::Null
+                    } else {
+                        serde_json::json!({
+                            "solve_for": "state-and-nongrav",
+                            "objects": nongrav_ref,
+                        })
+                    },
+                    "arm_tag": arm_tag_ref,
+                    "nongrav_objects": nongrav_ref,
                 })
             })
         })
