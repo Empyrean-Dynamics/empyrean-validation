@@ -448,11 +448,30 @@ pub fn shards(n_windows: usize) -> Vec<std::ops::Range<usize>> {
         .collect()
 }
 
-fn arm_config(arm: &ArmSpec, tier: empyrean::ForceModelTier, cut_mjd_tdb: f64) -> ODConfig {
+/// The perturbers an object's fit must exclude: a Self-Perturber (an
+/// SB441-N16 body in the catalog) must never be pulled by its own
+/// ephemeris. The same rule the OD channel applies
+/// (`plan::self_perturber_naif_ids`); resolved once per object, loudly —
+/// a manifest object absent from the catalog is a protocol violation.
+pub fn excluded_perturbers_for(object: &str) -> Result<Vec<empyrean::Origin>, String> {
+    let obj = empyrean_validation::catalog::all_objects()
+        .into_iter()
+        .find(|o| o.name == object)
+        .ok_or_else(|| format!("{object}: manifest object is not in the validation catalog"))?;
+    crate::runner::naif_to_origins(&empyrean_validation::plan::self_perturber_naif_ids(obj))
+}
+
+fn arm_config(
+    arm: &ArmSpec,
+    tier: empyrean::ForceModelTier,
+    cut_mjd_tdb: f64,
+    excluded_perturbers: &[empyrean::Origin],
+) -> ODConfig {
     let mut cfg = ODConfig {
         force_model: tier,
         output_epoch: OutputEpoch::Epoch(cut_mjd_tdb),
         num_threads: 1,
+        excluded_perturbers: excluded_perturbers.to_vec(),
         ..ODConfig::default()
     };
     match arm.rejection.as_str() {
@@ -619,11 +638,20 @@ pub fn run_walk(
     // relative to fits), so shards share the filtered observation vector.
     let mut per_object: std::collections::HashMap<&str, Vec<empyrean::Observation>> =
         Default::default();
+    let mut excluded: std::collections::HashMap<&str, Vec<empyrean::Origin>> = Default::default();
     for obj in &selected {
         per_object.insert(
             obj.object.as_str(),
             load_fit_observations(ctx, obj, &args.fixtures_dir)?,
         );
+        let ex = excluded_perturbers_for(&obj.object)?;
+        if !ex.is_empty() {
+            eprintln!(
+                "walk: {} excludes its own perturbation ({ex:?})",
+                obj.object
+            );
+        }
+        excluded.insert(obj.object.as_str(), ex);
     }
 
     // Stream each shard's sidecar rows the moment it completes; only thin
@@ -638,6 +666,7 @@ pub fn run_walk(
                 t.arm,
                 &t.window_idx[t.shard.clone()],
                 &per_object[t.obj.object.as_str()],
+                &excluded[t.obj.object.as_str()],
                 args.tier,
                 &args.profile,
                 &engine_version,
@@ -737,6 +766,7 @@ fn run_shard(
     arm: &ArmSpec,
     shard_windows: &[usize],
     fit_pool: &[empyrean::Observation],
+    excluded_perturbers: &[empyrean::Origin],
     tier: empyrean::ForceModelTier,
     selected_profile: &str,
     engine_version: &Option<String>,
@@ -749,10 +779,11 @@ fn run_shard(
         thin_rows: Vec::new(),
     };
     let mut warm: Option<Orbit> = None;
+    let eph_cfg = ephemeris_config(tier, excluded_perturbers);
 
     for &wi in shard_windows {
         let w = &obj.windows[wi];
-        let cfg = arm_config(arm, tier, w.cut_mjd_tdb);
+        let cfg = arm_config(arm, tier, w.cut_mjd_tdb, excluded_perturbers);
 
         // The manifest cut instant (TDB) is the slicing authority — never
         // the integer night (TDB−UTC ≈ 69 s at the boundary).
@@ -876,7 +907,7 @@ fn run_shard(
         let mut record = record;
         if let Some(orbit) = &orbit {
             let tp = Instant::now();
-            match predict_window(ctx, obj, w, orbit, arm, modes, mc_samples) {
+            match predict_window(ctx, obj, w, orbit, arm, modes, mc_samples, &eph_cfg) {
                 Ok(preds) => {
                     record.predict_time_ms = Some(tp.elapsed().as_secs_f64() * 1000.0);
                     out.predictions.extend(preds);
@@ -923,6 +954,25 @@ fn run_shard(
     Ok(out)
 }
 
+/// The ephemeris configuration a window's predictions run under: the
+/// fit's force-model tier and the object's own-perturbation exclusion —
+/// a Self-Perturber predicted with itself in the force model fails in the
+/// light-time iteration (and would be wrong if it did not).
+fn ephemeris_config(
+    tier: empyrean::ForceModelTier,
+    excluded_perturbers: &[empyrean::Origin],
+) -> EphemerisConfig {
+    EphemerisConfig {
+        propagation: empyrean::PropagationConfig {
+            force_model: tier,
+            excluded_perturbers: excluded_perturbers.to_vec(),
+            ..empyrean::PropagationConfig::default()
+        },
+        ..EphemerisConfig::default()
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 fn predict_window(
     ctx: &Context,
     obj: &ObjectWindows,
@@ -931,6 +981,7 @@ fn predict_window(
     arm: &ArmSpec,
     modes: &[UncertaintyMode],
     mc_samples: usize,
+    eph_cfg: &EphemerisConfig,
 ) -> Result<Vec<PredictedObservation>, String> {
     let mut targets: Vec<(u32, bool)> = w.targets.iter().map(|t| (t.obs_idx, false)).collect();
     targets.extend(w.in_sample.iter().map(|&i| (i, true)));
@@ -963,11 +1014,7 @@ fn predict_window(
     }
 
     let eph = ctx
-        .generate_ephemeris(
-            std::slice::from_ref(orbit),
-            &observers,
-            &EphemerisConfig::default(),
-        )
+        .generate_ephemeris(std::slice::from_ref(orbit), &observers, eph_cfg)
         .map_err(|e| format!("generate_ephemeris: {e}"))?;
     if eph.entries.len() != targets.len() {
         return Err(format!(
@@ -1033,7 +1080,7 @@ fn predict_window(
         let arm_name = format!("{}+{}", arm.name, suffix);
         if mode == UncertaintyMode::SecondOrder {
             out.extend(predict_second_order(
-                ctx, orbit, &observers, &out, arm, &arm_name,
+                ctx, orbit, &observers, &out, arm, &arm_name, eph_cfg,
             )?);
             continue;
         }
@@ -1089,7 +1136,7 @@ fn predict_window(
             })
             .collect();
         let eph = ctx
-            .generate_ephemeris(&variants, &observers, &EphemerisConfig::default())
+            .generate_ephemeris(&variants, &observers, eph_cfg)
             .map_err(|e| format!("generate_ephemeris ({arm_name} variants): {e}"))?;
         let n_targets = observers.len();
         if eph.entries.len() != variants.len() * n_targets {
@@ -1141,8 +1188,9 @@ fn predict_second_order(
     nominal_rows: &[PredictedObservation],
     arm: &ArmSpec,
     arm_name: &str,
+    eph_cfg: &EphemerisConfig,
 ) -> Result<Vec<PredictedObservation>, String> {
-    let mut cfg = EphemerisConfig::default();
+    let mut cfg = eph_cfg.clone();
     cfg.propagation.uncertainty_method = empyrean::UncertaintyMethod::SecondOrder;
     let eph = ctx
         .generate_ephemeris(std::slice::from_ref(orbit), observers, &cfg)
