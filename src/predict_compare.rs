@@ -790,13 +790,29 @@ fn night_stats(
     scored: &[ScoredPrediction],
     sp_matrices: &HashMap<RowKey, Mat2>,
 ) -> HashMap<(String, String, String), Vec<NightStat>> {
+    night_stats_with(manifest, scored, sp_matrices, false)
+}
+
+/// `include_flagged = true` keeps trust-flagged rows — only the
+/// flag-inclusive per-object fields read this; every headline statistic
+/// stays on the trust-gated call.
+fn night_stats_with(
+    manifest: &WindowManifest,
+    scored: &[ScoredPrediction],
+    sp_matrices: &HashMap<RowKey, Mat2>,
+    include_flagged: bool,
+) -> HashMap<(String, String, String), Vec<NightStat>> {
     let idx = index_manifest(manifest);
     // (tool, arm, object) → (window, night) → rows
     type NightGroups<'a> =
         HashMap<(String, String, String), HashMap<(u32, i64), Vec<&'a ScoredPrediction>>>;
     let mut groups: NightGroups = HashMap::new();
     for s in scored {
-        if s.in_sample || !s.flags.is_empty() || s.d2_combined.is_none() || s.obs_noise_dominated {
+        if s.in_sample
+            || (!include_flagged && !s.flags.is_empty())
+            || s.d2_combined.is_none()
+            || s.obs_noise_dominated
+        {
             continue;
         }
         groups
@@ -1088,25 +1104,45 @@ fn aggregate(
                 n_windows_failed: 0,
                 n_predictions: 0,
                 med_d2_norm: None,
+                n_predictions_incl_flagged: 0,
+                med_d2_norm_incl_flagged: None,
+                flag_counts: Default::default(),
+                trust_reasons: Default::default(),
                 med_sep_arcsec: None,
             });
         s.n_windows_expected += 1;
         if w.converged {
             s.n_windows_converged += 1;
+            // The variant name alone: `EncounterIntervenes { event: ... }`
+            // tallies as `EncounterIntervenes`; an absent verdict as `none`.
+            let reason = w
+                .covariance_trust
+                .as_deref()
+                .map(|t| t.split(['{', '(']).next().unwrap_or(t).trim().to_string())
+                .unwrap_or_else(|| "none".into());
+            *s.trust_reasons.entry(reason).or_insert(0) += 1;
         } else {
             s.n_windows_failed += 1;
         }
     }
     for s in scored {
-        if s.in_sample || !s.flags.is_empty() {
+        if s.in_sample {
             continue;
         }
         if let Some(sum) =
             summaries.get_mut(&(s.object.clone(), s.tool.clone(), s.config_arm.clone()))
         {
-            sum.n_predictions += 1;
+            sum.n_predictions_incl_flagged += 1;
+            if s.flags.is_empty() {
+                sum.n_predictions += 1;
+            } else {
+                for f in &s.flags {
+                    *sum.flag_counts.entry(f.clone()).or_insert(0) += 1;
+                }
+            }
         }
     }
+    let nights_incl = night_stats_with(manifest, scored, sp_matrices, true);
     let mut per_obj_sep: HashMap<(String, String, String), Vec<f64>> = HashMap::new();
     for s in scored {
         if !s.in_sample && s.flags.is_empty() {
@@ -1119,6 +1155,10 @@ fn aggregate(
     for (key, sum) in summaries.iter_mut() {
         if let Some(v) = per_obj_sep.get_mut(key) {
             sum.med_sep_arcsec = median(v);
+        }
+        if let Some(stats) = nights_incl.get(&(key.1.clone(), key.2.clone(), key.0.clone())) {
+            let mut d2s: Vec<f64> = stats.iter().map(|st| st.d2).collect();
+            sum.med_d2_norm_incl_flagged = median(&mut d2s).map(|m| m / LN2X2);
         }
         if let Some(stats) = nights.get(&(key.1.clone(), key.2.clone(), key.0.clone())) {
             let mut d2s: Vec<f64> = stats.iter().map(|st| st.d2).collect();
@@ -1595,6 +1635,76 @@ mod tests {
             predict_time_ms: Some(1.0),
             captured: None,
         }
+    }
+
+    #[test]
+    fn per_object_summary_carries_flag_inclusive_fields_beside_the_gated_ones() {
+        // Same predictions under two arms; the second arm's window carries
+        // an engine trust flag, so the kernel gates every one of its rows out
+        // of the headline statistic. The flag-inclusive fields must still see
+        // them and name the flag; the gated fields must not move.
+        let (ra0, dec0) = (100.0_f64, 20.0_f64);
+        let cosd = dec0.to_radians().cos();
+        let n = 6u32;
+        let entries: Vec<ObsEntry> = (0..n)
+            .map(|i| {
+                obs(
+                    ra0 + 0.5 * ARCSEC2DEG / cosd,
+                    dec0,
+                    59060 + i64::from(i) * 7,
+                    0.1,
+                )
+            })
+            .collect();
+        let m = manifest(entries);
+        // Σ_pred = 4″² isotropic ≫ Σ_obs = 0.01″²: prediction-dominated rows.
+        let mut preds: Vec<PredictedObservation> = Vec::new();
+        for arm in ["default", "no-rejection"] {
+            for i in 0..n {
+                let mut p = prediction(&m, i, ra0, dec0, Some([[4.0, 0.0], [0.0, 4.0]]));
+                p.config_arm = arm.into();
+                preds.push(p);
+            }
+        }
+        let mut flagged = window_record("rust", "no-rejection", Some(1.0));
+        flagged.covariance_trust = Some("WeaklyDeterminedHighN { solved_width: 9 }".into());
+        let mut trusted_w = window_record("rust", "default", Some(1.0));
+        trusted_w.covariance_trust = Some("trusted".into());
+        let windows = vec![trusted_w, flagged];
+        let (scored, sp) = score_all(&m, &preds, &windows, &opts()).unwrap();
+        let agg = aggregate(&m, &scored, &windows, &sp);
+        let find = |arm: &str| {
+            agg.per_object
+                .iter()
+                .find(|s| s.config_arm == arm)
+                .unwrap_or_else(|| panic!("summary for {arm}"))
+        };
+        let trusted = find("default");
+        assert_eq!(trusted.n_predictions, trusted.n_predictions_incl_flagged);
+        assert!(trusted.n_predictions > 0);
+        assert!(trusted.flag_counts.is_empty());
+        assert_eq!(trusted.med_d2_norm, trusted.med_d2_norm_incl_flagged);
+        let gated = find("no-rejection");
+        assert_eq!(
+            gated.n_predictions, 0,
+            "gated arm must stay out of the headline"
+        );
+        assert_eq!(
+            gated.n_predictions_incl_flagged,
+            trusted.n_predictions_incl_flagged
+        );
+        assert_eq!(
+            gated.flag_counts.get("covariance_trust_flagged"),
+            Some(&(n))
+        );
+        assert_eq!(gated.trust_reasons.get("WeaklyDeterminedHighN"), Some(&1));
+        assert_eq!(trusted.trust_reasons.get("trusted"), Some(&1));
+        assert!(gated.med_d2_norm.is_none());
+        assert!(gated.med_d2_norm_incl_flagged.is_some());
+        assert_eq!(
+            gated.med_d2_norm_incl_flagged,
+            trusted.med_d2_norm_incl_flagged
+        );
     }
 
     #[test]

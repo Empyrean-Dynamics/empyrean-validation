@@ -7823,6 +7823,10 @@ mod tests {
                     n_predictions: 16,
                     med_d2_norm: Some(3.125_5),
                     med_sep_arcsec: Some(0.77),
+                    n_predictions_incl_flagged: 0,
+                    med_d2_norm_incl_flagged: None,
+                    flag_counts: Default::default(),
+                    trust_reasons: Default::default(),
                 },
                 crate::predict_schema::ObjectWalkSummary {
                     object: "Holman".to_string(),
@@ -7835,6 +7839,10 @@ mod tests {
                     n_predictions: 16,
                     med_d2_norm: Some(1.02),
                     med_sep_arcsec: Some(0.79),
+                    n_predictions_incl_flagged: 0,
+                    med_d2_norm_incl_flagged: None,
+                    flag_counts: Default::default(),
+                    trust_reasons: Default::default(),
                 },
             ],
             d2_histograms: vec![

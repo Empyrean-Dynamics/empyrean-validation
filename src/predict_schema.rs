@@ -718,6 +718,25 @@ pub struct ObjectWalkSummary {
     /// Median normalized d² over this object's unflagged predictions.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub med_d2_norm: Option<f64>,
+    /// Predictions counted regardless of the kernel's trust flags — a
+    /// series whose every window the engine flags (e.g. a 9-parameter
+    /// comet fit marked `WeaklyDeterminedHighN`) is otherwise invisible in
+    /// the aggregate. Never a substitute for `n_predictions`: a reader that
+    /// uses it names the flag beside the number.
+    #[serde(default)]
+    pub n_predictions_incl_flagged: u32,
+    /// Median normalized d² over this object's predictions INCLUDING
+    /// trust-flagged rows (same night-joint statistic as `med_d2_norm`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub med_d2_norm_incl_flagged: Option<f64>,
+    /// Trust-flag tallies over the flagged rows (flag name → rows).
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub flag_counts: std::collections::BTreeMap<String, u32>,
+    /// The engine's own covariance-trust verdicts over this series' converged
+    /// windows (variant name → windows; `"trusted"` counted too), so a
+    /// `covariance_trust_flagged` tally can be read back to its reason.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub trust_reasons: std::collections::BTreeMap<String, u32>,
     /// Median separation over this object's predictions, arcsec.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub med_sep_arcsec: Option<f64>,
