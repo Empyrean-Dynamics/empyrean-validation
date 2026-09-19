@@ -19,6 +19,7 @@ use empyrean::Context;
 
 mod runner;
 mod synth;
+mod truth_check;
 mod walk;
 
 #[derive(Parser, Debug)]
@@ -44,6 +45,32 @@ enum Command {
     /// covariance-realism family: truth fit + truth ephemeris + known noise,
     /// written as PSVs with the injected σ reported, plus the manifest.
     Synthesize(SynthesizeArgs),
+    /// State-space covariance test of a synthetic lane: propagate the
+    /// lane's truth orbit to every fit epoch and score the fitted 6×6
+    /// against it (transport-free; d²₆ ~ χ²₆ under a calibrated fit).
+    TruthCheck(TruthCheckArgs),
+}
+
+#[derive(Parser, Debug)]
+struct TruthCheckArgs {
+    /// The lane's `synthetic.json` (truth orbits per object).
+    #[arg(long)]
+    provenance: PathBuf,
+    /// Walk window-record sidecar(s) (`*_windows.jsonl`) run on that lane.
+    #[arg(long, required = true)]
+    windows: Vec<PathBuf>,
+    /// Output JSONL of per-window truth-check records.
+    #[arg(short, long)]
+    output: PathBuf,
+    /// Force model tier for propagating the truth (match the lane's).
+    #[arg(long, default_value = "standard")]
+    tier: String,
+    /// Subset of object names (empty = all).
+    #[arg(long, value_delimiter = ',')]
+    only: Vec<String>,
+    /// Empyrean data directory.
+    #[arg(long)]
+    data_dir: Option<PathBuf>,
 }
 
 #[derive(Parser, Debug)]
@@ -227,7 +254,30 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         Command::Od(args) => od(args),
         Command::Walk(args) => walk_cmd(args),
         Command::Synthesize(args) => synthesize_cmd(args),
+        Command::TruthCheck(args) => truth_check_cmd(args),
     }
+}
+
+fn truth_check_cmd(args: TruthCheckArgs) -> Result<(), Box<dyn std::error::Error>> {
+    let tier = match args.tier.as_str() {
+        "approximate" => empyrean::ForceModelTier::Approximate,
+        "basic" => empyrean::ForceModelTier::Basic,
+        "standard" => empyrean::ForceModelTier::Standard,
+        other => return Err(format!("unknown tier {other:?}").into()),
+    };
+    eprintln!("Loading empyrean context...");
+    let ctx = Context::from_data_dir(args.data_dir.as_deref())?;
+    truth_check::run(
+        &ctx,
+        &truth_check::TruthCheckArgs {
+            provenance: args.provenance,
+            windows: args.windows,
+            output: args.output,
+            tier,
+            only: args.only,
+        },
+    )?;
+    Ok(())
 }
 
 fn synthesize_cmd(args: SynthesizeArgs) -> Result<(), Box<dyn std::error::Error>> {
