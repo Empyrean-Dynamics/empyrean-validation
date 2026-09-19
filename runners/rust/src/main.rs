@@ -18,6 +18,7 @@ use clap::{Parser, Subcommand};
 use empyrean::Context;
 
 mod runner;
+mod synth;
 mod walk;
 
 #[derive(Parser, Debug)]
@@ -39,6 +40,54 @@ enum Command {
     /// Run the walk-forward covariance-realism family from the window
     /// manifest.
     Walk(WalkArgs),
+    /// Generate the synthetic (perfect-model) fixture set for the
+    /// covariance-realism family: truth fit + truth ephemeris + known noise,
+    /// written as PSVs with the injected σ reported, plus the manifest.
+    Synthesize(SynthesizeArgs),
+}
+
+#[derive(Parser, Debug)]
+struct SynthesizeArgs {
+    /// Real PSV fixtures directory (sibling `manifest.json` supplies the
+    /// source snapshot id).
+    #[arg(long, default_value = "../../fixtures/psv")]
+    fixtures_dir: PathBuf,
+    /// Output root: one lane per noise law under `<out_root>/<tag>/`
+    /// (`gaussian/`, `t4/`, …), each with `psv/`, `manifest.json`,
+    /// `windows.json`, `synthetic.json`.
+    #[arg(short, long)]
+    out_root: PathBuf,
+    /// Noise laws, comma-separated: gaussian | student-t (with --nu). All
+    /// laws share one truth fit + truth ephemeris per object.
+    #[arg(long, value_delimiter = ',', default_values_t = ["gaussian".to_string()])]
+    noise: Vec<String>,
+    /// Student-t degrees of freedom (>= 3; the rows still report the
+    /// Gaussian-equivalent σ).
+    #[arg(long)]
+    nu: Option<u32>,
+    /// Global seed; every row's draw is a pure function of (seed, object,
+    /// station, obsTime).
+    #[arg(long, default_value_t = 1)]
+    seed: u64,
+    /// Injected σ (arcsec) for every station outside the VFC17 survey table.
+    #[arg(long, default_value_t = empyrean_validation::synthetic::FIDUCIAL_SIGMA_ARCSEC)]
+    fiducial_sigma_arcsec: f64,
+    /// Force model tier for the truth fit and the truth ephemeris.
+    #[arg(long, default_value = "standard")]
+    tier: String,
+    /// Subset of object names (empty = all). Unselected objects still get
+    /// header-only PSVs so the manifest generator's invariant holds.
+    #[arg(long, value_delimiter = ',')]
+    only: Vec<String>,
+    /// EFCC2020 debias table directory for the regenerated manifest.
+    #[arg(long)]
+    debias_dir: PathBuf,
+    /// Empyrean data directory.
+    #[arg(long)]
+    data_dir: Option<PathBuf>,
+    /// Worker thread count (0 = rayon default).
+    #[arg(long)]
+    threads: Option<usize>,
 }
 
 #[derive(Parser, Debug)]
@@ -160,7 +209,52 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         Command::Run(args) => run(args),
         Command::Od(args) => od(args),
         Command::Walk(args) => walk_cmd(args),
+        Command::Synthesize(args) => synthesize_cmd(args),
     }
+}
+
+fn synthesize_cmd(args: SynthesizeArgs) -> Result<(), Box<dyn std::error::Error>> {
+    if let Some(t) = args.threads {
+        rayon::ThreadPoolBuilder::new()
+            .num_threads(t)
+            .build_global()?;
+    }
+    let tier = match args.tier.as_str() {
+        "approximate" => empyrean::ForceModelTier::Approximate,
+        "basic" => empyrean::ForceModelTier::Basic,
+        "standard" => empyrean::ForceModelTier::Standard,
+        other => return Err(format!("unknown tier {other:?}").into()),
+    };
+    let models = args
+        .noise
+        .iter()
+        .map(|n| empyrean_validation::synthetic::NoiseModel::parse(n, args.nu))
+        .collect::<Result<Vec<_>, _>>()?;
+    if !(args.fiducial_sigma_arcsec > 0.0 && args.fiducial_sigma_arcsec.is_finite()) {
+        return Err(format!(
+            "fiducial sigma must be positive and finite, got {}",
+            args.fiducial_sigma_arcsec
+        )
+        .into());
+    }
+    eprintln!("Loading empyrean context...");
+    let ctx = Context::from_data_dir(args.data_dir.as_deref())?;
+    std::fs::create_dir_all(&args.out_root)?;
+    synth::run(
+        &ctx,
+        &synth::SynthArgs {
+            fixtures_dir: args.fixtures_dir,
+            out_root: args.out_root,
+            models,
+            seed: args.seed,
+            fiducial_sigma_arcsec: args.fiducial_sigma_arcsec,
+            tier,
+            tier_name: args.tier,
+            only: args.only,
+            debias_dir: args.debias_dir,
+        },
+    )?;
+    Ok(())
 }
 
 fn walk_cmd(args: WalkArgs) -> Result<(), Box<dyn std::error::Error>> {
