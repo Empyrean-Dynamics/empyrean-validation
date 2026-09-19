@@ -38,5 +38,6 @@ pub mod predict_compare;
 pub mod predict_schema;
 pub mod report;
 pub mod schema;
+pub mod synthetic;
 pub mod weights;
 pub mod windows;
