@@ -175,6 +175,9 @@ RUST_MERGED := $(RESULTS_DIR)/validation_rust_merged.json
 # channel parity panel uses as its reference.
 CORE_MERGED := $(RESULTS_DIR)/validation_core_merged.json
 REPORT := $(RESULTS_DIR)/validation_report.html
+# The renderer writes the page's dataset beside the report, named from the
+# report's stem. The page fetches it, so it travels with the report everywhere.
+REPORT_DATA := $(RESULTS_DIR)/validation_report.data.json
 SUMMARY := $(RESULTS_DIR)/validation_summary.json
 
 # Channel JSON list fed to `validate report`. Comma-joined; empyrean-core
@@ -1134,7 +1137,7 @@ ARCHIVE_DIR := $(RESULTS_DIR)/archive
 # responses cached at the time). Removing them is now something you have to ask
 # for by name.
 clean:
-	@rm -f $(REPORT) $(SUMMARY) $(RUST_MERGED) $(CORE_MERGED) $(PLAN)
+	@rm -f $(REPORT) $(REPORT_DATA) $(SUMMARY) $(RUST_MERGED) $(CORE_MERGED) $(PLAN)
 	@echo "Removed the derived report / summary / merge / plan from $(RESULTS_DIR)."
 	@echo "Per-channel results are PRESERVED — 'make clean-results' removes those,"
 	@echo "'make archive' snapshots them to $(ARCHIVE_DIR)/<timestamp>/ first."
