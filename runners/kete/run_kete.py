@@ -384,7 +384,7 @@ def main() -> int:
         # Uncertainty axis: skip Jet1 rows. The kete runner currently
         # propagates state only (no covariance); cross-tool Jet1 parity
         # via kete.state_transition is a follow-up.
-        if r.get("propagation_uncertainty") == "first_order_with_cov":
+        if r.get("propagation_uncertainty") not in (None, "f64_detection_on"):
             n_skipped += 1
             continue
         new = dict(r)

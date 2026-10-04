@@ -320,19 +320,19 @@ pub fn run_propagation_validation(
     // report can compare timing + accuracy across empyrean's
     // production-relevant uncertainty surfaces head-to-head:
     //
-    //   - "f64_no_cov"             — single particle, no STM. Pairs
+    //   - "f64_detection_on"             — single particle, no STM. Pairs
     //                                 with ASSIST single-particle.
-    //   - "first_order_with_cov"   — Jet1 STM + 6×6 covariance. Pairs
+    //   - "first_order_detection_on"   — Jet1 STM + 6×6 covariance. Pairs
     //                                 with ASSIST 6 first-order
     //                                 variational particles (28 dual
     //                                 numbers per state component on
     //                                 either side).
-    //   - "second_order_with_cov"  — Jet2 STM+STT (6 + 21 partials).
+    //   - "second_order_detection_on"  — Jet2 STM+STT (6 + 21 partials).
     //                                 Pairs with ASSIST 6 first-order
     //                                 + 21 second-order variational
     //                                 particles (28 + 84 = 112 dual
     //                                 numbers per state).
-    //   - "auto"                   — UncertaintyMethod::Auto: the
+    //   - "auto_detection_on"                   — UncertaintyMethod::Auto: the
     //                                 engine's Phase A/B/C cascade
     //                                 (FirstOrder / SecondOrder / AGM
     //                                 mixture, driven by per-CA κ and
@@ -356,25 +356,25 @@ pub fn run_propagation_validation(
     let modes: Vec<UncertaintyAxis> = if config.attach_covariance {
         vec![
             UncertaintyAxis {
-                tag: "first_order_with_cov",
+                tag: "first_order_detection_on",
                 attach: true,
                 method: UncertaintyMethod::FirstOrder,
                 timing_runs: 0,
             },
             UncertaintyAxis {
-                tag: "f64_no_cov",
+                tag: "f64_detection_on",
                 attach: false,
                 method: UncertaintyMethod::FirstOrder,
                 timing_runs: 0,
             },
             UncertaintyAxis {
-                tag: "second_order_with_cov",
+                tag: "second_order_detection_on",
                 attach: true,
                 method: UncertaintyMethod::SecondOrder,
                 timing_runs: 0,
             },
             UncertaintyAxis {
-                tag: "auto",
+                tag: "auto_detection_on",
                 attach: true,
                 method: UncertaintyMethod::auto(),
                 timing_runs: 0,
@@ -384,21 +384,30 @@ pub fn run_propagation_validation(
             // seeded Monte Carlo with 100 samples. Sampling methods cost
             // ~100-120 propagations per call — timing_runs = 1.
             UncertaintyAxis {
-                tag: "sigma_point_with_cov",
+                tag: "sigma_point_detection_on",
                 attach: true,
                 method: UncertaintyMethod::sigma_point(),
                 timing_runs: 1,
             },
             UncertaintyAxis {
-                tag: "monte_carlo_100_with_cov",
+                tag: "monte_carlo_100_detection_on",
                 attach: true,
                 method: UncertaintyMethod::monte_carlo(100),
                 timing_runs: 1,
             },
+            // NOTE: the detection-off timing arm `f64_detection_off` is
+            // deliberately NOT in this ladder. It
+            // requires switching per-step event detection OFF (villeneuve's
+            // EventConfig::detection_enabled), which the public wrapper this
+            // runner exercises cannot express — the C ABI drops that field —
+            // so this channel could only ever run them WITH detection on,
+            // under a detection-off label. That is the same reason the
+            // python / cli runners skip those rows explicitly. They are a
+            // core-only arm (empyrean-core's validate-core), measured there.
         ]
     } else {
         vec![UncertaintyAxis {
-            tag: "f64_no_cov",
+            tag: "f64_detection_on",
             attach: false,
             method: UncertaintyMethod::FirstOrder,
             timing_runs: 0,
@@ -519,7 +528,7 @@ pub fn run_propagation_validation(
                                     if !result.states.is_empty() {
                                         emp_state = Some(result.states[0].position);
                                         // Propagated position 3×3 covariance (AU²) — present only
-                                        // when a covariance was propagated (first_order_with_cov).
+                                        // when a covariance was propagated (first_order_detection_on).
                                         emp_pos_cov = result.covariance_at_cartesian(0, 0).ok().map(|tc| {
                                             let m = tc.matrix;
                                             [
@@ -574,6 +583,7 @@ pub fn run_propagation_validation(
                             emp_vs_horizons_km: Some(emp_vs_hor),
                             emp_pos_au: Some(emp_pos),
                             emp_pos_cov_au2: emp_pos_cov,
+                            emp_stm: None,
                             emp_time_ms: Some(emp_ms),
                             separation_arcsec: None,
                             d_ra_arcsec: None,
@@ -651,6 +661,10 @@ pub fn run_propagation_validation(
                             assist_vs_horizons_km: None,
                             emp_vs_assist_km: None,
                             assist_time_ms: None,
+                            assist_call_time_ms: None,
+                            assist_stm: None,
+                            fd_stm: None,
+                            var_stm_fixed: None,
                             speed_ratio: None,
                             findorb_rms_residual: None,
                             findorb_n_obs_used: None,
@@ -717,7 +731,7 @@ pub fn run_propagation_validation(
                 // timing-ladder modes (Jet2 / auto / sigma-point / MC) have no
                 // ephemeris plan rows to compare against, and the sampling
                 // methods would pay ~100 propagations per site for nothing.
-                if !matches!(axis.tag, "first_order_with_cov" | "f64_no_cov") {
+                if !matches!(axis.tag, "first_order_detection_on" | "f64_detection_on") {
                     continue;
                 }
                 for &obs_code in obs_codes {
@@ -775,8 +789,49 @@ pub fn run_propagation_validation(
                                 continue;
                             }
                         };
-                    match ctx.generate_ephemeris(&[orbit.clone()], &observers, &eph_config) {
-                        Ok(eph) => {
+                    // Time the ephemeris-generation call per row with the same
+                    // stopwatch boundary as the core runner's `replay_ephemeris`
+                    // (and the CLI channel): the stopwatch wraps exactly the
+                    // `generate_ephemeris` call for this one object / observing
+                    // site / epoch, with orbit, observer, and config construction
+                    // outside the timed region. Best-of the runner's
+                    // `n_timing_runs` like the propagation rows above (core times a
+                    // single call; the boundary — what the stopwatch wraps — is
+                    // identical). `generate_ephemeris` is deterministic run to run,
+                    // so the delivered sky position is bit-identical to the
+                    // pre-timing single call.
+                    let eph_runs = if axis.timing_runs > 0 {
+                        axis.timing_runs
+                    } else {
+                        config.n_timing_runs
+                    };
+                    let mut eph_times = Vec::new();
+                    let mut eph_out = None;
+                    let mut eph_failed = false;
+                    for _ in 0..eph_runs {
+                        let t0 = Instant::now();
+                        match ctx.generate_ephemeris(
+                            std::slice::from_ref(&orbit),
+                            &observers,
+                            &eph_config,
+                        ) {
+                            Ok(eph) => {
+                                eph_times.push(t0.elapsed().as_secs_f64() * 1000.0);
+                                eph_out = Some(eph);
+                            }
+                            Err(e) => {
+                                eprintln!("  {} dt={dt:+.0}d FAIL ({e})", data.name);
+                                eph_failed = true;
+                                break;
+                            }
+                        }
+                    }
+                    if eph_failed {
+                        continue;
+                    }
+                    let emp_eph_ms = eph_times.iter().copied().fold(f64::INFINITY, f64::min);
+                    match eph_out {
+                        Some(eph) => {
                             let Some(entry) = eph.entries.first() else {
                                 continue;
                             };
@@ -843,7 +898,8 @@ pub fn run_propagation_validation(
                                 emp_vs_horizons_km: None,
                                 emp_pos_au: None,
                                 emp_pos_cov_au2: None,
-                                emp_time_ms: None,
+                                emp_stm: None,
+                                emp_time_ms: Some(emp_eph_ms),
                                 separation_arcsec: Some(sep),
                                 d_ra_arcsec: Some(d_ra_arcsec),
                                 d_dec_arcsec: Some(d_dec_arcsec),
@@ -920,6 +976,10 @@ pub fn run_propagation_validation(
                                 assist_vs_horizons_km: None,
                                 emp_vs_assist_km: None,
                                 assist_time_ms: None,
+                                assist_call_time_ms: None,
+                                assist_stm: None,
+                                fd_stm: None,
+                                var_stm_fixed: None,
                                 speed_ratio: None,
                                 findorb_rms_residual: None,
                                 findorb_n_obs_used: None,
@@ -977,9 +1037,7 @@ pub fn run_propagation_validation(
                                 notes: data.notes.clone(),
                             });
                         }
-                        Err(e) => {
-                            eprintln!("  {} dt={dt:+.0}d FAIL ({e})", data.name);
-                        }
+                        None => continue,
                     }
                 }
                 } // end for &obs_code (observing sites)
@@ -1306,6 +1364,7 @@ fn run_radar_od(
         emp_vs_horizons_km: None,
         emp_pos_au: Some(orbit_r.position),
         emp_pos_cov_au2: None,
+        emp_stm: None,
         emp_time_ms: Some(ms_r),
         separation_arcsec: None,
         d_ra_arcsec: None,
@@ -1380,6 +1439,10 @@ fn run_radar_od(
         assist_vs_horizons_km: None,
         emp_vs_assist_km: None,
         assist_time_ms: None,
+        assist_call_time_ms: None,
+        assist_stm: None,
+        fd_stm: None,
+        var_stm_fixed: None,
         speed_ratio: None,
         findorb_rms_residual: None,
         findorb_n_obs_used: None,
@@ -1844,6 +1907,7 @@ pub fn run_od_validation(
                 emp_vs_horizons_km: None,
                 emp_pos_au: Some(orbit.position),
                 emp_pos_cov_au2: None,
+                emp_stm: None,
                 emp_time_ms: Some(ms),
                 separation_arcsec: None,
                 d_ra_arcsec: None,
@@ -1918,6 +1982,10 @@ pub fn run_od_validation(
                 assist_vs_horizons_km: None,
                 emp_vs_assist_km: None,
                 assist_time_ms: None,
+                assist_call_time_ms: None,
+                assist_stm: None,
+                fd_stm: None,
+                var_stm_fixed: None,
                 speed_ratio: None,
                 findorb_rms_residual: None,
                 findorb_n_obs_used: None,
@@ -2063,6 +2131,7 @@ pub fn run_od_validation(
                             emp_vs_horizons_km: None,
                             emp_pos_au: Some(orbit_n.position),
                             emp_pos_cov_au2: None,
+                            emp_stm: None,
                             emp_time_ms: Some(ms_n),
                             separation_arcsec: None,
                             d_ra_arcsec: None,
@@ -2137,6 +2206,10 @@ pub fn run_od_validation(
                             assist_vs_horizons_km: None,
                             emp_vs_assist_km: None,
                             assist_time_ms: None,
+                            assist_call_time_ms: None,
+                            assist_stm: None,
+                            fd_stm: None,
+                            var_stm_fixed: None,
                             speed_ratio: None,
                             findorb_rms_residual: None,
                             findorb_n_obs_used: None,

@@ -8,6 +8,11 @@
 //! - [`strip-plan`](StripPlanArgs) — reduce a channel-result JSON (the
 //!   rust reference's) to the canonical plan, keeping only the
 //!   plan-contract keys and popping everything else.
+//! - [`arm-plan`](ArmPlanArgs) — clone every propagation row of a source
+//!   arm (`--from`) into one or more destination arms (`--to`), rewriting
+//!   only `propagation_uncertainty`. Used to derive the detection-off /
+//!   tolerance / prebuilt-system timing arms from the `f64_detection_on`
+//!   and `first_order_detection_on` grids.
 //! - [`merge-external`](MergeExternalArgs) — fold ASSIST and find_orb
 //!   per-channel JSONs into a base channel JSON (typically the rust
 //!   runner's), populating the `assist_*` / `findorb_*` fields on each
@@ -56,8 +61,13 @@ enum Command {
     Plan(PlanArgs),
     /// Strip a channel-result JSON down to the canonical plan contract.
     StripPlan(StripPlanArgs),
+    /// Clone every propagation row of a source arm into one or more
+    /// destination arms (rewriting only `propagation_uncertainty`).
+    ArmPlan(ArmPlanArgs),
     /// Merge ASSIST / find_orb per-channel JSONs into a rust-channel JSON.
-    MergeExternal(MergeExternalArgs),
+    /// Boxed: this variant's argument struct is far larger than the others, so
+    /// keeping it behind a pointer keeps `Command` small.
+    MergeExternal(Box<MergeExternalArgs>),
     /// Render an HTML report from one or more channel JSONs.
     Report(ReportArgs),
     /// Read a CI summary JSON and exit non-zero on fidelity failures.
@@ -116,6 +126,29 @@ struct StripPlanArgs {
 }
 
 #[derive(Parser, Debug)]
+struct ArmPlanArgs {
+    /// Plan JSON to read the source arm's propagation rows from.
+    #[arg(short, long, default_value = "results/validation_plan.json")]
+    input: PathBuf,
+    /// Output JSON path.
+    #[arg(short, long)]
+    output: PathBuf,
+    /// Source arm: clone every propagation row whose `propagation_uncertainty`
+    /// equals this (e.g. `f64_detection_on`, `first_order_detection_on`).
+    #[arg(long)]
+    from: String,
+    /// Destination arm(s): each source row is cloned once per value, with
+    /// `propagation_uncertainty` rewritten to it (e.g.
+    /// `f64_detection_off,f64_detection_off_eps1e-6`).
+    #[arg(long, value_delimiter = ',', required = true)]
+    to: Vec<String>,
+    /// Emit ONLY the newly cloned rows (the subset the core replay runs
+    /// against). Default: emit the full input plan with the new rows appended.
+    #[arg(long, default_value_t = false)]
+    new_only: bool,
+}
+
+#[derive(Parser, Debug)]
 struct MergeExternalArgs {
     /// Base channel JSON (usually the rust runner's
     /// `validation_rust.json`) — its `assist_*` / `findorb_*` fields
@@ -128,6 +161,20 @@ struct MergeExternalArgs {
     /// ASSIST per-channel JSON (from `runners/assist/run_assist.py`).
     #[arg(long)]
     assist: Option<PathBuf>,
+    /// Core first-order STM sidecar (from `validate-core --stm-output`). Each
+    /// `{object, dt_days, propagation_uncertainty, emp_stm}` record is folded as
+    /// `emp_stm` onto the matching core propagation row — the empyrean side of
+    /// the STM-agreement comparison. The pinned validation schema the core links
+    /// has no STM field, so the STM travels out of band here.
+    #[arg(long)]
+    core_stm: Option<PathBuf>,
+    /// Finite-difference STM sidecar for the STM-validation panel. Each
+    /// `{object, dt_days, propagation_uncertainty, fd_stm, var_stm_fixed}` record
+    /// is folded as `fd_stm` (the ASSIST single-particle central finite-difference
+    /// reference) and `var_stm_fixed` (the corrected ASSIST variational STM) onto
+    /// the matching core row.
+    #[arg(long)]
+    core_fd_stm: Option<PathBuf>,
     /// find_orb per-channel JSON (from `runners/findorb/run_findorb.py`).
     #[arg(long)]
     findorb: Option<PathBuf>,
@@ -253,7 +300,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     match cli.command {
         Command::Plan(args) => plan(args),
         Command::StripPlan(args) => strip_plan(args),
-        Command::MergeExternal(args) => merge_external(args),
+        Command::ArmPlan(args) => arm_plan(args),
+        Command::MergeExternal(args) => merge_external(*args),
         Command::Report(args) => report(args),
         Command::CiCheck(args) => ci_check(args),
         Command::ListObjects(args) => list_objects(args),
@@ -492,11 +540,104 @@ fn strip_plan(args: StripPlanArgs) -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
+/// Clone every propagation row of the `--from` arm into each `--to` arm.
+///
+/// The timing arms are DERIVED, not regenerated. Regenerating from the rust
+/// channel cannot express them — the public wrapper cannot disable event
+/// detection or attach a covariance on demand — so the honest source is the
+/// existing `--from` rows, whose object/offset/force-model grid is exactly
+/// the grid the destination arms measure. Every field except
+/// `propagation_uncertainty` is carried through byte-for-byte, so the new
+/// rows deserialize as valid `ValidationResult`s and the core replay compares
+/// them against Horizons the same way it does the source rows.
+fn arm_plan(args: ArmPlanArgs) -> Result<(), Box<dyn std::error::Error>> {
+    let raw = std::fs::read_to_string(&args.input)
+        .map_err(|e| format!("read {}: {e}", args.input.display()))?;
+    let rows: Vec<serde_json::Value> =
+        serde_json::from_str(&raw).map_err(|e| format!("parse {}: {e}", args.input.display()))?;
+
+    // A clone with only `propagation_uncertainty` rewritten. Any other field
+    // touched here would silently make the arm measure a different test than
+    // the source row it is derived from.
+    let clone_as = |row: &serde_json::Value, variant: &str| -> serde_json::Value {
+        let mut c = row.clone();
+        c["propagation_uncertainty"] = serde_json::Value::String(variant.to_string());
+        c
+    };
+
+    let is_source_prop = |row: &serde_json::Value| -> bool {
+        row["test_type"].as_str() == Some(test_types::PROPAGATION)
+            && row["propagation_uncertainty"].as_str() == Some(args.from.as_str())
+    };
+
+    // Grouped by destination arm (all of arm 1, then all of arm 2, …).
+    let mut new_rows: Vec<serde_json::Value> = Vec::new();
+    let mut per_variant: Vec<(String, usize)> = Vec::new();
+    for variant in &args.to {
+        let mut n = 0usize;
+        for row in &rows {
+            if is_source_prop(row) {
+                new_rows.push(clone_as(row, variant));
+                n += 1;
+            }
+        }
+        per_variant.push((variant.clone(), n));
+    }
+
+    if new_rows.is_empty() {
+        return Err(format!(
+            "{} carries ZERO `{}` propagation rows to clone. The destination \
+             arms cannot be derived from a plan that has no `{}` propagation grid.",
+            args.input.display(),
+            args.from,
+            args.from,
+        )
+        .into());
+    }
+
+    let n_new = new_rows.len();
+    let mut out: Vec<serde_json::Value> = if args.new_only {
+        Vec::with_capacity(n_new)
+    } else {
+        rows.clone()
+    };
+    out.extend(new_rows);
+
+    if let Some(parent) = args.output.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::write(&args.output, serde_json::to_string_pretty(&out)?)?;
+    let breakdown = per_variant
+        .iter()
+        .map(|(v, n)| format!("{n} {v}"))
+        .collect::<Vec<_>>()
+        .join(" + ");
+    eprintln!(
+        "Wrote {} rows to {} ({breakdown} new{})",
+        out.len(),
+        args.output.display(),
+        if args.new_only {
+            ", subset only"
+        } else {
+            ", appended to the input plan"
+        }
+    );
+    Ok(())
+}
+
 fn merge_external(args: MergeExternalArgs) -> Result<(), Box<dyn std::error::Error>> {
     let raw = std::fs::read_to_string(&args.input)
         .map_err(|e| format!("read {}: {e}", args.input.display()))?;
     let mut rows: Vec<ValidationResult> = serde_json::from_str(&raw)?;
 
+    if let Some(path) = &args.core_stm {
+        let n = merge_core_stm(&mut rows, path)?;
+        eprintln!("Merged {n} core first-order STM rows (emp_stm)");
+    }
+    if let Some(path) = &args.core_fd_stm {
+        let n = merge_core_fd_stm(&mut rows, path)?;
+        eprintln!("Merged {n} finite-difference STM reference rows (fd_stm)");
+    }
     if let Some(path) = &args.assist {
         let n = merge_assist(&mut rows, path)?;
         eprintln!("Merged {n} ASSIST rows");
@@ -512,19 +653,18 @@ fn merge_external(args: MergeExternalArgs) -> Result<(), Box<dyn std::error::Err
     if let Some(path) = &args.findorb_radar {
         let n = merge_findorb(&mut rows, path)?;
         eprintln!("Merged {n} find_orb radar rows");
-        // Expected while radar is rust-only: the reference channel is built
-        // from the plan, the plan no longer carries radar rows
-        // (`PLAN_RUST_ONLY_TEST_TYPES`), so there is nothing for find_orb's
-        // radar fits to attach to. Say it out loud — a merge that folds zero
-        // rows out of a non-empty input file is otherwise indistinguishable
-        // from a merge that folded everything.
+        // The reference channel now carries orbit_determination_radar rows
+        // (every channel replays the radar arc), so find_orb's radar fits
+        // should fold onto them. Zero folds out of a non-empty input file is
+        // therefore an anomaly, not the by-design outcome it once was — say it
+        // out loud rather than let it hide behind an otherwise-silent success.
         if n == 0 {
             eprintln!(
                 "  NOTE: find_orb ran its radar pass but no reference row accepted it. \
-                 Radar OD is rust-only today (empyrean-s1ab), so the reference channel \
-                 carries no orbit_determination_radar rows to fold onto. find_orb's \
-                 radar fits are preserved verbatim in {} — they are simply not shown \
-                 as a cross-tool comparison until a replay driver can fit radar.",
+                 The reference channel was expected to carry orbit_determination_radar \
+                 rows for the radar objects; none matched. Check that the radar OD rows \
+                 were replayed into the reference channel. find_orb's radar fits are \
+                 preserved verbatim in {}.",
                 path.display()
             );
         }
@@ -558,20 +698,18 @@ fn merge_external(args: MergeExternalArgs) -> Result<(), Box<dyn std::error::Err
     if let Some(path) = &args.grss_radar {
         let n = merge_grss(&mut rows, path)?;
         eprintln!("Merged {n} GRSS radar rows");
-        // Same expected-zero as `--findorb-radar`: the reference channel is
-        // built from the plan, and the plan no longer carries radar rows
-        // (`PLAN_RUST_ONLY_TEST_TYPES`), so there is nothing for GRSS's radar
-        // fits to attach to. Say it out loud — a merge that folds zero rows
-        // out of a non-empty input file is otherwise indistinguishable from a
-        // merge that folded everything.
+        // Same as `--findorb-radar`: the reference channel now carries
+        // orbit_determination_radar rows, so GRSS's radar fits should fold
+        // onto them. Zero folds out of a non-empty input file is an anomaly,
+        // not a by-design outcome — say it out loud.
         if n == 0 {
             eprintln!(
                 "  NOTE: GRSS ran its radar pass but no reference row accepted it. \
-                 Radar OD is rust-only today (empyrean-s1ab), so the reference channel \
-                 carries no orbit_determination_radar rows to fold onto. GRSS's radar \
-                 fits — including its delay/Doppler residual RMS, an axis no other \
-                 channel measures — are preserved verbatim in {} until a replay driver \
-                 can fit radar.",
+                 The reference channel was expected to carry orbit_determination_radar \
+                 rows for the radar objects; none matched. Check that the radar OD rows \
+                 were replayed into the reference channel. GRSS's radar fits — including \
+                 its delay/Doppler residual RMS, an axis no other channel measures — are \
+                 preserved verbatim in {}.",
                 path.display()
             );
         }
@@ -587,22 +725,48 @@ fn merge_external(args: MergeExternalArgs) -> Result<(), Box<dyn std::error::Err
     Ok(())
 }
 
-fn merge_assist(
+/// Parse a JSON `6×6` array-of-arrays into `[[f64; 6]; 6]`. Returns `None`
+/// unless the value is exactly a 6-row, 6-column matrix of finite numbers — a
+/// malformed or absent STM must stay `None` (not a silently zeroed matrix that
+/// would read as a real, wildly-disagreeing STM in the comparison).
+fn parse_stm_6x6(v: &serde_json::Value) -> Option<[[f64; 6]; 6]> {
+    let rows = v.as_array()?;
+    if rows.len() != 6 {
+        return None;
+    }
+    let mut out = [[0.0_f64; 6]; 6];
+    for (i, row) in rows.iter().enumerate() {
+        let cols = row.as_array()?;
+        if cols.len() != 6 {
+            return None;
+        }
+        for (j, x) in cols.iter().enumerate() {
+            let f = x.as_f64()?;
+            if !f.is_finite() {
+                return None;
+            }
+            out[i][j] = f;
+        }
+    }
+    Some(out)
+}
+
+/// Fold Empyrean's own first-order 6×6 STMs from the `validate-core --stm-output`
+/// sidecar onto the matching core propagation rows as `emp_stm`. Keyed on
+/// object + dt + `propagation_uncertainty`, so the `first_order_detection_on`
+/// and `first_order_detection_off` sidecar records land on their own rows. The
+/// core links a pinned validation schema with no STM field, so its replay writes
+/// the STM here rather than on the row; this is where it rejoins the row.
+/// Returns the number of rows that received an `emp_stm`.
+fn merge_core_stm(
     rows: &mut [ValidationResult],
     path: &std::path::Path,
 ) -> Result<usize, Box<dyn std::error::Error>> {
     let txt = std::fs::read_to_string(path).map_err(|e| format!("read {}: {e}", path.display()))?;
-    let assist: Vec<serde_json::Value> = serde_json::from_str(&txt)?;
-    // Key by (object, dt, propagation_uncertainty) so the f64 ASSIST row
-    // attaches only to the empyrean f64_no_cov rust row, and (if the
-    // runner emitted it) the STM ASSIST row attaches only to the
-    // first_order_with_cov rust row. Without the uncertainty axis in
-    // the key, the same ASSIST timing landed on both empyrean modes —
-    // making the timing chart compare empyrean's STM-bearing Jet1 path
-    // against ASSIST's f64 path on the same axis.
+    let recs: Vec<serde_json::Value> = serde_json::from_str(&txt)?;
     let mut idx: std::collections::HashMap<(String, i64, Option<String>), &serde_json::Value> =
         Default::default();
-    for a in &assist {
+    for a in &recs {
         if let (Some(o), Some(d)) = (a["object"].as_str(), a["dt_days"].as_f64()) {
             let unc = a["propagation_uncertainty"].as_str().map(str::to_string);
             idx.insert((o.to_string(), d as i64, unc), a);
@@ -613,42 +777,269 @@ fn merge_assist(
         if r.test_type != "propagation" {
             continue;
         }
-        // For empyrean's "auto" rows (UncertaintyMethod::Auto), pair
-        // against ASSIST's STM row — the closest analogue REBOUND
-        // offers. Auto in well-behaved regimes resolves to FirstOrder
-        // (matches STM), and in high-κ regimes escalates to
-        // SecondOrder or AGM mixture (no REBOUND analogue at all). STM
-        // is the strongest available comparison baseline.
-        let assist_uncertainty = match r.propagation_uncertainty.as_deref() {
-            Some("auto") => Some("first_order_with_cov".to_string()),
-            other => other.map(str::to_string),
+        let key = (
+            r.object.clone(),
+            r.dt_days as i64,
+            r.propagation_uncertainty.clone(),
+        );
+        let Some(a) = idx.get(&key) else { continue };
+        if let Some(stm) = parse_stm_6x6(&a["emp_stm"]) {
+            r.emp_stm = Some(stm);
+            n += 1;
+        }
+    }
+    Ok(n)
+}
+
+/// Fold the finite-difference STM reference (and the corrected ASSIST
+/// variational STM) from the FD sidecar onto matching core propagation rows,
+/// keyed on object + dt + `propagation_uncertainty`. Sets `fd_stm` and, when
+/// present, `var_stm_fixed`. Returns the number of rows that received an
+/// `fd_stm`.
+fn merge_core_fd_stm(
+    rows: &mut [ValidationResult],
+    path: &std::path::Path,
+) -> Result<usize, Box<dyn std::error::Error>> {
+    let txt = std::fs::read_to_string(path).map_err(|e| format!("read {}: {e}", path.display()))?;
+    let recs: Vec<serde_json::Value> = serde_json::from_str(&txt)?;
+    let mut idx: std::collections::HashMap<(String, i64, Option<String>), &serde_json::Value> =
+        Default::default();
+    for a in &recs {
+        if let (Some(o), Some(d)) = (a["object"].as_str(), a["dt_days"].as_f64()) {
+            let unc = a["propagation_uncertainty"].as_str().map(str::to_string);
+            idx.insert((o.to_string(), d as i64, unc), a);
+        }
+    }
+    let mut n = 0;
+    for r in rows.iter_mut() {
+        if r.test_type != "propagation" {
+            continue;
+        }
+        let key = (
+            r.object.clone(),
+            r.dt_days as i64,
+            r.propagation_uncertainty.clone(),
+        );
+        let Some(a) = idx.get(&key) else { continue };
+        if let Some(stm) = parse_stm_6x6(&a["fd_stm"]) {
+            r.fd_stm = Some(stm);
+            n += 1;
+        }
+        if let Some(stm) = parse_stm_6x6(&a["var_stm_fixed"]) {
+            r.var_stm_fixed = Some(stm);
+        }
+    }
+    Ok(n)
+}
+
+/// The ASSIST configuration whose numbers the pre-six-arm report showed — the
+/// adam-assist defaults (epsilon 1e-6, min_dt 1e-9, adaptive_mode 1, dt 1e-6).
+/// Its two arms fold onto the matching core rows so every existing
+/// empyrean-vs-ASSIST panel keeps working unchanged; the other five arms live
+/// only as standalone rows.
+const ASSIST_BACKCOMPAT_CONFIG: &str = "assist_asteroid_institute";
+
+/// Read `assist_pos_au` off a raw ASSIST JSON row.
+fn assist_pos3(a: &serde_json::Value) -> Option<[f64; 3]> {
+    let arr = a["assist_pos_au"].as_array()?;
+    if arr.len() != 3 {
+        return None;
+    }
+    Some([arr[0].as_f64()?, arr[1].as_f64()?, arr[2].as_f64()?])
+}
+
+/// One-line resolved-settings string for a standalone ASSIST arm row's `notes`,
+/// built from the runner's `assist_config_settings` (read back off the sim after
+/// attach + config). The report reads this to render the per-configuration
+/// provenance without a schema field for it.
+fn assist_settings_note(a: &serde_json::Value) -> String {
+    let s = &a["assist_config_settings"];
+    if !s.is_object() {
+        return String::new();
+    }
+    format!(
+        "config={} integrator={} epsilon={} min_dt={} adaptive_mode={} initial_dt={} (assist {} rebound {})",
+        s["config"].as_str().unwrap_or("?"),
+        s["integrator"].as_str().unwrap_or("?"),
+        s["ias15_epsilon"].as_f64().unwrap_or(f64::NAN),
+        s["ias15_min_dt"].as_f64().unwrap_or(f64::NAN),
+        s["ias15_adaptive_mode"].as_str().unwrap_or("?"),
+        s["initial_dt"].as_f64().unwrap_or(f64::NAN),
+        s["assist_version"].as_str().unwrap_or("?"),
+        s["rebound_version"].as_str().unwrap_or("?"),
+    )
+}
+
+/// Snapshot of a core empyrean f64 propagation row, folded onto the standalone
+/// ASSIST arm rows: propagated position (AU), wall-clock (ms), and population.
+type CoreF64Snapshot = ([f64; 3], Option<f64>, String);
+
+/// Fold the ASSIST channel onto the core reference and append the standalone
+/// per-arm rows. Two things happen:
+///
+/// 1. **Backward-compatible fold.** The `assist_asteroid_institute` arms (the
+///    configuration the report's ASSIST panels were built on) fold onto the
+///    matching core `f64_detection_on` / `first_order_detection_on` rows exactly
+///    as before, so every existing empyrean-vs-ASSIST panel renders unchanged.
+/// 2. **Standalone arm rows.** ALL six arms (three configurations × variational
+///    off/on) are appended as `channel = "assist"` rows carrying their own
+///    `assist_time_ms` / `assist_vs_horizons_km` / `assist_stm`, plus the
+///    empyrean position (`emp_pos_au`) and STM (`emp_stm`) folded from the core
+///    reference so the report can show per-configuration position agreement and
+///    per-arm STM agreement. `emp_vs_assist_km` and `speed_ratio` are computed
+///    here. The resolved integrator settings ride in `notes`.
+///
+/// Returns the number of rows folded onto the core reference (the backward-compat
+/// count); the standalone-append count is logged separately by the caller path.
+fn merge_assist(
+    rows: &mut Vec<ValidationResult>,
+    path: &std::path::Path,
+) -> Result<usize, Box<dyn std::error::Error>> {
+    let txt = std::fs::read_to_string(path).map_err(|e| format!("read {}: {e}", path.display()))?;
+    let assist: Vec<serde_json::Value> = serde_json::from_str(&txt)?;
+    let au_km = empyrean_validation::compare::AU_KM;
+
+    // Snapshot the core empyrean outputs BEFORE any mutation: the propagated
+    // position + timing off the f64 row, and the STM off the first-order row,
+    // keyed by (object, dt). The standalone arm rows fold these on.
+    let mut core_f64: std::collections::HashMap<(String, i64), CoreF64Snapshot> =
+        Default::default();
+    let mut core_fo_stm: std::collections::HashMap<(String, i64), [[f64; 6]; 6]> =
+        Default::default();
+    for r in rows.iter() {
+        if r.channel != "core" || r.test_type != "propagation" {
+            continue;
+        }
+        let key = (r.object.clone(), r.dt_days as i64);
+        match r.propagation_uncertainty.as_deref() {
+            Some("f64_detection_on") => {
+                if let Some(pos) = r.emp_pos_au {
+                    core_f64.insert(key, (pos, r.emp_time_ms, r.population.clone()));
+                }
+            }
+            Some("first_order_detection_on") => {
+                if let Some(stm) = r.emp_stm {
+                    core_fo_stm.insert(key, stm);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    // 1. Backward-compatible fold onto core rows (asteroid_institute config only).
+    let mut idx: std::collections::HashMap<(String, i64, String), &serde_json::Value> =
+        Default::default();
+    for a in &assist {
+        if let (Some(o), Some(d), Some(arm)) = (
+            a["object"].as_str(),
+            a["dt_days"].as_f64(),
+            a["propagation_uncertainty"].as_str(),
+        ) {
+            idx.insert((o.to_string(), d as i64, arm.to_string()), a);
+        }
+    }
+    let mut n_folded = 0;
+    for r in rows.iter_mut() {
+        if r.test_type != "propagation" || r.channel == "assist" {
+            continue;
+        }
+        // The core arm each backward-compat ASSIST arm folds onto; `auto`
+        // pairs with the first-order arm (its closest REBOUND analogue).
+        let core_arm = match r.propagation_uncertainty.as_deref() {
+            Some("auto_detection_on") => "first_order_detection_on",
+            Some(other) => other,
+            None => continue,
         };
-        let key = (r.object.clone(), r.dt_days as i64, assist_uncertainty);
+        let arm = if core_arm == "f64_detection_on" {
+            format!("{ASSIST_BACKCOMPAT_CONFIG}_variational_off")
+        } else if core_arm == "first_order_detection_on" {
+            format!("{ASSIST_BACKCOMPAT_CONFIG}_variational_on")
+        } else {
+            continue;
+        };
+        let key = (r.object.clone(), r.dt_days as i64, arm);
         let Some(a) = idx.get(&key) else { continue };
         r.assist_vs_horizons_km = a["assist_vs_horizons_km"].as_f64();
         r.assist_time_ms = a["assist_time_ms"].as_f64();
-        if let (Some(emp), Some(arr)) = (&r.emp_pos_au, a["assist_pos_au"].as_array())
-            && arr.len() == 3
-        {
-            let ast = [
-                arr[0].as_f64().unwrap_or(0.0),
-                arr[1].as_f64().unwrap_or(0.0),
-                arr[2].as_f64().unwrap_or(0.0),
-            ];
-            let dx = emp[0] - ast[0];
-            let dy = emp[1] - ast[1];
-            let dz = emp[2] - ast[2];
-            r.emp_vs_assist_km =
-                Some((dx * dx + dy * dy + dz * dz).sqrt() * empyrean_validation::compare::AU_KM);
+        r.assist_call_time_ms = a["assist_call_time_ms"].as_f64();
+        if let Some(stm) = parse_stm_6x6(&a["assist_stm"]) {
+            r.assist_stm = Some(stm);
+        }
+        if let (Some(emp), Some(ast)) = (&r.emp_pos_au, assist_pos3(a)) {
+            let d = [emp[0] - ast[0], emp[1] - ast[1], emp[2] - ast[2]];
+            r.emp_vs_assist_km = Some((d[0] * d[0] + d[1] * d[1] + d[2] * d[2]).sqrt() * au_km);
         }
         if let (Some(emp), Some(ast)) = (r.emp_time_ms, r.assist_time_ms)
             && ast > 0.0
         {
             r.speed_ratio = Some(emp / ast);
         }
-        n += 1;
+        n_folded += 1;
     }
-    Ok(n)
+
+    // 2. Standalone per-arm rows (all six arms), appended as channel="assist".
+    let mut appended: Vec<ValidationResult> = Vec::new();
+    for a in &assist {
+        let (Some(object), Some(dt), Some(arm)) = (
+            a["object"].as_str(),
+            a["dt_days"].as_f64(),
+            a["propagation_uncertainty"].as_str(),
+        ) else {
+            continue;
+        };
+        let key = (object.to_string(), dt as i64);
+        let variational = a["variational"].as_bool().unwrap_or(arm.ends_with("_on"));
+        let mut row = ValidationResult::empty();
+        row.object = object.to_string();
+        row.channel = "assist".to_string();
+        row.test_type = "propagation".to_string();
+        row.propagation_uncertainty = Some(arm.to_string());
+        row.force_model = a["force_model"].as_str().unwrap_or("full").to_string();
+        row.epoch_mjd_tdb = a["epoch_mjd_tdb"].as_f64().unwrap_or(0.0);
+        row.dt_days = dt;
+        row.t_mjd_tdb = a["t_mjd_tdb"].as_f64().unwrap_or(0.0);
+        row.population = a["population"]
+            .as_str()
+            .map(str::to_string)
+            .or_else(|| core_f64.get(&key).map(|(_, _, p)| p.clone()))
+            .unwrap_or_default();
+        row.assist_vs_horizons_km = a["assist_vs_horizons_km"].as_f64();
+        row.assist_time_ms = a["assist_time_ms"].as_f64();
+        row.assist_call_time_ms = a["assist_call_time_ms"].as_f64();
+        if let Some(stm) = parse_stm_6x6(&a["assist_stm"]) {
+            row.assist_stm = Some(stm);
+        }
+        // Fold the empyrean reference outputs so the arm row is self-contained.
+        if let Some((pos, emp_ms, _)) = core_f64.get(&key) {
+            row.emp_pos_au = Some(*pos);
+            row.emp_time_ms = *emp_ms;
+            if let Some(ast) = assist_pos3(a) {
+                let d = [pos[0] - ast[0], pos[1] - ast[1], pos[2] - ast[2]];
+                row.emp_vs_assist_km =
+                    Some((d[0] * d[0] + d[1] * d[1] + d[2] * d[2]).sqrt() * au_km);
+            }
+            if let (Some(emp), Some(ast)) = (*emp_ms, row.assist_time_ms)
+                && ast > 0.0
+            {
+                row.speed_ratio = Some(emp / ast);
+            }
+        }
+        if variational && let Some(stm) = core_fo_stm.get(&key) {
+            row.emp_stm = Some(*stm);
+        }
+        // Resolved settings + any FAIL reason travel in notes.
+        let mut note = assist_settings_note(a);
+        if let Some(reason) = a["notes"].as_str().filter(|s| s.contains("WALL-CLOCK CAP")) {
+            note = format!("{reason} | {note}");
+        }
+        row.notes = note;
+        appended.push(row);
+    }
+    let n_appended = appended.len();
+    rows.append(&mut appended);
+    eprintln!("  (appended {n_appended} standalone per-arm ASSIST rows across six arms)");
+
+    Ok(n_folded)
 }
 
 fn merge_findorb(

@@ -829,6 +829,17 @@ const SHORT_ARC_NEOS: &[ValidationObject] = &[
 /// is what stops it drifting from the fetched fixture set.
 pub const RADAR_FIXTURE_OBJECTS: [&str; 5] = ["Apophis", "Bennu", "Didymos", "Eros", "Toutatis"];
 
+/// Whether this object has a radar-augmented fixture in `fixtures/psv-radar/`
+/// and therefore gets a second, optical+radar `orbit_determination_radar` row.
+///
+/// The membership predicate over [`RADAR_FIXTURE_OBJECTS`]. Shared by the plan
+/// generator (which emits the paired radar OD row for these objects) and any
+/// caller that needs to decide radar eligibility from a catalog name alone, so
+/// the "which objects have radar" answer has one source.
+pub fn has_radar_fixture(name: &str) -> bool {
+    RADAR_FIXTURE_OBJECTS.contains(&name)
+}
+
 /// Returns the full validation object catalog (44 objects across 13
 /// populations). Order matches the populations enumerated in the module
 /// docstring.

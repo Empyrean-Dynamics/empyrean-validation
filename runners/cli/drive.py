@@ -79,6 +79,46 @@ def _read_line(proc):
     return out
 
 
+def _mark_nonfinite_fail(row):
+    """If a row carries any non-finite float (NaN/Inf) — a v0.10.0 engine
+    defect, e.g. the 67P comet ephemeris position — rewrite it as a FAIL row:
+    the offending fields and their raw values are recorded as strings in
+    ``notes``, the offending numeric field is set to null (the schema's
+    ``[f64; 3]`` cannot hold a partial/string value), and the row is KEPT.
+    Returns True if the row had any non-finite value; other rows are untouched.
+    Previously json.dumps(..., allow_nan=False) raised on the first such value
+    and the all-or-nothing dump discarded every row of the channel."""
+
+    def _nf(v):
+        return isinstance(v, float) and not math.isfinite(v)
+
+    def _scan(lst, path, hits):
+        for i, e in enumerate(lst):
+            if isinstance(e, list):
+                _scan(e, f"{path}[{i}]", hits)
+            elif _nf(e):
+                hits.append(f"{path}[{i}]={e!r}")
+
+    offenders = []
+    for k, v in list(row.items()):
+        if _nf(v):
+            offenders.append(f"{k}={v!r}")
+            row[k] = None
+        elif isinstance(v, list):
+            hits = []
+            _scan(v, k, hits)
+            if hits:
+                offenders.append(f"{k} raw={v!r}")
+                offenders.extend(hits)
+                row[k] = None
+    if offenders:
+        msg = "FAIL non-finite (v0.10.0 engine output): " + "; ".join(offenders)
+        prev = row.get("notes") or ""
+        row["notes"] = f"{prev} | {msg}" if prev else msg
+        return True
+    return False
+
+
 def main() -> int:
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument(
@@ -177,7 +217,23 @@ def main() -> int:
         # Uncertainty axis: skip Jet1 rows. The CLI runner daemon
         # protocol does not yet accept a covariance for the input orbit;
         # cross-channel Jet1 parity is a follow-up.
-        if r.get("propagation_uncertainty") == "first_order_with_cov":
+        #
+        # Also skip every detection-off timing arm and the first-order
+        # (covariance) arms. The CLI protocol propagates only plain f64 with
+        # detection ON: it cannot attach a covariance and cannot disable
+        # per-step event detection, so any other arm would measure the wrong
+        # thing under that arm's label. Those arms are core-only; skip them
+        # explicitly, never silently and never with detection on. (OD rows
+        # carry a null propagation_uncertainty and are not caught here.)
+        if r.get("propagation_uncertainty") in (
+            "first_order_detection_on",
+            "first_order_detection_off",
+            "f64_detection_off",
+            "f64_detection_off_assist_default_like",
+            "first_order_detection_off_assist_default_like",
+            "f64_detection_off_assist_asteroid_institute_like",
+            "first_order_detection_off_assist_asteroid_institute_like",
+        ):
             n_skipped += 1
             continue
         if tt == "propagation":
@@ -227,6 +283,20 @@ def main() -> int:
                     f"  {r['object']} dt={r['dt_days']:+.0f}d eph FAIL: {out_line}",
                     file=sys.stderr,
                 )
+                # Emit a FAIL row carrying the engine's message rather than
+                # dropping it (same no-silent-drop principle as the OD path).
+                msg = (
+                    out_line[len("fail"):].strip()
+                    if out_line and out_line.startswith("fail")
+                    else "no output from CLI runner"
+                )
+                fail_row = dict(r)
+                fail_row["channel"] = "cli"
+                fail_row["timestamp"] = timestamp
+                fail_row["source_version"] = source_version
+                fail_row["emp_pos_au"] = None
+                fail_row["notes"] = f"ephemeris FAIL: {msg}"
+                out_rows.append(fail_row)
                 n_skipped += 1
                 continue
             parts = out_line.split()
@@ -298,6 +368,22 @@ def main() -> int:
             out_line = _read_line(proc)
             if not out_line or out_line.startswith("fail"):
                 print(f"  {r['object']} OD FAIL: {out_line}", file=sys.stderr)
+                # Emit a FAIL row carrying the engine's message, exactly as the
+                # rust / core / python channels do, instead of silently dropping
+                # the object. out_line is "fail <message>"; strip the marker.
+                msg = (
+                    out_line[len("fail"):].strip()
+                    if out_line and out_line.startswith("fail")
+                    else "no output from CLI runner"
+                )
+                fail_row = dict(r)
+                fail_row["channel"] = "cli"
+                fail_row["timestamp"] = timestamp
+                fail_row["source_version"] = source_version
+                fail_row["emp_pos_au"] = None
+                fail_row["od_converged"] = False
+                fail_row["notes"] = f"determine FAIL: {msg}"
+                out_rows.append(fail_row)
                 n_skipped += 1
                 continue
             parts = out_line.split()
@@ -363,6 +449,71 @@ def main() -> int:
                 ng["od_a3_sigma"] = _or_none(ng_s3)
                 out_rows.append(ng)
 
+        elif tt == "orbit_determination_radar":
+            # Optical+radar OD. The CLI runner's `od` command reads its ADES
+            # file through read_ades, which folds a <radar> delay/Doppler table
+            # into the fit, so pointing it at the psv-radar fixture (the same
+            # optical arc plus radar) fits optical+radar under the same config
+            # as the optical row. No non_grav second pass — this row is the
+            # radar-tightened state fit, cross-checked against find_orb's radar
+            # fit the way the optical row is against its optical fit.
+            radar_dir = args.fixtures_dir.parent / "psv-radar"
+            psv = radar_dir / f"{r['object'].replace('/', '_')}.psv"
+            if not psv.exists():
+                print(
+                    f"  {r['object']} radar OD FAIL: no radar PSV fixture at {psv}",
+                    file=sys.stderr,
+                )
+                n_missing_fixture += 1
+                n_skipped += 1
+                continue
+            tier = _TIER_TO_INT.get(r["force_model"])
+            if tier is None:
+                n_skipped += 1
+                continue
+            excl = r.get("excluded_perturbers_naif") or []
+            exclude_naif = int(excl[0]) if excl else 0
+            proc.stdin.write(f"od {tier} {exclude_naif} {psv}\n")
+            proc.stdin.flush()
+            out_line = _read_line(proc)
+            if not out_line or out_line.startswith("fail"):
+                print(f"  {r['object']} radar OD FAIL: {out_line}", file=sys.stderr)
+                msg = (
+                    out_line[len("fail"):].strip()
+                    if out_line and out_line.startswith("fail")
+                    else "no output from CLI runner"
+                )
+                fail_row = dict(r)
+                fail_row["channel"] = "cli"
+                fail_row["timestamp"] = timestamp
+                fail_row["source_version"] = source_version
+                fail_row["emp_pos_au"] = None
+                fail_row["od_converged"] = False
+                fail_row["notes"] = f"radar determine FAIL: {msg}"
+                out_rows.append(fail_row)
+                n_skipped += 1
+                continue
+            parts = out_line.split()
+            if len(parts) != 20 or parts[0] != "ok":
+                print(f"  unexpected radar od output: {out_line!r}", file=sys.stderr)
+                n_skipped += 1
+                continue
+            x, y, z = map(float, parts[1:4])
+            iters = int(parts[7])
+            ms = float(parts[8])
+            od_rms = float(parts[15])
+            new = dict(r)
+            new["channel"] = "cli"
+            new["timestamp"] = timestamp
+            new["source_version"] = source_version
+            new["emp_pos_au"] = [x, y, z]
+            new["emp_time_ms"] = ms
+            new["od_iterations"] = iters
+            new["od_rms_combined_arcsec"] = od_rms
+            _prev = new.get("notes") or ""
+            new["notes"] = f"{_prev} | optical+radar" if _prev else "optical+radar"
+            out_rows.append(new)
+
         else:
             n_skipped += 1
 
@@ -370,6 +521,14 @@ def main() -> int:
     proc.wait(timeout=5)
 
     args.output.parent.mkdir(parents=True, exist_ok=True)
+    _n_nonfinite = sum(_mark_nonfinite_fail(r) for r in out_rows)
+    if _n_nonfinite:
+        print(
+            f"  NOTE: {_n_nonfinite} row(s) carried a non-finite engine value; "
+            "written as FAIL rows (offending fields + raw values in notes, "
+            "numeric field nulled) instead of discarding the whole channel.",
+            file=sys.stderr,
+        )
     try:
         _payload = json.dumps(out_rows, indent=2, default=str, allow_nan=False)
     except ValueError as _e:

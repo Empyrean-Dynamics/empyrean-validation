@@ -204,15 +204,51 @@ pub mod test_types {
 }
 
 /// Canonical [`ValidationResult::propagation_uncertainty`] values.
+///
+/// Every value names the numeric path and the detection state as
+/// `<path>_detection_<on|off>`, with an `_assist_<config>_like` suffix on the
+/// ASSIST-matched barebones arms (force-model handle built once outside the
+/// timer, integrator knobs matched to an ASSIST configuration). The path ×
+/// detection two-by-two is complete: {f64, first_order} × {on, off}.
 pub mod uncertainty_modes {
-    /// Input orbit carries a covariance, so the propagator dispatches to
-    /// Jet1 / STM integration. The production hot path because empyrean
-    /// is uncertainty-first by design.
-    pub const FIRST_ORDER_WITH_COV: &str = "first_order_with_cov";
-    /// Covariance stripped; pure f64 state-only propagation. Used to
-    /// measure Jet1 overhead and to compare against external propagators
-    /// that don't carry uncertainty.
-    pub const F64_NO_COV: &str = "f64_no_cov";
+    /// First-order covariance transport (Jet1 / STM) with per-step event
+    /// detection ON. The production hot path — empyrean is uncertainty-first.
+    pub const FIRST_ORDER_DETECTION_ON: &str = "first_order_detection_on";
+    /// First-order covariance transport with per-step event detection and
+    /// dense output OFF. Same rows and covariance as
+    /// [`FIRST_ORDER_DETECTION_ON`]; isolates the detection cost on the
+    /// covariance-bearing path. Bit-identical transported state.
+    pub const FIRST_ORDER_DETECTION_OFF: &str = "first_order_detection_off";
+    /// Plain f64 state propagation (no input covariance) with per-step event
+    /// detection ON. Pairs against external single-particle propagators.
+    pub const F64_DETECTION_ON: &str = "f64_detection_on";
+    /// Plain f64 state propagation with per-step event detection and dense
+    /// output OFF. The propagated state is bit-identical to
+    /// [`F64_DETECTION_ON`]; only the wall-clock differs, so the measured
+    /// cost is attributable to the detection pass alone. Makes the ASSIST
+    /// wall-clock comparison like-for-like (ASSIST times integrate only).
+    pub const F64_DETECTION_OFF: &str = "f64_detection_off";
+    /// ASSIST-matched barebones arm: [`F64_DETECTION_OFF`] on a force-model
+    /// handle built ONCE per object outside the timer (only the propagate call
+    /// timed — the like-for-like boundary against an ASSIST integrate call),
+    /// with the integrator knobs villeneuve exposes matched to the ASSIST
+    /// `assist_default` configuration (epsilon 1e-9, initial step 0.001 d,
+    /// minimum step 0; encounter floor follows epsilon).
+    pub const F64_DETECTION_OFF_ASSIST_DEFAULT_LIKE: &str = "f64_detection_off_assist_default_like";
+    /// The Jet1/STM counterpart of [`F64_DETECTION_OFF_ASSIST_DEFAULT_LIKE`]:
+    /// same barebones prebuilt/detection-off boundary and `assist_default`-matched
+    /// knobs, but the covariance-bearing first-order path.
+    pub const FIRST_ORDER_DETECTION_OFF_ASSIST_DEFAULT_LIKE: &str =
+        "first_order_detection_off_assist_default_like";
+    /// ASSIST-matched barebones arm matched to the ASSIST `assist_asteroid_institute`
+    /// configuration (epsilon 1e-6, initial step 1e-6 d, minimum step 1e-9 d),
+    /// same prebuilt/detection-off boundary as the default-like arm.
+    pub const F64_DETECTION_OFF_ASSIST_ASTEROID_INSTITUTE_LIKE: &str =
+        "f64_detection_off_assist_asteroid_institute_like";
+    /// The Jet1/STM counterpart of
+    /// [`F64_DETECTION_OFF_ASSIST_ASTEROID_INSTITUTE_LIKE`].
+    pub const FIRST_ORDER_DETECTION_OFF_ASSIST_ASTEROID_INSTITUTE_LIKE: &str =
+        "first_order_detection_off_assist_asteroid_institute_like";
 }
 
 /// One row in the validation result table.
@@ -262,12 +298,25 @@ pub struct ValidationResult {
     /// position block of Empyrean's STM-propagated 6×6. Lets the report show
     /// the propagation offset as a Mahalanobis distance
     /// \\(d = \sqrt{\Delta r^\top C^{-1} \Delta r}\\) instead of raw km.
-    /// Populated only on `first_order_with_cov` propagation rows (Empyrean is
+    /// Populated only on `first_order_detection_on` propagation rows (Empyrean is
     /// the only tool that propagates a covariance). NOTE: the validation
     /// attaches a synthetic typical-NEO input covariance, so `d` is measured
     /// against that propagated envelope, not the object's real OD covariance.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub emp_pos_cov_au2: Option<[[f64; 3]; 3]>,
+    /// Empyrean's first-order 6×6 state transition matrix \\(\Phi(t, t_0)\\),
+    /// row-major, `matrix[i][j] = ∂(out_i)/∂(in_j)` so that
+    /// \\(C_\text{out} = \Phi\,C_\text{in}\,\Phi^\top\\). Components are ordered
+    /// `[x, y, z, vx, vy, vz]` in AU and AU/day, ICRF equatorial, SSB-centered —
+    /// the same units, ordering and frame as [`assist_stm`](Self::assist_stm),
+    /// so the two are directly comparable element-for-element. This is the exact
+    /// dual-number (nolan Jet1) Jacobian the engine carries on its covariance
+    /// path — the same chain that produces [`emp_pos_cov_au2`](Self::emp_pos_cov_au2)
+    /// (its top-left 3×3 is that covariance's Φ block). Populated only on the
+    /// `first_order_detection_on` / `first_order_detection_off` propagation rows
+    /// (the Jet1/STM path); `None` on every f64, OD, or ephemeris row.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub emp_stm: Option<[[f64; 6]; 6]>,
     /// Wall-clock per row (ms). Best-of `n_timing_runs`.
     pub emp_time_ms: Option<f64>,
     /// Angular separation vs Horizons (arcsec). Ephemeris rows.
@@ -281,7 +330,7 @@ pub struct ValidationResult {
     /// \\(C_\text{radec} = J\,C_\text{in}\,J^\top\\) (RA row/col scaled by
     /// cosδ to match `d_ra_arcsec`). Lets the report show the sky-plane offset
     /// as a Mahalanobis distance instead of raw mas. Populated only on
-    /// `first_order_with_cov` ephemeris rows; same synthetic-input caveat as
+    /// `first_order_detection_on` ephemeris rows; same synthetic-input caveat as
     /// [`emp_pos_cov_au2`](Self::emp_pos_cov_au2).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub emp_radec_cov_arcsec2: Option<[[f64; 2]; 2]>,
@@ -551,8 +600,8 @@ pub struct ValidationResult {
 
     // ── Test-configuration axis ─────────────────────────────────────
     /// Tag distinguishing prop+eph rows by uncertainty-propagation mode.
-    /// One of [`uncertainty_modes::FIRST_ORDER_WITH_COV`] or
-    /// [`uncertainty_modes::F64_NO_COV`]. `None` on OD rows because OD
+    /// One of [`uncertainty_modes::FIRST_ORDER_DETECTION_ON`] or
+    /// [`uncertainty_modes::F64_DETECTION_ON`]. `None` on OD rows because OD
     /// always produces a post-fit covariance — the axis doesn't apply.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub propagation_uncertainty: Option<String>,
@@ -565,8 +614,55 @@ pub struct ValidationResult {
     pub assist_vs_horizons_km: Option<f64>,
     /// |empyrean − ASSIST| in km.
     pub emp_vs_assist_km: Option<f64>,
-    /// ASSIST wall-clock per row (ms).
+    /// ASSIST wall-clock per row (ms) — integrate call only, forces built
+    /// outside the timer (the like-for-like partner of the detection-off,
+    /// prebuilt-system empyrean arms).
     pub assist_time_ms: Option<f64>,
+    /// ASSIST whole-call wall-clock per row (ms): the [`assist_time_ms`]
+    /// boundary plus the per-row setup that timer excludes (Simulation
+    /// creation, `assist.Extras` binding, adding the particle) — everything
+    /// from the start of the row through the end of `sim.integrate`. The
+    /// ephemeris object stays outside both timers, matching empyrean's
+    /// context. Gives `f64_detection_on` (whole `propagate()` call) a
+    /// symmetric partner. Populated by `merge-external`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub assist_call_time_ms: Option<f64>,
+    /// ASSIST's variational-particle 6×6 STM \\(\Phi(t, t_0)\\), folded by
+    /// `merge-external` from the ASSIST channel onto the matching
+    /// `first_order_detection_on` row (keyed on object + dt + uncertainty). Same
+    /// row-major layout, `[x, y, z, vx, vy, vz]` AU / AU-day ordering, and ICRF /
+    /// SSB frame as [`emp_stm`](Self::emp_stm), so the two are compared
+    /// element-for-element. ASSIST integrates six REBOUND first-order variational
+    /// particles seeded with unit state perturbations (Holman et al. 2023). The
+    /// shadows see gravity only — ASSIST's non-grav `additional_forces` is not
+    /// applied to them — so for an active body (a1/a2/a3 ≠ 0) this is a
+    /// gravity-only approximation of Empyrean's full-Jacobian STM. This ASSIST
+    /// run uses REBOUND's library-default IAS15 truncation tolerance (1e-9).
+    /// `None` when no ASSIST STM row matched.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub assist_stm: Option<[[f64; 6]; 6]>,
+    /// Reference 6×6 STM from an ASSIST **single-particle** central finite
+    /// difference — propagate the nominal state, then re-propagate with each of
+    /// the six state components perturbed by ±δ, and form
+    /// \\(\Phi_{ij} \approx [x_i(x_0+\delta e_j) - x_i(x_0-\delta e_j)]/2\delta\\).
+    /// This is the method-independent ground truth for the STM: it uses only the
+    /// forward propagator, no variational machinery, so it validates both
+    /// Empyrean's [`emp_stm`](Self::emp_stm) and ASSIST's variational
+    /// [`assist_stm`](Self::assist_stm). Same row-major layout / units / frame as
+    /// `emp_stm`. Its own numerical floor (step-size convergence at δ vs δ/10) is
+    /// ~1e-8. Folded by `merge-external --core-fd-stm` onto the representative
+    /// subset only; `None` elsewhere.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fd_stm: Option<[[f64; 6]; 6]>,
+    /// ASSIST's variational-particle 6×6 STM computed with the runner's variational
+    /// path corrected (`add_variation(order=1, testparticle=0)` plus zero-padded
+    /// `particle_params` for the shadow particles). Distinct from
+    /// [`assist_stm`](Self::assist_stm), which was produced by the pre-fix runner
+    /// (the degenerate free-particle matrix). Compared against
+    /// [`fd_stm`](Self::fd_stm) it agrees to the finite-difference floor in every
+    /// regime. Folded on the same representative subset; `None` elsewhere.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub var_stm_fixed: Option<[[f64; 6]; 6]>,
     /// `empyrean_time_ms / assist_time_ms`.
     pub speed_ratio: Option<f64>,
     /// find_orb post-fit residual RMS (arcsec). find_orb is an
@@ -854,6 +950,7 @@ impl ValidationResult {
             emp_vs_horizons_km: None,
             emp_pos_au: None,
             emp_pos_cov_au2: None,
+            emp_stm: None,
             emp_time_ms: None,
             separation_arcsec: None,
             d_ra_arcsec: None,
@@ -928,6 +1025,10 @@ impl ValidationResult {
             assist_vs_horizons_km: None,
             emp_vs_assist_km: None,
             assist_time_ms: None,
+            assist_call_time_ms: None,
+            assist_stm: None,
+            fd_stm: None,
+            var_stm_fixed: None,
             speed_ratio: None,
             findorb_rms_residual: None,
             findorb_n_obs_used: None,

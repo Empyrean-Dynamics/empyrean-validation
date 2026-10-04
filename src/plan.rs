@@ -43,9 +43,9 @@ pub struct PlanConfig {
     /// Force-model tier names emitted on plan rows. Each tier produces
     /// its own row per (object, dt) combination.
     pub tiers: Vec<String>,
-    /// When `true`, emit both `first_order_with_cov` and `f64_no_cov`
+    /// When `true`, emit both `first_order_detection_on` and `f64_detection_on`
     /// propagation+ephemeris rows so the replay channels exercise the
-    /// uncertainty axis. When `false`, only `f64_no_cov` rows are
+    /// uncertainty axis. When `false`, only `f64_detection_on` rows are
     /// emitted (benchmark mode for head-to-head comparison with external
     /// propagators that don't propagate covariance).
     pub uncertainty_axis: bool,
@@ -94,11 +94,11 @@ pub fn build_plan(
     let mut plan: ValidationPlan = Vec::new();
     let uncertainty_modes_to_emit: &[Option<&str>] = if config.uncertainty_axis {
         &[
-            Some(uncertainty_modes::FIRST_ORDER_WITH_COV),
-            Some(uncertainty_modes::F64_NO_COV),
+            Some(uncertainty_modes::FIRST_ORDER_DETECTION_ON),
+            Some(uncertainty_modes::F64_DETECTION_ON),
         ]
     } else {
-        &[Some(uncertainty_modes::F64_NO_COV)]
+        &[Some(uncertainty_modes::F64_DETECTION_ON)]
     };
 
     eprintln!("Fetching initial conditions and reference values...");
@@ -301,6 +301,20 @@ pub fn build_plan(
                 plan.push(od_plan_row(obj, tier, &timestamp));
             }
         }
+
+        // Radar OD plan rows: a second, optical+radar fit for every object
+        // that has a radar-augmented fixture in `fixtures/psv-radar/`. Emitted
+        // from the catalog's [`crate::catalog::RADAR_FIXTURE_OBJECTS`] list —
+        // generated, never hand-added — so the paired row exists for exactly
+        // the objects whose fixture carries a `<radar>` table. Every replay
+        // channel loads the psv-radar fixture and folds its delay/Doppler
+        // records into the same fit as the optical row, so the two rows differ
+        // only by the observations, not the configuration.
+        if crate::catalog::has_radar_fixture(obj.name) {
+            for tier in &config.tiers {
+                plan.push(od_radar_plan_row(obj, tier, &timestamp));
+            }
+        }
     }
 
     eprintln!("Plan: {} rows", plan.len());
@@ -414,6 +428,33 @@ fn od_plan_row(obj: &ValidationObject, tier: &str, timestamp: &str) -> Validatio
     r.t_mjd_tdb = 0.0;
     r.force_model = tier.to_string();
     r.test_type = test_types::ORBIT_DETERMINATION.to_string();
+    r.channel = channels::PLAN.to_string();
+    r.excluded_perturbers_naif = self_perturber_naif_ids(obj);
+    r.timestamp = timestamp.to_string();
+    r.notes = obj.notes.to_string();
+    r
+}
+
+/// Build a single radar OD plan row.
+///
+/// Identical to [`od_plan_row`] apart from the `test_type`
+/// ([`test_types::ORBIT_DETERMINATION_RADAR`]): the plan row is a fit request,
+/// not a fit result, and carries no initial condition or reference — the
+/// replay channel seeds itself from the object's `fixtures/psv-radar/` fixture,
+/// which is the same optical arc as the optical row plus a `<radar>`
+/// delay/Doppler table. The two rows therefore ask for the same fit under the
+/// same configuration, differing only in the observation set they load, which
+/// is exactly the apples-to-apples optical-vs-radar comparison the report
+/// pairs.
+fn od_radar_plan_row(obj: &ValidationObject, tier: &str, timestamp: &str) -> ValidationResult {
+    let mut r = ValidationResult::empty();
+    r.object = obj.name.to_string();
+    r.population = obj.population.to_string();
+    r.epoch_mjd_tdb = 0.0; // filled in by the OD runner
+    r.dt_days = 0.0;
+    r.t_mjd_tdb = 0.0;
+    r.force_model = tier.to_string();
+    r.test_type = test_types::ORBIT_DETERMINATION_RADAR.to_string();
     r.channel = channels::PLAN.to_string();
     r.excluded_perturbers_naif = self_perturber_naif_ids(obj);
     r.timestamp = timestamp.to_string();
@@ -543,8 +584,8 @@ pub const PLAN_CLEARED_KEYS: [&str; 23] = [
 
 /// Uncertainty axes a replay channel can actually reproduce.
 ///
-/// The rust reference also sweeps `second_order_with_cov`, `auto`,
-/// `sigma_point_with_cov`, and `monte_carlo_100_with_cov`. Those are
+/// The rust reference also sweeps `second_order_detection_on`, `auto`,
+/// `sigma_point_detection_on`, and `monte_carlo_100_detection_on`. Those are
 /// rust-only axes; a plan row asking another channel to replay one is a row
 /// that channel will never match. The old strip blacklisted the first two and
 /// let the sigma-point and Monte-Carlo rows through, so they rode into the
@@ -553,40 +594,36 @@ pub const PLAN_CLEARED_KEYS: [&str; 23] = [
 ///
 /// `None` (OD rows carry no uncertainty tag) is always in the plan.
 pub const PLAN_UNCERTAINTY_AXES: [&str; 2] = [
-    uncertainty_modes::FIRST_ORDER_WITH_COV,
-    uncertainty_modes::F64_NO_COV,
+    uncertainty_modes::FIRST_ORDER_DETECTION_ON,
+    uncertainty_modes::F64_DETECTION_ON,
 ];
 
 /// Test types no replay channel can reproduce, and so must never reach the
 /// plan.
 ///
-/// **Deliberate and temporary — tracked as `empyrean-s1ab`.** Un-nesting the
-/// radar OD pass made the rust runner emit `orbit_determination_radar` rows for
-/// the first time, and nothing but the rust runner can replay them:
+/// **Currently empty — the radar OD axis is now replayable everywhere
+/// (`empyrean-s1ab` resolved).** `orbit_determination_radar` used to sit here:
+/// the rust runner emitted the rows, but nothing else could replay them, so a
+/// plan carrying them made the gate unsatisfiable for a reason unrelated to any
+/// regression. That is no longer true. Every replay channel now grows a radar
+/// arm that loads the object's `fixtures/psv-radar/` fixture and folds its
+/// `<radar>` delay/Doppler table into the fit:
 ///
-/// - `runners/python/run.py` skips any non-`orbit_determination` row that
-///   carries no `ic_pos_au` / `ic_vel_au_d`, and the radar rows carry
-///   `ic_pos_au: null` by construction (the fit seeds itself from the fixture,
-///   not from the plan), so python replays zero of them — a python-side floor
-///   on that axis can never be met.
-/// - `empyrean-core`'s `validate-core` has no radar arm; it falls through to
-///   `_ => {}` and pushes the row anyway with a null position. The report
-///   counts such a row as *compared* but never as *passing*, so the core
-///   channel fails its `passing == total` strict check on exactly those rows
-///   (measured: 448 rows, 446 passing, the 2 missing being the radar pair).
+/// - `empyrean-core`'s `validate-core` has a `replay_od_radar` branch,
+/// - `runners/python/run.py` dispatches the `orbit_determination_radar` row to
+///   the wheel's radar-folding `read_ades` path, and
+/// - `runners/cli/drive.py` points the CLI runner's `od` command at the
+///   psv-radar fixture (the runner reads radar through `read_ades`).
 ///
-/// So a plan carrying these rows does not describe a cross-channel radar
-/// comparison — it describes work no channel can do, and makes the gate
-/// unsatisfiable for a reason unrelated to any real regression. Stripping them
-/// is the honest state: the suite stops implying a comparison that does not
-/// exist. The radar axis stays gated by a row floor on the **rust** channel,
-/// where the rows are actually produced and visible (see the `--min-rows`
-/// handling in `src/bin/cli.rs` and the ci-check step in
-/// `.github/workflows/validation.yml`).
+/// So the radar row now describes a real cross-channel comparison, and the
+/// strip keeps it. Its floor moves off the rust-only `--min-rows` special case
+/// and onto the strict channels, exactly as the resolution note that used to
+/// live here promised.
 ///
-/// Removing an entry here is the *goal*, not a regression: once the replay
-/// drivers grow a real radar arm (`empyrean-s1ab`), the row comes back into the
-/// plan and its floor moves back onto the strict channels.
+/// The machinery ([`PlanExclusion::RustOnlyTestType`], the
+/// [`PlanDrops::rust_only_test_type`] counter) stays: it is the generic guard
+/// for the *next* test type that lands rust-first, kept so re-blacklisting is a
+/// one-line, visible act rather than a rebuild.
 ///
 /// # Why a blacklist when [`PLAN_UNCERTAINTY_AXES`] is a whitelist
 ///
@@ -596,8 +633,8 @@ pub const PLAN_UNCERTAINTY_AXES: [&str; 2] = [
 /// is meant to be replayed by everyone — blacklisting means a new one reaches
 /// the plan and fails loudly in the channels that cannot yet run it, instead of
 /// silently vanishing from the plan and taking a whole test axis with it. That
-/// silent-axis-deletion is the exact defect this branch exists to kill.
-pub const PLAN_RUST_ONLY_TEST_TYPES: [&str; 1] = [test_types::ORBIT_DETERMINATION_RADAR];
+/// silent-axis-deletion is the exact defect this list exists to guard against.
+pub const PLAN_RUST_ONLY_TEST_TYPES: [&str; 0] = [];
 
 /// Why a channel-result row was excluded from the plan.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -763,7 +800,7 @@ mod tests {
             [1.0, 0.0, 0.0],
             [0.0, 0.017, 0.0],
             Some(([-0.004, 0.0, 0.0], [0.0, 1e-6, 0.0])),
-            Some(uncertainty_modes::F64_NO_COV),
+            Some(uncertainty_modes::F64_DETECTION_ON),
             "2026-04-29T00:00:00Z",
         );
         assert_eq!(r.ref_sun_pos_au, Some([-0.004, 0.0, 0.0]));
@@ -774,7 +811,10 @@ mod tests {
         assert_eq!(r.channel, "plan");
         assert_eq!(r.t_mjd_tdb, 61030.0);
         assert!(r.emp_pos_au.is_none());
-        assert_eq!(r.propagation_uncertainty.as_deref(), Some("f64_no_cov"),);
+        assert_eq!(
+            r.propagation_uncertainty.as_deref(),
+            Some("f64_detection_on"),
+        );
     }
 
     #[test]
@@ -783,6 +823,28 @@ mod tests {
         let r = od_plan_row(pallas, "standard", "ts");
         assert_eq!(r.test_type, "orbit_determination");
         assert_eq!(r.excluded_perturbers_naif, vec![2_000_002]);
+    }
+
+    #[test]
+    fn od_radar_plan_row_is_the_radar_test_type() {
+        // Apophis has a radar fixture; its radar plan row is a distinct test
+        // type from the optical one but is otherwise the same fit request
+        // (no IC, no reference — the channel seeds itself from the fixture).
+        let apophis = catalog::filter_by_name(&["Apophis"])[0];
+        let r = od_radar_plan_row(apophis, "standard", "ts");
+        assert_eq!(r.test_type, test_types::ORBIT_DETERMINATION_RADAR);
+        assert_eq!(r.channel, channels::PLAN);
+        assert!(r.ic_pos_au.is_none());
+        assert!(r.ref_pos_au.is_none());
+    }
+
+    #[test]
+    fn radar_fixture_objects_get_a_paired_radar_plan_row() {
+        // The generator emits exactly one radar OD row for each object that
+        // has a radar fixture, and none for objects that do not — the pairing
+        // is derived from the catalog, never hand-added.
+        assert!(catalog::has_radar_fixture("Apophis"));
+        assert!(!catalog::has_radar_fixture("Nysa"));
     }
 
     /// A body must not perturb itself on a propagation row either. Before
@@ -803,7 +865,7 @@ mod tests {
             [1.0, 0.0, 0.0],
             [0.0, 0.017, 0.0],
             None,
-            Some(uncertainty_modes::F64_NO_COV),
+            Some(uncertainty_modes::F64_DETECTION_ON),
             "ts",
         );
         assert_eq!(r.excluded_perturbers_naif, vec![2_000_002]);
@@ -849,7 +911,7 @@ mod tests {
             [0.0, 0.017, 0.0],
             (0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, None),
             &hor,
-            Some(uncertainty_modes::F64_NO_COV),
+            Some(uncertainty_modes::F64_DETECTION_ON),
             "ts",
         );
         assert_eq!(r.excluded_perturbers_naif, vec![2_000_002]);
@@ -1005,7 +1067,7 @@ mod tests {
     #[test]
     fn plan_from_rows_with_unknown_fields_deserializes_against_the_pinned_schema() {
         let rows = vec![rust_row_with_unknown_fields(Some(
-            uncertainty_modes::F64_NO_COV,
+            uncertainty_modes::F64_DETECTION_ON,
         ))];
         let (plan, drops) = strip_to_plan(&rows).expect("strip");
         assert_eq!(drops.total(), 0);
@@ -1075,12 +1137,12 @@ mod tests {
     #[test]
     fn rust_only_uncertainty_axes_never_reach_the_plan() {
         // sigma_point and monte_carlo rode into the "plan" under the old
-        // blacklist, which named only `auto` and `second_order_with_cov`.
+        // blacklist, which named only `auto` and `second_order_detection_on`.
         for axis in [
-            "auto",
-            "second_order_with_cov",
-            "sigma_point_with_cov",
-            "monte_carlo_100_with_cov",
+            "auto_detection_on",
+            "second_order_detection_on",
+            "sigma_point_detection_on",
+            "monte_carlo_100_detection_on",
         ] {
             let (plan, drops) = strip_to_plan(&[rust_row_with_unknown_fields(Some(axis))]).unwrap();
             assert!(plan.is_empty(), "{axis} leaked into the plan");
@@ -1098,24 +1160,29 @@ mod tests {
     }
 
     #[test]
-    fn rust_only_test_types_never_reach_the_plan() {
-        // The radar OD rows the rust runner emits are unreplayable by every
-        // other channel (empyrean-s1ab); a plan carrying them makes the gate
-        // unsatisfiable. They must be dropped, and dropped under their OWN
-        // counter so the strip's log says which rule removed them.
-        for tt in PLAN_RUST_ONLY_TEST_TYPES {
-            let (plan, drops) = strip_to_plan(&[rust_row_with_test_type(tt)]).unwrap();
-            assert!(plan.is_empty(), "{tt} leaked into the plan");
-            assert_eq!(drops.rust_only_test_type, 1);
-            assert_eq!(drops.uncertainty_axis, 0);
-        }
-        // Every other test type still rides through. Pinned by name so adding
-        // a test type to the blacklist is a deliberate, visible act — the
-        // whole hazard of a plan strip is that it deletes an axis quietly.
+    fn the_test_type_blacklist_is_empty_and_drops_nothing() {
+        // `empyrean-s1ab` is resolved: the radar OD axis is replayable by every
+        // channel, so no test type is rust-only any more. The blacklist is
+        // empty, and the strip drops nothing on the test-type axis. The
+        // machinery stays (this test guards that it fires for nothing today),
+        // so re-blacklisting a future rust-first test type is one line.
+        assert!(
+            PLAN_RUST_ONLY_TEST_TYPES.is_empty(),
+            "the radar axis is replayable; nothing is rust-only",
+        );
+    }
+
+    #[test]
+    fn every_test_type_including_radar_reaches_the_plan() {
+        // Every canonical test type rides through the strip now, radar
+        // included. Pinned by name so removing a type from the plan would be a
+        // deliberate, visible act — the whole hazard of a plan strip is that it
+        // deletes an axis quietly.
         for tt in [
             test_types::PROPAGATION,
             test_types::EPHEMERIS,
             test_types::ORBIT_DETERMINATION,
+            test_types::ORBIT_DETERMINATION_RADAR,
             test_types::NON_GRAV_RECOVERY,
             test_types::DT_RECOVERY,
             test_types::PHOTOMETRY_RECOVERY,
@@ -1130,16 +1197,17 @@ mod tests {
     #[test]
     fn strip_counts_each_drop_reason_separately() {
         let rows = vec![
-            rust_row_with_unknown_fields(Some("monte_carlo_100_with_cov")),
-            rust_row_with_unknown_fields(Some("auto")),
+            rust_row_with_unknown_fields(Some("monte_carlo_100_detection_on")),
+            rust_row_with_unknown_fields(Some("auto_detection_on")),
+            // The radar OD row now rides through — it is no longer rust-only.
             rust_row_with_test_type(test_types::ORBIT_DETERMINATION_RADAR),
             rust_row_with_test_type(test_types::ORBIT_DETERMINATION),
         ];
         let (plan, drops) = strip_to_plan(&rows).unwrap();
-        assert_eq!(plan.len(), 1);
+        assert_eq!(plan.len(), 2, "both OD rows reach the plan");
         assert_eq!(drops.uncertainty_axis, 2);
-        assert_eq!(drops.rust_only_test_type, 1);
-        assert_eq!(drops.total(), 3);
+        assert_eq!(drops.rust_only_test_type, 0);
+        assert_eq!(drops.total(), 2);
     }
 
     #[test]
