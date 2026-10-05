@@ -44,6 +44,103 @@ MJD_TO_JD = 2_400_000.5
 J2000_JD = 2_451_545.0
 AU_KM = 149_597_870.700
 
+
+class WalltimeExceeded(Exception):
+    """Raised by :func:`propagate_assist` when a row's wall-clock cap is hit.
+
+    Carries the elapsed and cap seconds so the caller can write a loud FAIL row
+    with the reason and the measured time — never a silent skip and never a
+    substituted number. Under REBOUND's library defaults IAS15 has ``min_dt = 0``
+    (no floor on the adaptive step), so an encounter arc that makes the step
+    shrink without bound would otherwise hang the channel; the cap turns that
+    into an explicit failure.
+    """
+
+    def __init__(self, elapsed_s: float, cap_s: float):
+        self.elapsed_s = elapsed_s
+        self.cap_s = cap_s
+        super().__init__(
+            f"wall-clock cap {cap_s:.1f}s exceeded (integration ran {elapsed_s:.1f}s "
+            "without reaching the target epoch — REBOUND IAS15 step collapse)"
+        )
+
+
+# ── ASSIST configurations ───────────────────────────────
+#
+# A configuration is a named set of integrator settings applied in ONE place,
+# to the simulation AFTER `assist.Extras(sim, ephem)` has attached. Attach
+# itself sets `ri_ias15.adaptive_mode = 1` (assist_attach, assist.c) and rescales
+# G; REBOUND leaves epsilon 1e-9, min_dt 0, initial dt 0.001 day untouched. The
+# runner sets nothing else on the simulation but the particle and the epoch, so
+# `assist_default` applies NOTHING (it is exactly what attach leaves). Every arm
+# reads its resolved settings back off the simulation after attach + config for
+# provenance — assumed values are never stamped.
+#
+# Sources:
+#   assist_default            — attach defaults (mode 1, eps 1e-9, min_dt 0, dt 0.001 d).
+#   assist_layup              — Smithsonian/layup sets ri_ias15.adaptive_mode = 2 (PRS 2024)
+#                               after attach; src/lib/orbit_fit/orbit_fit.cpp:72.
+#   assist_asteroid_institute — B612 adam-assist ASSISTPropagator constructor defaults
+#                               (src/adam_assist/propagator.py): eps 1e-6, min_dt 1e-9 d,
+#                               adaptive_mode 1, initial dt 1e-6 d. This is the configuration
+#                               the runner used before, i.e. the stored report numbers.
+ASSIST_CONFIGS = {
+    "assist_default": {},
+    "assist_layup": {"adaptive_mode": 2},
+    "assist_asteroid_institute": {
+        "epsilon": 1e-6, "min_dt": 1e-9, "adaptive_mode": 1, "dt": 1e-6,
+    },
+}
+
+# The six arms: three configurations, each with variational particles off / on.
+ASSIST_ARMS = [
+    ("assist_default", False, "assist_default_variational_off"),
+    ("assist_default", True, "assist_default_variational_on"),
+    ("assist_layup", False, "assist_layup_variational_off"),
+    ("assist_layup", True, "assist_layup_variational_on"),
+    ("assist_asteroid_institute", False, "assist_asteroid_institute_variational_off"),
+    ("assist_asteroid_institute", True, "assist_asteroid_institute_variational_on"),
+]
+
+
+def apply_config(sim, config):
+    """Apply a named configuration's integrator settings to `sim`.
+
+    Called ONCE, right after `assist.Extras(sim, ephem)` attaches. `assist_default`
+    applies nothing (attach already left the settings it wants). The others set
+    only the knobs their source specifies, over what attach left.
+    """
+    c = ASSIST_CONFIGS[config]
+    if "epsilon" in c:
+        sim.ri_ias15.epsilon = c["epsilon"]
+    if "min_dt" in c:
+        sim.ri_ias15.min_dt = c["min_dt"]
+    if "adaptive_mode" in c:
+        sim.ri_ias15.adaptive_mode = c["adaptive_mode"]
+    if "dt" in c:
+        sim.dt = c["dt"]
+
+
+def resolved_config(config, ephem):
+    """Read the integrator settings back off a probe simulation AFTER attach +
+    config, so provenance reports what the arm actually ran under — never
+    assumed values. A dummy heliocentric particle is enough to attach."""
+    sim = rebound.Simulation()
+    sim.add(x=1.0, y=0.0, z=0.0, vx=0.0, vy=0.0172, vz=0.0)
+    assist.Extras(sim, ephem)
+    apply_config(sim, config)
+    return {
+        "config": config,
+        "assist_version": assist.__version__,
+        "rebound_version": rebound.__version__,
+        "integrator": sim.integrator,
+        "ias15_epsilon": sim.ri_ias15.epsilon,
+        "ias15_min_dt": sim.ri_ias15.min_dt,
+        "ias15_adaptive_mode": str(sim.ri_ias15.adaptive_mode),
+        "initial_dt": sim.dt,
+    }
+
+
 # ── Horizons cache ──────────────────────────────────────
 
 
@@ -242,6 +339,8 @@ def propagate_assist(
     gr_nn=None,
     gr_r0=None,
     with_stm=False,
+    walltime_cap_s=None,
+    config="assist_default",
 ):
     """Propagate with ASSIST. Returns (pos, vel, time_ms, stm).
 
@@ -249,10 +348,10 @@ def propagate_assist(
 
     - False (default): single-particle f64 propagation. `stm`
       returned as None. Comparable to empyrean's
-      `propagation_uncertainty = "f64_no_cov"` path.
+      `propagation_uncertainty = "f64_detection_on"` path.
     - True: 6 REBOUND first-order variational particles seeded with
       unit vectors in each state component. The integrated 6×6 STM is
-      returned. Comparable to empyrean's `"first_order_with_cov"`
+      returned. Comparable to empyrean's `"first_order_detection_on"`
       path.
 
     ASSIST encodes first-order variational derivatives only ("the
@@ -261,7 +360,7 @@ def propagate_assist(
     variational machinery would integrate shadow particles that
     receive no second-order contributions from ASSIST's force model,
     and the resulting timing would not be comparable to a genuine
-    STT propagation. empyrean's `"second_order_with_cov"` rows have
+    STT propagation. empyrean's `"second_order_detection_on"` rows have
     no ASSIST counterpart.
 
     REBOUND propagates the variational equations under the
@@ -279,26 +378,69 @@ def propagate_assist(
         g(r) function parameters. None = ASSIST defaults (r^{-2}).
     with_stm : bool
         Adds 6 first-order variational particles for the STM.
+    walltime_cap_s : float or None
+        When set, install a REBOUND heartbeat that calls ``sim.stop()`` once the
+        call's wall-clock exceeds this many seconds; if the integration is
+        stopped short of the target epoch, raise :class:`WalltimeExceeded`. The
+        heartbeat fires every timestep and adds a per-step Python-callback cost,
+        so the caller uses it ONLY on the untimed warm-up call and leaves the
+        timed best-of-N runs uncapped (a warm-up that finished within the cap
+        proves the same deterministic integration cannot hang when repeated).
+        ``None`` (default) installs no heartbeat and no cap.
+
+    config : str
+        Name of the configuration in :data:`ASSIST_CONFIGS` to apply AFTER
+        `assist.Extras` attaches. ``assist_default`` applies nothing (attach's
+        own settings ride). The resolved settings are read back off the
+        simulation for provenance by :func:`resolved_config`.
     """
     t0_sim = epoch_mjd + MJD_TO_JD - J2000_JD
     dt = target_mjd - epoch_mjd
+    tmax = t0_sim + dt
 
+    # Whole-call timer: everything from the start of the row (Simulation
+    # creation, Extras binding, adding the particle, variational setup)
+    # through the end of sim.integrate. The ephemeris object is created by the
+    # caller and stays outside this timer, matching empyrean's Context. This
+    # is the symmetric partner of empyrean's whole-propagate() f64_detection_on
+    # timing; the narrower `elapsed_ms` below times only sim.integrate.
+    t_call0 = time.perf_counter()
     sim = rebound.Simulation()
     sim.t = t0_sim
-    sim.ri_ias15.min_dt = 1e-9
-    sim.ri_ias15.adaptive_mode = 1
-    sim.ri_ias15.epsilon = 1e-6
-    sim.dt = 1e-6
+    # No integrator overrides: run at rebound + assist library defaults.
+    if walltime_cap_s is not None:
+        # Heartbeat runs in-process every timestep; when the wall-clock cap is
+        # exceeded it asks REBOUND to stop cleanly (ret_value 5, no exception
+        # from integrate). We then detect the short stop below and raise.
+        def _heartbeat(_sim_ptr, _cap=walltime_cap_s, _start=t_call0):
+            if time.perf_counter() - _start > _cap:
+                sim.stop()
+
+        sim.heartbeat = _heartbeat
     sim.add(
         x=pos_ssb[0], y=pos_ssb[1], z=pos_ssb[2],
         vx=vel_ssb[0], vy=vel_ssb[1], vz=vel_ssb[2],
     )
     extras = assist.Extras(sim, ephem)
+    # Apply the configuration in ONE place, after attach. `assist_default`
+    # applies nothing (attach's own settings ride).
+    apply_config(sim, config)
 
     # Non-gravitational forces
     has_ng = a1 != 0.0 or a2 != 0.0 or a3 != 0.0
     if has_ng:
-        extras.particle_params = np.array([a1, a2, a3])
+        # ASSIST's non-grav variational loop (assist_additional_force_non_gravitational
+        # in src/forces.c) reads particle_params for EACH variational particle at
+        # index 3*(N_real + v); with only the three real-particle values it reads
+        # past the array (undefined behaviour — it produced erratic, up to ~1e4,
+        # STM elements for active a1/a2/a3 bodies). The STM perturbs the state
+        # only, never A1/A2/A3, so every shadow carries a zero non-grav
+        # perturbation. Pad to cover the six variational particles whenever they
+        # are present; the f64 (no-STM) path keeps the bare three-element array.
+        if with_stm:
+            extras.particle_params = np.array([a1, a2, a3] + [0.0] * 18)
+        else:
+            extras.particle_params = np.array([a1, a2, a3])
 
         # Set g(r) parameters if provided
         if gr_alpha is not None:
@@ -314,10 +456,23 @@ def propagate_assist(
 
     # Variational particles: 6 first-order particles seeded with unit
     # perturbations in each state component (x, y, z, vx, vy, vz).
+    #
+    # `testparticle=0` is REQUIRED, not optional. ASSIST's variational force
+    # loop (assist_additional_force_direct in src/forces.c) applies the
+    # gravitational-gradient acceleration to a variational particle only when
+    # its configuration's `testparticle` index equals the real particle it
+    # tracks: `if (tp == j)`. REBOUND's `add_variation(order=1)` defaults
+    # `testparticle=-1` (a whole-simulation variation), so with the default the
+    # `tp == j` test never fires, the shadows receive ZERO acceleration, and the
+    # returned STM degenerates to the free-particle matrix [[I, dt·I],[0,I]] for
+    # every object. Tying each variation to the single real particle (index 0)
+    # makes ASSIST integrate the variational equations under its ephemeris
+    # gravity; the resulting STM then agrees with a single-particle central
+    # finite difference to ~1e-8 (verified on Nysa at |dt| = 365 d and 5475 d).
     first_order = []
     if with_stm:
         for k in range(6):
-            v = sim.add_variation(order=1)
+            v = sim.add_variation(order=1, testparticle=0)
             vp = v.particles[0]
             vp.x = 1.0 if k == 0 else 0.0
             vp.y = 1.0 if k == 1 else 0.0
@@ -328,8 +483,16 @@ def propagate_assist(
             first_order.append(v)
 
     t0 = time.perf_counter()
-    sim.integrate(t0_sim + dt)
-    elapsed_ms = (time.perf_counter() - t0) * 1000.0
+    sim.integrate(tmax)
+    _t_after_integrate = time.perf_counter()
+    elapsed_ms = (_t_after_integrate - t0) * 1000.0
+    call_ms = (_t_after_integrate - t_call0) * 1000.0
+
+    # Cap hit: the heartbeat stopped the integration short of the target epoch.
+    # Fail loudly with the elapsed time; never return a partial state as if it
+    # reached the requested epoch.
+    if walltime_cap_s is not None and abs(sim.t - tmax) > 1e-6:
+        raise WalltimeExceeded(_t_after_integrate - t_call0, walltime_cap_s)
 
     p = sim.particles[0]
     pos = np.array([p.x, p.y, p.z])
@@ -352,7 +515,7 @@ def propagate_assist(
     # only the propagated state and the timing.
 
     del extras
-    return pos, vel, elapsed_ms, stm
+    return pos, vel, elapsed_ms, call_ms, stm
 
 
 # ── Object catalog ──────────────────────────────────────
@@ -556,7 +719,37 @@ def main():
         "--n-timing-runs", type=int, default=3,
         help="Number of timing runs (reports best-of-N)",
     )
+    parser.add_argument(
+        "--prev-timings", type=str, default=None,
+        help="Prior ASSIST results JSON. Its single-particle (f64_detection_on) "
+             "assist_time_ms per (object, dt) seeds the per-row wall-clock cap "
+             "(cap = max(floor, factor x previous single-particle time)). When "
+             "absent, every row's cap is the floor.",
+    )
+    parser.add_argument(
+        "--walltime-cap-floor", type=float, default=10.0,
+        help="Minimum per-row wall-clock cap in seconds (default 10).",
+    )
+    parser.add_argument(
+        "--walltime-cap-factor", type=float, default=100.0,
+        help="Per-row cap = max(floor, factor x the row's previous "
+             "single-particle time) (default 100).",
+    )
+    parser.add_argument(
+        "--print-defaults", action="store_true",
+        help="Print the resolved rebound/assist integrator defaults as JSON and "
+             "exit without propagating (dry run).",
+    )
     args = parser.parse_args()
+
+    if args.print_defaults:
+        # Read every configuration's settings back off a probe simulation AFTER
+        # assist attach (a planets-only ephem is enough to attach and read).
+        dd = Path(args.data_dir) if args.data_dir else Path.home() / ".empyrean" / "data"
+        probe_ephem = assist.Ephem(planets_path=str(dd / "linux_p1550p2650.440"))
+        for c in ASSIST_CONFIGS:
+            print(json.dumps(resolved_config(c, probe_ephem)))
+        return
 
     # Load empyrean validation results to get objects, epochs, and dt_days
     with open(args.validation_json) as f:
@@ -640,12 +833,43 @@ def main():
     # imported (the top-of-file import guard exits otherwise), so no fallback
     # is needed here.
     source_version = f"assist {assist.__version__} + rebound {rebound.__version__}"
+    # Resolved settings per configuration, read back off a probe simulation
+    # AFTER attach + config, stamped onto every row of that configuration so the
+    # numbers say what they were measured under (never assumed values).
+    config_prov = {c: resolved_config(c, ephem) for c in ASSIST_CONFIGS}
     results = []
     n_runs = args.n_timing_runs
 
+    # Per-row wall-clock caps seeded from a prior run's single-particle timings.
+    # Map (object, round(dt)) -> previous f64_detection_on assist_time_ms.
+    prev_ms = {}
+    if args.prev_timings:
+        try:
+            with open(args.prev_timings) as pf:
+                for r in json.load(pf):
+                    if r.get("propagation_uncertainty") == "f64_detection_on" \
+                            and r.get("assist_time_ms") is not None:
+                        prev_ms[(r["object"], round(r["dt_days"]))] = float(r["assist_time_ms"])
+            print(f"Wall-clock caps seeded from {len(prev_ms)} prior single-particle timings "
+                  f"in {args.prev_timings}")
+        except (OSError, ValueError, KeyError) as e:
+            print(f"WARNING: could not read --prev-timings {args.prev_timings}: {e}; "
+                  f"every cap falls back to the {args.walltime_cap_floor:.0f}s floor")
+
+    def cap_for(obj, dt):
+        pm = prev_ms.get((obj, round(dt)))
+        if pm is None:
+            return args.walltime_cap_floor
+        return max(args.walltime_cap_floor, args.walltime_cap_factor * pm / 1000.0)
+
     print(f"\n{'=' * 80}")
-    print("  ASSIST Propagation")
+    print("  ASSIST Propagation — six arms (three configurations x variational off/on)")
+    for c in ASSIST_CONFIGS:
+        print(f"  {c}: {json.dumps(config_prov[c])}")
     print(f"{'=' * 80}\n")
+    n_capped = 0
+    capped_rows = []
+    capped_by_arm = {arm: 0 for _, _, arm in ASSIST_ARMS}
 
     for name, data in sorted(obj_data.items()):
         epoch = data["epoch"]
@@ -701,53 +925,54 @@ def main():
                 print(f"  dt={dt:>+.0f}d SKIP (Horizons ref: {e})")
                 continue
 
-            # ASSIST propagation under two modes:
-            #   - f64-only (single particle): matches empyrean's
-            #     propagation_uncertainty = "f64_no_cov" rust row.
-            #   - first-order STM (6 variational particles): matches
-            #     empyrean's "first_order_with_cov" (Jet1) rust row.
-            # No STT mode: ASSIST encodes first-order variational
-            # derivatives only, so empyrean's "second_order_with_cov"
-            # (Jet2) rows have no ASSIST counterpart (see
-            # propagate_assist's docstring).
-            # The variational equations propagate under gravity only
-            # (REBOUND's built-in force model); ASSIST's non-grav
-            # `additional_forces` is not seen by the shadows, so for
-            # active bodies (a1/a2/a3 != 0) the STM is a gravity-only
+            # ASSIST propagation over the six arms: three configurations
+            # (assist_default / assist_layup / assist_asteroid_institute), each
+            # with variational particles off (single-particle f64) and on (six
+            # first-order variational particles, a 6x6 STM).
+            # No STT mode: ASSIST encodes first-order variational derivatives
+            # only, so empyrean's second-order (Jet2) rows have no ASSIST
+            # counterpart. The variational equations propagate under gravity
+            # only (ASSIST's non-grav `additional_forces` is not seen by the
+            # shadows), so for active bodies the STM is a gravity-only
             # approximation of empyrean's full-Jacobian outputs.
-            for mode, propagation_uncertainty in (
-                ("f64", "f64_no_cov"),
-                ("stm", "first_order_with_cov"),
-            ):
-                with_stm = mode == "stm"
+            for config, with_stm, arm in ASSIST_ARMS:
+                # Per-row wall-clock cap, seeded from the stored single-particle
+                # timing for this (object, dt). Applied only to the untimed
+                # warm-up call; the timed best-of-N runs are uncapped so the
+                # heartbeat's per-step cost never enters the reported time.
+                cap = cap_for(name, dt)
                 try:
-                    # warmup
+                    # warmup (carries the wall-clock cap)
                     propagate_assist(
                         pos0, vel0, epoch, target, obj_ephem,
                         a1=a1, a2=a2, a3=a3,
                         gr_alpha=gr_alpha, gr_nk=gr_nk, gr_nm=gr_nm,
                         gr_nn=gr_nn, gr_r0=gr_r0,
-                        with_stm=with_stm,
+                        with_stm=with_stm, config=config,
+                        walltime_cap_s=cap,
                     )
 
                     ast_times = []
+                    ast_call_times = []
                     ast_pos = ast_vel = None
                     ast_stm = None
                     for _ in range(n_runs):
-                        ast_pos, ast_vel, ms, ast_stm = propagate_assist(
+                        ast_pos, ast_vel, ms, call_ms, ast_stm = propagate_assist(
                             pos0, vel0, epoch, target, obj_ephem,
                             a1=a1, a2=a2, a3=a3,
                             gr_alpha=gr_alpha, gr_nk=gr_nk, gr_nm=gr_nm,
                             gr_nn=gr_nn, gr_r0=gr_r0,
-                            with_stm=with_stm,
+                            with_stm=with_stm, config=config,
                         )
                         ast_times.append(ms)
+                        ast_call_times.append(call_ms)
 
                     ast_ms = min(ast_times)
+                    ast_call_ms = min(ast_call_times)
                     ast_vs_hor = float(np.linalg.norm(ast_pos - hor_pos) * AU_KM)
 
                     print(
-                        f"  dt={dt:>+6.0f}d  [{mode:>3}]  a-h={fmt_km(ast_vs_hor)}  {ast_ms:>7.1f}ms"
+                        f"  dt={dt:>+6.0f}d  {arm:<44} a-h={fmt_km(ast_vs_hor)}  {ast_ms:>7.1f}ms"
                     )
 
                     row = {
@@ -758,9 +983,12 @@ def main():
                         "t_mjd_tdb": target,
                         "force_model": "full",
                         "test_type": "assist",
-                        "propagation_uncertainty": propagation_uncertainty,
+                        "propagation_uncertainty": arm,
+                        "assist_config": config,
+                        "variational": with_stm,
                         "assist_vs_horizons_km": ast_vs_hor,
                         "assist_time_ms": ast_ms,
+                        "assist_call_time_ms": ast_call_ms,
                         "assist_pos_au": ast_pos.tolist(),
                         "horizons_pos_au": hor_pos.tolist(),
                         "has_nongrav": has_ng,
@@ -772,13 +1000,58 @@ def main():
                         "source_version": source_version,
                         "assist_version": assist.__version__,
                         "rebound_version": rebound.__version__,
+                        "assist_config_settings": config_prov[config],
                     }
                     if ast_stm is not None:
                         row["assist_stm"] = ast_stm.tolist()
                     results.append(row)
 
+                except WalltimeExceeded as e:
+                    # Loud FAIL row: reason + elapsed, numeric fields null, never
+                    # a silent skip and never a substituted number.
+                    n_capped += 1
+                    capped_by_arm[arm] += 1
+                    capped_rows.append((name, dt, arm, e.elapsed_s, e.cap_s))
+                    print(
+                        f"  dt={dt:>+6.0f}d  {arm:<44} ASSIST FAIL — {e}"
+                    )
+                    results.append({
+                        "object": name,
+                        "population": data["population"],
+                        "epoch_mjd_tdb": epoch,
+                        "dt_days": dt,
+                        "t_mjd_tdb": target,
+                        "force_model": "full",
+                        "test_type": "assist",
+                        "propagation_uncertainty": arm,
+                        "assist_config": config,
+                        "variational": with_stm,
+                        "status": "FAIL",
+                        "assist_vs_horizons_km": None,
+                        "assist_time_ms": None,
+                        "assist_call_time_ms": None,
+                        "assist_pos_au": None,
+                        "horizons_pos_au": hor_pos.tolist(),
+                        "has_nongrav": has_ng,
+                        "a1": a1,
+                        "a2": a2,
+                        "a3": a3,
+                        "timestamp": timestamp,
+                        "notes": (
+                            f"WALL-CLOCK CAP: {e}. "
+                            f"cap={e.cap_s:.1f}s elapsed={e.elapsed_s:.1f}s. {data['notes']}"
+                        ).strip(),
+                        "source_version": source_version,
+                        "assist_version": assist.__version__,
+                        "rebound_version": rebound.__version__,
+                        "assist_config_settings": config_prov[config],
+                        "assist_fail_reason": "walltime_cap_exceeded",
+                        "assist_fail_elapsed_s": e.elapsed_s,
+                        "assist_fail_cap_s": e.cap_s,
+                    })
+
                 except Exception as e:
-                    print(f"  dt={dt:>+6.0f}d  [{mode:>3}]  ASSIST FAIL ({e})")
+                    print(f"  dt={dt:>+6.0f}d  {arm:<44} ASSIST FAIL ({e})")
 
     # Save results
     output_path = Path(args.output)
@@ -800,7 +1073,15 @@ def main():
     print(f"\n{'=' * 80}")
     print(f"  Results saved to {output_path}")
     print(f"  {len(results)} test cases")
+    for c in ASSIST_CONFIGS:
+        print(f"  config {c}: {json.dumps(config_prov[c])}")
     print(f"  Horizons cache: {cache.hits} hits")
+    print(f"  WALL-CLOCK CAP FAILURES: {n_capped} row(s) total")
+    for arm, n in capped_by_arm.items():
+        print(f"    {arm:<44} {n} capped")
+    if n_capped:
+        for obj, dt, arm, el, cp in capped_rows:
+            print(f"    {obj:<14} dt={dt:>+6.0f}d  {arm:<44} elapsed={el:.1f}s cap={cp:.1f}s")
     print(f"{'=' * 80}")
 
 

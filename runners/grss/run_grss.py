@@ -117,7 +117,7 @@ rather than smoothed over:
   correspondingly the set's largest at 11.95 µs.
 
 * **Uncertainty axis.** Plan rows are emitted once per (object, test type,
-  dt, observer): the `first_order_with_cov` duplicates are skipped, because
+  dt, observer): the `first_order_detection_on` duplicates are skipped, because
   GRSS propagates state only here and a covariance-mode row would be the same
   computation twice. `merge-external` keys GRSS's propagation / ephemeris
   rows without the uncertainty tag, so one GRSS row attaches to both empyrean
@@ -1000,7 +1000,7 @@ def run_plan_pass(ctx, plan: list[dict], fixtures_dir: Path) -> list[dict]:
             continue
         # One GRSS row per (object, test type, dt, observer): see the module
         # docstring on the uncertainty axis.
-        if row.get("propagation_uncertainty") not in (None, "f64_no_cov"):
+        if row.get("propagation_uncertainty") not in (None, "f64_detection_on"):
             continue
         out = dict(row)
         out["channel"] = "grss"

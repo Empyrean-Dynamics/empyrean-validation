@@ -200,8 +200,16 @@ def _ephemeris_one(
     ic_non_grav_dt: float | None,
     obs_code: str,
     force_model: str,
-) -> tuple[float, float, float, float] | None:
-    """Generate ephemeris at target_t for obs_code; return (ra_rad, dec_rad, rho_au, light_time_days)."""
+    n_timing_runs: int,
+) -> tuple[float, float, float, float, float] | BaseException | None:
+    """Generate ephemeris at target_t for obs_code.
+
+    Return ``(ra_rad, dec_rad, rho_au, light_time_days, emp_time_ms)`` where
+    ``emp_time_ms`` is the best-of-``n_timing_runs`` wall time of the
+    ``_generate_ephemeris`` call — the same stopwatch boundary the core and
+    propagation channels use (array construction outside; the generate call
+    inside).
+    """
     tier = _TIER_TO_INT.get(force_model)
     if tier is None:
         return None
@@ -264,46 +272,55 @@ def _ephemeris_one(
         else None
     )
 
-    try:
-        result = _generate_ephemeris(
-            orbit_ids=[object_id],
-            object_ids=[object_id],
-            epochs=epochs,
-            elements=elements,
-            covariances=covariances,
-            has_covariance=has_covariance,
-            representations=representations,
-            frames=frames,
-            origins=origins,
-            a1s=a1s,
-            a2s=a2s,
-            a3s=a3s,
-            phot_h=phot_h,
-            phot_slope1=phot_slope1,
-            phot_system=phot_system,
-            obs_codes=[obs_code],
-            obs_epochs=obs_epochs,
-            obs_x=obs_x,
-            obs_y=obs_y,
-            obs_z=obs_z,
-            obs_vx=obs_vx,
-            obs_vy=obs_vy,
-            obs_vz=obs_vz,
-            force_model=tier,
-            ng_alphas=ng_alphas,
-            ng_r0s=ng_r0s,
-            ng_ms=ng_ms,
-            ng_ns=ng_ns,
-            ng_ks=ng_ks,
-            non_grav_dts=non_grav_dts,
-        )
-    except Exception as e:  # noqa: BLE001
-        print(
-            f"  {object_id} ephemeris t={target_t_mjd_tdb}: FAIL {e}", file=sys.stderr
-        )
-        return None
+    # Best-of-`n_timing_runs` like `_propagate_one`: the stopwatch wraps exactly
+    # the `_generate_ephemeris` call for this one object / site / epoch, with all
+    # array construction above done outside the timed region — the same boundary
+    # the core runner's `replay_ephemeris` uses. The call is deterministic, so the
+    # delivered sky position is unchanged from the pre-timing single call.
+    timings_ms = []
+    result = None
+    for _ in range(max(1, n_timing_runs)):
+        t0 = time.perf_counter()
+        try:
+            result = _generate_ephemeris(
+                orbit_ids=[object_id],
+                object_ids=[object_id],
+                epochs=epochs,
+                elements=elements,
+                covariances=covariances,
+                has_covariance=has_covariance,
+                representations=representations,
+                frames=frames,
+                origins=origins,
+                a1s=a1s,
+                a2s=a2s,
+                a3s=a3s,
+                phot_h=phot_h,
+                phot_slope1=phot_slope1,
+                phot_system=phot_system,
+                obs_codes=[obs_code],
+                obs_epochs=obs_epochs,
+                force_model=tier,
+                ng_alphas=ng_alphas,
+                ng_r0s=ng_r0s,
+                ng_ms=ng_ms,
+                ng_ns=ng_ns,
+                ng_ks=ng_ks,
+                non_grav_dts=non_grav_dts,
+            )
+        except Exception as e:  # noqa: BLE001
+            print(
+                f"  {object_id} ephemeris t={target_t_mjd_tdb}: FAIL {e}",
+                file=sys.stderr,
+            )
+            # Return the exception (not None) so the caller can emit a FAIL row
+            # carrying the engine's message instead of silently dropping the row.
+            # The other return-None paths (tier invalid, empty observer states,
+            # empty result) remain legitimate skips.
+            return e
+        timings_ms.append((time.perf_counter() - t0) * 1000.0)
 
-    if len(result.get("ra", [])) == 0:
+    if result is None or len(result.get("ra", [])) == 0:
         return None
 
     ra_deg = float(result["ra"][0])
@@ -311,7 +328,13 @@ def _ephemeris_one(
     rho_au = float(result["rho"][0])
     lt_d = float(result["light_time"][0]) if "light_time" in result else math.nan
 
-    return math.radians(ra_deg), math.radians(dec_deg), rho_au, lt_d
+    return (
+        math.radians(ra_deg),
+        math.radians(dec_deg),
+        rho_au,
+        lt_d,
+        min(timings_ms),
+    )
 
 
 def _single_fit(batch: dict, object_id: str, what: str) -> dict:
@@ -389,7 +412,10 @@ def _determine_one(
         result = _single_fit(batch, object_id, "OD")
     except Exception as e:  # noqa: BLE001
         print(f"  {object_id} OD: FAIL {e}", file=sys.stderr)
-        return None
+        # Return the exception (not None) so the caller can emit a FAIL row
+        # carrying the engine's message, mirroring the rust / core channels,
+        # instead of silently dropping the object.
+        return e
     ms = (time.perf_counter() - t0) * 1000.0
 
     pos = [float(result["orbit_x"]), float(result["orbit_y"]), float(result["orbit_z"])]
@@ -583,16 +609,36 @@ def main() -> int:
     for r in rust_rows:
         ic_pos = r.get("ic_pos_au")
         ic_vel = r.get("ic_vel_au_d")
-        # OD rows discover the orbit from observations — no IC required.
-        if r["test_type"] != "orbit_determination" and (
-            ic_pos is None or ic_vel is None
-        ):
+        # OD rows (optical and optical+radar) discover the orbit from
+        # observations — no IC required. Both seed themselves from a PSV
+        # fixture, so a null IC is expected on them, not a reason to skip.
+        if r["test_type"] not in (
+            "orbit_determination",
+            "orbit_determination_radar",
+        ) and (ic_pos is None or ic_vel is None):
             n_skipped += 1
             continue
         # Uncertainty axis: skip Jet1 rows for now. The PyO3 _propagate
         # entry doesn't accept a covariance arg yet; cross-channel Jet1
         # parity is a follow-up. Rust + core handle both modes today.
-        if r.get("propagation_uncertainty") == "first_order_with_cov":
+        #
+        # Also skip every detection-off timing arm and the first-order
+        # (covariance) arms. This entry propagates only plain f64 with
+        # detection ON: it cannot attach a covariance and cannot disable
+        # per-step event detection, so replaying any other arm here would
+        # measure the wrong thing under that arm's label. Those arms are
+        # core-only; skip them explicitly, never silently and never by
+        # running them with detection on. (OD rows carry a null
+        # propagation_uncertainty and are not caught here.)
+        if r.get("propagation_uncertainty") in (
+            "first_order_detection_on",
+            "first_order_detection_off",
+            "f64_detection_off",
+            "f64_detection_off_assist_default_like",
+            "first_order_detection_off_assist_default_like",
+            "f64_detection_off_assist_asteroid_institute_like",
+            "first_order_detection_off_assist_asteroid_institute_like",
+        ):
             n_skipped += 1
             continue
 
@@ -674,6 +720,15 @@ def main() -> int:
                 max_iterations=100,
                 excluded_perturbers_naif=r.get("excluded_perturbers_naif"),
             )
+            if isinstance(ret, BaseException):
+                # Non-converged / failed OD: emit a FAIL row carrying the
+                # engine's message, exactly as the rust and core channels do,
+                # instead of silently dropping the object.
+                new["od_converged"] = False
+                new["notes"] = f"determine FAIL: {ret}"
+                out_rows.append(new)
+                n_skipped += 1
+                continue
             if ret is None:
                 n_skipped += 1
                 continue
@@ -755,6 +810,63 @@ def main() -> int:
                     ) = s_out
                     out_rows.append(ng_row)
 
+        elif r["test_type"] == "orbit_determination_radar":
+            # Optical+radar OD: the same fit as the optical row, run on the
+            # object's fixtures/psv-radar/ fixture. That fixture is the
+            # byte-identical optical arc plus a <radar> delay/Doppler table,
+            # which the wheel's read_ades folds into the fit automatically — so
+            # this row differs from the optical one only by the observations,
+            # never the configuration. No non_grav second pass: this row is the
+            # radar-tightened state fit, cross-checked against find_orb's radar
+            # fit the same way the optical row is against its optical fit.
+            radar_dir = args.fixtures_dir.parent / "psv-radar"
+            psv_path = radar_dir / f"{r['object'].replace('/', '_')}.psv"
+            if not psv_path.exists():
+                print(
+                    f"  {r['object']} radar OD FAIL: no radar PSV fixture at {psv_path}",
+                    file=sys.stderr,
+                )
+                n_missing_fixture += 1
+                n_skipped += 1
+                continue
+            psv_text = psv_path.read_text()
+            ret = _determine_one(
+                object_id=r["object"],
+                psv_text=psv_text,
+                force_model=r["force_model"],
+                max_iterations=100,
+                excluded_perturbers_naif=r.get("excluded_perturbers_naif"),
+            )
+            if isinstance(ret, BaseException):
+                new["od_converged"] = False
+                new["notes"] = f"radar determine FAIL: {ret}"
+                out_rows.append(new)
+                n_skipped += 1
+                continue
+            if ret is None:
+                n_skipped += 1
+                continue
+            pos, raw, ms = ret
+            new["emp_pos_au"] = pos
+            new["emp_time_ms"] = ms
+            new["n_obs_used"] = int(raw.get("summary_num_selected", 0))
+            new["od_iterations"] = int(raw.get("iterations", 0))
+            new["od_converged"] = bool(raw.get("converged", False))
+            new["od_rms_ra_arcsec"] = float(raw.get("summary_rms_ra", float("nan")))
+            new["od_rms_dec_arcsec"] = float(raw.get("summary_rms_dec", float("nan")))
+            new["od_rms_combined_arcsec"] = float(
+                raw.get("summary_rms_combined", float("nan"))
+            )
+            new["od_chi2"] = float(raw.get("summary_chi2", float("nan")))
+            new["od_reduced_chi2"] = float(
+                raw.get("summary_reduced_chi2", float("nan"))
+            )
+            new.update(_solve_metadata(raw))
+            _prev_note = new.get("notes") or ""
+            new["notes"] = (
+                f"{_prev_note} | optical+radar" if _prev_note else "optical+radar"
+            )
+
         elif r["test_type"] == "ephemeris":
             obs_code = r.get("observer")
             if not obs_code:
@@ -777,11 +889,21 @@ def main() -> int:
                 ic_non_grav_dt=r.get("ic_non_grav_dt"),
                 obs_code=obs_code,
                 force_model=r["force_model"],
+                n_timing_runs=args.n_timing_runs,
             )
+            if isinstance(ret, BaseException):
+                # Failed ephemeris (e.g. "no dense trajectory: initial state
+                # overlaps" for a self-perturbing main-belt asteroid): emit a
+                # FAIL row carrying the engine's message rather than dropping it.
+                new["notes"] = f"ephemeris FAIL: {ret}"
+                out_rows.append(new)
+                n_skipped += 1
+                continue
             if ret is None:
                 n_skipped += 1
                 continue
-            ra_rad, dec_rad, rho_au, lt_d = ret
+            ra_rad, dec_rad, rho_au, lt_d, ms = ret
+            new["emp_time_ms"] = ms
             ref_ra = r.get("ref_ra_rad")
             ref_dec = r.get("ref_dec_rad")
             ref_rho = r.get("ref_rho_au")

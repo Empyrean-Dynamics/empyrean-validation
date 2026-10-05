@@ -1020,6 +1020,7 @@ jobs:
           gcloud storage cp results/validation.json            ${{ env.GCS_BUCKET }}/latest/validation.json
           gcloud storage cp results/od_validation.json         ${{ env.GCS_BUCKET }}/latest/od_validation.json
           gcloud storage cp results/validation_report.html     ${{ env.GCS_BUCKET }}/latest/validation_report.html
+          gcloud storage cp results/validation_report.data.json ${{ env.GCS_BUCKET }}/latest/validation_report.data.json
           gcloud storage cp results/validation_summary.json    ${{ env.GCS_BUCKET }}/latest/validation_summary.json
           for ch in rust python c cli core assist findorb oorb kete jorbit layup orbfit; do
             f="results/validation_${ch}.json"
@@ -1029,6 +1030,7 @@ jobs:
           gcloud storage cp results/validation.json            ${{ env.GCS_BUCKET }}/archive/${TIMESTAMP}/validation.json
           gcloud storage cp results/od_validation.json         ${{ env.GCS_BUCKET }}/archive/${TIMESTAMP}/od_validation.json
           gcloud storage cp results/validation_report.html     ${{ env.GCS_BUCKET }}/archive/${TIMESTAMP}/validation_report.html
+          gcloud storage cp results/validation_report.data.json ${{ env.GCS_BUCKET }}/archive/${TIMESTAMP}/validation_report.data.json
           gcloud storage cp results/validation_summary.json    ${{ env.GCS_BUCKET }}/archive/${TIMESTAMP}/validation_summary.json
           for ch in rust python c cli core assist findorb oorb kete jorbit layup orbfit; do
             f="results/validation_${ch}.json"
@@ -1041,6 +1043,7 @@ jobs:
           name: validation-report
           path: |
             empyrean-validation/results/validation_report.html
+            empyrean-validation/results/validation_report.data.json
             empyrean-validation/results/validation_summary.json
             empyrean-validation/results/*.json
             empyrean-validation/results/*.jsonl
