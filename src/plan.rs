@@ -634,7 +634,12 @@ pub const PLAN_UNCERTAINTY_AXES: [&str; 2] = [
 /// the plan and fails loudly in the channels that cannot yet run it, instead of
 /// silently vanishing from the plan and taking a whole test axis with it. That
 /// silent-axis-deletion is the exact defect this list exists to guard against.
-pub const PLAN_RUST_ONLY_TEST_TYPES: [&str; 0] = [];
+///
+/// `covariance_realism` is on this list deliberately (not as debt): the
+/// walk-forward family is reference-channel-only by design in v1 — its windows
+/// are driven by the window manifest, not by plan rows, and no replay channel
+/// has a walk arm.
+pub const PLAN_RUST_ONLY_TEST_TYPES: [&str; 1] = [test_types::COVARIANCE_REALISM];
 
 /// Why a channel-result row was excluded from the plan.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1160,16 +1165,28 @@ mod tests {
     }
 
     #[test]
-    fn the_test_type_blacklist_is_empty_and_drops_nothing() {
+    fn covariance_realism_is_the_only_rust_only_test_type() {
         // `empyrean-s1ab` is resolved: the radar OD axis is replayable by every
-        // channel, so no test type is rust-only any more. The blacklist is
-        // empty, and the strip drops nothing on the test-type axis. The
-        // machinery stays (this test guards that it fires for nothing today),
-        // so re-blacklisting a future rust-first test type is one line.
-        assert!(
-            PLAN_RUST_ONLY_TEST_TYPES.is_empty(),
-            "the radar axis is replayable; nothing is rust-only",
+        // channel, so it is NOT rust-only. The walk-forward covariance-realism
+        // family is reference-channel-only by design — its windows come from the
+        // window manifest, not plan rows, and no replay channel has a walk arm —
+        // so `covariance_realism` is the single rust-only test type. The strip
+        // drops a covariance_realism row on the test-type axis and leaves every
+        // replayable type (see `every_test_type_including_radar_reaches_the_plan`)
+        // alone.
+        assert_eq!(
+            PLAN_RUST_ONLY_TEST_TYPES,
+            [test_types::COVARIANCE_REALISM],
+            "covariance_realism is the only rust-only test type",
         );
+        let (plan, drops) =
+            strip_to_plan(&[rust_row_with_test_type(test_types::COVARIANCE_REALISM)]).unwrap();
+        assert!(
+            plan.is_empty(),
+            "a covariance_realism row must not reach the plan",
+        );
+        assert_eq!(drops.rust_only_test_type, 1);
+        assert_eq!(drops.uncertainty_axis, 0);
     }
 
     #[test]

@@ -49,3 +49,4 @@ results/
 
 # macOS Finder metadata.
 .DS_Store
+fixtures/windows.json
