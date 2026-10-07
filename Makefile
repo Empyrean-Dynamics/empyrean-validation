@@ -458,6 +458,99 @@ $(RUST_PROPEPH): $(RUST_BIN)
 RUST_OD_ORBITS := $(RESULTS_DIR)/validation_rust_od_orbits.jsonl
 RUST_OD_COMPARE := $(RESULTS_DIR)/validation_rust_od_compare.jsonl
 
+# ── Covariance realism (walk-forward family) — LOCAL-ONLY for now ────────
+# Expanding per-night windows; predictions scored vs their predicted covariance. Profiles:
+# full (the surface run) / ci (iteration + config sweeps) / ladder (smoke).
+# The window manifest is the single source every runner consumes; regenerate
+# it only against the fixture snapshot on disk.
+WALK_PROFILE ?= ci
+WALK_MANIFEST := $(ROOT)/fixtures/windows.json
+WALK := $(RESULTS_DIR)/validation_rust_walk.json
+WALK_WINDOWS := $(RESULTS_DIR)/validation_rust_walk_windows.jsonl
+WALK_PREDICTIONS := $(RESULTS_DIR)/validation_rust_walk_predictions.jsonl
+WALK_SCORED := $(RESULTS_DIR)/validation_predict_scored.jsonl
+WALK_AGG := $(RESULTS_DIR)/validation_predict_agg.json
+
+.PHONY: walk-manifest walk walk-score
+walk-manifest: | fixtures
+	@echo "──── Covariance realism: window manifest ───────────────"
+	@cargo run --release --bin empyrean-validation -- windows 	    --fixtures-dir $(FIXTURES_PSV) --output $(WALK_MANIFEST) 	    --debias-dir $(DATA_DIR)
+
+walk: $(RUST_BIN) | fixtures
+	@echo "──── Covariance realism: rust walk ($(WALK_PROFILE)) ───"
+	@test -f $(WALK_MANIFEST) || { 	    echo "ERROR: no window manifest at $(WALK_MANIFEST) — run 'make walk-manifest'."; 	    exit 1; }
+	@$(DYLD) $(RUST_BIN) walk --manifest $(WALK_MANIFEST) 	    --profile $(WALK_PROFILE) 	    --fixtures-dir $(FIXTURES_PSV) --data-dir $(DATA_DIR) 	    --output $(WALK)
+
+walk-score:
+	@echo "──── Covariance realism: scoring ───────────────────────"
+	@cargo run --release --bin empyrean-validation -- score-predictions 	    --manifest $(WALK_MANIFEST) 	    --predictions $(WALK_PREDICTIONS) --windows $(WALK_WINDOWS) 	    --out-scored $(WALK_SCORED) --out-agg $(WALK_AGG)
+
+# ── Synthetic (perfect-model) lane of the covariance-realism family ──────
+# One truth fit + truth ephemeris per object, then per noise law a fixture
+# set whose rows carry the injected σ as rmsRA/rmsDec (astCat=Gaia2 so the
+# EFCC debias is identically zero). Fits run sigma_policy=reported so the
+# 0.2″ fiducial is not floored by the VFCC2017 preset. Local-only, like
+# the rest of the family; results/ is ignored.
+SYNTH_ROOT := $(RESULTS_DIR)/synthetic
+# Injection laws (the law the DATA follow). Tags: gaussian, t$(SYNTH_NU)
+# (per-axis Student-t), t$(SYNTH_NU)j (JOINT elliptical Student-t — the law
+# the engine's robust fit assumes, so the matched heavy-tailed lane).
+SYNTH_LAWS ?= gaussian,student-t,student-t-joint
+SYNTH_NU ?= 4
+SYNTH_SEED ?= 1
+SYNTH_FIDUCIAL ?= 0.2
+# The lane a walk / score targets (a law tag: gaussian | t$(SYNTH_NU) |
+# t$(SYNTH_NU)j).
+SYNTH_LANE ?= gaussian
+SYNTH_DIR := $(SYNTH_ROOT)/$(SYNTH_LANE)
+SYNTH_WALK := $(SYNTH_DIR)/validation_rust_walk_synthetic.json
+SYNTH_WINDOWS := $(SYNTH_DIR)/validation_rust_walk_synthetic_windows.jsonl
+SYNTH_PREDICTIONS := $(SYNTH_DIR)/validation_rust_walk_synthetic_predictions.jsonl
+SYNTH_SCORED := $(SYNTH_DIR)/validation_predict_scored_synthetic.jsonl
+SYNTH_AGG := $(SYNTH_DIR)/validation_predict_agg_synthetic.json
+# Debias is inert on Gaia2 rows, so the grid collapses to rejection × nightly.
+SYNTH_ARMS ?= efcc.adap.vfc,efcc.adap.nonight,efcc.cmc.vfc,efcc.cmc.nonight,efcc.norej.vfc,efcc.norej.nonight
+SYNTH_MODES ?= first-order,sigma-points
+# The ASSUMED fit-side error law (the law the estimator assumes — distinct
+# from the injection law above). Empty leaves every arm at its own value
+# (normal for the grid). Set SYNTH_ERROR_MODEL=student-t + SYNTH_FIT_NU to
+# fit the whole grid under a Student-t law; SYNTH_COV_INFO picks the
+# covariance information matrix (observed | expected). For a MIXED matrix of
+# laws / rejection gates (incl. the blunder gate) in one walk, point
+# SYNTH_CONFIG_SET at an arm JSON file instead of using the grid.
+SYNTH_ERROR_MODEL ?=
+SYNTH_FIT_NU ?=
+SYNTH_COV_INFO ?=
+SYNTH_CONFIG_SET ?=
+SYNTH_ARM_SOURCE := $(if $(SYNTH_CONFIG_SET),--config-set $(SYNTH_CONFIG_SET),--grid --arms $(SYNTH_ARMS))
+SYNTH_EM_FLAGS := $(if $(SYNTH_ERROR_MODEL),--error-model $(SYNTH_ERROR_MODEL),) $(if $(SYNTH_FIT_NU),--nu $(SYNTH_FIT_NU),) $(if $(SYNTH_COV_INFO),--covariance-information $(SYNTH_COV_INFO),)
+
+.PHONY: synth synth-walk synth-score
+synth: $(RUST_BIN) | fixtures
+	@echo "──── Covariance realism: synthetic fixtures ($(SYNTH_LAWS)) ───"
+	@$(DYLD) $(RUST_BIN) synthesize --out-root $(SYNTH_ROOT) \
+	    --noise $(SYNTH_LAWS) --nu $(SYNTH_NU) --seed $(SYNTH_SEED) \
+	    --fiducial-sigma-arcsec $(SYNTH_FIDUCIAL) \
+	    --fixtures-dir $(FIXTURES_PSV) --debias-dir $(DATA_DIR) --data-dir $(DATA_DIR)
+
+synth-walk: $(RUST_BIN)
+	@echo "──── Covariance realism: synthetic walk [$(SYNTH_LANE)] ($(WALK_PROFILE)) ───"
+	@test -f $(SYNTH_DIR)/windows.json || { \
+	    echo "ERROR: no synthetic manifest at $(SYNTH_DIR)/windows.json — run 'make synth'."; \
+	    exit 1; }
+	@$(DYLD) $(RUST_BIN) walk --manifest $(SYNTH_DIR)/windows.json \
+	    --profile $(WALK_PROFILE) $(SYNTH_ARM_SOURCE) $(SYNTH_EM_FLAGS) \
+	    --sigma-policy reported --uncertainty-modes $(SYNTH_MODES) \
+	    --fixtures-dir $(SYNTH_DIR)/psv --data-dir $(DATA_DIR) \
+	    --output $(SYNTH_WALK)
+
+synth-score:
+	@echo "──── Covariance realism: synthetic scoring [$(SYNTH_LANE)] ───"
+	@cargo run --release --bin empyrean-validation -- score-predictions \
+	    --manifest $(SYNTH_DIR)/windows.json \
+	    --predictions $(SYNTH_PREDICTIONS) --windows $(SYNTH_WINDOWS) \
+	    --out-scored $(SYNTH_SCORED) --out-agg $(SYNTH_AGG)
+
 $(RUST_OD): $(RUST_BIN) | fixtures
 	@echo "──── Rust channel: orbit determination ─────────────────"
 	@$(DYLD) $(RUST_BIN) od $(ONLY_FLAG) --tier $(TIERS) \
@@ -739,7 +832,7 @@ export ASSEMBLE_SHARDS
 # `non_grav_recovery` rows satisfied the old form while carrying not one row
 # of the axis this assertion protects. So both halves are asserted: some OD
 # row must exist, and `orbit_determination` itself must be among them.
-OD_TEST_TYPES := orbit_determination,orbit_determination_radar,non_grav_recovery,dt_recovery,photometry_recovery,thrust_recovery
+OD_TEST_TYPES := orbit_determination,orbit_determination_radar,non_grav_recovery,dt_recovery,photometry_recovery,thrust_recovery,covariance_realism
 define ASSERT_PLAN_HAS_OD
 import json, sys
 from collections import Counter

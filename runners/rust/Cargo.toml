@@ -11,6 +11,17 @@ publish = false
 name = "validate"
 path = "src/main.rs"
 
+[features]
+# OFF by default: the default build is the Gaussian arm set against the
+# PUBLISHED empyrean `=0.10.0` wrapper. Turning it on compiles the
+# covariance-realism fit-provenance surface (the engine's NoiseModel,
+# delivered-noise-law, delivered-rejection, CovarianceInformation and the
+# expected-d2 / tail / n_eff / robust-weight summary), which only the
+# unreleased noise-model distribution of empyrean carries. Build with
+# `--features noise-model` against that distribution once the chain is
+# tagged; never commit a path/patch override to point at it.
+noise-model = []
+
 [dependencies]
 # Public API via the safe wrapper — same C ABI other channels ride.
 # Pinned to the PUBLISHED release this harness version validates, so a

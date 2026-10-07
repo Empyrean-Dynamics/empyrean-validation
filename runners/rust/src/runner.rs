@@ -1133,7 +1133,7 @@ impl SolveMetadata {
 /// old OD path silently mapped an unparseable designation to "exclude
 /// nothing", which is the worst of the three outcomes: the object runs *with*
 /// the self-perturbation, and the row still reads as a self-perturber row.
-fn naif_to_origins(naif: &[i32]) -> Result<Vec<Origin>, String> {
+pub(crate) fn naif_to_origins(naif: &[i32]) -> Result<Vec<Origin>, String> {
     naif.iter()
         .map(|&id| {
             Origin::from_naif_id(id)
@@ -2331,7 +2331,7 @@ fn propagate_and_capture(
 /// Promote an `empyrean::PropagatedState` (OD output shape) to a full
 /// [`CoordinateState`] so it can flow through `ctx.transform`. fit's
 /// OD output is always Cartesian.
-fn propagated_state_to_coord(orbit: &empyrean::PropagatedState) -> CoordinateState {
+pub(crate) fn propagated_state_to_coord(orbit: &empyrean::PropagatedState) -> CoordinateState {
     CoordinateState {
         epoch: orbit.epoch,
         elements: [
@@ -2359,7 +2359,7 @@ fn propagated_state_to_coord(orbit: &empyrean::PropagatedState) -> CoordinateSta
 /// (as-supplied), Sun-centered ICRF Cartesian, and Sun-centered
 /// ecliptic-J2000 Keplerian. Covariance is propagated through the
 /// Jacobian by `ctx.transform`.
-fn capture_orbit(
+pub(crate) fn capture_orbit(
     ctx: &Context,
     object: &str,
     source: &str,

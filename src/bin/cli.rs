@@ -74,6 +74,67 @@ enum Command {
     CiCheck(CiCheckArgs),
     /// List the catalog objects a run would cover, with CI-safe slugs.
     ListObjects(ListObjectsArgs),
+    /// Generate the walk-forward window manifest from the pinned fixtures.
+    Windows(WindowsArgs),
+    /// Score walk-forward prediction sidecars against the window manifest.
+    ScorePredictions(ScorePredictionsArgs),
+}
+
+#[derive(Parser, Debug)]
+struct WindowsArgs {
+    /// Optical PSV fixture directory (sibling `manifest.json` supplies the
+    /// snapshot id).
+    #[arg(long, default_value = "fixtures/psv")]
+    fixtures_dir: PathBuf,
+    /// Output manifest path.
+    #[arg(short, long, default_value = "fixtures/windows.json")]
+    output: PathBuf,
+    /// Nights per walk step in the base schedule.
+    #[arg(long, default_value_t = 1)]
+    bundle_nights: u32,
+    /// EFCC2020 debias table directory. Required unless --no-debias.
+    #[arg(long)]
+    debias_dir: Option<PathBuf>,
+    /// Generate without debias corrections — an explicit, loud choice.
+    #[arg(long, default_value_t = false)]
+    no_debias: bool,
+}
+
+#[derive(Parser, Debug)]
+struct ScorePredictionsArgs {
+    /// Window manifest path.
+    #[arg(long, default_value = "fixtures/windows.json")]
+    manifest: PathBuf,
+    /// Prediction sidecar JSONL path(s) (`*_predictions.jsonl`, `.gz` ok).
+    #[arg(long, required = true)]
+    predictions: Vec<PathBuf>,
+    /// Window-record sidecar JSONL path(s) (`*_windows.jsonl`).
+    #[arg(long)]
+    windows: Vec<PathBuf>,
+    /// Scored-prediction JSONL output.
+    #[arg(long, default_value = "results/validation_predict_scored.jsonl")]
+    out_scored: PathBuf,
+    /// Surface-aggregate JSON output (what the report embeds).
+    #[arg(long, default_value = "results/validation_predict_agg.json")]
+    out_agg: PathBuf,
+    /// Which σ table scores this pass.
+    #[arg(long, default_value = "pinned")]
+    sigma_table: String,
+    /// Score against raw (undebiased) positions — the sensitivity arm.
+    #[arg(long, default_value_t = false)]
+    raw_positions: bool,
+    /// Which predictive law scores each row: `own` (the arm's recorded error
+    /// law — the ranking view), `normal`, or `student-t`. A series with no
+    /// recorded law is refused under `own`.
+    #[arg(long, default_value = "own")]
+    scoring_law: String,
+    /// Degrees of freedom ν for a pinned `--scoring-law student-t`.
+    #[arg(long)]
+    scoring_nu: Option<f64>,
+    /// Baseline series (`config_arm`) for the paired log-score difference;
+    /// defaults to the normal-law, rejection-off arm.
+    #[arg(long)]
+    baseline_series: Option<String>,
 }
 
 #[derive(Parser, Debug)]
@@ -305,6 +366,45 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         Command::Report(args) => report(args),
         Command::CiCheck(args) => ci_check(args),
         Command::ListObjects(args) => list_objects(args),
+        Command::Windows(args) => empyrean_validation::windows::run(
+            &args.fixtures_dir,
+            &args.output,
+            &empyrean_validation::windows::WindowsOptions {
+                bundle_nights: args.bundle_nights,
+                debias_dir: args.debias_dir.clone(),
+                no_debias: args.no_debias,
+            },
+        )
+        .map_err(Into::into),
+        Command::ScorePredictions(args) => {
+            use empyrean_validation::predict_compare::ScoringLawOpt;
+            let scoring_law = match args.scoring_law.as_str() {
+                "own" => ScoringLawOpt::Own,
+                "normal" => ScoringLawOpt::Normal,
+                "student-t" => ScoringLawOpt::StudentT,
+                other => {
+                    return Err(format!(
+                        "unknown --scoring-law {other:?} (own | normal | student-t)"
+                    )
+                    .into());
+                }
+            };
+            empyrean_validation::predict_compare::run(
+                &args.manifest,
+                &args.predictions,
+                &args.windows,
+                &args.out_scored,
+                &args.out_agg,
+                &empyrean_validation::predict_compare::ScoreOptions {
+                    sigma_table: args.sigma_table.clone(),
+                    apply_debias: !args.raw_positions,
+                    scoring_law,
+                    scoring_nu: args.scoring_nu,
+                    baseline_series: args.baseline_series.clone(),
+                },
+            )
+            .map_err(Into::into)
+        }
     }
 }
 
@@ -1275,7 +1375,15 @@ fn merge_grss(
                     eph_idx.insert((name.to_string(), dt, obs.to_string()), g);
                 }
             }
-            Some(tt) if empyrean_validation::schema::test_types::is_orbit_determination(tt) => {
+            // Exact-string exclusion of `covariance_realism`, not a family
+            // test: this index is one-record-per-(object, test_type), so a
+            // walk family record here would collapse every window onto the
+            // last one, silently. Walk predictions merge through their own
+            // per-(object, window) sidecar path instead.
+            Some(tt)
+                if empyrean_validation::schema::test_types::is_orbit_determination(tt)
+                    && tt != empyrean_validation::schema::test_types::COVARIANCE_REALISM =>
+            {
                 od_idx.insert((name.to_string(), tt.to_string()), g);
             }
             _ => {}
@@ -1291,7 +1399,9 @@ fn merge_grss(
                 };
                 eph_idx.get(&(r.object.clone(), r.dt_days as i64, obs.to_string()))
             }
-            tt if empyrean_validation::schema::test_types::is_orbit_determination(tt) => {
+            tt if empyrean_validation::schema::test_types::is_orbit_determination(tt)
+                && tt != empyrean_validation::schema::test_types::COVARIANCE_REALISM =>
+            {
                 od_idx.get(&(r.object.clone(), r.test_type.clone()))
             }
             _ => continue,
@@ -1760,8 +1870,14 @@ fn report(args: ReportArgs) -> Result<(), Box<dyn std::error::Error>> {
 
 /// Is this an orbit-determination row — i.e. a row produced by a
 /// differential-correction fit rather than a propagate / ephemeris call?
+///
+/// `covariance_realism` is in the OD *family* (its rows come from DC fits)
+/// but is excluded here on purpose: the walk family's data travels in the
+/// prediction sidecars, not the orbit-comparison sidecar, so a walk-only
+/// results file must not demand a `*_compare.jsonl` it never produces.
 fn is_od_row(r: &ValidationResult) -> bool {
     test_types::is_orbit_determination(&r.test_type)
+        && r.test_type != test_types::COVARIANCE_REALISM
 }
 
 /// Candidate sidecar paths for the orbit-comparison data associated
