@@ -38,7 +38,7 @@ serde_json = "1"
 # exactly to the release generation this harness version validates, so a
 # checkout of a validation tag reproduces the validation-of-record.
 empyrean = "=0.10.0"
-hyperjet = "=1.13.0"
+hyperjet = "=1.15.0"
 # EFCC2020 star-catalog debiasing (covariance-realism family): same
 # HEALPix crate the engine's own debiasing uses, so the harness and the
 # engine assign identical tiles for identical positions.
