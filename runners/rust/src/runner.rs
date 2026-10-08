@@ -3,6 +3,58 @@
 //! Channel: rust, going through the empyrean safe wrapper (same C ABI
 //! that python / c / cli ride) — so Section 09 fidelity diffs reflect
 //! only binding-translation drift, not propagator-path drift.
+//!
+//! # Uncertainty-method axis and cross-channel reproducibility
+//!
+//! Every (object, tier, dt) propagation and every (object, site, dt)
+//! ephemeris row is swept under the engine's uncertainty methods — see
+//! [`build_uncertainty_axes`]. Under the *same* method, these rows are
+//! reproducible across channels as follows:
+//!
+//! - `f64_no_cov`, `first_order_with_cov`, `second_order_with_cov` and
+//!   `sigma_point_with_cov` are **deterministic**: identical inputs give
+//!   identical outputs, so a same-method cross-channel diff is expected to
+//!   be zero within the suite's `1e-10` fidelity band (SPICE-backed
+//!   magnitudes stay band-compared, never bit-pinned).
+//! - `monte_carlo_100_with_cov` is **seeded** with the single suite-wide
+//!   `MONTE_CARLO_SEED`. The engine owns the RNG and the sample order, so a
+//!   fixed seed makes the sample moment bit-reproducible across runs and
+//!   channels too — a bit check as well as a moment check.
+//! - `gaussian_mixture_with_cov` (close-approach objects only) is
+//!   **deterministic**: the engine splits the object's own covariance with
+//!   no RNG, and this runner compares the moment-collapsed covariance it
+//!   returns.
+//! - `auto` is bit-reproducible once the resolved rung agrees; the rung the
+//!   engine resolved to is recorded per row in `resolved_method`, so the
+//!   cross-channel compare keys on the outcome rather than the request.
+//!
+//! No row this runner emits is moment-only — every swept method above is
+//! deterministic or seeded.
+//!
+//! ## Ephemeris sky covariance
+//!
+//! The ephemeris sky covariance has two sources: the harness projection of
+//! the input covariance through the ephemeris Jacobian (the first-order sky
+//! covariance) and the engine's delivered per-method covariance. On
+//! `first_order_with_cov` / `f64_no_cov` rows the **published** value stays
+//! the harness projection — the pinned first-order golden — and the delivered
+//! covariance is recorded only as a diagnostic (its RA/Dec σ difference, in
+//! `notes`), because switching the published value on these rows is a golden
+//! move that waits on a measured table from the first local run. On every
+//! other method the delivered covariance is the published one (there is no
+//! prior golden). See [`published_sky_covariance`].
+//!
+//! ## Products not exposed by the pinned wrapper
+//!
+//! The packed-joint lower triangle, the per-orbit outcome channel and the
+//! Gaussian-mixture **side table** (component count, survivors, the four
+//! tallies) are **not** exposed by the pinned `empyrean 0.10.0-rc.0` wrapper
+//! (no `PackedJoint`, no `outcomes[]`, no mixture side table; `ODConfig`
+//! carries no `uncertainty_method`). The schema fields that carry them stay
+//! `None` here and populate when the harness binds the 0.11 distribution. The
+//! mixture *method* itself and its moment-collapsed covariance are available
+//! at this pin, so the Gaussian-mixture rows are produced — only the side
+//! table waits.
 
 use std::collections::HashMap;
 use std::time::Instant;
@@ -10,10 +62,13 @@ use std::time::Instant;
 use rayon::prelude::*;
 
 use empyrean::{
-    Context, CoordinateState, EphemerisConfig, EphemerisEntry, Epoch, ForceModelTier, Frame,
-    ODConfig, Orbit, Origin, PropagationConfig, Representation, UncertaintyMethod,
+    Context, CoordinateState, CovarianceKind, EphemerisConfig, EphemerisEntry, Epoch,
+    ForceModelTier, Frame, ODConfig, Orbit, Origin, PropagationConfig, Representation,
+    UncertaintyMethod,
 };
-use empyrean_validation::catalog::{DEFAULT_DT_DAYS, FORCE_MODEL_TIERS, ValidationObject};
+use empyrean_validation::catalog::{
+    DEFAULT_DT_DAYS, FORCE_MODEL_TIERS, ValidationObject, is_close_approach,
+};
 use empyrean_validation::compare;
 use empyrean_validation::orbit_compare::compare_orbits;
 use empyrean_validation::schema::{
@@ -117,6 +172,213 @@ fn tier_from_str(s: &str) -> ForceModelTier {
         // default but is excluded in v0.7.0; map it to Standard.
         _ => ForceModelTier::Standard,
     }
+}
+
+/// The resolved uncertainty method to report for a propagation row: the
+/// tag of the covariance **kind the engine delivered** at the compared
+/// epoch, for every row that carried a covariance.
+///
+/// On an `auto` row this names the rung auto resolved to. On an explicit
+/// method it equals the requested method when the engine honoured the
+/// request — the engine runs the requested rung end to end and refuses by
+/// name rather than substitute (the no-silent-substitution invariant) — and
+/// if a *different* kind was delivered under an explicit request this
+/// reports the **delivered** kind, never the request, so the cross-channel
+/// compare catches the silent substitution. `None` only when the row
+/// carried no covariance (`f64_no_cov`) or the delivered kind is one the
+/// plan's method axis does not name (the retired third order).
+///
+/// `_requested_tag` is the method the row asked for. It is kept in the
+/// signature so the call site and the tests pair a request with its
+/// delivered kind, but the reported tag is purely a function of what was
+/// delivered — the requested method already rides
+/// [`ValidationResult::propagation_uncertainty`].
+fn resolved_method_for(_requested_tag: &str, delivered: Option<CovarianceKind>) -> Option<String> {
+    use empyrean_validation::schema::uncertainty_modes as um;
+    let tag = match delivered? {
+        CovarianceKind::Linear => um::FIRST_ORDER_WITH_COV,
+        CovarianceKind::SecondOrder => um::SECOND_ORDER_WITH_COV,
+        CovarianceKind::Mixture => um::GAUSSIAN_MIXTURE_WITH_COV,
+        CovarianceKind::MonteCarlo => um::MONTE_CARLO_100_WITH_COV,
+        CovarianceKind::SigmaPoint => um::SIGMA_POINT_WITH_COV,
+        // Third order is not on the plan's seven-way method axis (retired);
+        // report nothing rather than invent a tag the schema never defines.
+        CovarianceKind::ThirdOrder => return None,
+    };
+    Some(tag.to_string())
+}
+
+/// Extract the (RA·cosδ, Dec) sky-plane 2×2 covariance in arcsec² from the
+/// engine-delivered 6×6 ephemeris covariance.
+///
+/// The delivered matrix is ordered (rho, RA, Dec, vrho, vRA, vDec) in
+/// (AU, deg), so the sky block is rows/columns 1 (RA) and 2 (Dec) read in
+/// deg². The RA row and column are scaled by cosδ so the result matches
+/// `d_ra_arcsec`, and deg² is converted to arcsec² — the same convention
+/// [`project_sky_covariance`] applies to the harness projection, so a
+/// first-order row reads the same quantity whether it comes from the
+/// engine's delivered covariance or from the projection fallback.
+fn delivered_sky_covariance(cov6: &[[f64; 6]; 6], dec_rad: f64) -> [[f64; 2]; 2] {
+    const RA: usize = 1;
+    const DEC: usize = 2;
+    let cosd = dec_rad.cos();
+    let deg2_to_arcsec2 = 3600.0_f64 * 3600.0;
+    let c_ra_ra = cov6[RA][RA] * cosd * cosd * deg2_to_arcsec2;
+    let c_ra_dec = cov6[RA][DEC] * cosd * deg2_to_arcsec2;
+    let c_dec_dec = cov6[DEC][DEC] * deg2_to_arcsec2;
+    [[c_ra_ra, c_ra_dec], [c_ra_dec, c_dec_dec]]
+}
+
+/// The RA/Dec σ difference (delivered − projection, arcsec) recorded as a
+/// diagnostic note on a first-order ephemeris row whose published sky
+/// covariance stays the harness projection. `None` when either covariance
+/// is absent (there is nothing to compare).
+fn sky_covariance_diagnostic(
+    projected: Option<[[f64; 2]; 2]>,
+    delivered: Option<[[f64; 2]; 2]>,
+) -> Option<String> {
+    let (p, d) = (projected?, delivered?);
+    // Diagonal σ in arcsec (the 2×2 is a variance block in arcsec²).
+    let sigma = |m: [[f64; 2]; 2], i: usize| m[i][i].max(0.0).sqrt();
+    let d_sigma_ra = sigma(d, 0) - sigma(p, 0);
+    let d_sigma_dec = sigma(d, 1) - sigma(p, 1);
+    Some(format!(
+        "sky_cov_diag(delivered-projection): d_sigma_ra_arcsec={d_sigma_ra:.6e} d_sigma_dec_arcsec={d_sigma_dec:.6e}"
+    ))
+}
+
+/// Choose the ephemeris row's **published** sky covariance and its
+/// diagnostic note from the harness projection and the engine-delivered
+/// covariance.
+///
+/// On a first-order / f64 row the published value stays the harness
+/// projection — the pinned first-order golden — and the engine's delivered
+/// covariance is recorded only as a diagnostic (its RA/Dec σ against the
+/// projection, via [`sky_covariance_diagnostic`]): switching the published
+/// value on these rows is a golden move that waits on a measured table from
+/// the first local run. On every other method the delivered covariance is
+/// the published one (there is no prior golden), with the projection as the
+/// fallback when the engine returned no sky covariance for the row.
+fn published_sky_covariance(
+    uncertainty_tag: &str,
+    projected: Option<[[f64; 2]; 2]>,
+    delivered: Option<[[f64; 2]; 2]>,
+) -> (Option<[[f64; 2]; 2]>, Option<String>) {
+    use empyrean_validation::schema::uncertainty_modes as um;
+    let first_order_pinned =
+        uncertainty_tag == um::FIRST_ORDER_WITH_COV || uncertainty_tag == um::F64_NO_COV;
+    if first_order_pinned {
+        (projected, sky_covariance_diagnostic(projected, delivered))
+    } else {
+        (delivered.or(projected), None)
+    }
+}
+
+/// One requested uncertainty method in the per-row sweep.
+struct UncertaintyAxis {
+    tag: &'static str,
+    attach: bool,
+    method: UncertaintyMethod,
+    /// Timing repetitions (best-of-N). The sampling methods cost
+    /// ~100-120 propagations per call, so they measure once.
+    timing_runs: usize,
+}
+
+/// The uncertainty-method axis each (object, tier, dt) propagation and each
+/// (object, site, dt) ephemeris row is swept under.
+///
+/// With covariance attached (the production default) every object is swept
+/// under the engine's six production uncertainty surfaces; with covariance
+/// dropped only the covariance-free `f64` method runs (benchmark mode for a
+/// head-to-head against external propagators that carry no uncertainty).
+///
+/// A close-approach object (`is_close_approach`) additionally carries the
+/// `gaussian_mixture_with_cov` arm: the engine splits the object's own
+/// covariance into a mixture and returns the moment-collapsed covariance (the
+/// mixture side table — component count, survivors, tallies — is a 0.11
+/// product, so those schema fields stay `None` here). Non-close-approach
+/// objects get no mixture row, matching the plan.
+/// `CLOSE_APPROACH_OBJECTS` in `empyrean_validation::catalog` is the source
+/// of truth for which objects those are.
+///
+/// `monte_carlo_100_with_cov` is pinned to the suite-wide sample count and
+/// seed (`MONTE_CARLO_SAMPLE_COUNT` / `MONTE_CARLO_SEED` in
+/// `empyrean_validation::schema::uncertainty_modes`),
+/// **not** [`UncertaintyMethod::monte_carlo`] (whose fixed seed is a
+/// per-call convenience, not the validation-of-record seed): one suite-wide
+/// seed makes a seeded Monte-Carlo row a cross-channel bit check as well as
+/// a moment check.
+fn build_uncertainty_axes(
+    attach_covariance: bool,
+    is_close_approach: bool,
+) -> Vec<UncertaintyAxis> {
+    use empyrean_validation::schema::uncertainty_modes as um;
+    if !attach_covariance {
+        return vec![UncertaintyAxis {
+            tag: um::F64_NO_COV,
+            attach: false,
+            method: UncertaintyMethod::FirstOrder,
+            timing_runs: 0,
+        }];
+    }
+    let mut axes = vec![
+        UncertaintyAxis {
+            tag: um::FIRST_ORDER_WITH_COV,
+            attach: true,
+            method: UncertaintyMethod::FirstOrder,
+            timing_runs: 0,
+        },
+        UncertaintyAxis {
+            tag: um::F64_NO_COV,
+            attach: false,
+            method: UncertaintyMethod::FirstOrder,
+            timing_runs: 0,
+        },
+        UncertaintyAxis {
+            tag: um::SECOND_ORDER_WITH_COV,
+            attach: true,
+            method: UncertaintyMethod::SecondOrder,
+            timing_runs: 0,
+        },
+        UncertaintyAxis {
+            tag: um::AUTO,
+            attach: true,
+            method: UncertaintyMethod::auto(),
+            timing_runs: 0,
+        },
+        // The full uncertainty ladder, for the report's performance strip:
+        // sigma-point (120 samples at the wrapper defaults) and seeded
+        // Monte Carlo at the suite-wide N and seed. Sampling methods cost
+        // ~100-120 propagations per call — timing_runs = 1.
+        UncertaintyAxis {
+            tag: um::SIGMA_POINT_WITH_COV,
+            attach: true,
+            method: UncertaintyMethod::sigma_point(),
+            timing_runs: 1,
+        },
+        UncertaintyAxis {
+            tag: um::MONTE_CARLO_100_WITH_COV,
+            attach: true,
+            method: UncertaintyMethod::MonteCarlo {
+                n_samples: um::MONTE_CARLO_SAMPLE_COUNT as usize,
+                seed: Some(um::MONTE_CARLO_SEED),
+            },
+            timing_runs: 1,
+        },
+    ];
+    if is_close_approach {
+        // Close-approach objects only: the engine splits the object's own
+        // covariance into a Gaussian mixture (no caller input) and returns
+        // the moment-collapsed covariance. Component-splitting costs several
+        // propagations per call — timing_runs = 1.
+        axes.push(UncertaintyAxis {
+            tag: um::GAUSSIAN_MIXTURE_WITH_COV,
+            attach: true,
+            method: UncertaintyMethod::gaussian_mixture(),
+            timing_runs: 1,
+        });
+    }
+    axes
 }
 
 /// Run propagation + ephemeris validation against Horizons reference.
@@ -315,110 +577,27 @@ pub fn run_propagation_validation(
         .build()
         .expect("failed to build thread pool");
 
-    // Uncertainty axis. When config.attach_covariance is true (default),
-    // every (object, dt, tier) row is propagated FOUR times so the
-    // report can compare timing + accuracy across empyrean's
-    // production-relevant uncertainty surfaces head-to-head:
+    // Uncertainty-method axis. When config.attach_covariance is true (the
+    // default) every (object, tier, dt) row is propagated under each of the
+    // engine's production uncertainty surfaces so the report can compare
+    // timing + accuracy across methods head-to-head; the ephemeris seam
+    // sweeps the same axis. When attach_covariance is false only the
+    // covariance-free f64 row is emitted (benchmark mode for a head-to-head
+    // against external propagators that carry no uncertainty). The axis and
+    // its cross-channel reproducibility are documented on
+    // `build_uncertainty_axes` and in the module doc.
     //
-    //   - "f64_detection_on"             — single particle, no STM. Pairs
-    //                                 with ASSIST single-particle.
-    //   - "first_order_detection_on"   — Jet1 STM + 6×6 covariance. Pairs
-    //                                 with ASSIST 6 first-order
-    //                                 variational particles (28 dual
-    //                                 numbers per state component on
-    //                                 either side).
-    //   - "second_order_detection_on"  — Jet2 STM+STT (6 + 21 partials).
-    //                                 Pairs with ASSIST 6 first-order
-    //                                 + 21 second-order variational
-    //                                 particles (28 + 84 = 112 dual
-    //                                 numbers per state).
-    //   - "auto_detection_on"                   — UncertaintyMethod::Auto: the
-    //                                 engine's Phase A/B/C cascade
-    //                                 (FirstOrder / SecondOrder / AGM
-    //                                 mixture, driven by per-CA κ and
-    //                                 IP-skip thresholds). No REBOUND
-    //                                 cascade analogue; baselines
-    //                                 against ASSIST's STM row in the
-    //                                 report via the merge step's
-    //                                 translation table.
-    //
-    // When attach_covariance is false, only the f64 row is emitted
-    // (benchmark mode for head-to-head comparison with external
-    // propagators that don't propagate covariance).
-    struct UncertaintyAxis {
-        tag: &'static str,
-        attach: bool,
-        method: UncertaintyMethod,
-        /// Timing repetitions (best-of-N). The sampling methods cost
-        /// ~100-120 propagations per call, so they measure once.
-        timing_runs: usize,
-    }
-    let modes: Vec<UncertaintyAxis> = if config.attach_covariance {
-        vec![
-            UncertaintyAxis {
-                tag: "first_order_detection_on",
-                attach: true,
-                method: UncertaintyMethod::FirstOrder,
-                timing_runs: 0,
-            },
-            UncertaintyAxis {
-                tag: "f64_detection_on",
-                attach: false,
-                method: UncertaintyMethod::FirstOrder,
-                timing_runs: 0,
-            },
-            UncertaintyAxis {
-                tag: "second_order_detection_on",
-                attach: true,
-                method: UncertaintyMethod::SecondOrder,
-                timing_runs: 0,
-            },
-            UncertaintyAxis {
-                tag: "auto_detection_on",
-                attach: true,
-                method: UncertaintyMethod::auto(),
-                timing_runs: 0,
-            },
-            // The full uncertainty ladder, for the report's performance
-            // strip: sigma-point (120 samples at the wrapper defaults) and
-            // seeded Monte Carlo with 100 samples. Sampling methods cost
-            // ~100-120 propagations per call — timing_runs = 1.
-            UncertaintyAxis {
-                tag: "sigma_point_detection_on",
-                attach: true,
-                method: UncertaintyMethod::sigma_point(),
-                timing_runs: 1,
-            },
-            UncertaintyAxis {
-                tag: "monte_carlo_100_detection_on",
-                attach: true,
-                method: UncertaintyMethod::monte_carlo(100),
-                timing_runs: 1,
-            },
-            // NOTE: the detection-off timing arm `f64_detection_off` is
-            // deliberately NOT in this ladder. It
-            // requires switching per-step event detection OFF (villeneuve's
-            // EventConfig::detection_enabled), which the public wrapper this
-            // runner exercises cannot express — the C ABI drops that field —
-            // so this channel could only ever run them WITH detection on,
-            // under a detection-off label. That is the same reason the
-            // python / cli runners skip those rows explicitly. They are a
-            // core-only arm (empyrean-core's validate-core), measured there.
-        ]
-    } else {
-        vec![UncertaintyAxis {
-            tag: "f64_detection_on",
-            attach: false,
-            method: UncertaintyMethod::FirstOrder,
-            timing_runs: 0,
-        }]
-    };
-
+    // Built per object: a close-approach object additionally carries the
+    // Gaussian-mixture arm (see `build_uncertainty_axes`).
     let all_results: Vec<Vec<ValidationResult>> = pool.install(|| {
         obj_data
             .par_iter()
             .map(|data| {
                 let mut results: Vec<ValidationResult> = Vec::new();
+                let modes = build_uncertainty_axes(
+                    config.attach_covariance,
+                    is_close_approach(&data.name),
+                );
 
                 for axis in &modes {
                 // Synthetic typical-NEO 6×6 Cartesian covariance:
@@ -511,6 +690,12 @@ pub fn run_propagation_validation(
 
                         let mut emp_times = Vec::new();
                         let mut emp_pos_cov: Option<[[f64; 3]; 3]> = None;
+                        // The covariance kind the engine resolved to at the
+                        // compared epoch, read off the delivered tagged
+                        // covariance. Only `auto` turns this into a
+                        // `resolved_method`; for an explicit method the
+                        // request is the outcome (`resolved_method_for`).
+                        let mut resolved_kind: Option<CovarianceKind> = None;
                         let mut emp_state: Option<[f64; 3]> = None;
                         let mut failed = false;
 
@@ -527,16 +712,18 @@ pub fn run_propagation_validation(
                                     emp_times.push(ms);
                                     if !result.states.is_empty() {
                                         emp_state = Some(result.states[0].position);
-                                        // Propagated position 3×3 covariance (AU²) — present only
-                                        // when a covariance was propagated (first_order_detection_on).
-                                        emp_pos_cov = result.covariance_at_cartesian(0, 0).ok().map(|tc| {
+                                        // Propagated position 3×3 covariance (AU²) and the
+                                        // resolved covariance kind — present only when a
+                                        // covariance was propagated (not f64_no_cov).
+                                        if let Ok(tc) = result.covariance_at_cartesian(0, 0) {
+                                            resolved_kind = Some(tc.kind);
                                             let m = tc.matrix;
-                                            [
+                                            emp_pos_cov = Some([
                                                 [m[0][0], m[0][1], m[0][2]],
                                                 [m[1][0], m[1][1], m[1][2]],
                                                 [m[2][0], m[2][1], m[2][2]],
-                                            ]
-                                        });
+                                            ]);
+                                        }
                                     } else {
                                         eprintln!(
                                             "  {} {tier_str} dt={dt:+.0}d {} empyrean Ok but states.len()=0 (likely AGM mixture-only return; skipping row)",
@@ -658,6 +845,30 @@ pub fn run_propagation_validation(
                             od_disposition_thrust: Vec::new(),
                             od_warnings: Vec::new(),
                             propagation_uncertainty: Some(uncertainty_tag.to_string()),
+                            // Per-method uncertainty output. `resolved_method`
+                            // is the tag of the covariance kind the engine
+                            // delivered on every covariance-bearing row (the
+                            // rung an `auto` row chose; the honoured request on
+                            // an explicit row; the delivered kind, never the
+                            // request, on a silent substitution the compare
+                            // catches); `None` on an `f64_no_cov` row. The
+                            // packed-joint lower triangle, the per-orbit outcome
+                            // channel and the Gaussian-mixture side-table
+                            // tallies are not exposed by the pinned 0.10.0-rc.0
+                            // wrapper (see the module doc) — `None` until the
+                            // harness binds the 0.11 distribution.
+                            resolved_method: resolved_method_for(axis.tag, resolved_kind),
+                            cov_kind: None,
+                            cov_joint_width: None,
+                            cov_tri: None,
+                            orbit_delivered: None,
+                            orbit_status: None,
+                            mix_n_components_total: None,
+                            mix_weight_delivered: None,
+                            mix_n_failed: None,
+                            mix_n_unresolved: None,
+                            mix_n_curvature_refused: None,
+                            mix_n_sky_linearization_refused: None,
                             assist_vs_horizons_km: None,
                             emp_vs_assist_km: None,
                             assist_time_ms: None,
@@ -726,14 +937,11 @@ pub fn run_propagation_validation(
                     }
                 }
 
-                // Ephemeris tests (Standard tier) — one row per observing site.
-                // Only for the two plan modes (first_order / f64): the
-                // timing-ladder modes (Jet2 / auto / sigma-point / MC) have no
-                // ephemeris plan rows to compare against, and the sampling
-                // methods would pay ~100 propagations per site for nothing.
-                if !matches!(axis.tag, "first_order_detection_on" | "f64_detection_on") {
-                    continue;
-                }
+                // Ephemeris tests (Standard tier) — one row per observing site,
+                // swept under the full method axis (ruling 1: every method on
+                // every ephemeris row). The requested method is threaded into
+                // the ephemeris propagation config below, and the engine's
+                // per-method sky covariance is read off the delivered entry.
                 for &obs_code in obs_codes {
                 for &dt in data.dt_list {
                     let Some(hor) = data.horizons_ephemeris.get(&(obs_code, dt as i64)) else {
@@ -789,6 +997,10 @@ pub fn run_propagation_validation(
                                 continue;
                             }
                         };
+                    // Thread the row's requested method, exactly as the
+                    // propagation sweep does — the engine delivers the
+                    // ephemeris (and its sky covariance) under this method.
+                    eph_config.propagation.uncertainty_method = axis.method.clone();
                     // Time the ephemeris-generation call per row with the same
                     // stopwatch boundary as the core runner's `replay_ephemeris`
                     // (and the CLI channel): the stopwatch wraps exactly the
@@ -859,9 +1071,17 @@ pub fn run_propagation_validation(
                             let d_ra_arcsec = d_ra.to_degrees() * 3600.0;
                             let d_dec_arcsec = d_dec.to_degrees() * 3600.0;
 
-                            // Sky-plane 2×2 covariance (arcsec², RA·cosδ) = the input
-                            // covariance mapped through the ephemeris Jacobian.
-                            let emp_radec_cov: Option<[[f64; 2]; 2]> =
+                            // Sky-plane 2×2 covariance (arcsec², RA·cosδ). Two
+                            // sources: the harness projection of the input
+                            // covariance through the ephemeris Jacobian (the
+                            // FIRST-ORDER sky covariance) and the engine's
+                            // delivered per-method covariance (what the requested
+                            // method actually produced). On first-order / f64
+                            // rows the projection stays the PUBLISHED golden and
+                            // the delivered covariance is a diagnostic only; on
+                            // every other method the delivered covariance is
+                            // published — see `published_sky_covariance`.
+                            let projected: Option<[[f64; 2]; 2]> =
                                 match (&covariance, eph.sensitivity.first()) {
                                     (Some(cin), Some(sens)) => project_sky_covariance(
                                         &sens.jacobian,
@@ -871,6 +1091,19 @@ pub fn run_propagation_validation(
                                     ),
                                     _ => None,
                                 };
+                            let delivered: Option<[[f64; 2]; 2]> = entry
+                                .covariance
+                                .map(|c| delivered_sky_covariance(&c, emp_dec_rad));
+                            let (emp_radec_cov, sky_cov_diag) =
+                                published_sky_covariance(uncertainty_tag, projected, delivered);
+                            // Carry the object's free-form notes, plus the
+                            // first-order delivered-vs-projection σ diagnostic
+                            // when one was recorded (first-order rows only).
+                            let eph_notes = match &sky_cov_diag {
+                                Some(diag) if data.notes.is_empty() => diag.clone(),
+                                Some(diag) => format!("{}; {diag}", data.notes),
+                                None => data.notes.clone(),
+                            };
 
                             let d_rho_km = Some((entry.rho_au - hor.rho_au) * compare::AU_KM);
                             let d_lt_s = if entry.light_time_days.is_finite() {
@@ -973,6 +1206,29 @@ pub fn run_propagation_validation(
                                 od_disposition_thrust: Vec::new(),
                                 od_warnings: Vec::new(),
                                 propagation_uncertainty: Some(uncertainty_tag.to_string()),
+                                // Per-method output. The ephemeris entry carries
+                                // no resolved-kind tag, so `resolved_method` is
+                                // left to `propagation_uncertainty`; the sky
+                                // covariance above is the harness projection on
+                                // first-order rows (the delivered covariance a
+                                // `notes` diagnostic) and the engine's delivered
+                                // per-method product on every other method — see
+                                // `published_sky_covariance`. The packed joint,
+                                // per-orbit outcome channel and mixture side-table
+                                // tallies are not exposed by the pinned
+                                // 0.10.0-rc.0 wrapper (see the module doc).
+                                resolved_method: None,
+                                cov_kind: None,
+                                cov_joint_width: None,
+                                cov_tri: None,
+                                orbit_delivered: None,
+                                orbit_status: None,
+                                mix_n_components_total: None,
+                                mix_weight_delivered: None,
+                                mix_n_failed: None,
+                                mix_n_unresolved: None,
+                                mix_n_curvature_refused: None,
+                                mix_n_sky_linearization_refused: None,
                                 assist_vs_horizons_km: None,
                                 emp_vs_assist_km: None,
                                 assist_time_ms: None,
@@ -1034,7 +1290,7 @@ pub fn run_propagation_validation(
                                 grss_error: None,
                                 source_version: engine_version.clone(),
                                 timestamp: timestamp.clone(),
-                                notes: data.notes.clone(),
+                                notes: eph_notes,
                             });
                         }
                         None => continue,
@@ -1436,6 +1692,22 @@ fn run_radar_od(
         od_warnings: meta_r.warnings,
         od_joint_covariance_width: meta_r.joint_width,
         propagation_uncertainty: None,
+        // Per-method uncertainty output. `ODConfig` carries no
+        // `uncertainty_method` in the pinned 0.10.0-rc.0 wrapper, so the OD
+        // fit runs method-free and these stay `None`; they populate when the
+        // harness binds the 0.11 distribution (OD method axis + packed joint).
+        resolved_method: None,
+        cov_kind: None,
+        cov_joint_width: None,
+        cov_tri: None,
+        orbit_delivered: None,
+        orbit_status: None,
+        mix_n_components_total: None,
+        mix_weight_delivered: None,
+        mix_n_failed: None,
+        mix_n_unresolved: None,
+        mix_n_curvature_refused: None,
+        mix_n_sky_linearization_refused: None,
         assist_vs_horizons_km: None,
         emp_vs_assist_km: None,
         assist_time_ms: None,
@@ -1979,6 +2251,23 @@ pub fn run_od_validation(
                 od_warnings: meta.warnings,
                 od_joint_covariance_width: meta.joint_width,
                 propagation_uncertainty: None,
+                // Per-method uncertainty output; `None` on OD rows — the
+                // pinned 0.10.0-rc.0 `ODConfig` carries no `uncertainty_method`
+                // (method-free fit) and the wrapper exposes no packed joint,
+                // outcome channel or mixture side table. Populated at the 0.11
+                // adoption.
+                resolved_method: None,
+                cov_kind: None,
+                cov_joint_width: None,
+                cov_tri: None,
+                orbit_delivered: None,
+                orbit_status: None,
+                mix_n_components_total: None,
+                mix_weight_delivered: None,
+                mix_n_failed: None,
+                mix_n_unresolved: None,
+                mix_n_curvature_refused: None,
+                mix_n_sky_linearization_refused: None,
                 assist_vs_horizons_km: None,
                 emp_vs_assist_km: None,
                 assist_time_ms: None,
@@ -2203,6 +2492,23 @@ pub fn run_od_validation(
                             od_warnings: meta_n.warnings,
                             od_joint_covariance_width: meta_n.joint_width,
                             propagation_uncertainty: None,
+                            // Per-method uncertainty output; `None` on OD rows —
+                            // the pinned 0.10.0-rc.0 `ODConfig` carries no
+                            // `uncertainty_method` (method-free fit) and the
+                            // wrapper exposes no packed joint, outcome channel or
+                            // mixture side table. Populated at the 0.11 adoption.
+                            resolved_method: None,
+                            cov_kind: None,
+                            cov_joint_width: None,
+                            cov_tri: None,
+                            orbit_delivered: None,
+                            orbit_status: None,
+                            mix_n_components_total: None,
+                            mix_weight_delivered: None,
+                            mix_n_failed: None,
+                            mix_n_unresolved: None,
+                            mix_n_curvature_refused: None,
+                            mix_n_sky_linearization_refused: None,
                             assist_vs_horizons_km: None,
                             emp_vs_assist_km: None,
                             assist_time_ms: None,
@@ -2555,5 +2861,196 @@ mod tests {
         assert!(
             project_sky_covariance(&row_labelled_jacobian(5), 5, &identity6(), dec_rad).is_none()
         );
+    }
+
+    /// The engine-delivered ephemeris covariance is ordered
+    /// (rho, RA, Dec, vrho, vRA, vDec) in (AU, deg): the sky block is rows
+    /// and columns 1 (RA) and 2 (Dec), RA scaled by cos²δ, Dec unscaled,
+    /// deg² → arcsec². The range diagonal (row 0) must never surface — the
+    /// same hazard the projection pin guards, now on the
+    /// delivered read.
+    #[test]
+    fn delivered_sky_covariance_reads_the_ra_dec_block_scaled_by_cosd() {
+        let mut c = [[0.0f64; 6]; 6];
+        c[0][0] = 7.0; // rho — must be ignored
+        c[1][1] = 2.0; // RA, deg²
+        c[2][2] = 3.0; // Dec, deg²
+        c[1][2] = 0.5; // RA/Dec cross, deg²
+        c[2][1] = 0.5;
+        let dec_rad = 60.0_f64.to_radians(); // cosδ = 0.5
+        let cosd = dec_rad.cos();
+        let a2 = 3600.0_f64 * 3600.0;
+        let got = delivered_sky_covariance(&c, dec_rad);
+        let close = |x: f64, y: f64| (x - y).abs() / y.abs().max(1.0) < 1e-12;
+        assert!(close(got[0][0], 2.0 * cosd * cosd * a2), "RA·cosδ variance");
+        assert!(close(got[1][1], 3.0 * a2), "Dec variance");
+        assert!(close(got[0][1], 0.5 * cosd * a2), "RA/Dec cross");
+        assert!(close(got[1][0], got[0][1]), "symmetry");
+        // The range diagonal (7.0 deg²·a2) must not land anywhere.
+        assert!(got[0][0] < 7.0 * a2, "range row leaked into the sky block");
+    }
+
+    /// A first-order / f64 ephemeris row PUBLISHES the harness projection —
+    /// the pinned first-order golden — and records the engine's delivered
+    /// covariance only as a diagnostic; switching the published value on
+    /// these rows waits on a measured table. Every other method publishes the
+    /// delivered covariance, with the projection as the fallback.
+    #[test]
+    fn first_order_ephemeris_sky_covariance_is_the_projection_not_the_delivered() {
+        use empyrean_validation::schema::uncertainty_modes as um;
+        let proj = [[1.0, 0.0], [0.0, 2.0]];
+        let deliv = [[9.0, 0.0], [0.0, 16.0]];
+
+        // First-order: the projection is published; the delivered covariance
+        // is a diagnostic only (its σ difference against the projection).
+        let (published, diag) =
+            published_sky_covariance(um::FIRST_ORDER_WITH_COV, Some(proj), Some(deliv));
+        assert_eq!(published, Some(proj));
+        assert!(
+            diag.is_some(),
+            "the delivered-vs-projection σ diagnostic is recorded"
+        );
+
+        // A non-first-order method publishes the delivered covariance, no
+        // diagnostic.
+        let (published, diag) =
+            published_sky_covariance(um::SECOND_ORDER_WITH_COV, Some(proj), Some(deliv));
+        assert_eq!(published, Some(deliv));
+        assert!(diag.is_none());
+
+        // A non-first-order method with no delivered covariance falls back to
+        // the projection.
+        let (published, _) = published_sky_covariance(um::SIGMA_POINT_WITH_COV, Some(proj), None);
+        assert_eq!(published, Some(proj));
+
+        // f64 row carries no delivered covariance: the projection (itself
+        // None without an attached covariance) is published, no diagnostic.
+        let (published, diag) = published_sky_covariance(um::F64_NO_COV, None, None);
+        assert_eq!(published, None);
+        assert!(diag.is_none());
+    }
+
+    /// `resolved_method` is the tag of the covariance KIND the engine
+    /// delivered, on every covariance-bearing row. An `auto` row reports the
+    /// rung auto chose; an honoured explicit row reports its own tag; a
+    /// silent substitution reports the DELIVERED kind, never the request, so
+    /// the cross-channel compare catches it; a row with no covariance
+    /// resolves to nothing.
+    #[test]
+    fn resolved_method_reports_the_delivered_kind_on_every_covariance_row() {
+        use empyrean_validation::schema::uncertainty_modes as um;
+        // Auto resolves to the delivered rung.
+        assert_eq!(
+            resolved_method_for(um::AUTO, Some(CovarianceKind::SecondOrder)),
+            Some(um::SECOND_ORDER_WITH_COV.to_string())
+        );
+        assert_eq!(
+            resolved_method_for(um::AUTO, Some(CovarianceKind::Linear)),
+            Some(um::FIRST_ORDER_WITH_COV.to_string())
+        );
+        assert_eq!(
+            resolved_method_for(um::AUTO, Some(CovarianceKind::Mixture)),
+            Some(um::GAUSSIAN_MIXTURE_WITH_COV.to_string())
+        );
+        assert_eq!(resolved_method_for(um::AUTO, None), None);
+        // An honoured explicit request reports its own tag (the delivered
+        // kind equals the request) — the purity check the compare pairs with
+        // `propagation_uncertainty`.
+        assert_eq!(
+            resolved_method_for(um::FIRST_ORDER_WITH_COV, Some(CovarianceKind::Linear)),
+            Some(um::FIRST_ORDER_WITH_COV.to_string())
+        );
+        assert_eq!(
+            resolved_method_for(um::SECOND_ORDER_WITH_COV, Some(CovarianceKind::SecondOrder)),
+            Some(um::SECOND_ORDER_WITH_COV.to_string())
+        );
+        // A silent substitution — explicit SecondOrder requested but Linear
+        // delivered — reports the Linear tag, never the request, so the
+        // cross-channel compare flags the mismatch.
+        assert_eq!(
+            resolved_method_for(um::SECOND_ORDER_WITH_COV, Some(CovarianceKind::Linear)),
+            Some(um::FIRST_ORDER_WITH_COV.to_string())
+        );
+        // No covariance delivered → nothing resolved.
+        assert_eq!(resolved_method_for(um::FIRST_ORDER_WITH_COV, None), None);
+    }
+
+    /// With covariance attached a non-close-approach object is swept under
+    /// the six production uncertainty methods; a close-approach object adds a
+    /// seventh, `gaussian_mixture_with_cov` (the mixture plan rows the runner
+    /// would otherwise never produce). With covariance dropped only the
+    /// covariance-free f64 method runs, close-approach or not. The ephemeris
+    /// seam iterates the same axis, so a method present here is a method the
+    /// ephemeris path now produces a row for (this is what the removed
+    /// non-first-order ephemeris skip used to suppress for all but the first
+    /// two).
+    #[test]
+    fn every_method_is_swept_with_covariance_and_only_f64_without() {
+        use empyrean_validation::schema::uncertainty_modes as um;
+        // Non-close-approach object: the six production surfaces, no mixture.
+        let tags: Vec<&str> = build_uncertainty_axes(true, false)
+            .iter()
+            .map(|a| a.tag)
+            .collect();
+        assert_eq!(
+            tags,
+            vec![
+                um::FIRST_ORDER_WITH_COV,
+                um::F64_NO_COV,
+                um::SECOND_ORDER_WITH_COV,
+                um::AUTO,
+                um::SIGMA_POINT_WITH_COV,
+                um::MONTE_CARLO_100_WITH_COV,
+            ]
+        );
+        // Close-approach object: the same six plus the Gaussian-mixture arm.
+        let ca_tags: Vec<&str> = build_uncertainty_axes(true, true)
+            .iter()
+            .map(|a| a.tag)
+            .collect();
+        assert_eq!(
+            ca_tags,
+            vec![
+                um::FIRST_ORDER_WITH_COV,
+                um::F64_NO_COV,
+                um::SECOND_ORDER_WITH_COV,
+                um::AUTO,
+                um::SIGMA_POINT_WITH_COV,
+                um::MONTE_CARLO_100_WITH_COV,
+                um::GAUSSIAN_MIXTURE_WITH_COV,
+            ]
+        );
+        assert_eq!(build_uncertainty_axes(true, true).len(), 7);
+        assert_eq!(build_uncertainty_axes(true, false).len(), 6);
+        // Benchmark mode is the covariance-free f64 row only, close-approach
+        // or not (no mixture without covariance).
+        for ca in [false, true] {
+            let bench: Vec<&str> = build_uncertainty_axes(false, ca)
+                .iter()
+                .map(|a| a.tag)
+                .collect();
+            assert_eq!(bench, vec![um::F64_NO_COV]);
+        }
+    }
+
+    /// The Monte-Carlo axis carries the one suite-wide seed and sample
+    /// count, not `UncertaintyMethod::monte_carlo`'s per-call convenience
+    /// seed — the property that makes a seeded Monte-Carlo row a
+    /// cross-channel bit check.
+    #[test]
+    fn monte_carlo_axis_carries_the_suite_seed_and_sample_count() {
+        use empyrean_validation::schema::uncertainty_modes as um;
+        let axes = build_uncertainty_axes(true, false);
+        let mc = axes
+            .iter()
+            .find(|a| a.tag == um::MONTE_CARLO_100_WITH_COV)
+            .expect("monte carlo axis present");
+        match mc.method {
+            UncertaintyMethod::MonteCarlo { n_samples, seed } => {
+                assert_eq!(n_samples, um::MONTE_CARLO_SAMPLE_COUNT as usize);
+                assert_eq!(seed, Some(um::MONTE_CARLO_SEED));
+            }
+            _ => panic!("the monte_carlo axis must carry UncertaintyMethod::MonteCarlo"),
+        }
     }
 }
