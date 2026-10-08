@@ -840,6 +840,31 @@ pub fn has_radar_fixture(name: &str) -> bool {
     RADAR_FIXTURE_OBJECTS.contains(&name)
 }
 
+/// Catalog objects with a high-κ close approach in the validation window —
+/// the only objects for which the plan emits a `gaussian_mixture_with_cov`
+/// row.
+///
+/// The engine generates a Gaussian mixture by κ-gating and AGM-splitting an
+/// object's own OD covariance at a close approach; an object with no close
+/// approach delivers a single second-order Gaussian, never a mixture, so a
+/// mixture row for it would describe work the engine never does. The caller
+/// supplies no mixture — "wide" is flight width at the encounter, not a wide
+/// prior.
+///
+/// Named here, not derived, for the same reason [`RADAR_FIXTURE_OBJECTS`] is:
+/// the list is the claim, and the `close_approach_objects_are_in_the_catalog`
+/// test is what keeps it from drifting off the catalog. The set is the objects
+/// the per-method-widening design names (the close-approach / hazardous NEAs);
+/// extend it only with an object the engine actually splits.
+pub const CLOSE_APPROACH_OBJECTS: [&str; 4] = ["Apophis", "2024 YR4", "Didymos", "Bennu"];
+
+/// Whether the plan emits a Gaussian-mixture row for this object, i.e. it is
+/// one of the [`CLOSE_APPROACH_OBJECTS`]. Case-sensitive — matches
+/// [`ValidationObject::name`] exactly, as the plan keys on it.
+pub fn is_close_approach(name: &str) -> bool {
+    CLOSE_APPROACH_OBJECTS.contains(&name)
+}
+
 /// Returns the full validation object catalog (44 objects across 13
 /// populations). Order matches the populations enumerated in the module
 /// docstring.
@@ -1008,5 +1033,22 @@ mod tests {
         for code in OBSERVER_CODES {
             assert!(code.len() == 3 || code.len() == 4, "{code}");
         }
+    }
+
+    #[test]
+    fn close_approach_objects_are_in_the_catalog() {
+        // The plan emits a gaussian_mixture row for exactly these objects; a
+        // typo here would silently drop the mixture axis for that object, or
+        // ask every channel to reproduce a mixture for one the engine never
+        // splits. Pin each to a real catalog entry by its exact name.
+        for name in CLOSE_APPROACH_OBJECTS {
+            assert!(is_close_approach(name), "{name} not flagged close-approach");
+            let found = filter_by_name(&[name]);
+            assert_eq!(found.len(), 1, "{name} not in the catalog exactly once");
+            assert_eq!(found[0].name, name, "{name} spelling mismatch with catalog");
+        }
+        // An object with no close approach is not flagged (Eros has a radar
+        // fixture but no splitting encounter in the window).
+        assert!(!is_close_approach("Eros"));
     }
 }

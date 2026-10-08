@@ -34,7 +34,7 @@ use std::collections::HashMap;
 
 use empyrean::EphemerisEntry;
 
-use crate::catalog::{DEFAULT_DT_DAYS, OBSERVER_CODES, ValidationObject};
+use crate::catalog::{DEFAULT_DT_DAYS, OBSERVER_CODES, ValidationObject, is_close_approach};
 use crate::schema::{ValidationPlan, ValidationResult, channels, test_types, uncertainty_modes};
 
 /// Plan-generation configuration.
@@ -43,11 +43,13 @@ pub struct PlanConfig {
     /// Force-model tier names emitted on plan rows. Each tier produces
     /// its own row per (object, dt) combination.
     pub tiers: Vec<String>,
-    /// When `true`, emit both `first_order_detection_on` and `f64_detection_on`
-    /// propagation+ephemeris rows so the replay channels exercise the
-    /// uncertainty axis. When `false`, only `f64_detection_on` rows are
-    /// emitted (benchmark mode for head-to-head comparison with external
-    /// propagators that don't propagate covariance).
+    /// When `true`, emit one prop+eph row per uncertainty method — the full
+    /// engine method axis (`f64`, first- and second-order, `auto`,
+    /// sigma-point, Monte-Carlo, plus Gaussian-mixture on the close-approach
+    /// objects) — so the replay channels exercise every method. When `false`,
+    /// only `f64_no_cov` rows are emitted (benchmark mode for head-to-head
+    /// comparison with external propagators that don't propagate covariance).
+    /// The exact per-object method set is [`plan_methods_for_object`].
     pub uncertainty_axis: bool,
 }
 
@@ -70,10 +72,11 @@ impl Default for PlanConfig {
 ///    [`DEFAULT_DT_DAYS`] as fallback), fetch Horizons vectors and an
 ///    ephemeris record from observer code [`OBSERVER_CODES`]`[0]`
 ///    (`W84` — CTIO 4m).
-/// 4. Emit propagation plan rows for every `(object, dt, tier,
-///    uncertainty_mode)` and ephemeris plan rows for every `(object,
-///    dt != 0)`. When `config.uncertainty_axis` is true, every prop+eph
-///    row is doubled across both modes.
+/// 4. Emit propagation plan rows for every `(object, dt, tier, method)` and
+///    ephemeris plan rows for every `(object, observer, dt != 0, method)`,
+///    where `method` ranges over [`plan_methods_for_object`] — the full
+///    uncertainty-method axis when `config.uncertainty_axis` is true, `f64`
+///    only otherwise.
 /// 5. For objects with `skip_od == false`, emit one OD plan row per
 ///    tier.
 ///
@@ -92,14 +95,6 @@ pub fn build_plan(
 ) -> ValidationPlan {
     let timestamp = chrono::Utc::now().to_rfc3339();
     let mut plan: ValidationPlan = Vec::new();
-    let uncertainty_modes_to_emit: &[Option<&str>] = if config.uncertainty_axis {
-        &[
-            Some(uncertainty_modes::FIRST_ORDER_DETECTION_ON),
-            Some(uncertainty_modes::F64_DETECTION_ON),
-        ]
-    } else {
-        &[Some(uncertainty_modes::F64_DETECTION_ON)]
-    };
 
     eprintln!("Fetching initial conditions and reference values...");
 
@@ -229,13 +224,18 @@ pub fn build_plan(
             }
         }
 
+        // The uncertainty-method axis for this object: every method on prop
+        // and eph, with the Gaussian-mixture method added only for a
+        // close-approach object (see [`plan_methods_for_object`]).
+        let methods = plan_methods_for_object(obj, config.uncertainty_axis);
+
         // 4a. Propagation plan rows.
         for tier in &config.tiers {
             for &dt in dt_list {
                 let Some(&(ref_pos, ref_vel)) = horizons_vectors.get(&(dt as i64)) else {
                     continue;
                 };
-                for &uncertainty in uncertainty_modes_to_emit {
+                for &method in &methods {
                     plan.push(propagation_plan_row(
                         obj,
                         epoch,
@@ -247,7 +247,7 @@ pub fn build_plan(
                         ref_pos,
                         ref_vel,
                         sun_vectors.get(&(dt as i64)).copied(),
-                        uncertainty,
+                        Some(method),
                         &timestamp,
                     ));
                 }
@@ -265,7 +265,7 @@ pub fn build_plan(
                 let Some(hor) = horizons_ephemeris.get(&(obs, dt as i64)) else {
                     continue;
                 };
-                for &uncertainty in uncertainty_modes_to_emit {
+                for &method in &methods {
                     plan.push(ephemeris_plan_row(
                         obj,
                         epoch,
@@ -275,31 +275,17 @@ pub fn build_plan(
                         ic_vel,
                         (a1, a2, a3, g_alpha, g_r0, g_m, g_n, g_k, ng_dt),
                         hor,
-                        uncertainty,
+                        Some(method),
                         &timestamp,
                     ));
                 }
             }
         }
 
-        // 5. OD plan rows. self-perturbers stay in (skip_od is honored
-        // by the runner via the excluded_perturbers_naif field, not by
-        // dropping the row from the plan — the plan tells the runner
-        // which perturbers to exclude, the runner does the actual fit).
-        if !obj.skip_od {
-            for tier in &config.tiers {
-                plan.push(od_plan_row(obj, tier, &timestamp));
-            }
-        } else {
-            // Self-perturbers DO get OD plan rows, with their own NAIF id
-            // in excluded_perturbers_naif. The skip_od flag was a legacy
-            // workaround from before the runner honored exclusions; with
-            // empyrean-w351 and the related self-perturber wiring the
-            // flag is purely advisory. Emit the row anyway and let the
-            // exclusion mechanism do the right thing.
-            for tier in &config.tiers {
-                plan.push(od_plan_row(obj, tier, &timestamp));
-            }
+        // 5. OD plan rows (the fit and its post-fit transport, each under the
+        // object's method list — ruling 9). See [`od_plan_rows`].
+        for tier in &config.tiers {
+            plan.extend(od_plan_rows(obj, tier, config.uncertainty_axis, &timestamp));
         }
 
         // Radar OD plan rows: a second, optical+radar fit for every object
@@ -319,6 +305,101 @@ pub fn build_plan(
 
     eprintln!("Plan: {} rows", plan.len());
     plan
+}
+
+/// The uncertainty-method axis the plan emits for one object.
+///
+/// Every object carries the deterministic and sampled methods; the Gaussian
+/// mixture is added only for a close-approach object ([`is_close_approach`]),
+/// because the engine splits a covariance into a mixture only at a close
+/// approach — an
+/// unsplit object delivers a single second-order Gaussian, which the
+/// `second_order_with_cov` row already covers. In benchmark mode
+/// (`uncertainty_axis == false`) only the covariance-free `f64` method is
+/// emitted, matching the head-to-head external-propagator comparison.
+///
+/// The returned tags are a subset of [`PLAN_UNCERTAINTY_AXES`], the plan's
+/// method whitelist, so every row this produces survives [`strip_to_plan`].
+pub fn plan_methods_for_object(
+    obj: &ValidationObject,
+    uncertainty_axis: bool,
+) -> Vec<&'static str> {
+    if !uncertainty_axis {
+        return vec![uncertainty_modes::F64_NO_COV];
+    }
+    let mut methods = vec![
+        uncertainty_modes::F64_NO_COV,
+        uncertainty_modes::FIRST_ORDER_WITH_COV,
+        uncertainty_modes::SECOND_ORDER_WITH_COV,
+        uncertainty_modes::AUTO,
+        uncertainty_modes::SIGMA_POINT_WITH_COV,
+        uncertainty_modes::MONTE_CARLO_100_WITH_COV,
+    ];
+    if is_close_approach(obj.name) {
+        methods.push(uncertainty_modes::GAUSSIAN_MIXTURE_WITH_COV);
+    }
+    methods
+}
+
+/// The OD-seam plan rows for one object and force tier (ruling 9).
+///
+/// `skip_od` is purely advisory: self-perturbers are handled by the
+/// `excluded_perturbers_naif` field the runner honors, not by dropping the row
+/// from the plan, so every object gets its OD rows regardless of the flag. (The
+/// flag predates the runner honoring exclusions; the plan tells the runner
+/// which perturbers to exclude, the runner does the fit.)
+///
+/// The method axis rides TWO row kinds, each crossed with the object's method
+/// list ([`plan_methods_for_object`]):
+/// * the **fit** ([`test_types::ORBIT_DETERMINATION`]), tagged with the
+///   requested method, and
+/// * the **post-fit transport** of its covariance
+///   ([`test_types::ORBIT_DETERMINATION_TRANSPORT`]), tagged with the method the
+///   covariance is transported under.
+///
+/// The plan emits the full axis on both seams; the runner reports the engine's
+/// outcome per method (a refusal-by-name is a row with a status, never a
+/// dropped row). The leading **legacy untagged** fit row (method `None`) is
+/// KEPT: tagging it would add a `propagation_uncertainty` key the pinned v0.7.0
+/// consumer never saw, changing its bytes. It rides alongside the tagged rows,
+/// so the `first_order_with_cov` fit row reproduces its work; the follow-up
+/// runner commit retires this untagged row once the runner reads the method tag
+/// off the fit rows.
+///
+/// In benchmark mode (`uncertainty_axis == false`) only the legacy untagged fit
+/// row is emitted — the method axis is off, as it is for prop/eph.
+fn od_plan_rows(
+    obj: &ValidationObject,
+    tier: &str,
+    uncertainty_axis: bool,
+    timestamp: &str,
+) -> Vec<ValidationResult> {
+    let mut rows = vec![od_plan_row(
+        obj,
+        tier,
+        test_types::ORBIT_DETERMINATION,
+        None,
+        timestamp,
+    )];
+    if uncertainty_axis {
+        for &method in &plan_methods_for_object(obj, true) {
+            rows.push(od_plan_row(
+                obj,
+                tier,
+                test_types::ORBIT_DETERMINATION,
+                Some(method),
+                timestamp,
+            ));
+            rows.push(od_plan_row(
+                obj,
+                tier,
+                test_types::ORBIT_DETERMINATION_TRANSPORT,
+                Some(method),
+                timestamp,
+            ));
+        }
+    }
+    rows
 }
 
 /// Build a single propagation plan row.
@@ -418,8 +499,23 @@ fn ephemeris_plan_row(
     r
 }
 
-/// Build a single OD plan row.
-fn od_plan_row(obj: &ValidationObject, tier: &str, timestamp: &str) -> ValidationResult {
+/// Build a single OD-seam plan row: the fit
+/// ([`test_types::ORBIT_DETERMINATION`]) or the post-fit transport of its
+/// covariance ([`test_types::ORBIT_DETERMINATION_TRANSPORT`]), optionally tagged
+/// with a requested uncertainty method.
+///
+/// Epoch/dt/t are `0.0` placeholders the OD runner fills in: the fit epoch, and
+/// the transport's target epoch, are known only at run time (the transport
+/// derives its target from the paired orbit, exactly as the orbit-vs-orbit
+/// transport leg does today). `uncertainty == None` is the legacy untagged OD
+/// fit row kept for byte-identity.
+fn od_plan_row(
+    obj: &ValidationObject,
+    tier: &str,
+    test_type: &str,
+    uncertainty: Option<&str>,
+    timestamp: &str,
+) -> ValidationResult {
     let mut r = ValidationResult::empty();
     r.object = obj.name.to_string();
     r.population = obj.population.to_string();
@@ -427,9 +523,10 @@ fn od_plan_row(obj: &ValidationObject, tier: &str, timestamp: &str) -> Validatio
     r.dt_days = 0.0;
     r.t_mjd_tdb = 0.0;
     r.force_model = tier.to_string();
-    r.test_type = test_types::ORBIT_DETERMINATION.to_string();
+    r.test_type = test_type.to_string();
     r.channel = channels::PLAN.to_string();
     r.excluded_perturbers_naif = self_perturber_naif_ids(obj);
+    r.propagation_uncertainty = uncertainty.map(|s| s.to_string());
     r.timestamp = timestamp.to_string();
     r.notes = obj.notes.to_string();
     r
@@ -582,20 +679,31 @@ pub const PLAN_CLEARED_KEYS: [&str; 23] = [
     "findorb_n_obs_rejected",
 ];
 
-/// Uncertainty axes a replay channel can actually reproduce.
+/// The uncertainty methods the canonical plan carries — the full engine
+/// method axis.
 ///
-/// The rust reference also sweeps `second_order_detection_on`, `auto`,
-/// `sigma_point_detection_on`, and `monte_carlo_100_detection_on`. Those are
-/// rust-only axes; a plan row asking another channel to replay one is a row
-/// that channel will never match. The old strip blacklisted the first two and
-/// let the sigma-point and Monte-Carlo rows through, so they rode into the
-/// "plan" as unreplayable work. Whitelisted for the same reason the key set
-/// is: a new rust-only axis must not silently become everyone's problem.
+/// A plan row's [`ValidationResult::propagation_uncertainty`] tag names the
+/// method every replay channel reproduces for that row; the plan is the
+/// contract they consume. All seven engine methods are listed, so a row under
+/// any of them survives [`strip_to_plan`] into the plan.
+///
+/// This stays a **whitelist**, not an open gate: a method the rust runner
+/// might gain later is not on the plan's axis until it is named here, so it
+/// cannot silently become an unreplayable row every channel is asked — and
+/// fails — to match. The whitelist governs which method *tags* may appear;
+/// [`build_plan`] (via [`plan_methods_for_object`]) governs which objects emit
+/// which of them — `gaussian_mixture_with_cov` reaches the plan only for the
+/// close-approach objects ([`crate::catalog::CLOSE_APPROACH_OBJECTS`]).
 ///
 /// `None` (OD rows carry no uncertainty tag) is always in the plan.
-pub const PLAN_UNCERTAINTY_AXES: [&str; 2] = [
-    uncertainty_modes::FIRST_ORDER_DETECTION_ON,
-    uncertainty_modes::F64_DETECTION_ON,
+pub const PLAN_UNCERTAINTY_AXES: [&str; 7] = [
+    uncertainty_modes::F64_NO_COV,
+    uncertainty_modes::FIRST_ORDER_WITH_COV,
+    uncertainty_modes::SECOND_ORDER_WITH_COV,
+    uncertainty_modes::AUTO,
+    uncertainty_modes::SIGMA_POINT_WITH_COV,
+    uncertainty_modes::MONTE_CARLO_100_WITH_COV,
+    uncertainty_modes::GAUSSIAN_MIXTURE_WITH_COV,
 ];
 
 /// Test types no replay channel can reproduce, and so must never reach the
@@ -825,9 +933,17 @@ mod tests {
     #[test]
     fn od_plan_row_marks_self_perturbers() {
         let pallas = catalog::filter_by_name(&["Pallas"])[0];
-        let r = od_plan_row(pallas, "standard", "ts");
+        let r = od_plan_row(
+            pallas,
+            "standard",
+            test_types::ORBIT_DETERMINATION,
+            None,
+            "ts",
+        );
         assert_eq!(r.test_type, "orbit_determination");
         assert_eq!(r.excluded_perturbers_naif, vec![2_000_002]);
+        // The legacy untagged fit row carries no method tag.
+        assert!(r.propagation_uncertainty.is_none());
     }
 
     #[test]
@@ -928,6 +1044,177 @@ mod tests {
     fn non_self_perturbers_exclude_nothing_on_any_row_type() {
         let apophis = catalog::filter_by_name(&["Apophis"])[0];
         assert!(self_perturber_naif_ids(apophis).is_empty());
+    }
+
+    #[test]
+    fn plan_method_axis_is_seven_for_close_approach_six_otherwise() {
+        let apophis = catalog::filter_by_name(&["Apophis"])[0]; // close approach
+        let eros = catalog::filter_by_name(&["Eros"])[0]; // no splitting encounter
+        let m_apophis = plan_methods_for_object(apophis, true);
+        let m_eros = plan_methods_for_object(eros, true);
+
+        // Non-close-approach: the six non-mixture methods, no Gaussian mixture.
+        assert_eq!(m_eros.len(), 6, "non-CA object should get six methods");
+        assert!(!m_eros.contains(&uncertainty_modes::GAUSSIAN_MIXTURE_WITH_COV));
+        for m in [
+            uncertainty_modes::F64_NO_COV,
+            uncertainty_modes::FIRST_ORDER_WITH_COV,
+            uncertainty_modes::SECOND_ORDER_WITH_COV,
+            uncertainty_modes::AUTO,
+            uncertainty_modes::SIGMA_POINT_WITH_COV,
+            uncertainty_modes::MONTE_CARLO_100_WITH_COV,
+        ] {
+            assert!(m_eros.contains(&m), "non-CA object missing {m}");
+        }
+        // Close-approach: the same six plus the Gaussian mixture.
+        assert_eq!(
+            m_apophis.len(),
+            7,
+            "CA object should add the mixture method"
+        );
+        assert!(m_apophis.contains(&uncertainty_modes::GAUSSIAN_MIXTURE_WITH_COV));
+
+        // Every emitted method is on the plan's whitelist (so it survives the
+        // strip into the plan the replay channels consume).
+        for &m in m_apophis.iter().chain(m_eros.iter()) {
+            assert!(PLAN_UNCERTAINTY_AXES.contains(&m), "{m} is not whitelisted");
+        }
+
+        // Benchmark mode stays f64-only on every object.
+        assert_eq!(
+            plan_methods_for_object(apophis, false),
+            vec![uncertainty_modes::F64_NO_COV]
+        );
+    }
+
+    #[test]
+    fn od_rows_carry_both_kinds_under_every_method() {
+        // Ruling 9: each object's OD seam carries the fit AND the post-fit
+        // transport, each under the object's full method list, plus one legacy
+        // untagged fit row kept for byte-identity.
+        let apophis = catalog::filter_by_name(&["Apophis"])[0]; // close approach → 7 methods
+        let eros = catalog::filter_by_name(&["Eros"])[0]; // no mixture → 6 methods
+        for (obj, n_methods) in [(apophis, 7usize), (eros, 6usize)] {
+            let rows = od_plan_rows(obj, "standard", true, "ts");
+            // 1 legacy untagged fit + n_methods tagged fit + n_methods transport.
+            assert_eq!(rows.len(), 1 + 2 * n_methods, "{} OD row count", obj.name);
+
+            // Exactly one untagged legacy fit row.
+            let legacy = rows
+                .iter()
+                .filter(|r| {
+                    r.test_type == test_types::ORBIT_DETERMINATION
+                        && r.propagation_uncertainty.is_none()
+                })
+                .count();
+            assert_eq!(legacy, 1, "{} legacy untagged fit row", obj.name);
+
+            // One tagged fit row and one transport row per method.
+            for &m in &plan_methods_for_object(obj, true) {
+                let fit = rows
+                    .iter()
+                    .filter(|r| {
+                        r.test_type == test_types::ORBIT_DETERMINATION
+                            && r.propagation_uncertainty.as_deref() == Some(m)
+                    })
+                    .count();
+                assert_eq!(fit, 1, "{}: one fit row for {m}", obj.name);
+                let transport = rows
+                    .iter()
+                    .filter(|r| {
+                        r.test_type == test_types::ORBIT_DETERMINATION_TRANSPORT
+                            && r.propagation_uncertainty.as_deref() == Some(m)
+                    })
+                    .count();
+                assert_eq!(transport, 1, "{}: one transport row for {m}", obj.name);
+            }
+
+            // Every transport row carries the runner-filled epoch placeholders
+            // (the transport's target epoch is derived at run time from the
+            // paired orbit, exactly as the orbit-vs-orbit leg does today) and a
+            // whitelisted method tag that survives the strip.
+            for r in rows
+                .iter()
+                .filter(|r| r.test_type == test_types::ORBIT_DETERMINATION_TRANSPORT)
+            {
+                assert_eq!((r.epoch_mjd_tdb, r.dt_days, r.t_mjd_tdb), (0.0, 0.0, 0.0));
+                let tag = r.propagation_uncertainty.as_deref().unwrap();
+                assert!(
+                    PLAN_UNCERTAINTY_AXES.contains(&tag),
+                    "{tag} not whitelisted"
+                );
+            }
+        }
+
+        // Benchmark mode: only the legacy untagged fit row, no method axis — OD
+        // collapses the same way prop/eph do when the axis is off.
+        let rows = od_plan_rows(eros, "standard", false, "ts");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].test_type, test_types::ORBIT_DETERMINATION);
+        assert!(rows[0].propagation_uncertainty.is_none());
+    }
+
+    #[test]
+    fn first_order_and_f64_rows_carry_no_new_method_fields() {
+        // Byte-identity of the existing rows: the per-method output fields are
+        // all Option + skip-if-none and unset on a first_order / f64 row, so
+        // that row serializes without any of them — exactly its pre-widening
+        // bytes. A leaked key would break the pinned consumers.
+        let obj = catalog::filter_by_name(&["Apophis"])[0];
+        let new_fields = [
+            "resolved_method",
+            "cov_kind",
+            "cov_joint_width",
+            "cov_tri",
+            "orbit_delivered",
+            "orbit_status",
+            "mix_n_components_total",
+            "mix_weight_delivered",
+            "mix_n_failed",
+            "mix_n_unresolved",
+            "mix_n_curvature_refused",
+            "mix_n_sky_linearization_refused",
+        ];
+        for method in [
+            uncertainty_modes::FIRST_ORDER_WITH_COV,
+            uncertainty_modes::F64_NO_COV,
+        ] {
+            let r = propagation_plan_row(
+                obj,
+                61000.0,
+                30.0,
+                "standard",
+                [1.0, 0.0, 0.0],
+                [0.0, 0.017, 0.0],
+                (0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, None),
+                [1.0, 0.0, 0.0],
+                [0.0, 0.017, 0.0],
+                None,
+                Some(method),
+                "ts",
+            );
+            let v = serde_json::to_value(&r).unwrap();
+            let map = v.as_object().unwrap();
+            for f in new_fields {
+                assert!(!map.contains_key(f), "{method} row leaked new field {f}");
+            }
+        }
+
+        // The legacy untagged OD fit row is kept byte-identical: the method
+        // axis is carried by the *added* tagged rows, never by mutating this
+        // one, so it must still serialize WITHOUT a `propagation_uncertainty`
+        // key (and without any new method field). Tagging it would change its
+        // bytes and break the pinned v0.7.0 consumer.
+        let legacy_od = od_plan_row(obj, "standard", test_types::ORBIT_DETERMINATION, None, "ts");
+        let v = serde_json::to_value(&legacy_od).unwrap();
+        let map = v.as_object().unwrap();
+        assert!(
+            !map.contains_key("propagation_uncertainty"),
+            "legacy OD row leaked a propagation_uncertainty key"
+        );
+        for f in new_fields {
+            assert!(!map.contains_key(f), "legacy OD row leaked new field {f}");
+        }
     }
 
     // ── Plan contract ───────────────────────────────────────────────
@@ -1140,25 +1427,23 @@ mod tests {
     }
 
     #[test]
-    fn rust_only_uncertainty_axes_never_reach_the_plan() {
-        // sigma_point and monte_carlo rode into the "plan" under the old
-        // blacklist, which named only `auto` and `second_order_detection_on`.
-        for axis in [
-            "auto_detection_on",
-            "second_order_detection_on",
-            "sigma_point_detection_on",
-            "monte_carlo_100_detection_on",
-        ] {
-            let (plan, drops) = strip_to_plan(&[rust_row_with_unknown_fields(Some(axis))]).unwrap();
-            assert!(plan.is_empty(), "{axis} leaked into the plan");
-            assert_eq!(drops.uncertainty_axis, 1);
-            assert_eq!(drops.rust_only_test_type, 0);
-        }
+    fn every_engine_uncertainty_axis_reaches_the_plan() {
+        // Before the per-method widening, only first_order/f64 were on the plan
+        // axis and the other five engine methods were stripped as rust-only.
+        // The plan is now the method contract: every engine method reaches the
+        // plan so the replay channels reproduce it.
         for axis in PLAN_UNCERTAINTY_AXES {
             let (plan, drops) = strip_to_plan(&[rust_row_with_unknown_fields(Some(axis))]).unwrap();
-            assert_eq!(plan.len(), 1, "{axis} should be replayable");
-            assert_eq!(drops.total(), 0);
+            assert_eq!(plan.len(), 1, "{axis} should reach the plan");
+            assert_eq!(drops.total(), 0, "{axis} was dropped");
         }
+        // The whitelist's guard is intact: a method NOT on it — a future
+        // rust-only axis — is still dropped under its own counter.
+        let (plan, drops) =
+            strip_to_plan(&[rust_row_with_unknown_fields(Some("future_method_with_cov"))]).unwrap();
+        assert!(plan.is_empty(), "an unknown axis leaked into the plan");
+        assert_eq!(drops.uncertainty_axis, 1);
+        assert_eq!(drops.rust_only_test_type, 0);
         // OD rows carry no uncertainty tag and are always in the plan.
         let (plan, drops) = strip_to_plan(&[rust_row_with_unknown_fields(None)]).unwrap();
         assert_eq!((plan.len(), drops.total()), (1, 0));
@@ -1190,16 +1475,51 @@ mod tests {
     }
 
     #[test]
-    fn every_test_type_including_radar_reaches_the_plan() {
-        // Every canonical test type rides through the strip now, radar
-        // included. Pinned by name so removing a type from the plan would be a
-        // deliberate, visible act — the whole hazard of a plan strip is that it
-        // deletes an axis quietly.
+    fn all_seven_engine_methods_are_whitelisted_into_the_plan() {
+        // The method contract named explicitly: each of the seven engine
+        // methods must survive the strip into the plan. Dropping one from
+        // PLAN_UNCERTAINTY_AXES regresses exactly here.
+        for method in [
+            uncertainty_modes::F64_NO_COV,
+            uncertainty_modes::FIRST_ORDER_WITH_COV,
+            uncertainty_modes::SECOND_ORDER_WITH_COV,
+            uncertainty_modes::AUTO,
+            uncertainty_modes::SIGMA_POINT_WITH_COV,
+            uncertainty_modes::MONTE_CARLO_100_WITH_COV,
+            uncertainty_modes::GAUSSIAN_MIXTURE_WITH_COV,
+        ] {
+            let (plan, drops) =
+                strip_to_plan(&[rust_row_with_unknown_fields(Some(method))]).unwrap();
+            assert_eq!(plan.len(), 1, "{method} stripped out of the plan");
+            assert_eq!(drops.uncertainty_axis, 0, "{method} counted as a drop");
+        }
+        assert_eq!(PLAN_UNCERTAINTY_AXES.len(), 7);
+    }
+
+    #[test]
+    fn rust_only_test_types_never_reach_the_plan() {
+        // The radar OD rows the rust runner emits are unreplayable by every
+        // other channel (empyrean-s1ab); a plan carrying them makes the gate
+        // unsatisfiable. They must be dropped, and dropped under their OWN
+        // counter so the strip's log says which rule removed them.
+        for tt in PLAN_RUST_ONLY_TEST_TYPES {
+            let (plan, drops) = strip_to_plan(&[rust_row_with_test_type(tt)]).unwrap();
+            assert!(plan.is_empty(), "{tt} leaked into the plan");
+            assert_eq!(drops.rust_only_test_type, 1);
+            assert_eq!(drops.uncertainty_axis, 0);
+        }
+        // Every other test type still rides through. Pinned by name so adding
+        // a test type to the blacklist is a deliberate, visible act — the
+        // whole hazard of a plan strip is that it deletes an axis quietly. The
+        // OD post-fit transport is here, not in the blacklist: ruling 9 puts
+        // every method at that seam on every engine channel, so every channel
+        // replays it.
         for tt in [
             test_types::PROPAGATION,
             test_types::EPHEMERIS,
             test_types::ORBIT_DETERMINATION,
             test_types::ORBIT_DETERMINATION_RADAR,
+            test_types::ORBIT_DETERMINATION_TRANSPORT,
             test_types::NON_GRAV_RECOVERY,
             test_types::DT_RECOVERY,
             test_types::PHOTOMETRY_RECOVERY,
@@ -1214,9 +1534,8 @@ mod tests {
     #[test]
     fn strip_counts_each_drop_reason_separately() {
         let rows = vec![
-            rust_row_with_unknown_fields(Some("monte_carlo_100_detection_on")),
-            rust_row_with_unknown_fields(Some("auto_detection_on")),
-            // The radar OD row now rides through — it is no longer rust-only.
+            rust_row_with_unknown_fields(Some("future_method_a_with_cov")),
+            rust_row_with_unknown_fields(Some("future_method_b_with_cov")),
             rust_row_with_test_type(test_types::ORBIT_DETERMINATION_RADAR),
             rust_row_with_test_type(test_types::ORBIT_DETERMINATION),
         ];

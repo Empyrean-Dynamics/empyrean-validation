@@ -23,7 +23,14 @@
 //! 5. **OD-specific output** — `n_obs_used`, `od_*`, plus the
 //!    `excluded_perturbers_naif` field that records which bodies were
 //!    dropped from the force model during the fit.
-//! 6. **Test-configuration tags** — `propagation_uncertainty` (Jet1 vs f64).
+//! 6. **Test-configuration tags + per-method output** —
+//!    `propagation_uncertainty` is the requested uncertainty method (the
+//!    seven-way method axis the plan carries), and the per-method output
+//!    fields record what the engine actually delivered under it:
+//!    `resolved_method`, the packed-joint covariance (`cov_kind`,
+//!    `cov_joint_width`, `cov_tri`), the per-orbit outcome
+//!    (`orbit_delivered`, `orbit_status`), and the Gaussian-mixture tallies
+//!    (`mix_*`).
 //! 7. **External-reference comparisons** — ASSIST and find_orb fields,
 //!    populated by the `merge-external` post-processing step.
 //! 8. **Metadata** — `timestamp`, `notes`.
@@ -170,6 +177,25 @@ pub mod test_types {
     /// realism family: per-night windows, predictions scored vs their covariance.
     pub const COVARIANCE_REALISM: &str = "covariance_realism";
 
+    /// Transport the post-fit OD covariance to a target epoch under a
+    /// requested uncertainty method, and compare the propagated joint across
+    /// channels. One row per method (the OD method axis of ruling 9's
+    /// post-fit-transport seam), carrying the method in
+    /// [`ValidationResult::propagation_uncertainty`](super::ValidationResult::propagation_uncertainty).
+    /// The target epoch/dt are
+    /// `0.0` placeholders the runner fills in — the transport derives its
+    /// target from the paired orbit at run time, exactly as the orbit-vs-orbit
+    /// transport leg does today.
+    ///
+    /// This is a *propagate* of the fit's covariance, not a
+    /// differential-correction fit, so it sits OUTSIDE
+    /// [`ORBIT_DETERMINATION_FAMILY`] alongside propagation/ephemeris and
+    /// carries a method tag the way those rows do (the fit rows'
+    /// `propagation_uncertainty` is the requested fit method). Every engine
+    /// channel replays it (it is **not** a [`crate::plan::PLAN_RUST_ONLY_TEST_TYPES`]
+    /// row): ruling 9 puts every method at this seam on every channel.
+    pub const ORBIT_DETERMINATION_TRANSPORT: &str = "orbit_determination_transport";
+
     /// Every canonical test type, in declaration order.
     ///
     /// The membership set for anything that accepts a test-type name from
@@ -177,7 +203,7 @@ pub mod test_types {
     /// flag. A name checked for syntax but never for membership turns a typo
     /// into "that axis was never exercised", which reads as a dead channel
     /// when the truth is a misspelling.
-    pub const ALL: [&str; 9] = [
+    pub const ALL: [&str; 10] = [
         PROPAGATION,
         EPHEMERIS,
         ORBIT_DETERMINATION,
@@ -187,6 +213,7 @@ pub mod test_types {
         PHOTOMETRY_RECOVERY,
         THRUST_RECOVERY,
         COVARIANCE_REALISM,
+        ORBIT_DETERMINATION_TRANSPORT,
     ];
 
     /// The orbit-determination family: every test type whose row comes from a
@@ -260,6 +287,52 @@ pub mod uncertainty_modes {
     /// [`F64_DETECTION_OFF_ASSIST_ASTEROID_INSTITUTE_LIKE`].
     pub const FIRST_ORDER_DETECTION_OFF_ASSIST_ASTEROID_INSTITUTE_LIKE: &str =
         "first_order_detection_off_assist_asteroid_institute_like";
+    /// Input orbit carries a covariance, so the propagator dispatches to
+    /// Jet1 / STM integration. The production hot path because empyrean
+    /// is uncertainty-first by design.
+    pub const FIRST_ORDER_WITH_COV: &str = "first_order_with_cov";
+    /// Covariance stripped; pure f64 state-only propagation. Used to
+    /// measure Jet1 overhead and to compare against external propagators
+    /// that don't carry uncertainty.
+    pub const F64_NO_COV: &str = "f64_no_cov";
+    /// Second-order (Jet2 / state-transition-tensor) uncertainty: the
+    /// propagated covariance carries the second-order curvature of the
+    /// flow, compared as the about-nominal moment (central + δμδμᵀ).
+    pub const SECOND_ORDER_WITH_COV: &str = "second_order_with_cov";
+    /// Adaptive method: the engine resolves the rung per epoch from its own
+    /// thresholds. The only method permitted a ladder — every other method
+    /// runs its rung end to end and refuses by name rather than substitute.
+    /// The row records what it resolved to in
+    /// [`ValidationResult::resolved_method`](super::ValidationResult::resolved_method).
+    pub const AUTO: &str = "auto";
+    /// Sigma-point (deterministic unscented) uncertainty: the moment of a
+    /// delivered set of sigma-point sample flights.
+    pub const SIGMA_POINT_WITH_COV: &str = "sigma_point_with_cov";
+    /// Monte-Carlo uncertainty: the sample moment of
+    /// [`MONTE_CARLO_SAMPLE_COUNT`] seeded draws. The sample count is
+    /// encoded in the tag and the seed is [`MONTE_CARLO_SEED`].
+    pub const MONTE_CARLO_100_WITH_COV: &str = "monte_carlo_100_with_cov";
+    /// Gaussian-mixture uncertainty: the engine κ-gates the object's own
+    /// covariance and splits it into an adaptive mixture at a close
+    /// approach. The plan emits this method only for the close-approach
+    /// objects ([`crate::catalog::CLOSE_APPROACH_OBJECTS`]); an object with
+    /// no close approach delivers a single second-order Gaussian, never a
+    /// mixture. The row carries the moment-matched matrix plus the component
+    /// count, the surviving mass, and the four refusal tallies.
+    pub const GAUSSIAN_MIXTURE_WITH_COV: &str = "gaussian_mixture_with_cov";
+
+    /// Sample count for the suite's seeded Monte-Carlo method, fixed
+    /// suite-wide so a Monte-Carlo row is comparable across runs and
+    /// channels. Encoded in [`MONTE_CARLO_100_WITH_COV`].
+    pub const MONTE_CARLO_SAMPLE_COUNT: u32 = 100;
+    /// The single fixed Monte-Carlo seed used suite-wide. A fixed seed makes
+    /// a seeded Monte-Carlo row a cross-channel *bit* check as well as a
+    /// moment check: the engine owns the RNG and the sample order, so one
+    /// seed yields identical draws and therefore identical moments in every
+    /// channel. The value is arbitrary but fixed — the ASCII bytes of
+    /// `EMPYREAN` — so a drift in the draws reads as a defect, never as a new
+    /// seed.
+    pub const MONTE_CARLO_SEED: u64 = 0x454D_5059_5245_414E;
 }
 
 /// One row in the validation result table.
@@ -610,12 +683,83 @@ pub struct ValidationResult {
     pub od_joint_covariance_width: Option<u32>,
 
     // ── Test-configuration axis ─────────────────────────────────────
-    /// Tag distinguishing prop+eph rows by uncertainty-propagation mode.
-    /// One of [`uncertainty_modes::FIRST_ORDER_DETECTION_ON`] or
-    /// [`uncertainty_modes::F64_DETECTION_ON`]. `None` on OD rows because OD
-    /// always produces a post-fit covariance — the axis doesn't apply.
+    /// The uncertainty method **requested** for this row. One of the
+    /// [`uncertainty_modes`] tags — the seven-way method axis the plan carries
+    /// (`f64_no_cov`, `first_order_with_cov`, `second_order_with_cov`, `auto`,
+    /// `sigma_point_with_cov`, `monte_carlo_100_with_cov`,
+    /// `gaussian_mixture_with_cov`). Set on every propagation and ephemeris
+    /// row, on the method-tagged OD fit rows
+    /// ([`test_types::ORBIT_DETERMINATION`]), and on the post-fit transport
+    /// rows ([`test_types::ORBIT_DETERMINATION_TRANSPORT`]) — the OD fit method
+    /// and the method its post-fit covariance is transported under,
+    /// respectively. `None` only on the one legacy untagged OD fit row the plan
+    /// keeps per object for byte-identity with the pinned consumer. What
+    /// actually ran is [`resolved_method`](Self::resolved_method).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub propagation_uncertainty: Option<String>,
+
+    // ── Per-method uncertainty output (0.10 engine line) ────────────
+    //
+    // The widened method axis (every object swept under every engine
+    // uncertainty method) delivers more than a single 6×6: a packed joint
+    // whose `kind` tags how it was computed, a per-orbit delivery outcome,
+    // and — for a Gaussian mixture — the component tallies. Every field is
+    // `Option` and omitted when `None`, so a first-order / f64 row serializes
+    // exactly its pre-0.10 bytes. `None` at plan time (the plan is the
+    // request; these are what a channel fills in).
+    //
+    /// What method actually ran. Equal to
+    /// [`propagation_uncertainty`](Self::propagation_uncertainty) for every
+    /// explicit method — the no-silent-substitution invariant — while under
+    /// [`uncertainty_modes::AUTO`] it is the rung the engine resolved to at
+    /// this epoch. `None` on rows that carry no method and at plan time.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resolved_method: Option<String>,
+    /// Packed-joint `kind` discriminant, travelling with the covariance so
+    /// the report never shows a covariance without its method
+    /// (`linear` = 1, `second_order` = 2, `mixture` = 3, …; the engine owns
+    /// the mapping).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cov_kind: Option<u8>,
+    /// Packed-joint width \\(N\\) = state width + present parameters. The 6×6
+    /// moment view stays in [`emp_pos_cov_au2`](Self::emp_pos_cov_au2); this
+    /// records the joint the engine actually delivered.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cov_joint_width: Option<u32>,
+    /// Packed lower triangle of the joint covariance — \\(N(N+1)/2\\) doubles
+    /// in lower-triangular order, the full-precision carrier behind the
+    /// collapsed moment views.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cov_tri: Option<Vec<f64>>,
+    /// Whether the engine delivered an orbit for this row. The sole delivery
+    /// discriminator is the per-orbit outcome channel, never a state count,
+    /// so a withheld or failed orbit stays one row with a status rather than
+    /// a dropped row.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub orbit_delivered: Option<bool>,
+    /// The per-orbit outcome as a string: `delivered`, `failed:<variant>`, or
+    /// `cov_withheld:<reason>`. Keeps a refusal visible by name instead of
+    /// collapsing into a blank cell.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub orbit_status: Option<String>,
+    /// Retained mixture component count (`gaussian_mixture_with_cov` rows).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mix_n_components_total: Option<u32>,
+    /// Surviving mixture mass; \\(< 1\\) when components were dropped.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mix_weight_delivered: Option<f64>,
+    /// Mixture components that failed outright.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mix_n_failed: Option<u32>,
+    /// Mixture components left unresolved.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mix_n_unresolved: Option<u32>,
+    /// Mixture components the engine refused on curvature grounds.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mix_n_curvature_refused: Option<u32>,
+    /// Mixture components the engine refused to linearize on the sky.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mix_n_sky_linearization_refused: Option<u32>,
 
     // ── External-reference comparisons ──────────────────────────────
     /// |ASSIST − Horizons| in km. ASSIST is an independent N-body
@@ -1033,6 +1177,18 @@ impl ValidationResult {
             od_warnings: Vec::new(),
             od_joint_covariance_width: None,
             propagation_uncertainty: None,
+            resolved_method: None,
+            cov_kind: None,
+            cov_joint_width: None,
+            cov_tri: None,
+            orbit_delivered: None,
+            orbit_status: None,
+            mix_n_components_total: None,
+            mix_weight_delivered: None,
+            mix_n_failed: None,
+            mix_n_unresolved: None,
+            mix_n_curvature_refused: None,
+            mix_n_sky_linearization_refused: None,
             assist_vs_horizons_km: None,
             emp_vs_assist_km: None,
             assist_time_ms: None,
@@ -1297,16 +1453,28 @@ mod tests {
         // neither side of the split is a row nothing knows how to count.
         for tt in test_types::ALL {
             let od = test_types::ORBIT_DETERMINATION_FAMILY.contains(&tt);
-            let prop_eph = matches!(tt, test_types::PROPAGATION | test_types::EPHEMERIS);
+            // The non-fit side: propagate/ephemeris calls plus the post-fit
+            // transport, which propagates the OD covariance and so is a
+            // propagate, not a differential-correction fit — it stays out of
+            // the OD family for the same reason prop/eph do.
+            let not_a_fit = matches!(
+                tt,
+                test_types::PROPAGATION
+                    | test_types::EPHEMERIS
+                    | test_types::ORBIT_DETERMINATION_TRANSPORT
+            );
             assert!(
-                od ^ prop_eph,
-                "{tt} is in neither or both of (propagation/ephemeris) and \
+                od ^ not_a_fit,
+                "{tt} is in neither or both of \
+                 (propagation/ephemeris/orbit_determination_transport) and \
                  ORBIT_DETERMINATION_FAMILY"
             );
         }
         assert_eq!(
             test_types::ALL.len(),
-            test_types::ORBIT_DETERMINATION_FAMILY.len() + 2,
+            // + 3: propagation, ephemeris, orbit_determination_transport — the
+            // three non-fit test types outside ORBIT_DETERMINATION_FAMILY.
+            test_types::ORBIT_DETERMINATION_FAMILY.len() + 3,
             "a test type is missing from ALL"
         );
     }
@@ -1582,6 +1750,108 @@ mod tests {
                 !crate::plan::PLAN_CARRIED_KEYS.contains(&key),
                 "{key} must not be in the plan contract — empyrean-core pins \
                  an older schema and denies unknown fields"
+            );
+            assert!(
+                !crate::plan::PLAN_CLEARED_KEYS.contains(&key),
+                "{key} must not be a cleared plan key either"
+            );
+        }
+    }
+
+    // ── Per-method uncertainty axis (0.10 engine line) ──────────────
+
+    /// The method tags are a wire contract shared with the engine and the
+    /// report; a rename here must wedge until every consumer is updated. The
+    /// Monte-Carlo tag must also encode the fixed sample count.
+    #[test]
+    fn uncertainty_mode_constants_match_canonical_tags() {
+        use uncertainty_modes::*;
+        assert_eq!(F64_NO_COV, "f64_no_cov");
+        assert_eq!(FIRST_ORDER_WITH_COV, "first_order_with_cov");
+        assert_eq!(SECOND_ORDER_WITH_COV, "second_order_with_cov");
+        assert_eq!(AUTO, "auto");
+        assert_eq!(SIGMA_POINT_WITH_COV, "sigma_point_with_cov");
+        assert_eq!(MONTE_CARLO_100_WITH_COV, "monte_carlo_100_with_cov");
+        assert_eq!(GAUSSIAN_MIXTURE_WITH_COV, "gaussian_mixture_with_cov");
+        // The tag encodes the sample count: the two cannot drift apart.
+        assert_eq!(MONTE_CARLO_SAMPLE_COUNT, 100);
+        assert_eq!(
+            MONTE_CARLO_100_WITH_COV,
+            format!("monte_carlo_{MONTE_CARLO_SAMPLE_COUNT}_with_cov")
+        );
+        // The seed is a single fixed suite-wide value (the ASCII of EMPYREAN).
+        assert_eq!(MONTE_CARLO_SEED, 0x454D_5059_5245_414E);
+    }
+
+    /// Populated per-method output fields must survive a JSON round-trip, and
+    /// each must be omitted entirely when `None` so a first-order / f64 row
+    /// keeps its pre-0.10 bytes.
+    #[test]
+    fn method_output_fields_round_trip_and_omit_when_none() {
+        let none = ValidationResult::empty();
+        let s_none = serde_json::to_string(&none).unwrap();
+        for key in [
+            "resolved_method",
+            "cov_kind",
+            "cov_joint_width",
+            "cov_tri",
+            "orbit_delivered",
+            "orbit_status",
+            "mix_n_components_total",
+            "mix_weight_delivered",
+            "mix_n_failed",
+            "mix_n_unresolved",
+            "mix_n_curvature_refused",
+            "mix_n_sky_linearization_refused",
+        ] {
+            assert!(!s_none.contains(key), "{key} must be omitted when None");
+        }
+
+        let mut r = ValidationResult::empty();
+        r.test_type = test_types::PROPAGATION.into();
+        r.propagation_uncertainty = Some(uncertainty_modes::GAUSSIAN_MIXTURE_WITH_COV.into());
+        r.resolved_method = Some("mixture".into());
+        r.cov_kind = Some(3);
+        r.cov_joint_width = Some(6);
+        r.cov_tri = Some(vec![1.0, 0.0, 1.0, 0.0, 0.0, 1.0]);
+        r.orbit_delivered = Some(true);
+        r.orbit_status = Some("delivered".into());
+        r.mix_n_components_total = Some(3);
+        r.mix_weight_delivered = Some(0.79);
+        r.mix_n_failed = Some(0);
+        r.mix_n_unresolved = Some(0);
+        r.mix_n_curvature_refused = Some(1);
+        r.mix_n_sky_linearization_refused = Some(0);
+        let s = serde_json::to_string(&r).unwrap();
+        assert!(s.contains("resolved_method"));
+        assert!(s.contains("mix_n_sky_linearization_refused"));
+        let r2: ValidationResult = serde_json::from_str(&s).unwrap();
+        assert_eq!(r, r2);
+    }
+
+    /// The per-method output fields are channel outputs, not plan inputs; they
+    /// must stay out of the plan contract. `empyrean-core` pins an older schema
+    /// and deserializes the plan with `deny_unknown_fields`, so a field that
+    /// reached a plan row would break the reference channel outright.
+    #[test]
+    fn method_output_fields_are_not_carried_into_the_plan() {
+        for key in [
+            "resolved_method",
+            "cov_kind",
+            "cov_joint_width",
+            "cov_tri",
+            "orbit_delivered",
+            "orbit_status",
+            "mix_n_components_total",
+            "mix_weight_delivered",
+            "mix_n_failed",
+            "mix_n_unresolved",
+            "mix_n_curvature_refused",
+            "mix_n_sky_linearization_refused",
+        ] {
+            assert!(
+                !crate::plan::PLAN_CARRIED_KEYS.contains(&key),
+                "{key} must not be in the plan contract"
             );
             assert!(
                 !crate::plan::PLAN_CLEARED_KEYS.contains(&key),
