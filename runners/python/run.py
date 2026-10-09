@@ -8,6 +8,13 @@ same schema. The combined JSONs feed into
     validate report --results validation_rust.json,validation_python.json
 
 so the Distribution Channel Fidelity table can compare bindings.
+
+On first-order ephemeris rows this channel publishes the
+engine-delivered sky covariance (grouping with the core channel), while
+the rust channel keeps the harness projection as its golden with the
+delivered covariance beside it as a diagnostic, so the cross-channel
+matrix reads projection (rust) versus delivered (python / core) on those
+rows by design.
 """
 
 from __future__ import annotations
@@ -21,9 +28,9 @@ from datetime import datetime, timezone
 from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
 
-import numpy as np
-
 import empyrean
+import numpy as np
+from empyrean import CovarianceKind, OrbitOutcome, UncertaintyMethod
 from empyrean._empyrean_rs import (
     _determine,
     _generate_ephemeris,
@@ -31,6 +38,18 @@ from empyrean._empyrean_rs import (
     _propagate,
 )
 
+# The distribution's own canonical uncertainty-method → wire-int map, so this
+# channel lowers an `UncertaintyMethod` to the int the low-level `_propagate`
+# expects exactly as `empyrean.propagate` does (no restated encoding to drift).
+from empyrean.propagation.config import _UNCERTAINTY_METHOD_TO_INT
+
+# The 0.11 per-method product builders — the SAME functions `empyrean.propagate`
+# runs on the result dict, so the python channel reads its products off the
+# wrapper rather than recomputing them (mirrors the rust channel reading the
+# safe wrapper's PackedJoint / OrbitStatuses / MixtureComponent).
+from empyrean.propagation.mixtures import ComponentStatus, build_mixture_chains
+from empyrean.propagation.propagate import _build_tagged_covariance
+from empyrean.propagation.status import build_orbit_statuses
 
 # Mirrors empyrean::ForceModelTier integer encoding.
 _TIER_TO_INT = {"approximate": 0, "basic": 1, "standard": 2}
@@ -41,6 +60,283 @@ _FRAME_ICRF = 0
 _ORIGIN_SSB = 0
 _REP_CARTESIAN = 0
 _AU_KM = 149_597_870.700
+
+
+# ── Uncertainty-method axis (0.11 per-method products) ──────────────────────
+#
+# Schema `uncertainty_modes` tag → (attach_covariance, empyrean UncertaintyMethod).
+# Mirrors the rust channel's `build_uncertainty_axes` and the cli channel's
+# `method_for_tag`: `f64_no_cov` is the covariance-free first-order path; every
+# other tag attaches the synthetic covariance and runs its named rung. The
+# method is lowered to the low-level `_propagate` wire int via the
+# distribution's own `UncertaintyMethod` map, so the python channel asks for
+# the identical method the rust / cli channels ask for.
+_METHOD_BY_TAG: dict[str, tuple[bool, UncertaintyMethod]] = {
+    "f64_no_cov": (False, UncertaintyMethod.FIRST_ORDER),
+    "first_order_with_cov": (True, UncertaintyMethod.FIRST_ORDER),
+    "second_order_with_cov": (True, UncertaintyMethod.SECOND_ORDER),
+    "auto": (True, UncertaintyMethod.AUTO),
+    "sigma_point_with_cov": (True, UncertaintyMethod.SIGMA_POINT),
+    "monte_carlo_100_with_cov": (True, UncertaintyMethod.MONTE_CARLO),
+    "gaussian_mixture_with_cov": (True, UncertaintyMethod.GAUSSIAN_MIXTURE),
+}
+
+# Sampling methods cost ~100-120 propagations per call, so — like the rust
+# channel's `timing_runs = 1` — they are timed once rather than best-of-N.
+_SAMPLING_TAGS = frozenset(
+    {"sigma_point_with_cov", "monte_carlo_100_with_cov", "gaussian_mixture_with_cov"}
+)
+
+# The suite-wide Monte-Carlo sample count and seed. A LITERAL mirror of
+# `empyrean_validation::schema::uncertainty_modes::MONTE_CARLO_SAMPLE_COUNT` /
+# `MONTE_CARLO_SEED` (src/schema.rs): N = 100, seed = the ASCII bytes of
+# "EMPYREAN" (0x454D5059_5245414E). The python channel cannot import the Rust
+# const; the values are pinned against drift by tests/test_run_products.py.
+_MONTE_CARLO_SAMPLE_COUNT = 100
+_MONTE_CARLO_SEED = 0x454D_5059_5245_414E
+
+# The OD-fit method-axis note. A LITERAL mirror of
+# `empyrean_validation::schema::OD_METHOD_AXIS_NOT_PRODUCED` (src/schema.rs):
+# `ODConfig` carries no `uncertainty_method` at this distribution revision
+# (ae00643), so OD fits run method-free — every OD fit row records this by name
+# rather than a blank or a silent first-order default. Pinned in the tests.
+_OD_METHOD_AXIS_NOT_PRODUCED = (
+    "OD method axis not produced at this pin: "
+    "ODConfig.uncertainty_method not on the wrapper"
+)
+
+# The 12 per-method output fields the plan/rust input carries. A python row is
+# built as a copy of its input row, so each must be CLEARED before the python
+# channel repopulates it from ITS OWN delivery — otherwise the input channel's
+# products ride out under this channel's name. `emp_pos_cov_au2` /
+# `emp_radec_cov_arcsec2` are the collapsed moment views that travel with them
+# and are reset for the same reason.
+_PER_METHOD_FIELDS = (
+    "resolved_method",
+    "cov_kind",
+    "cov_joint_width",
+    "cov_tri",
+    "orbit_delivered",
+    "orbit_status",
+    "mix_n_components_total",
+    "mix_weight_delivered",
+    "mix_n_failed",
+    "mix_n_unresolved",
+    "mix_n_curvature_refused",
+    "mix_n_sky_linearization_refused",
+    "emp_pos_cov_au2",
+    "emp_radec_cov_arcsec2",
+)
+
+
+def _synthetic_covariance() -> np.ndarray:
+    """A synthetic typical-NEO 6×6 input covariance: 1 km (1σ) position, 1
+    mm·s⁻¹ (1σ) velocity, uncorrelated. Bit-identical to the rust / cli
+    channels' ``synthetic_covariance`` (same literals, same AU/km constant) so
+    a same-method cross-channel diff reflects binding drift, not a different
+    prior.
+    """
+    pos_var_au2 = (1.0 / _AU_KM) ** 2
+    vel_var_au2_d2 = (1e-6 / _AU_KM * 86_400.0) ** 2
+    cov = np.zeros((6, 6), dtype=np.float64)
+    cov[0, 0] = cov[1, 1] = cov[2, 2] = pos_var_au2
+    cov[3, 3] = cov[4, 4] = cov[5, 5] = vel_var_au2_d2
+    return cov
+
+
+# C-ABI wire discriminant for a delivered covariance kind — the `cov_kind` the
+# schema carries. Mirrors `empyrean.orbits.joint._KIND_TO_CODE` and the rust /
+# cli channels' `cov_kind_wire` (linear 0, second-order 1, mixture 3,
+# monte-carlo 4, sigma-point 5); pinned in the tests.
+_COV_KIND_WIRE = {
+    CovarianceKind.LINEAR: 0,
+    CovarianceKind.SECOND_ORDER: 1,
+    CovarianceKind.MIXTURE: 3,
+    CovarianceKind.MONTE_CARLO: 4,
+    CovarianceKind.SIGMA_POINT: 5,
+}
+
+# The schema `uncertainty_modes` tag for a DELIVERED covariance kind — the
+# `resolved_method`. Mirrors the rust channel's `resolved_method_for`: on an
+# explicit method it equals the request when the engine honoured it, and names
+# the delivered kind (never the request) if a different kind came back.
+_RESOLVED_METHOD_TAG = {
+    CovarianceKind.LINEAR: "first_order_with_cov",
+    CovarianceKind.SECOND_ORDER: "second_order_with_cov",
+    CovarianceKind.MIXTURE: "gaussian_mixture_with_cov",
+    CovarianceKind.MONTE_CARLO: "monte_carlo_100_with_cov",
+    CovarianceKind.SIGMA_POINT: "sigma_point_with_cov",
+}
+
+
+def _propagate_failure_variant(code: int | None, message: str) -> str:
+    """Name an ``EMPYREAN_PROPAGATE_FAILURE_*`` classification code. The integer
+    codes are the C-ABI contract; an unrecognized code falls back to the
+    engine's own message so no failure is ever reported as a bare number.
+    Mirrors the rust channel's ``propagate_failure_variant``.
+    """
+    names = {
+        1: "integration",
+        2: "kepler_dt_backprop",
+        3: "transform",
+        4: "covariance_input",
+        5: "sigma_point",
+        6: "sampled_parameter",
+        7: "ensemble_member",
+        8: "output_assembly",
+        99: "other",
+    }
+    if code in names:
+        return names[code]
+    return f"code_{code}({message})"
+
+
+def _orbit_outcome_channel(
+    outcome: str, err_code: int | None, err_msg: str | None, withheld: str | None
+) -> tuple[bool, str]:
+    """The per-orbit delivery outcome, read off the status table — the SOLE
+    delivery discriminator, never a state count. Returns
+    ``(orbit_delivered, orbit_status)``. Mirrors the rust channel's
+    ``orbit_outcome_channel``.
+    """
+    if outcome == OrbitOutcome.FAILED.value:
+        return False, f"failed:{_propagate_failure_variant(err_code, err_msg or '')}"
+    # Delivered: a covariance that was expected but could not be read back is a
+    # withheld covariance, named rather than left blank.
+    if withheld is not None:
+        return True, f"cov_withheld:{withheld}"
+    return True, "delivered"
+
+
+def _populate_mixture_tallies(result: dict, row: dict) -> None:
+    """Fill a row's six Gaussian-mixture tallies from the wrapper's RETAINED
+    mixture components (the per-component status table — the 0.11 product).
+    Empty on every non-mixture delivery, so the tally only fills on a row the
+    engine actually split. Mirrors the rust channel's
+    ``populate_mixture_tallies`` (retained components; the core channel reads
+    villeneuve's pre-retention tallies — a cross-channel surface difference,
+    not physics).
+    """
+    chains = build_mixture_chains(result)
+    if chains is None or len(chains) == 0:
+        return
+    # Components retained for this (single) orbit.
+    comp = chains.select("orbit_index", 0)
+    if len(comp) == 0:
+        return
+    weights = comp.weight.to_numpy(zero_copy_only=False)
+    statuses = comp.status.to_pylist()
+
+    def _n(member: ComponentStatus) -> int:
+        return int(sum(1 for s in statuses if s == member.value))
+
+    row["mix_n_components_total"] = len(comp)
+    row["mix_weight_delivered"] = float(weights.sum())
+    row["mix_n_failed"] = _n(ComponentStatus.FAILED)
+    row["mix_n_unresolved"] = _n(ComponentStatus.UNRESOLVED)
+    row["mix_n_curvature_refused"] = _n(ComponentStatus.CURVATURE_REFUSED)
+    row["mix_n_sky_linearization_refused"] = _n(ComponentStatus.SKY_LINEARIZATION_REFUSED)
+
+
+def _delivered_sky_cov_arcsec2(cov6: np.ndarray, dec_rad: float) -> list[list[float]]:
+    """Extract the (RA·cosδ, Dec) sky-plane 2×2 covariance in arcsec² from the
+    engine-delivered 6×6 ephemeris covariance, ordered (rho, RA, Dec, vrho,
+    vRA, vDec) in (AU, deg). The RA row/column are scaled by cosδ to match
+    ``d_ra_arcsec`` and deg² is converted to arcsec². Mirrors the rust
+    channel's ``delivered_sky_covariance``.
+    """
+    ra, dec = 1, 2
+    cosd = math.cos(dec_rad)
+    deg2_to_arcsec2 = 3600.0 * 3600.0
+    c_ra_ra = float(cov6[ra][ra]) * cosd * cosd * deg2_to_arcsec2
+    c_ra_dec = float(cov6[ra][dec]) * cosd * deg2_to_arcsec2
+    c_dec_dec = float(cov6[dec][dec]) * deg2_to_arcsec2
+    return [[c_ra_ra, c_ra_dec], [c_ra_dec, c_dec_dec]]
+
+
+def _with_od_method_note(base: str) -> str:
+    """Append the OD method-axis note to an OD fit row's base note so the row
+    records the missing axis by name — never a blank, never a silent
+    first-order default. An empty base yields the marker alone. Mirrors the
+    rust channel's ``with_od_method_note``.
+    """
+    if not base:
+        return _OD_METHOD_AXIS_NOT_PRODUCED
+    return f"{base}; {_OD_METHOD_AXIS_NOT_PRODUCED}"
+
+
+def _fill_propagation_products(row: dict, result: dict, attach_cov: bool) -> None:
+    """Populate a propagation row's 0.11 per-method products from the wrapper
+    result dict: the per-orbit delivery outcome, the delivered packed joint
+    (`cov_kind` / `cov_joint_width` / `cov_tri`) and its resolved kind, the
+    collapsed position 3×3 moment view, and the retained mixture tallies.
+    Mirrors the rust channel's propagation-row population.
+    """
+    status = build_orbit_statuses(result["outcomes"])
+    outcome = status.outcome.to_pylist()[0]
+    err_code = status.error_code.to_pylist()[0]
+    err_msg = status.error_message.to_pylist()[0]
+
+    # The resolved covariance kind + packed joint, read off the delivered
+    # tagged covariance (only on a row that carried a covariance). A covariance
+    # that was attached (expected) but unreadable is a WITHHELD covariance,
+    # named on the outcome below rather than back-filled.
+    withheld: str | None = None
+    if attach_cov:
+        tagged = _build_tagged_covariance(result)
+        pj = None
+        if (
+            tagged is not None
+            and len(tagged) > 0
+            and bool(tagged.has_tagged.to_pylist()[0])
+        ):
+            pj = tagged.covariance.joint(0)
+        tri = None if pj is None else np.asarray(pj.tri, dtype=np.float64)
+        if pj is not None and tri is not None and np.isfinite(tri).all():
+            row["resolved_method"] = _RESOLVED_METHOD_TAG[pj.kind]
+            row["cov_kind"] = _COV_KIND_WIRE[pj.kind]
+            row["cov_joint_width"] = int(pj.width)
+            row["cov_tri"] = [float(v) for v in tri]
+            # The 6×6 moment view's position 3×3 (AU²) — the compared envelope.
+            m = pj.state_block()
+            row["emp_pos_cov_au2"] = [[float(m[i][j]) for j in range(3)] for i in range(3)]
+        else:
+            withheld = "no tagged covariance returned"
+
+    row["orbit_delivered"], row["orbit_status"] = _orbit_outcome_channel(
+        outcome, err_code, err_msg, withheld
+    )
+    _populate_mixture_tallies(result, row)
+
+
+def _fill_ephemeris_products(row: dict, result: dict, dec_rad: float) -> None:
+    """Populate an ephemeris row's products: the per-orbit delivery outcome and
+    the delivered sky covariance (projected to the RA·cosδ / Dec 2×2).
+    `resolved_method` / `cov_kind` stay ``None`` — the wrapper flattens the
+    delivered sky covariance to a bare 6×6 with no resolved-kind tag and no
+    packed joint, so back-filling them from the request would be a silent
+    substitution (the named gap, exactly as the rust channel).
+
+    The published covariance is the engine-DELIVERED one on every row
+    including first order (grouping this channel with the core channel; the
+    rust channel keeps the harness projection as its golden), so a
+    first-order ephemeris row reads delivered-vs-projection against the rust
+    reference in the cross-channel matrix by design.
+    """
+    status = build_orbit_statuses(result["outcomes"])
+    outcome = status.outcome.to_pylist()[0]
+    err_code = status.error_code.to_pylist()[0]
+    err_msg = status.error_message.to_pylist()[0]
+
+    has_cov = np.asarray(result.get("has_covariance", []), dtype=bool)
+    if has_cov.size > 0 and bool(has_cov[0]):
+        cov6 = np.asarray(result["covariance"])[0]
+        if np.isfinite(cov6).all():
+            row["emp_radec_cov_arcsec2"] = _delivered_sky_cov_arcsec2(cov6, dec_rad)
+
+    row["orbit_delivered"], row["orbit_status"] = _orbit_outcome_channel(
+        outcome, err_code, err_msg, None
+    )
 
 
 def _wheel_source_version() -> str:
@@ -83,12 +379,31 @@ def _propagate_one(
     ic_g_k: float,
     ic_non_grav_dt: float | None,
     force_model: str,
+    method_tag: str,
     n_timing_runs: int,
-) -> tuple[list[float], float] | None:
-    """Run propagation once, return (out_pos_au, min_time_ms) or None on failure."""
+) -> tuple[list[float], float, dict] | None:
+    """Propagate once under ``method_tag``'s uncertainty method, returning
+    ``(out_pos_au, min_time_ms, raw_result)`` or ``None`` on failure.
+
+    The method is mapped to an ``UncertaintyMethod`` and lowered to the
+    low-level wire int; every method but ``f64_no_cov`` attaches the synthetic
+    covariance and requests the provenance-tagged readback so the caller can
+    read the 0.11 per-method products off ``raw_result``.
+    """
     tier = _TIER_TO_INT.get(force_model)
     if tier is None:
         return None
+    method_entry = _METHOD_BY_TAG.get(method_tag)
+    if method_entry is None:
+        # Refuse an unknown method by name rather than silently substituting
+        # one (the no-silent-substitution invariant).
+        print(
+            f"  {object_id} {force_model}: SKIP unknown uncertainty_method {method_tag!r}",
+            file=sys.stderr,
+        )
+        return None
+    attach_cov, method = method_entry
+    um_int = _UNCERTAINTY_METHOD_TO_INT[method]
 
     times = np.array([target_t_mjd_tdb], dtype=np.float64)
     epochs = np.array([epoch_mjd_tdb], dtype=np.float64)
@@ -105,8 +420,13 @@ def _propagate_one(
         ],
         dtype=np.float64,
     )
+    # Attach the synthetic typical-NEO covariance on every method but
+    # f64_no_cov (which runs covariance-free), same prior as the rust / cli
+    # channels so a same-method cross-channel diff reflects binding drift only.
     covariances = np.zeros((1, 6, 6), dtype=np.float64)
-    has_covariance = np.array([False])
+    if attach_cov:
+        covariances[0] = _synthetic_covariance()
+    has_covariance = np.array([attach_cov])
     representations = np.array([_REP_CARTESIAN], dtype=np.int32)
     frames = np.array([_FRAME_ICRF], dtype=np.int32)
     origins = np.array([0], dtype=np.int32)  # SSB
@@ -133,9 +453,19 @@ def _propagate_one(
         else None
     )
 
+    # Monte-Carlo carries the suite-wide sample count + seed (a cross-channel
+    # bit check); the other methods take the wrapper defaults, matching the
+    # rust channel's sigma_point() / gaussian_mixture() / auto().
+    mc_kwargs = (
+        {"mc_n_samples": _MONTE_CARLO_SAMPLE_COUNT, "mc_seed": _MONTE_CARLO_SEED}
+        if method_tag == "monte_carlo_100_with_cov"
+        else {}
+    )
+    # Sampling methods cost ~100-120 propagations per call — time once.
+    runs = 1 if method_tag in _SAMPLING_TAGS else max(1, n_timing_runs)
     timings_ms = []
     last_result = None
-    for _ in range(max(1, n_timing_runs)):
+    for _ in range(runs):
         t0 = time.perf_counter()
         try:
             result = _propagate(
@@ -150,7 +480,7 @@ def _propagate_one(
                 origins=origins,
                 times_mjd_tdb=times,
                 force_model=tier,
-                uncertainty_method=0,
+                uncertainty_method=um_int,
                 a1s=a1s,
                 a2s=a2s,
                 a3s=a3s,
@@ -163,6 +493,8 @@ def _propagate_one(
                 ng_ns=ng_ns,
                 ng_ks=ng_ks,
                 non_grav_dts=non_grav_dts,
+                with_tagged_covariance=attach_cov,
+                **mc_kwargs,
             )
         except Exception as e:  # noqa: BLE001
             print(
@@ -180,7 +512,7 @@ def _propagate_one(
         float(last_result["y"][0]),
         float(last_result["z"][0]),
     ]
-    return pos, min(timings_ms)
+    return pos, min(timings_ms), last_result
 
 
 def _ephemeris_one(
@@ -201,18 +533,36 @@ def _ephemeris_one(
     obs_code: str,
     force_model: str,
     n_timing_runs: int,
-) -> tuple[float, float, float, float, float] | BaseException | None:
-    """Generate ephemeris at target_t for obs_code.
+    method_tag: str,
+) -> tuple[float, float, float, float, float, dict] | BaseException | None:
+    """Generate ephemeris at target_t for obs_code under ``method_tag``'s
+    uncertainty method.
 
-    Return ``(ra_rad, dec_rad, rho_au, light_time_days, emp_time_ms)`` where
-    ``emp_time_ms`` is the best-of-``n_timing_runs`` wall time of the
-    ``_generate_ephemeris`` call — the same stopwatch boundary the core and
-    propagation channels use (array construction outside; the generate call
-    inside).
+    Return ``(ra_rad, dec_rad, rho_au, light_time_days, emp_time_ms,
+    raw_result)`` where ``emp_time_ms`` is the best-of-``n_timing_runs`` wall
+    time of the ``_generate_ephemeris`` call — the same stopwatch boundary the
+    core and propagation channels use (array construction outside; the generate
+    call inside) — and the sky covariance the engine delivers rides
+    ``raw_result["covariance"]`` for the caller to publish. Returns the
+    exception on failure (not ``None``) so the caller can emit a FAIL row.
     """
     tier = _TIER_TO_INT.get(force_model)
     if tier is None:
         return None
+    method_entry = _METHOD_BY_TAG.get(method_tag)
+    if method_entry is None:
+        print(
+            f"  {object_id} ephemeris: SKIP unknown uncertainty_method {method_tag!r}",
+            file=sys.stderr,
+        )
+        return None
+    attach_cov, method = method_entry
+    um_int = _UNCERTAINTY_METHOD_TO_INT[method]
+    mc_kwargs = (
+        {"mc_n_samples": _MONTE_CARLO_SAMPLE_COUNT, "mc_seed": _MONTE_CARLO_SEED}
+        if method_tag == "monte_carlo_100_with_cov"
+        else {}
+    )
 
     # The observer basis is an explicit request as of the 0.10 ABI.
     # (Frame::ICRF, Origin::SSB) is the construction basis — the states come
@@ -249,8 +599,13 @@ def _ephemeris_one(
         ],
         dtype=np.float64,
     )
+    # Same synthetic prior as the propagation path / rust / cli channels, on
+    # every method but f64_no_cov. The delivered sky covariance is then the
+    # engine's per-method projection, not the covariance-free default.
     covariances = np.zeros((1, 6, 6), dtype=np.float64)
-    has_covariance = np.array([False])
+    if attach_cov:
+        covariances[0] = _synthetic_covariance()
+    has_covariance = np.array([attach_cov])
     representations = np.array([_REP_CARTESIAN], dtype=np.int32)
     frames = np.array([_FRAME_ICRF], dtype=np.int32)
     origins = np.array([0], dtype=np.int32)
@@ -307,6 +662,8 @@ def _ephemeris_one(
                 ng_ns=ng_ns,
                 ng_ks=ng_ks,
                 non_grav_dts=non_grav_dts,
+                uncertainty_method=um_int,
+                **mc_kwargs,
             )
         except Exception as e:  # noqa: BLE001
             print(
@@ -334,6 +691,7 @@ def _ephemeris_one(
         rho_au,
         lt_d,
         min(timings_ms),
+        result,
     )
 
 
@@ -618,27 +976,12 @@ def main() -> int:
         ) and (ic_pos is None or ic_vel is None):
             n_skipped += 1
             continue
-        # Uncertainty axis: skip Jet1 rows for now. The PyO3 _propagate
-        # entry doesn't accept a covariance arg yet; cross-channel Jet1
-        # parity is a follow-up. Rust + core handle both modes today.
-        #
-        # Also skip every detection-off timing arm and the first-order
-        # (covariance) arms. This entry propagates only plain f64 with
-        # detection ON: it cannot attach a covariance and cannot disable
-        # per-step event detection, so replaying any other arm here would
-        # measure the wrong thing under that arm's label. Those arms are
-        # core-only; skip them explicitly, never silently and never by
-        # running them with detection on. (OD rows carry a null
-        # propagation_uncertainty and are not caught here.)
-        if r.get("propagation_uncertainty") in (
-            "first_order_detection_on",
-            "first_order_detection_off",
-            "f64_detection_off",
-            "f64_detection_off_assist_default_like",
-            "first_order_detection_off_assist_default_like",
-            "f64_detection_off_assist_asteroid_institute_like",
-            "first_order_detection_off_assist_asteroid_institute_like",
-        ):
+        # Per-method OD transport rows are `not produced` at this pin: this
+        # runner's post-fit transport is the orbit-versus-reference compare,
+        # which emits no product-bearing result row (the core channel produces
+        # them), exactly as the rust channel. Their absence from this channel's
+        # output reads as `not produced` in the report — never a blank row.
+        if r["test_type"] == "orbit_determination_transport":
             n_skipped += 1
             continue
 
@@ -649,7 +992,11 @@ def main() -> int:
         # carried; overwrite the inherited source_version with our own. The
         # non_grav_recovery row is a dict(new) copy, so it inherits this stamp.
         new["source_version"] = source_version
-        # Reset all empyrean-output fields; we'll repopulate from the Python channel.
+        # Reset every empyrean-output field; we repopulate from the Python
+        # channel below. A python row is a copy of its input (plan / rust) row,
+        # so without this the input channel's values — including the 12
+        # per-method product fields and the moment views that travel with them
+        # — would ride out under this channel's name (a leak).
         for k in (
             "emp_vs_horizons_km",
             "emp_pos_au",
@@ -660,6 +1007,8 @@ def main() -> int:
             "d_rho_km",
             "d_light_time_s",
         ):
+            new[k] = None
+        for k in _PER_METHOD_FIELDS:
             new[k] = None
 
         if r["test_type"] == "propagation":
@@ -680,18 +1029,23 @@ def main() -> int:
                 ic_g_k=r.get("ic_g_k") or 0.0,
                 ic_non_grav_dt=r.get("ic_non_grav_dt"),
                 force_model=r["force_model"],
+                method_tag=r.get("propagation_uncertainty"),
                 n_timing_runs=args.n_timing_runs,
             )
             if ret is None:
                 n_skipped += 1
                 continue
-            pos, ms = ret
+            pos, ms, prop_result = ret
             new["emp_pos_au"] = pos
             new["emp_time_ms"] = ms
             ref = r.get("ref_pos_au")
             if ref:
                 d = math.sqrt(sum((pos[i] - ref[i]) ** 2 for i in range(3)))
                 new["emp_vs_horizons_km"] = d * _AU_KM
+            # 0.11 per-method products off the delivered packed joint, the
+            # per-orbit outcome table, and the retained mixture components.
+            attach_cov = _METHOD_BY_TAG[r["propagation_uncertainty"]][0]
+            _fill_propagation_products(new, prop_result, attach_cov)
 
         elif r["test_type"] == "orbit_determination":
             # "/"-bearing object names (comets / interstellars) store the
@@ -748,6 +1102,13 @@ def main() -> int:
                 raw.get("summary_reduced_chi2", float("nan"))
             )
             new.update(_solve_metadata(raw))
+            # OD fits run method-free at this pin — ODConfig carries no
+            # uncertainty_method on the wrapper (ae00643) — so every OD fit row
+            # records the missing method axis by name rather than a blank or a
+            # silent first-order default; the 12 per-method fields stay None
+            # (reset above). The non_grav_recovery row is a dict(new) copy, so
+            # it inherits this note.
+            new["notes"] = _with_od_method_note(new.get("notes") or "")
 
             # ── Second OD: state + non-grav recovery ──────────────────────
             # For objects whose JPL SBDB reference carries a non-grav signal
@@ -890,6 +1251,7 @@ def main() -> int:
                 obs_code=obs_code,
                 force_model=r["force_model"],
                 n_timing_runs=args.n_timing_runs,
+                method_tag=r.get("propagation_uncertainty"),
             )
             if isinstance(ret, BaseException):
                 # Failed ephemeris (e.g. "no dense trajectory: initial state
@@ -902,7 +1264,7 @@ def main() -> int:
             if ret is None:
                 n_skipped += 1
                 continue
-            ra_rad, dec_rad, rho_au, lt_d, ms = ret
+            ra_rad, dec_rad, rho_au, lt_d, ms, eph_result = ret
             new["emp_time_ms"] = ms
             ref_ra = r.get("ref_ra_rad")
             ref_dec = r.get("ref_dec_rad")
@@ -926,6 +1288,11 @@ def main() -> int:
                 new["d_rho_km"] = (rho_au - ref_rho) * _AU_KM
             if ref_lt is not None and not math.isnan(lt_d):
                 new["d_light_time_s"] = (lt_d - ref_lt) * 86400.0
+            # Per-orbit outcome + the delivered sky covariance (projected to
+            # RA·cosδ / Dec). resolved_method / cov_kind stay None — the
+            # ephemeris seam delivers a bare 6×6 with no resolved-kind tag and
+            # no packed joint (the named gap, exactly as the rust channel).
+            _fill_ephemeris_products(new, eph_result, dec_rad)
 
         out_rows.append(new)
 
