@@ -11,16 +11,16 @@
 //! [`build_uncertainty_axes`]. Under the *same* method, these rows are
 //! reproducible across channels as follows:
 //!
-//! - `f64_no_cov`, `first_order_with_cov`, `second_order_with_cov` and
-//!   `sigma_point_with_cov` are **deterministic**: identical inputs give
+//! - `none`, `first_order`, `second_order` and
+//!   `sigma_point` are **deterministic**: identical inputs give
 //!   identical outputs, so a same-method cross-channel diff is expected to
 //!   be zero within the suite's `1e-10` fidelity band (SPICE-backed
 //!   magnitudes stay band-compared, never bit-pinned).
-//! - `monte_carlo_100_with_cov` is **seeded** with the single suite-wide
+//! - `monte_carlo` is **seeded** with the single suite-wide
 //!   `MONTE_CARLO_SEED`. The engine owns the RNG and the sample order, so a
 //!   fixed seed makes the sample moment bit-reproducible across runs and
 //!   channels too — a bit check as well as a moment check.
-//! - `gaussian_mixture_with_cov` (close-approach objects only) is
+//! - `gaussian_mixture` (close-approach objects only) is
 //!   **deterministic**: the engine splits the object's own covariance with
 //!   no RNG, and this runner compares the moment-collapsed covariance it
 //!   returns.
@@ -36,7 +36,7 @@
 //! The ephemeris sky covariance has two sources: the harness projection of
 //! the input covariance through the ephemeris Jacobian (the first-order sky
 //! covariance) and the engine's delivered per-method covariance. On
-//! `first_order_with_cov` / `f64_no_cov` rows the **published** value stays
+//! `first_order` / `none` rows the **published** value stays
 //! the harness projection — the pinned first-order golden — and the delivered
 //! covariance is recorded only as a diagnostic (its RA/Dec σ difference, in
 //! `notes`), because switching the published value on these rows is a golden
@@ -238,7 +238,7 @@ fn tier_from_str(s: &str) -> ForceModelTier {
 /// if a *different* kind was delivered under an explicit request this
 /// reports the **delivered** kind, never the request, so the cross-channel
 /// compare catches the silent substitution. `None` only when the row
-/// carried no covariance (`f64_no_cov`).
+/// carried no covariance (`none`).
 ///
 /// `_requested_tag` is the method the row asked for. It is kept in the
 /// signature so the call site and the tests pair a request with its
@@ -248,11 +248,11 @@ fn tier_from_str(s: &str) -> ForceModelTier {
 fn resolved_method_for(_requested_tag: &str, delivered: Option<CovarianceKind>) -> Option<String> {
     use empyrean_validation::schema::uncertainty_modes as um;
     let tag = match delivered? {
-        CovarianceKind::Linear => um::FIRST_ORDER_WITH_COV,
-        CovarianceKind::SecondOrder => um::SECOND_ORDER_WITH_COV,
-        CovarianceKind::Mixture => um::GAUSSIAN_MIXTURE_WITH_COV,
-        CovarianceKind::MonteCarlo => um::MONTE_CARLO_100_WITH_COV,
-        CovarianceKind::SigmaPoint => um::SIGMA_POINT_WITH_COV,
+        CovarianceKind::Linear => um::FIRST_ORDER,
+        CovarianceKind::SecondOrder => um::SECOND_ORDER,
+        CovarianceKind::Mixture => um::GAUSSIAN_MIXTURE,
+        CovarianceKind::MonteCarlo => um::MONTE_CARLO,
+        CovarianceKind::SigmaPoint => um::SIGMA_POINT,
     };
     Some(tag.to_string())
 }
@@ -515,8 +515,7 @@ fn published_sky_covariance(
     delivered: Option<[[f64; 2]; 2]>,
 ) -> (Option<[[f64; 2]; 2]>, Option<String>) {
     use empyrean_validation::schema::uncertainty_modes as um;
-    let first_order_pinned =
-        uncertainty_tag == um::FIRST_ORDER_WITH_COV || uncertainty_tag == um::F64_NO_COV;
+    let first_order_pinned = uncertainty_tag == um::FIRST_ORDER || uncertainty_tag == um::NONE;
     if first_order_pinned {
         (projected, sky_covariance_diagnostic(projected, delivered))
     } else {
@@ -543,7 +542,7 @@ struct UncertaintyAxis {
 /// head-to-head against external propagators that carry no uncertainty).
 ///
 /// A close-approach object (`is_close_approach`) additionally carries the
-/// `gaussian_mixture_with_cov` arm: the engine splits the object's own
+/// `gaussian_mixture` arm: the engine splits the object's own
 /// covariance into a mixture and returns the moment-collapsed covariance (the
 /// mixture side table — component count, survivors, tallies — is a 0.11
 /// product, so those schema fields stay `None` here). Non-close-approach
@@ -551,7 +550,7 @@ struct UncertaintyAxis {
 /// `CLOSE_APPROACH_OBJECTS` in `empyrean_validation::catalog` is the source
 /// of truth for which objects those are.
 ///
-/// `monte_carlo_100_with_cov` is pinned to the suite-wide sample count and
+/// `monte_carlo` is pinned to the suite-wide sample count and
 /// seed (`MONTE_CARLO_SAMPLE_COUNT` / `MONTE_CARLO_SEED` in
 /// `empyrean_validation::schema::uncertainty_modes`),
 /// **not** [`UncertaintyMethod::monte_carlo`] (whose fixed seed is a
@@ -565,7 +564,7 @@ fn build_uncertainty_axes(
     use empyrean_validation::schema::uncertainty_modes as um;
     if !attach_covariance {
         return vec![UncertaintyAxis {
-            tag: um::F64_NO_COV,
+            tag: um::NONE,
             attach: false,
             method: UncertaintyMethod::FirstOrder,
             timing_runs: 0,
@@ -573,19 +572,19 @@ fn build_uncertainty_axes(
     }
     let mut axes = vec![
         UncertaintyAxis {
-            tag: um::FIRST_ORDER_WITH_COV,
+            tag: um::FIRST_ORDER,
             attach: true,
             method: UncertaintyMethod::FirstOrder,
             timing_runs: 0,
         },
         UncertaintyAxis {
-            tag: um::F64_NO_COV,
+            tag: um::NONE,
             attach: false,
             method: UncertaintyMethod::FirstOrder,
             timing_runs: 0,
         },
         UncertaintyAxis {
-            tag: um::SECOND_ORDER_WITH_COV,
+            tag: um::SECOND_ORDER,
             attach: true,
             method: UncertaintyMethod::SecondOrder,
             timing_runs: 0,
@@ -601,13 +600,13 @@ fn build_uncertainty_axes(
         // Monte Carlo at the suite-wide N and seed. Sampling methods cost
         // ~100-120 propagations per call — timing_runs = 1.
         UncertaintyAxis {
-            tag: um::SIGMA_POINT_WITH_COV,
+            tag: um::SIGMA_POINT,
             attach: true,
             method: UncertaintyMethod::sigma_point(),
             timing_runs: 1,
         },
         UncertaintyAxis {
-            tag: um::MONTE_CARLO_100_WITH_COV,
+            tag: um::MONTE_CARLO,
             attach: true,
             method: UncertaintyMethod::MonteCarlo {
                 n_samples: um::MONTE_CARLO_SAMPLE_COUNT as usize,
@@ -622,7 +621,7 @@ fn build_uncertainty_axes(
         // the moment-collapsed covariance. Component-splitting costs several
         // propagations per call — timing_runs = 1.
         axes.push(UncertaintyAxis {
-            tag: um::GAUSSIAN_MIXTURE_WITH_COV,
+            tag: um::GAUSSIAN_MIXTURE,
             attach: true,
             method: UncertaintyMethod::gaussian_mixture(),
             timing_runs: 1,
@@ -1108,7 +1107,7 @@ pub fn run_propagation_validation(
                             // chose; the honoured request on an explicit row;
                             // the delivered kind, never the request, on a silent
                             // substitution the compare catches); `None` on an
-                            // `f64_no_cov` row. `cov_kind` / `cov_joint_width` /
+                            // `none` row. `cov_kind` / `cov_joint_width` /
                             // `cov_tri` are the delivered packed joint; the
                             // outcome channel is `outcomes[0]`. The mixture
                             // side-table tallies are populated below when the
@@ -3357,8 +3356,7 @@ mod tests {
 
         // First-order: the projection is published; the delivered covariance
         // is a diagnostic only (its σ difference against the projection).
-        let (published, diag) =
-            published_sky_covariance(um::FIRST_ORDER_WITH_COV, Some(proj), Some(deliv));
+        let (published, diag) = published_sky_covariance(um::FIRST_ORDER, Some(proj), Some(deliv));
         assert_eq!(published, Some(proj));
         assert!(
             diag.is_some(),
@@ -3367,19 +3365,18 @@ mod tests {
 
         // A non-first-order method publishes the delivered covariance, no
         // diagnostic.
-        let (published, diag) =
-            published_sky_covariance(um::SECOND_ORDER_WITH_COV, Some(proj), Some(deliv));
+        let (published, diag) = published_sky_covariance(um::SECOND_ORDER, Some(proj), Some(deliv));
         assert_eq!(published, Some(deliv));
         assert!(diag.is_none());
 
         // A non-first-order method with no delivered covariance falls back to
         // the projection.
-        let (published, _) = published_sky_covariance(um::SIGMA_POINT_WITH_COV, Some(proj), None);
+        let (published, _) = published_sky_covariance(um::SIGMA_POINT, Some(proj), None);
         assert_eq!(published, Some(proj));
 
         // f64 row carries no delivered covariance: the projection (itself
         // None without an attached covariance) is published, no diagnostic.
-        let (published, diag) = published_sky_covariance(um::F64_NO_COV, None, None);
+        let (published, diag) = published_sky_covariance(um::NONE, None, None);
         assert_eq!(published, None);
         assert!(diag.is_none());
     }
@@ -3396,42 +3393,42 @@ mod tests {
         // Auto resolves to the delivered rung.
         assert_eq!(
             resolved_method_for(um::AUTO, Some(CovarianceKind::SecondOrder)),
-            Some(um::SECOND_ORDER_WITH_COV.to_string())
+            Some(um::SECOND_ORDER.to_string())
         );
         assert_eq!(
             resolved_method_for(um::AUTO, Some(CovarianceKind::Linear)),
-            Some(um::FIRST_ORDER_WITH_COV.to_string())
+            Some(um::FIRST_ORDER.to_string())
         );
         assert_eq!(
             resolved_method_for(um::AUTO, Some(CovarianceKind::Mixture)),
-            Some(um::GAUSSIAN_MIXTURE_WITH_COV.to_string())
+            Some(um::GAUSSIAN_MIXTURE.to_string())
         );
         assert_eq!(resolved_method_for(um::AUTO, None), None);
         // An honoured explicit request reports its own tag (the delivered
         // kind equals the request) — the purity check the compare pairs with
         // `propagation_uncertainty`.
         assert_eq!(
-            resolved_method_for(um::FIRST_ORDER_WITH_COV, Some(CovarianceKind::Linear)),
-            Some(um::FIRST_ORDER_WITH_COV.to_string())
+            resolved_method_for(um::FIRST_ORDER, Some(CovarianceKind::Linear)),
+            Some(um::FIRST_ORDER.to_string())
         );
         assert_eq!(
-            resolved_method_for(um::SECOND_ORDER_WITH_COV, Some(CovarianceKind::SecondOrder)),
-            Some(um::SECOND_ORDER_WITH_COV.to_string())
+            resolved_method_for(um::SECOND_ORDER, Some(CovarianceKind::SecondOrder)),
+            Some(um::SECOND_ORDER.to_string())
         );
         // A silent substitution — explicit SecondOrder requested but Linear
         // delivered — reports the Linear tag, never the request, so the
         // cross-channel compare flags the mismatch.
         assert_eq!(
-            resolved_method_for(um::SECOND_ORDER_WITH_COV, Some(CovarianceKind::Linear)),
-            Some(um::FIRST_ORDER_WITH_COV.to_string())
+            resolved_method_for(um::SECOND_ORDER, Some(CovarianceKind::Linear)),
+            Some(um::FIRST_ORDER.to_string())
         );
         // No covariance delivered → nothing resolved.
-        assert_eq!(resolved_method_for(um::FIRST_ORDER_WITH_COV, None), None);
+        assert_eq!(resolved_method_for(um::FIRST_ORDER, None), None);
     }
 
     /// With covariance attached a non-close-approach object is swept under
     /// the six production uncertainty methods; a close-approach object adds a
-    /// seventh, `gaussian_mixture_with_cov` (the mixture plan rows the runner
+    /// seventh, `gaussian_mixture` (the mixture plan rows the runner
     /// would otherwise never produce). With covariance dropped only the
     /// covariance-free f64 method runs, close-approach or not. The ephemeris
     /// seam iterates the same axis, so a method present here is a method the
@@ -3439,7 +3436,7 @@ mod tests {
     /// non-first-order ephemeris skip used to suppress for all but the first
     /// two).
     #[test]
-    fn every_method_is_swept_with_covariance_and_only_f64_without() {
+    fn every_method_is_swept_under_covariance_and_only_f64_without() {
         use empyrean_validation::schema::uncertainty_modes as um;
         // Non-close-approach object: the six production surfaces, no mixture.
         let tags: Vec<&str> = build_uncertainty_axes(true, false)
@@ -3449,12 +3446,12 @@ mod tests {
         assert_eq!(
             tags,
             vec![
-                um::FIRST_ORDER_WITH_COV,
-                um::F64_NO_COV,
-                um::SECOND_ORDER_WITH_COV,
+                um::FIRST_ORDER,
+                um::NONE,
+                um::SECOND_ORDER,
                 um::AUTO,
-                um::SIGMA_POINT_WITH_COV,
-                um::MONTE_CARLO_100_WITH_COV,
+                um::SIGMA_POINT,
+                um::MONTE_CARLO,
             ]
         );
         // Close-approach object: the same six plus the Gaussian-mixture arm.
@@ -3465,13 +3462,13 @@ mod tests {
         assert_eq!(
             ca_tags,
             vec![
-                um::FIRST_ORDER_WITH_COV,
-                um::F64_NO_COV,
-                um::SECOND_ORDER_WITH_COV,
+                um::FIRST_ORDER,
+                um::NONE,
+                um::SECOND_ORDER,
                 um::AUTO,
-                um::SIGMA_POINT_WITH_COV,
-                um::MONTE_CARLO_100_WITH_COV,
-                um::GAUSSIAN_MIXTURE_WITH_COV,
+                um::SIGMA_POINT,
+                um::MONTE_CARLO,
+                um::GAUSSIAN_MIXTURE,
             ]
         );
         assert_eq!(build_uncertainty_axes(true, true).len(), 7);
@@ -3483,7 +3480,7 @@ mod tests {
                 .iter()
                 .map(|a| a.tag)
                 .collect();
-            assert_eq!(bench, vec![um::F64_NO_COV]);
+            assert_eq!(bench, vec![um::NONE]);
         }
     }
 
@@ -3497,7 +3494,7 @@ mod tests {
         let axes = build_uncertainty_axes(true, false);
         let mc = axes
             .iter()
-            .find(|a| a.tag == um::MONTE_CARLO_100_WITH_COV)
+            .find(|a| a.tag == um::MONTE_CARLO)
             .expect("monte carlo axis present");
         match mc.method {
             UncertaintyMethod::MonteCarlo { n_samples, seed } => {
@@ -3751,7 +3748,7 @@ mod tests {
     /// the transport (ruling 9), not a silent first-order substitution.
     /// Mutation: drop the method threading (hardcode `FirstOrder` in the leg's
     /// `PropagationConfig`) and the SecondOrder row delivers Linear → resolves
-    /// `first_order_with_cov` → red.
+    /// `first_order` → red.
     #[test]
     fn od_transport_emits_one_row_per_method_resolved_to_the_delivered_kind() {
         use empyrean_validation::schema::test_types as tt;
@@ -3776,11 +3773,11 @@ mod tests {
         }
         let second = rows
             .iter()
-            .find(|r| r.propagation_uncertainty.as_deref() == Some(um::SECOND_ORDER_WITH_COV))
-            .expect("a second_order_with_cov transport row");
+            .find(|r| r.propagation_uncertainty.as_deref() == Some(um::SECOND_ORDER))
+            .expect("a second_order transport row");
         assert_eq!(
             second.resolved_method.as_deref(),
-            Some(um::SECOND_ORDER_WITH_COV),
+            Some(um::SECOND_ORDER),
             "SecondOrder transport must deliver the SecondOrder kind, not Linear"
         );
         assert_eq!(
@@ -3842,8 +3839,8 @@ mod tests {
         // A deterministic (sensitivity-chain) row reads a clean "delivered".
         let first = rows
             .iter()
-            .find(|r| r.propagation_uncertainty.as_deref() == Some(um::FIRST_ORDER_WITH_COV))
-            .expect("a first_order_with_cov transport row");
+            .find(|r| r.propagation_uncertainty.as_deref() == Some(um::FIRST_ORDER))
+            .expect("a first_order transport row");
         assert_eq!(first.orbit_status.as_deref(), Some("delivered"));
     }
 
@@ -3859,12 +3856,9 @@ mod tests {
         };
         let first = rows
             .iter()
-            .find(|r| r.propagation_uncertainty.as_deref() == Some(um::FIRST_ORDER_WITH_COV))
-            .expect("a first_order_with_cov transport row");
-        assert_eq!(
-            first.resolved_method.as_deref(),
-            Some(um::FIRST_ORDER_WITH_COV)
-        );
+            .find(|r| r.propagation_uncertainty.as_deref() == Some(um::FIRST_ORDER))
+            .expect("a first_order transport row");
+        assert_eq!(first.resolved_method.as_deref(), Some(um::FIRST_ORDER));
         assert_eq!(first.cov_kind, Some(cov_kind_wire(CovarianceKind::Linear)));
         let w = first.cov_joint_width.expect("a delivered joint width") as usize;
         assert!(w >= 6, "the state block is present at minimum");
@@ -3898,14 +3892,8 @@ mod tests {
         // covariance is delivered off the state regardless of the offset.
         let target = Epoch::from_mjd_tdb(59_030.0);
         for (tag, want_wire) in [
-            (
-                um::SIGMA_POINT_WITH_COV,
-                cov_kind_wire(CovarianceKind::SigmaPoint),
-            ),
-            (
-                um::MONTE_CARLO_100_WITH_COV,
-                cov_kind_wire(CovarianceKind::MonteCarlo),
-            ),
+            (um::SIGMA_POINT, cov_kind_wire(CovarianceKind::SigmaPoint)),
+            (um::MONTE_CARLO, cov_kind_wire(CovarianceKind::MonteCarlo)),
         ] {
             let Some((result, attach)) = propagate_under_axis(tag, target) else {
                 return;
@@ -3948,11 +3936,11 @@ mod tests {
         };
         let sp = rows
             .iter()
-            .find(|r| r.propagation_uncertainty.as_deref() == Some(um::SIGMA_POINT_WITH_COV))
-            .expect("a sigma_point_with_cov transport row");
+            .find(|r| r.propagation_uncertainty.as_deref() == Some(um::SIGMA_POINT))
+            .expect("a sigma_point transport row");
         assert_eq!(
             sp.resolved_method.as_deref(),
-            Some(um::SIGMA_POINT_WITH_COV),
+            Some(um::SIGMA_POINT),
             "the SigmaPoint transport delivers the SigmaPoint kind"
         );
         assert_eq!(sp.cov_kind, Some(cov_kind_wire(CovarianceKind::SigmaPoint)));
@@ -3983,7 +3971,7 @@ mod tests {
     fn first_order_joint_matches_the_chain_accessor_to_the_bit() {
         use empyrean_validation::schema::uncertainty_modes as um;
         let target = Epoch::from_mjd_tdb(59_030.0);
-        let Some((result, attach)) = propagate_under_axis(um::FIRST_ORDER_WITH_COV, target) else {
+        let Some((result, attach)) = propagate_under_axis(um::FIRST_ORDER, target) else {
             return;
         };
         let chain = result

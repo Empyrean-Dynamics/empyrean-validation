@@ -273,7 +273,7 @@ fn rollup_channels(results: &[ValidationResult]) -> Vec<ChannelRollup> {
         return Vec::new();
     };
     // Key includes `propagation_uncertainty` so that a row produced under
-    // the Jet1 STM path (`first_order_detection_on`) is matched against the
+    // the Jet1 STM path (`first_order`) is matched against the
     // same-mode core baseline rather than the f64 baseline (and vice
     // versa). Without this, the two modes silently overwrite in the
     // hash map and ~50% of the comparable rows hit a Jet1-vs-f64 diff
@@ -7056,7 +7056,7 @@ const ephBase = (() => {{
                  'oorb_separation_arcsec', 'oorb_d_ra_arcsec', 'oorb_d_dec_arcsec',
                  'findorb_separation_arcsec', 'findorb_d_ra_arcsec', 'findorb_d_dec_arcsec'];
     // Key on the uncertainty mode too, so we average over observing SITES
-    // only — not across the first_order_detection_on / f64_detection_on rows that eph
+    // only — not across the first_order / none rows that eph
     // is doubled over (they carry the same RA/Dec but must stay distinct rows).
     const groups = new Map();
     for (const r of rows) {{

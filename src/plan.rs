@@ -29,6 +29,17 @@
 //!
 //! Replay channels overwrite `channel`, `timestamp`, and the `emp_*`
 //! fields with their own results when consuming the plan.
+//!
+//! # Method-tag vocabulary
+//!
+//! The uncertainty-method tags are the suffix-free vocabulary in
+//! [`crate::schema::uncertainty_modes`] (`none`, `first_order`,
+//! `second_order`, `auto`, `sigma_point`, `monte_carlo`, `gaussian_mixture`).
+//! A result file written before this vocabulary landed carries the previous,
+//! longer tag spellings (the covariance-suffixed names and the sample-counted
+//! Monte-Carlo tag); the report keys the method matrix on the tag, so those
+//! rows read as an unknown method — "not produced" at every method cell —
+//! until the run is regenerated. Re-run the plan and channels to refresh them.
 
 use std::collections::HashMap;
 
@@ -47,7 +58,7 @@ pub struct PlanConfig {
     /// engine method axis (`f64`, first- and second-order, `auto`,
     /// sigma-point, Monte-Carlo, plus Gaussian-mixture on the close-approach
     /// objects) — so the replay channels exercise every method. When `false`,
-    /// only `f64_no_cov` rows are emitted (benchmark mode for head-to-head
+    /// only `none` rows are emitted (benchmark mode for head-to-head
     /// comparison with external propagators that don't propagate covariance).
     /// The exact per-object method set is [`plan_methods_for_object`].
     pub uncertainty_axis: bool,
@@ -314,7 +325,7 @@ pub fn build_plan(
 /// because the engine splits a covariance into a mixture only at a close
 /// approach — an
 /// unsplit object delivers a single second-order Gaussian, which the
-/// `second_order_with_cov` row already covers. In benchmark mode
+/// `second_order` row already covers. In benchmark mode
 /// (`uncertainty_axis == false`) only the covariance-free `f64` method is
 /// emitted, matching the head-to-head external-propagator comparison.
 ///
@@ -325,18 +336,18 @@ pub fn plan_methods_for_object(
     uncertainty_axis: bool,
 ) -> Vec<&'static str> {
     if !uncertainty_axis {
-        return vec![uncertainty_modes::F64_NO_COV];
+        return vec![uncertainty_modes::NONE];
     }
     let mut methods = vec![
-        uncertainty_modes::F64_NO_COV,
-        uncertainty_modes::FIRST_ORDER_WITH_COV,
-        uncertainty_modes::SECOND_ORDER_WITH_COV,
+        uncertainty_modes::NONE,
+        uncertainty_modes::FIRST_ORDER,
+        uncertainty_modes::SECOND_ORDER,
         uncertainty_modes::AUTO,
-        uncertainty_modes::SIGMA_POINT_WITH_COV,
-        uncertainty_modes::MONTE_CARLO_100_WITH_COV,
+        uncertainty_modes::SIGMA_POINT,
+        uncertainty_modes::MONTE_CARLO,
     ];
     if is_close_approach(obj.name) {
-        methods.push(uncertainty_modes::GAUSSIAN_MIXTURE_WITH_COV);
+        methods.push(uncertainty_modes::GAUSSIAN_MIXTURE);
     }
     methods
 }
@@ -362,7 +373,7 @@ pub fn plan_methods_for_object(
 /// dropped row). The leading **legacy untagged** fit row (method `None`) is
 /// KEPT: tagging it would add a `propagation_uncertainty` key the pinned v0.7.0
 /// consumer never saw, changing its bytes. It rides alongside the tagged rows,
-/// so the `first_order_with_cov` fit row reproduces its work; the follow-up
+/// so the `first_order` fit row reproduces its work; the follow-up
 /// runner commit retires this untagged row once the runner reads the method tag
 /// off the fit rows.
 ///
@@ -692,18 +703,18 @@ pub const PLAN_CLEARED_KEYS: [&str; 23] = [
 /// cannot silently become an unreplayable row every channel is asked — and
 /// fails — to match. The whitelist governs which method *tags* may appear;
 /// [`build_plan`] (via [`plan_methods_for_object`]) governs which objects emit
-/// which of them — `gaussian_mixture_with_cov` reaches the plan only for the
+/// which of them — `gaussian_mixture` reaches the plan only for the
 /// close-approach objects ([`crate::catalog::CLOSE_APPROACH_OBJECTS`]).
 ///
 /// `None` (OD rows carry no uncertainty tag) is always in the plan.
 pub const PLAN_UNCERTAINTY_AXES: [&str; 7] = [
-    uncertainty_modes::F64_NO_COV,
-    uncertainty_modes::FIRST_ORDER_WITH_COV,
-    uncertainty_modes::SECOND_ORDER_WITH_COV,
+    uncertainty_modes::NONE,
+    uncertainty_modes::FIRST_ORDER,
+    uncertainty_modes::SECOND_ORDER,
     uncertainty_modes::AUTO,
-    uncertainty_modes::SIGMA_POINT_WITH_COV,
-    uncertainty_modes::MONTE_CARLO_100_WITH_COV,
-    uncertainty_modes::GAUSSIAN_MIXTURE_WITH_COV,
+    uncertainty_modes::SIGMA_POINT,
+    uncertainty_modes::MONTE_CARLO,
+    uncertainty_modes::GAUSSIAN_MIXTURE,
 ];
 
 /// Test types no replay channel can reproduce, and so must never reach the
@@ -913,7 +924,7 @@ mod tests {
             [1.0, 0.0, 0.0],
             [0.0, 0.017, 0.0],
             Some(([-0.004, 0.0, 0.0], [0.0, 1e-6, 0.0])),
-            Some(uncertainty_modes::F64_DETECTION_ON),
+            Some(uncertainty_modes::NONE),
             "2026-04-29T00:00:00Z",
         );
         assert_eq!(r.ref_sun_pos_au, Some([-0.004, 0.0, 0.0]));
@@ -924,10 +935,7 @@ mod tests {
         assert_eq!(r.channel, "plan");
         assert_eq!(r.t_mjd_tdb, 61030.0);
         assert!(r.emp_pos_au.is_none());
-        assert_eq!(
-            r.propagation_uncertainty.as_deref(),
-            Some("f64_detection_on"),
-        );
+        assert_eq!(r.propagation_uncertainty.as_deref(), Some("none"),);
     }
 
     #[test]
@@ -986,7 +994,7 @@ mod tests {
             [1.0, 0.0, 0.0],
             [0.0, 0.017, 0.0],
             None,
-            Some(uncertainty_modes::F64_DETECTION_ON),
+            Some(uncertainty_modes::NONE),
             "ts",
         );
         assert_eq!(r.excluded_perturbers_naif, vec![2_000_002]);
@@ -1032,7 +1040,7 @@ mod tests {
             [0.0, 0.017, 0.0],
             (0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, None),
             &hor,
-            Some(uncertainty_modes::F64_DETECTION_ON),
+            Some(uncertainty_modes::NONE),
             "ts",
         );
         assert_eq!(r.excluded_perturbers_naif, vec![2_000_002]);
@@ -1055,14 +1063,14 @@ mod tests {
 
         // Non-close-approach: the six non-mixture methods, no Gaussian mixture.
         assert_eq!(m_eros.len(), 6, "non-CA object should get six methods");
-        assert!(!m_eros.contains(&uncertainty_modes::GAUSSIAN_MIXTURE_WITH_COV));
+        assert!(!m_eros.contains(&uncertainty_modes::GAUSSIAN_MIXTURE));
         for m in [
-            uncertainty_modes::F64_NO_COV,
-            uncertainty_modes::FIRST_ORDER_WITH_COV,
-            uncertainty_modes::SECOND_ORDER_WITH_COV,
+            uncertainty_modes::NONE,
+            uncertainty_modes::FIRST_ORDER,
+            uncertainty_modes::SECOND_ORDER,
             uncertainty_modes::AUTO,
-            uncertainty_modes::SIGMA_POINT_WITH_COV,
-            uncertainty_modes::MONTE_CARLO_100_WITH_COV,
+            uncertainty_modes::SIGMA_POINT,
+            uncertainty_modes::MONTE_CARLO,
         ] {
             assert!(m_eros.contains(&m), "non-CA object missing {m}");
         }
@@ -1072,7 +1080,7 @@ mod tests {
             7,
             "CA object should add the mixture method"
         );
-        assert!(m_apophis.contains(&uncertainty_modes::GAUSSIAN_MIXTURE_WITH_COV));
+        assert!(m_apophis.contains(&uncertainty_modes::GAUSSIAN_MIXTURE));
 
         // Every emitted method is on the plan's whitelist (so it survives the
         // strip into the plan the replay channels consume).
@@ -1083,7 +1091,7 @@ mod tests {
         // Benchmark mode stays f64-only on every object.
         assert_eq!(
             plan_methods_for_object(apophis, false),
-            vec![uncertainty_modes::F64_NO_COV]
+            vec![uncertainty_modes::NONE]
         );
     }
 
@@ -1175,10 +1183,7 @@ mod tests {
             "mix_n_curvature_refused",
             "mix_n_sky_linearization_refused",
         ];
-        for method in [
-            uncertainty_modes::FIRST_ORDER_WITH_COV,
-            uncertainty_modes::F64_NO_COV,
-        ] {
+        for method in [uncertainty_modes::FIRST_ORDER, uncertainty_modes::NONE] {
             let r = propagation_plan_row(
                 obj,
                 61000.0,
@@ -1358,9 +1363,7 @@ mod tests {
 
     #[test]
     fn plan_from_rows_with_unknown_fields_deserializes_against_the_pinned_schema() {
-        let rows = vec![rust_row_with_unknown_fields(Some(
-            uncertainty_modes::F64_DETECTION_ON,
-        ))];
+        let rows = vec![rust_row_with_unknown_fields(Some(uncertainty_modes::NONE))];
         let (plan, drops) = strip_to_plan(&rows).expect("strip");
         assert_eq!(drops.total(), 0);
         assert_eq!(plan.len(), 1);
@@ -1440,7 +1443,7 @@ mod tests {
         // The whitelist's guard is intact: a method NOT on it — a future
         // rust-only axis — is still dropped under its own counter.
         let (plan, drops) =
-            strip_to_plan(&[rust_row_with_unknown_fields(Some("future_method_with_cov"))]).unwrap();
+            strip_to_plan(&[rust_row_with_unknown_fields(Some("future_method"))]).unwrap();
         assert!(plan.is_empty(), "an unknown axis leaked into the plan");
         assert_eq!(drops.uncertainty_axis, 1);
         assert_eq!(drops.rust_only_test_type, 0);
@@ -1480,13 +1483,13 @@ mod tests {
         // methods must survive the strip into the plan. Dropping one from
         // PLAN_UNCERTAINTY_AXES regresses exactly here.
         for method in [
-            uncertainty_modes::F64_NO_COV,
-            uncertainty_modes::FIRST_ORDER_WITH_COV,
-            uncertainty_modes::SECOND_ORDER_WITH_COV,
+            uncertainty_modes::NONE,
+            uncertainty_modes::FIRST_ORDER,
+            uncertainty_modes::SECOND_ORDER,
             uncertainty_modes::AUTO,
-            uncertainty_modes::SIGMA_POINT_WITH_COV,
-            uncertainty_modes::MONTE_CARLO_100_WITH_COV,
-            uncertainty_modes::GAUSSIAN_MIXTURE_WITH_COV,
+            uncertainty_modes::SIGMA_POINT,
+            uncertainty_modes::MONTE_CARLO,
+            uncertainty_modes::GAUSSIAN_MIXTURE,
         ] {
             let (plan, drops) =
                 strip_to_plan(&[rust_row_with_unknown_fields(Some(method))]).unwrap();
@@ -1534,8 +1537,8 @@ mod tests {
     #[test]
     fn strip_counts_each_drop_reason_separately() {
         let rows = vec![
-            rust_row_with_unknown_fields(Some("future_method_a_with_cov")),
-            rust_row_with_unknown_fields(Some("future_method_b_with_cov")),
+            rust_row_with_unknown_fields(Some("future_method_a")),
+            rust_row_with_unknown_fields(Some("future_method_b")),
             rust_row_with_test_type(test_types::ORBIT_DETERMINATION_RADAR),
             rust_row_with_test_type(test_types::ORBIT_DETERMINATION),
         ];

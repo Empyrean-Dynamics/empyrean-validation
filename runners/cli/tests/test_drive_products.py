@@ -2,7 +2,7 @@
 JSON rows.
 
 ``drive.py`` sends each plan row's ``propagation_uncertainty`` method as the
-optional 19th daemon ``prop`` token (all tags but ``f64_no_cov`` / the untagged
+optional 19th daemon ``prop`` token (all tags but ``none`` / the untagged
 legacy row) and parses the delivered 0.11 product tokens the binary appends
 after the 8 fixed fields into the schema's 12 per-method fields. These tests pin:
 
@@ -96,7 +96,7 @@ def _prop_row(tag: str | None, *, leak: bool = False) -> dict:
                 "cov_kind": 5,
                 "cov_joint_width": 99,
                 "cov_tri": [1.0, 2.0, 3.0],
-                "resolved_method": "sigma_point_with_cov",
+                "resolved_method": "sigma_point",
                 "orbit_delivered": False,
                 "orbit_status": "LEAK",
                 "emp_pos_cov_au2": [[9.0, 9.0, 9.0], [9.0, 9.0, 9.0], [9.0, 9.0, 9.0]],
@@ -109,7 +109,7 @@ def _prop_row(tag: str | None, *, leak: bool = False) -> dict:
 # runners/cli/src/main.rs). 8 fixed fields then the 12 product tokens.
 _SECOND_ORDER_LINE = (
     "ok -1.06e0 8.30e-3 -2.39e-2 1.65e-3 -1.42e-2 -5.25e-3 25.759042 "
-    "resolved_method=second_order_with_cov cov_kind=1 cov_joint_width=6 "
+    "resolved_method=second_order cov_kind=1 cov_joint_width=6 "
     "orbit_delivered=1 orbit_status=delivered mix_n_components_total=na "
     "mix_weight_delivered=na mix_n_failed=na mix_n_unresolved=na "
     "mix_n_curvature_refused=na mix_n_sky_linearization_refused=na "
@@ -117,7 +117,7 @@ _SECOND_ORDER_LINE = (
 )
 _MIXTURE_LINE = (
     "ok 1.0e0 2.0e0 3.0e0 4.0e0 5.0e0 6.0e0 9.9 "
-    "resolved_method=gaussian_mixture_with_cov cov_kind=3 cov_joint_width=6 "
+    "resolved_method=gaussian_mixture cov_kind=3 cov_joint_width=6 "
     "orbit_delivered=1 orbit_status=delivered mix_n_components_total=4 "
     "mix_weight_delivered=9.87e-1 mix_n_failed=0 mix_n_unresolved=1 "
     "mix_n_curvature_refused=2 mix_n_sky_linearization_refused=0 "
@@ -138,7 +138,7 @@ def test_parse_products_second_order_line() -> None:
     parts = _SECOND_ORDER_LINE.split()
     assert parts[0] == "ok" and len(parts) == 20
     prod = drive._parse_products(parts[8:])
-    assert prod["resolved_method"] == "second_order_with_cov"
+    assert prod["resolved_method"] == "second_order"
     assert prod["cov_kind"] == 1
     assert prod["cov_joint_width"] == 6
     assert len(prod["cov_tri"]) == 21
@@ -181,7 +181,7 @@ def test_legacy_prop_row_keeps_per_method_null_and_resets_leak() -> None:
     exactly as before, and an inherited foreign product is cleared (no leak).
     Mutation: default a per-method field to 0 instead of null, or set-to-null
     (adding a key) instead of delete → red here or in the byte diff."""
-    r = _prop_row("f64_no_cov", leak=True)
+    r = _prop_row("none", leak=True)
     assert drive._method_token(r) is None  # f64 sends no token
     parts = _LEGACY_LINE.split()
     assert len(parts) == 8
@@ -211,11 +211,11 @@ def test_second_order_prop_row_populates_products() -> None:
     """A SecondOrder row populates the 12 fields from the binary tokens; the
     collapsed moment view stays None (the cli binary emits no 6x6 — named gap).
     Mutation: ignore the parsed tokens → the fields stay null → red."""
-    r = _prop_row("second_order_with_cov")
-    assert drive._method_token(r) == "second_order_with_cov"
+    r = _prop_row("second_order")
+    assert drive._method_token(r) == "second_order"
     parts = _SECOND_ORDER_LINE.split()
-    row = drive._build_prop_row(r, parts, "second_order_with_cov", "TS", "VER")
-    assert row["resolved_method"] == "second_order_with_cov"
+    row = drive._build_prop_row(r, parts, "second_order", "TS", "VER")
+    assert row["resolved_method"] == "second_order"
     assert row["cov_kind"] == 1
     assert row["cov_joint_width"] == 6
     assert len(row["cov_tri"]) == 21
@@ -233,23 +233,23 @@ def test_method_token_sent_for_non_f64_absent_for_f64() -> None:
     and omits it for f64 / the untagged row. Mutation: a ``_method_token`` that
     always returned None → the SecondOrder line loses its tag → red (and the
     SecondOrder binary response would report linear end-to-end)."""
-    so_line = drive._prop_daemon_line(_prop_row("second_order_with_cov"))
-    assert so_line.endswith(" second_order_with_cov")
+    so_line = drive._prop_daemon_line(_prop_row("second_order"))
+    assert so_line.endswith(" second_order")
     assert len(so_line.split()) == 20  # "prop" + 18 fields + method token
 
     for tag in (
-        "first_order_with_cov",
+        "first_order",
         "auto",
-        "sigma_point_with_cov",
-        "monte_carlo_100_with_cov",
-        "gaussian_mixture_with_cov",
+        "sigma_point",
+        "monte_carlo",
+        "gaussian_mixture",
     ):
         line = drive._prop_daemon_line(_prop_row(tag))
         assert line.endswith(f" {tag}"), tag
         assert len(line.split()) == 20, tag
 
-    f64_line = drive._prop_daemon_line(_prop_row("f64_no_cov"))
-    assert not f64_line.endswith("_with_cov")
+    f64_line = drive._prop_daemon_line(_prop_row("none"))
+    assert not f64_line.endswith(" none")  # the state-only tag is never appended
     assert len(f64_line.split()) == 19  # "prop" + 18 fields, no method token
 
 
@@ -302,7 +302,7 @@ def test_end_to_end_second_order_through_binary() -> None:
     ``_prop_daemon_line`` and the binary returns the 8-field f64 line, so the
     len==20 / resolved_method assertions go red."""
     binary = _binary()
-    line = drive._prop_daemon_line(_prop_row("second_order_with_cov"))
+    line = drive._prop_daemon_line(_prop_row("second_order"))
     proc = subprocess.Popen(
         [str(binary), "--daemon", "--data-dir", str(_DATA_DIR)],
         stdin=subprocess.PIPE,
@@ -327,7 +327,7 @@ def test_end_to_end_second_order_through_binary() -> None:
     assert parts[0] == "ok", out_line
     assert len(parts) == 20, out_line
     prod = drive._parse_products(parts[8:])
-    assert prod["resolved_method"] == "second_order_with_cov"
+    assert prod["resolved_method"] == "second_order"
     assert prod["cov_kind"] == 1
     assert len(prod["cov_tri"]) == 21
     assert prod["orbit_delivered"] is True

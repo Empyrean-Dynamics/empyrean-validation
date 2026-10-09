@@ -348,10 +348,10 @@ def propagate_assist(
 
     - False (default): single-particle f64 propagation. `stm`
       returned as None. Comparable to empyrean's
-      `propagation_uncertainty = "f64_detection_on"` path.
+      `propagation_uncertainty = "none"` path.
     - True: 6 REBOUND first-order variational particles seeded with
       unit vectors in each state component. The integrated 6×6 STM is
-      returned. Comparable to empyrean's `"first_order_detection_on"`
+      returned. Comparable to empyrean's `"first_order"`
       path.
 
     ASSIST encodes first-order variational derivatives only ("the
@@ -360,7 +360,7 @@ def propagate_assist(
     variational machinery would integrate shadow particles that
     receive no second-order contributions from ASSIST's force model,
     and the resulting timing would not be comparable to a genuine
-    STT propagation. empyrean's `"second_order_detection_on"` rows have
+    STT propagation. empyrean's `"second_order"` rows have
     no ASSIST counterpart.
 
     REBOUND propagates the variational equations under the

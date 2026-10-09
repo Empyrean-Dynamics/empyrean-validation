@@ -22,13 +22,13 @@
 //! propagation config exactly as the rust channel's `build_uncertainty_axes`
 //! does: `--uncertainty-method <tag>` in one-shot mode, or an **optional**
 //! 19th token after the 18 `prop` fields in daemon mode. The tag is one of the
-//! schema's `uncertainty_modes` spellings (`f64_no_cov`,
-//! `first_order_with_cov`, `second_order_with_cov`, `auto`,
-//! `sigma_point_with_cov`, `monte_carlo_100_with_cov`,
-//! `gaussian_mixture_with_cov`); Monte Carlo carries the suite-wide
+//! schema's `uncertainty_modes` spellings (`none`,
+//! `first_order`, `second_order`, `auto`,
+//! `sigma_point`, `monte_carlo`,
+//! `gaussian_mixture`); Monte Carlo carries the suite-wide
 //! `MONTE_CARLO_SAMPLE_COUNT` / `MONTE_CARLO_SEED`, and an unrecognized tag is
 //! refused by name (`fail unknown_uncertainty_method:<tag>`), never
-//! substituted. Every tag but `f64_no_cov` attaches the same synthetic
+//! substituted. Every tag but `none` attaches the same synthetic
 //! covariance the rust channel uses, which is what makes the propagator
 //! dispatch to Jet1 / STM integration.
 //!
@@ -118,10 +118,10 @@ struct Cli {
     #[arg(long, value_parser = parse_quintuple, default_value = "0,0,0,0,0")]
     g: [f64; 5],
     /// Per-method uncertainty axis (prop mode): a `propagation_uncertainty`
-    /// plan tag — `f64_no_cov`, `first_order_with_cov`,
-    /// `second_order_with_cov`, `auto`, `sigma_point_with_cov`,
-    /// `monte_carlo_100_with_cov`, or `gaussian_mixture_with_cov`. When set,
-    /// the synthetic covariance is attached (all tags except `f64_no_cov`),
+    /// plan tag — `none`, `first_order`,
+    /// `second_order`, `auto`, `sigma_point`,
+    /// `monte_carlo`, or `gaussian_mixture`. When set,
+    /// the synthetic covariance is attached (all tags except `none`),
     /// the named rung is requested (MonteCarlo at the suite-wide N and seed),
     /// and the delivered 0.11 per-method products are appended to the prop
     /// output line. An unrecognized tag is refused by name — never silently
@@ -211,28 +211,28 @@ fn synthetic_covariance() -> [[f64; 6]; 6] {
 
 /// Map a plan `propagation_uncertainty` tag to `(attach_covariance, method)`.
 ///
-/// `f64_no_cov` is the covariance-free path — first order, no covariance
+/// `none` is the covariance-free path — first order, no covariance
 /// attached. Every other known tag attaches the synthetic covariance and runs
-/// its named rung. `monte_carlo_100_with_cov` carries the suite-wide sample
+/// its named rung. `monte_carlo` carries the suite-wide sample
 /// count and seed from the schema — never the engine's per-call convenience
 /// seed — so a seeded Monte-Carlo row is a cross-channel bit check. An
 /// unrecognized tag yields `None` so the caller refuses it by name rather than
 /// silently substituting a method (the no-silent-substitution invariant).
 fn method_for_tag(tag: &str) -> Option<(bool, UncertaintyMethod)> {
     let m = match tag {
-        um::F64_NO_COV => (false, UncertaintyMethod::FirstOrder),
-        um::FIRST_ORDER_WITH_COV => (true, UncertaintyMethod::FirstOrder),
-        um::SECOND_ORDER_WITH_COV => (true, UncertaintyMethod::SecondOrder),
+        um::NONE => (false, UncertaintyMethod::FirstOrder),
+        um::FIRST_ORDER => (true, UncertaintyMethod::FirstOrder),
+        um::SECOND_ORDER => (true, UncertaintyMethod::SecondOrder),
         um::AUTO => (true, UncertaintyMethod::auto()),
-        um::SIGMA_POINT_WITH_COV => (true, UncertaintyMethod::sigma_point()),
-        um::MONTE_CARLO_100_WITH_COV => (
+        um::SIGMA_POINT => (true, UncertaintyMethod::sigma_point()),
+        um::MONTE_CARLO => (
             true,
             UncertaintyMethod::MonteCarlo {
                 n_samples: um::MONTE_CARLO_SAMPLE_COUNT as usize,
                 seed: Some(um::MONTE_CARLO_SEED),
             },
         ),
-        um::GAUSSIAN_MIXTURE_WITH_COV => (true, UncertaintyMethod::gaussian_mixture()),
+        um::GAUSSIAN_MIXTURE => (true, UncertaintyMethod::gaussian_mixture()),
         _ => return None,
     };
     Some(m)
@@ -259,11 +259,11 @@ fn cov_kind_wire(kind: CovarianceKind) -> u8 {
 /// compare. Mirrors the rust channel's `resolved_method_for`.
 fn resolved_method_tag(kind: CovarianceKind) -> &'static str {
     match kind {
-        CovarianceKind::Linear => um::FIRST_ORDER_WITH_COV,
-        CovarianceKind::SecondOrder => um::SECOND_ORDER_WITH_COV,
-        CovarianceKind::Mixture => um::GAUSSIAN_MIXTURE_WITH_COV,
-        CovarianceKind::MonteCarlo => um::MONTE_CARLO_100_WITH_COV,
-        CovarianceKind::SigmaPoint => um::SIGMA_POINT_WITH_COV,
+        CovarianceKind::Linear => um::FIRST_ORDER,
+        CovarianceKind::SecondOrder => um::SECOND_ORDER,
+        CovarianceKind::Mixture => um::GAUSSIAN_MIXTURE,
+        CovarianceKind::MonteCarlo => um::MONTE_CARLO,
+        CovarianceKind::SigmaPoint => um::SIGMA_POINT,
     }
 }
 
@@ -346,7 +346,7 @@ fn mixture_tallies(components: &[MixtureComponent]) -> Option<MixTallies> {
 
 /// The 0.11 per-method products carried on a propagation row, extracted from
 /// the wrapper's delivered result (never recomputed). All fields are `None`
-/// when the engine delivered no covariance (`f64_no_cov`), except the outcome
+/// when the engine delivered no covariance (`none`), except the outcome
 /// channel which is always read off `outcomes[0]`.
 struct Products {
     resolved_method: Option<&'static str>,
@@ -552,7 +552,7 @@ fn parse_prop_args(
     // The driver's 18-field line leaves the method absent → covariance-free
     // first order, output byte-identical to before. A 19th token requests
     // that method and attaches the synthetic covariance (all tags but
-    // `f64_no_cov`); an unrecognized tag is refused by name.
+    // `none`); an unrecognized tag is refused by name.
     let mut tokens = rest.split_whitespace();
     let mut f: Vec<f64> = Vec::with_capacity(18);
     for _ in 0..18 {
@@ -1141,25 +1141,21 @@ mod tests {
     #[test]
     fn method_for_tag_selects_the_requested_rung() {
         assert!(matches!(
-            method_for_tag(um::SECOND_ORDER_WITH_COV),
+            method_for_tag(um::SECOND_ORDER),
             Some((true, UncertaintyMethod::SecondOrder))
         ));
         assert!(matches!(
-            method_for_tag(um::FIRST_ORDER_WITH_COV),
+            method_for_tag(um::FIRST_ORDER),
             Some((true, UncertaintyMethod::FirstOrder))
         ));
-        // f64_no_cov is the covariance-free path: first order, no covariance.
+        // none is the covariance-free path: first order, no covariance.
         assert!(matches!(
-            method_for_tag(um::F64_NO_COV),
+            method_for_tag(um::NONE),
             Some((false, UncertaintyMethod::FirstOrder))
         ));
         // auto / sigma-point / gaussian-mixture attach a covariance and are
         // requestable; their inner shape is the engine's own concern.
-        for tag in [
-            um::AUTO,
-            um::SIGMA_POINT_WITH_COV,
-            um::GAUSSIAN_MIXTURE_WITH_COV,
-        ] {
+        for tag in [um::AUTO, um::SIGMA_POINT, um::GAUSSIAN_MIXTURE] {
             let (attach, _) = method_for_tag(tag).expect("tag must be requestable");
             assert!(attach, "{tag} must attach a covariance");
         }
@@ -1172,7 +1168,7 @@ mod tests {
     #[test]
     fn monte_carlo_carries_the_suite_sample_count_and_seed() {
         assert!(matches!(
-            method_for_tag(um::MONTE_CARLO_100_WITH_COV),
+            method_for_tag(um::MONTE_CARLO),
             Some((true, UncertaintyMethod::MonteCarlo { n_samples: 100, seed: Some(s) }))
                 if s == um::MONTE_CARLO_SEED
         ));
@@ -1230,15 +1226,12 @@ mod tests {
     fn resolved_method_tag_names_the_delivered_kind() {
         assert_eq!(
             resolved_method_tag(CovarianceKind::SecondOrder),
-            um::SECOND_ORDER_WITH_COV
+            um::SECOND_ORDER
         );
-        assert_eq!(
-            resolved_method_tag(CovarianceKind::Linear),
-            um::FIRST_ORDER_WITH_COV
-        );
+        assert_eq!(resolved_method_tag(CovarianceKind::Linear), um::FIRST_ORDER);
         assert_eq!(
             resolved_method_tag(CovarianceKind::Mixture),
-            um::GAUSSIAN_MIXTURE_WITH_COV
+            um::GAUSSIAN_MIXTURE
         );
     }
 
@@ -1276,7 +1269,7 @@ mod tests {
     #[test]
     fn products_render_carries_the_method_and_fields() {
         let p = Products {
-            resolved_method: Some(um::SECOND_ORDER_WITH_COV),
+            resolved_method: Some(um::SECOND_ORDER),
             cov_kind: Some(1),
             cov_joint_width: Some(6),
             cov_tri: Some(vec![1.0, 0.0, 1.0]),
@@ -1285,7 +1278,7 @@ mod tests {
             mix: None,
         };
         let s = p.render();
-        assert!(s.contains("resolved_method=second_order_with_cov"), "{s}");
+        assert!(s.contains("resolved_method=second_order"), "{s}");
         assert!(s.contains("cov_kind=1"), "{s}");
         assert!(s.contains("cov_joint_width=6"), "{s}");
         assert!(s.contains("orbit_delivered=1"), "{s}");

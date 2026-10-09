@@ -290,15 +290,15 @@ pub mod uncertainty_modes {
     /// Input orbit carries a covariance, so the propagator dispatches to
     /// Jet1 / STM integration. The production hot path because empyrean
     /// is uncertainty-first by design.
-    pub const FIRST_ORDER_WITH_COV: &str = "first_order_with_cov";
+    pub const FIRST_ORDER: &str = "first_order";
     /// Covariance stripped; pure f64 state-only propagation. Used to
     /// measure Jet1 overhead and to compare against external propagators
     /// that don't carry uncertainty.
-    pub const F64_NO_COV: &str = "f64_no_cov";
+    pub const NONE: &str = "none";
     /// Second-order (Jet2 / state-transition-tensor) uncertainty: the
     /// propagated covariance carries the second-order curvature of the
     /// flow, compared as the about-nominal moment (central + δμδμᵀ).
-    pub const SECOND_ORDER_WITH_COV: &str = "second_order_with_cov";
+    pub const SECOND_ORDER: &str = "second_order";
     /// Adaptive method: the engine resolves the rung per epoch from its own
     /// thresholds. The only method permitted a ladder — every other method
     /// runs its rung end to end and refuses by name rather than substitute.
@@ -307,11 +307,12 @@ pub mod uncertainty_modes {
     pub const AUTO: &str = "auto";
     /// Sigma-point (deterministic unscented) uncertainty: the moment of a
     /// delivered set of sigma-point sample flights.
-    pub const SIGMA_POINT_WITH_COV: &str = "sigma_point_with_cov";
+    pub const SIGMA_POINT: &str = "sigma_point";
     /// Monte-Carlo uncertainty: the sample moment of
-    /// [`MONTE_CARLO_SAMPLE_COUNT`] seeded draws. The sample count is
-    /// encoded in the tag and the seed is [`MONTE_CARLO_SEED`].
-    pub const MONTE_CARLO_100_WITH_COV: &str = "monte_carlo_100_with_cov";
+    /// [`MONTE_CARLO_SAMPLE_COUNT`] seeded draws. The sample count and the
+    /// seed ([`MONTE_CARLO_SEED`]) are fixed suite-wide schema constants; the
+    /// tag itself carries no number.
+    pub const MONTE_CARLO: &str = "monte_carlo";
     /// Gaussian-mixture uncertainty: the engine κ-gates the object's own
     /// covariance and splits it into an adaptive mixture at a close
     /// approach. The plan emits this method only for the close-approach
@@ -319,11 +320,12 @@ pub mod uncertainty_modes {
     /// no close approach delivers a single second-order Gaussian, never a
     /// mixture. The row carries the moment-matched matrix plus the component
     /// count, the surviving mass, and the four refusal tallies.
-    pub const GAUSSIAN_MIXTURE_WITH_COV: &str = "gaussian_mixture_with_cov";
+    pub const GAUSSIAN_MIXTURE: &str = "gaussian_mixture";
 
     /// Sample count for the suite's seeded Monte-Carlo method, fixed
     /// suite-wide so a Monte-Carlo row is comparable across runs and
-    /// channels. Encoded in [`MONTE_CARLO_100_WITH_COV`].
+    /// channels. A schema constant carried by the [`MONTE_CARLO`] method, not
+    /// spelled into its tag.
     pub const MONTE_CARLO_SAMPLE_COUNT: u32 = 100;
     /// The single fixed Monte-Carlo seed used suite-wide. A fixed seed makes
     /// a seeded Monte-Carlo row a cross-channel *bit* check as well as a
@@ -399,7 +401,7 @@ pub struct ValidationResult {
     /// position block of Empyrean's STM-propagated 6×6. Lets the report show
     /// the propagation offset as a Mahalanobis distance
     /// \\(d = \sqrt{\Delta r^\top C^{-1} \Delta r}\\) instead of raw km.
-    /// Populated only on `first_order_detection_on` propagation rows (Empyrean is
+    /// Populated only on `first_order` propagation rows (Empyrean is
     /// the only tool that propagates a covariance). NOTE: the validation
     /// attaches a synthetic typical-NEO input covariance, so `d` is measured
     /// against that propagated envelope, not the object's real OD covariance.
@@ -431,7 +433,7 @@ pub struct ValidationResult {
     /// \\(C_\text{radec} = J\,C_\text{in}\,J^\top\\) (RA row/col scaled by
     /// cosδ to match `d_ra_arcsec`). Lets the report show the sky-plane offset
     /// as a Mahalanobis distance instead of raw mas. Populated only on
-    /// `first_order_detection_on` ephemeris rows; same synthetic-input caveat as
+    /// `first_order` ephemeris rows; same synthetic-input caveat as
     /// [`emp_pos_cov_au2`](Self::emp_pos_cov_au2).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub emp_radec_cov_arcsec2: Option<[[f64; 2]; 2]>,
@@ -702,9 +704,9 @@ pub struct ValidationResult {
     // ── Test-configuration axis ─────────────────────────────────────
     /// The uncertainty method **requested** for this row. One of the
     /// [`uncertainty_modes`] tags — the seven-way method axis the plan carries
-    /// (`f64_no_cov`, `first_order_with_cov`, `second_order_with_cov`, `auto`,
-    /// `sigma_point_with_cov`, `monte_carlo_100_with_cov`,
-    /// `gaussian_mixture_with_cov`). Set on every propagation and ephemeris
+    /// (`none`, `first_order`, `second_order`, `auto`,
+    /// `sigma_point`, `monte_carlo`,
+    /// `gaussian_mixture`). Set on every propagation and ephemeris
     /// row, on the method-tagged OD fit rows
     /// ([`test_types::ORBIT_DETERMINATION`]), and on the post-fit transport
     /// rows ([`test_types::ORBIT_DETERMINATION_TRANSPORT`]) — the OD fit method
@@ -759,7 +761,7 @@ pub struct ValidationResult {
     /// collapsing into a blank cell.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub orbit_status: Option<String>,
-    /// Retained mixture component count (`gaussian_mixture_with_cov` rows).
+    /// Retained mixture component count (`gaussian_mixture` rows).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mix_n_components_total: Option<u32>,
     /// Surviving mixture mass; \\(< 1\\) when components were dropped.
@@ -1779,25 +1781,58 @@ mod tests {
 
     /// The method tags are a wire contract shared with the engine and the
     /// report; a rename here must wedge until every consumer is updated. The
-    /// Monte-Carlo tag must also encode the fixed sample count.
+    /// Monte-Carlo sample count and seed are separate schema constants — the
+    /// tag carries no number.
     #[test]
     fn uncertainty_mode_constants_match_canonical_tags() {
         use uncertainty_modes::*;
-        assert_eq!(F64_NO_COV, "f64_no_cov");
-        assert_eq!(FIRST_ORDER_WITH_COV, "first_order_with_cov");
-        assert_eq!(SECOND_ORDER_WITH_COV, "second_order_with_cov");
+        assert_eq!(NONE, "none");
+        assert_eq!(FIRST_ORDER, "first_order");
+        assert_eq!(SECOND_ORDER, "second_order");
         assert_eq!(AUTO, "auto");
-        assert_eq!(SIGMA_POINT_WITH_COV, "sigma_point_with_cov");
-        assert_eq!(MONTE_CARLO_100_WITH_COV, "monte_carlo_100_with_cov");
-        assert_eq!(GAUSSIAN_MIXTURE_WITH_COV, "gaussian_mixture_with_cov");
-        // The tag encodes the sample count: the two cannot drift apart.
+        assert_eq!(SIGMA_POINT, "sigma_point");
+        assert_eq!(MONTE_CARLO, "monte_carlo");
+        assert_eq!(GAUSSIAN_MIXTURE, "gaussian_mixture");
+        // The sample count and seed ride the schema, not the tag: fixed
+        // suite-wide so a Monte-Carlo row stays comparable across runs.
         assert_eq!(MONTE_CARLO_SAMPLE_COUNT, 100);
-        assert_eq!(
-            MONTE_CARLO_100_WITH_COV,
-            format!("monte_carlo_{MONTE_CARLO_SAMPLE_COUNT}_with_cov")
-        );
         // The seed is a single fixed suite-wide value (the ASCII of EMPYREAN).
         assert_eq!(MONTE_CARLO_SEED, 0x454D_5059_5245_414E);
+    }
+
+    /// The method-tag vocabulary is exactly the seven suffix-free strings, in
+    /// the plan's own axis order ([`crate::plan::PLAN_UNCERTAINTY_AXES`]).
+    /// Re-adding the old covariance suffix or a sample count to any tag turns
+    /// this red.
+    #[test]
+    fn uncertainty_mode_vocabulary_is_exactly_the_seven_plan_tags() {
+        use uncertainty_modes::*;
+        // In the plan's axis order: state-only first, then the covariance
+        // methods, the adaptive method, the sampled methods, and the mixture.
+        let vocabulary = [
+            NONE,
+            FIRST_ORDER,
+            SECOND_ORDER,
+            AUTO,
+            SIGMA_POINT,
+            MONTE_CARLO,
+            GAUSSIAN_MIXTURE,
+        ];
+        assert_eq!(
+            vocabulary,
+            [
+                "none",
+                "first_order",
+                "second_order",
+                "auto",
+                "sigma_point",
+                "monte_carlo",
+                "gaussian_mixture",
+            ]
+        );
+        // The vocabulary IS the plan's whitelist, in the same order — no tag
+        // lives outside the plan's axis.
+        assert_eq!(crate::plan::PLAN_UNCERTAINTY_AXES, vocabulary);
     }
 
     /// Populated per-method output fields must survive a JSON round-trip, and
@@ -1826,7 +1861,7 @@ mod tests {
 
         let mut r = ValidationResult::empty();
         r.test_type = test_types::PROPAGATION.into();
-        r.propagation_uncertainty = Some(uncertainty_modes::GAUSSIAN_MIXTURE_WITH_COV.into());
+        r.propagation_uncertainty = Some(uncertainty_modes::GAUSSIAN_MIXTURE.into());
         r.resolved_method = Some("mixture".into());
         r.cov_kind = Some(3);
         r.cov_joint_width = Some(6);

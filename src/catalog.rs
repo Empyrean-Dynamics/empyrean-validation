@@ -841,7 +841,7 @@ pub fn has_radar_fixture(name: &str) -> bool {
 }
 
 /// Catalog objects with a high-κ close approach in the validation window —
-/// the only objects for which the plan emits a `gaussian_mixture_with_cov`
+/// the only objects for which the plan emits a `gaussian_mixture`
 /// row.
 ///
 /// The engine generates a Gaussian mixture by κ-gating and AGM-splitting an

@@ -555,7 +555,7 @@ def main() -> int:
         # full 6×6 covariance via `--cov-format` but cross-tool Jet1
         # parity needs a separate handshake on the covariance
         # representation. Out of scope for this propagation-only pass.
-        if r.get("propagation_uncertainty") not in (None, "f64_detection_on"):
+        if r.get("propagation_uncertainty") not in (None, "none"):
             n_skipped += 1
             continue
         new = dict(r)

@@ -15,7 +15,7 @@ so both channels use the same fork-once-stream-many model.
 Per-method uncertainty axis
 ---------------------------
 Each plan row carries a ``propagation_uncertainty`` method tag. For every
-tag but ``f64_no_cov`` (and the untagged legacy row) the driver appends the
+tag but ``none`` (and the untagged legacy row) the driver appends the
 tag as the optional 19th ``prop`` token, so the binary attaches the synthetic
 covariance, requests that rung, and appends its delivered 0.11 products after
 the 8 fixed fields as whitespace-free ``key=value`` tokens (the binary's
@@ -23,7 +23,7 @@ the 8 fixed fields as whitespace-free ``key=value`` tokens (the binary's
 tokens into the schema's 12 per-method fields (``resolved_method``,
 ``cov_kind``, ``cov_joint_width``, ``cov_tri``, ``orbit_delivered``,
 ``orbit_status`` and the six ``mix_*``), reading what the engine *delivered*,
-never the request. A token-less response (the ``f64_no_cov`` / legacy line, the
+never the request. A token-less response (the ``none`` / legacy line, the
 ephemeris line) leaves all 12 fields null, byte-identical to the pre-widening
 row. The cli binary emits no collapsed moment view and ``ODConfig`` carries no
 ``uncertainty_method`` at this distribution revision, so ephemeris rows keep
@@ -58,7 +58,7 @@ _OD_METHOD_AXIS_NOT_PRODUCED = (
     "ODConfig.uncertainty_method not on the wrapper"
 )
 
-# Method tags that carry NO daemon method token: `f64_no_cov` is the
+# Method tags that carry NO daemon method token: `none` is the
 # covariance-free path (the binary attaches no covariance and emits no product
 # tokens, so the line stays byte-identical to the pre-widening 18-field line)
 # and `None` is the untagged legacy row. Every other tag (the schema's
@@ -66,7 +66,7 @@ _OD_METHOD_AXIS_NOT_PRODUCED = (
 # binary refuses an unrecognized tag by name (`fail unknown_uncertainty_method`).
 # Monte Carlo's sample count and seed come from the binary (schema constants),
 # so there is nothing to send beyond the tag.
-_NO_METHOD_TOKEN = frozenset((None, "f64_no_cov"))
+_NO_METHOD_TOKEN = frozenset((None, "none"))
 
 # The 12 per-method product fields plus the 2 collapsed moment views that travel
 # with them. A cli output row starts as a copy of its rust-channel input row, so
@@ -120,7 +120,7 @@ def _reset_per_method(row: dict) -> None:
 def _method_token(r: dict) -> str | None:
     """The optional 19th ``prop`` token for a plan row: its
     ``propagation_uncertainty`` tag, or ``None`` for the covariance-free
-    ``f64_no_cov`` / untagged legacy row (which sends the bare 18-field line).
+    ``none`` / untagged legacy row (which sends the bare 18-field line).
     """
     m = r.get("propagation_uncertainty")
     return None if m in _NO_METHOD_TOKEN else m
@@ -129,7 +129,7 @@ def _method_token(r: dict) -> str | None:
 def _prop_daemon_line(r: dict) -> str | None:
     """The daemon ``prop`` line for a plan row: the 18 fixed fields plus, for a
     covariance-bearing method, the optional 19th method token. Returns ``None``
-    when the row has no usable IC (the caller skips it). The ``f64_no_cov`` /
+    when the row has no usable IC (the caller skips it). The ``none`` /
     untagged row yields the bare 18-field line — byte-identical to the
     pre-widening driver — so its response stays the 8-field ``ok`` line.
     """
@@ -223,7 +223,7 @@ def _build_prop_row(
     are set exactly as the covariance-free path did; the per-method fields are
     reset — so a leaked input product never rides out under this channel — and,
     when a method token was sent, repopulated from the binary's product tokens.
-    A token-less (``f64_no_cov`` / legacy) response leaves all 12 null,
+    A token-less (``none`` / legacy) response leaves all 12 null,
     byte-identical to the pre-widening row.
     """
     x, y, z, _vx, _vy, _vz, ms = map(float, parts[1:8])
@@ -438,7 +438,7 @@ def main() -> int:
             continue
         if tt == "propagation":
             # Build the daemon line (18 fixed fields + optional method token).
-            # `f64_no_cov` / untagged rows send the bare 18-field line, so their
+            # `none` / untagged rows send the bare 18-field line, so their
             # response is the 8-field `ok` line; every other method sends its
             # tag so the binary attaches the synthetic covariance and appends
             # the delivered products.

@@ -74,13 +74,13 @@ _IC_VEL = [-0.008132198510292572, -0.01147982080464957, -0.004470724867546879]
 _EPOCH = 61200.0
 
 _METHOD_TAGS = [
-    "f64_no_cov",
-    "first_order_with_cov",
-    "second_order_with_cov",
+    "none",
+    "first_order",
+    "second_order",
     "auto",
-    "sigma_point_with_cov",
-    "monte_carlo_100_with_cov",
-    "gaussian_mixture_with_cov",
+    "sigma_point",
+    "monte_carlo",
+    "gaussian_mixture",
 ]
 
 
@@ -103,7 +103,7 @@ def _prop_row(tag: str) -> dict:
         "cov_kind": 5,
         "cov_joint_width": 99,
         "cov_tri": [1.0, 2.0, 3.0],
-        "resolved_method": "sigma_point_with_cov",
+        "resolved_method": "sigma_point",
         "orbit_delivered": False,
         "orbit_status": "LEAK",
         "emp_pos_cov_au2": [[9.0, 9.0, 9.0], [9.0, 9.0, 9.0], [9.0, 9.0, 9.0]],
@@ -151,19 +151,20 @@ def propagation_rows(tmp_path_factory) -> dict[str, dict]:
 def test_every_method_row_reports_its_products(propagation_rows) -> None:
     """Each attach-covariance method yields a packed joint + resolved kind; the
     SecondOrder row's DELIVERED kind is second_order (a dropped-method bug or a
-    stale engine would report linear), and f64_no_cov carries no covariance."""
-    so = propagation_rows["second_order_with_cov"]
-    assert so["resolved_method"] == "second_order_with_cov"
+    stale engine would report linear), and the ``none`` row carries no
+    covariance."""
+    so = propagation_rows["second_order"]
+    assert so["resolved_method"] == "second_order"
     assert so["cov_kind"] == 1  # second-order wire discriminant
     assert so["cov_joint_width"] == 6
     assert len(so["cov_tri"]) == 21  # 6*7/2 packed lower triangle
     assert isinstance(so["emp_pos_cov_au2"], list) and len(so["emp_pos_cov_au2"]) == 3
 
-    fo = propagation_rows["first_order_with_cov"]
-    assert fo["resolved_method"] == "first_order_with_cov"
+    fo = propagation_rows["first_order"]
+    assert fo["resolved_method"] == "first_order"
     assert fo["cov_kind"] == 0  # linear wire discriminant
 
-    f64 = propagation_rows["f64_no_cov"]
+    f64 = propagation_rows["none"]
     assert f64["resolved_method"] is None
     assert f64["cov_kind"] is None
     assert f64["cov_tri"] is None
@@ -175,13 +176,13 @@ def test_every_method_row_reports_its_products(propagation_rows) -> None:
 def test_inherited_per_method_fields_reset_no_leak(propagation_rows) -> None:
     """The bogus input cov_kind=5 must not ride out: a covariance-bearing row
     reports the python-delivered discriminant, an f64 row reports None."""
-    so = propagation_rows["second_order_with_cov"]
+    so = propagation_rows["second_order"]
     assert so["cov_kind"] == 1, "input cov_kind=5 leaked into the python row"
     assert so["cov_joint_width"] == 6, "input cov_joint_width=99 leaked"
     assert so["orbit_status"] != "LEAK", "input orbit_status leaked"
     assert so["emp_pos_cov_au2"] != [[9.0] * 3] * 3, "input moment view leaked"
 
-    f64 = propagation_rows["f64_no_cov"]
+    f64 = propagation_rows["none"]
     assert f64["cov_kind"] is None, "cov_kind not reset on the f64 row"
     assert f64["resolved_method"] is None
 

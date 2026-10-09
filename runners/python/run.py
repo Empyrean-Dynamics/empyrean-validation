@@ -66,25 +66,25 @@ _AU_KM = 149_597_870.700
 #
 # Schema `uncertainty_modes` tag → (attach_covariance, empyrean UncertaintyMethod).
 # Mirrors the rust channel's `build_uncertainty_axes` and the cli channel's
-# `method_for_tag`: `f64_no_cov` is the covariance-free first-order path; every
+# `method_for_tag`: `none` is the covariance-free first-order path; every
 # other tag attaches the synthetic covariance and runs its named rung. The
 # method is lowered to the low-level `_propagate` wire int via the
 # distribution's own `UncertaintyMethod` map, so the python channel asks for
 # the identical method the rust / cli channels ask for.
 _METHOD_BY_TAG: dict[str, tuple[bool, UncertaintyMethod]] = {
-    "f64_no_cov": (False, UncertaintyMethod.FIRST_ORDER),
-    "first_order_with_cov": (True, UncertaintyMethod.FIRST_ORDER),
-    "second_order_with_cov": (True, UncertaintyMethod.SECOND_ORDER),
+    "none": (False, UncertaintyMethod.FIRST_ORDER),
+    "first_order": (True, UncertaintyMethod.FIRST_ORDER),
+    "second_order": (True, UncertaintyMethod.SECOND_ORDER),
     "auto": (True, UncertaintyMethod.AUTO),
-    "sigma_point_with_cov": (True, UncertaintyMethod.SIGMA_POINT),
-    "monte_carlo_100_with_cov": (True, UncertaintyMethod.MONTE_CARLO),
-    "gaussian_mixture_with_cov": (True, UncertaintyMethod.GAUSSIAN_MIXTURE),
+    "sigma_point": (True, UncertaintyMethod.SIGMA_POINT),
+    "monte_carlo": (True, UncertaintyMethod.MONTE_CARLO),
+    "gaussian_mixture": (True, UncertaintyMethod.GAUSSIAN_MIXTURE),
 }
 
 # Sampling methods cost ~100-120 propagations per call, so — like the rust
 # channel's `timing_runs = 1` — they are timed once rather than best-of-N.
 _SAMPLING_TAGS = frozenset(
-    {"sigma_point_with_cov", "monte_carlo_100_with_cov", "gaussian_mixture_with_cov"}
+    {"sigma_point", "monte_carlo", "gaussian_mixture"}
 )
 
 # The suite-wide Monte-Carlo sample count and seed. A LITERAL mirror of
@@ -161,11 +161,11 @@ _COV_KIND_WIRE = {
 # explicit method it equals the request when the engine honoured it, and names
 # the delivered kind (never the request) if a different kind came back.
 _RESOLVED_METHOD_TAG = {
-    CovarianceKind.LINEAR: "first_order_with_cov",
-    CovarianceKind.SECOND_ORDER: "second_order_with_cov",
-    CovarianceKind.MIXTURE: "gaussian_mixture_with_cov",
-    CovarianceKind.MONTE_CARLO: "monte_carlo_100_with_cov",
-    CovarianceKind.SIGMA_POINT: "sigma_point_with_cov",
+    CovarianceKind.LINEAR: "first_order",
+    CovarianceKind.SECOND_ORDER: "second_order",
+    CovarianceKind.MIXTURE: "gaussian_mixture",
+    CovarianceKind.MONTE_CARLO: "monte_carlo",
+    CovarianceKind.SIGMA_POINT: "sigma_point",
 }
 
 
@@ -386,7 +386,7 @@ def _propagate_one(
     ``(out_pos_au, min_time_ms, raw_result)`` or ``None`` on failure.
 
     The method is mapped to an ``UncertaintyMethod`` and lowered to the
-    low-level wire int; every method but ``f64_no_cov`` attaches the synthetic
+    low-level wire int; every method but ``none`` attaches the synthetic
     covariance and requests the provenance-tagged readback so the caller can
     read the 0.11 per-method products off ``raw_result``.
     """
@@ -421,7 +421,7 @@ def _propagate_one(
         dtype=np.float64,
     )
     # Attach the synthetic typical-NEO covariance on every method but
-    # f64_no_cov (which runs covariance-free), same prior as the rust / cli
+    # none (which runs covariance-free), same prior as the rust / cli
     # channels so a same-method cross-channel diff reflects binding drift only.
     covariances = np.zeros((1, 6, 6), dtype=np.float64)
     if attach_cov:
@@ -458,7 +458,7 @@ def _propagate_one(
     # rust channel's sigma_point() / gaussian_mixture() / auto().
     mc_kwargs = (
         {"mc_n_samples": _MONTE_CARLO_SAMPLE_COUNT, "mc_seed": _MONTE_CARLO_SEED}
-        if method_tag == "monte_carlo_100_with_cov"
+        if method_tag == "monte_carlo"
         else {}
     )
     # Sampling methods cost ~100-120 propagations per call — time once.
@@ -560,7 +560,7 @@ def _ephemeris_one(
     um_int = _UNCERTAINTY_METHOD_TO_INT[method]
     mc_kwargs = (
         {"mc_n_samples": _MONTE_CARLO_SAMPLE_COUNT, "mc_seed": _MONTE_CARLO_SEED}
-        if method_tag == "monte_carlo_100_with_cov"
+        if method_tag == "monte_carlo"
         else {}
     )
 
@@ -600,7 +600,7 @@ def _ephemeris_one(
         dtype=np.float64,
     )
     # Same synthetic prior as the propagation path / rust / cli channels, on
-    # every method but f64_no_cov. The delivered sky covariance is then the
+    # every method but none. The delivered sky covariance is then the
     # engine's per-method projection, not the covariance-free default.
     covariances = np.zeros((1, 6, 6), dtype=np.float64)
     if attach_cov:

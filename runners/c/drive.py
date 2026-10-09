@@ -186,7 +186,7 @@ def main() -> int:
         # Uncertainty axis: skip Jet1 rows. The C runner stdin protocol
         # does not yet accept a covariance for the input orbit; the
         # cross-channel Jet1 parity comparison is a follow-up.
-        if r.get("propagation_uncertainty") not in (None, "f64_detection_on"):
+        if r.get("propagation_uncertainty") not in (None, "none"):
             n_skipped += 1
             continue
         if tt == "propagation":
