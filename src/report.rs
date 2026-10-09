@@ -254,7 +254,7 @@ fn vec_dr_km(a: &Option<[f64; 3]>, b: &Option<[f64; 3]>) -> Option<f64> {
 /// validated against `core` to confirm the FFI boundary is transparent.
 /// Every detection-off arm — f64 and first-order — is a timing probe whose
 /// transported state equals its detection-on sibling (bit-identical for
-/// `f64_detection_off`), so it carries no independent accuracy signal and is
+/// `none_detection_off`), so it carries no independent accuracy signal and is
 /// kept OUT of the fidelity rollup, the per-channel counts, and the accuracy /
 /// error-growth views — surfacing only in the dedicated timing panels.
 fn is_timing_only_uncertainty(mode: Option<&str>) -> bool {
@@ -4551,11 +4551,11 @@ fn build_part2_timing_t1(results: &[ValidationResult]) -> String {
     for (lbl, arm) in [
         (
             "empyrean barebones, ASSIST-default-like (f64)",
-            "f64_detection_off_assist_default_like",
+            "none_detection_off_assist_default_like",
         ),
         (
             "empyrean barebones, asteroid-institute-like (f64)",
-            "f64_detection_off_assist_asteroid_institute_like",
+            "none_detection_off_assist_asteroid_institute_like",
         ),
         (
             "empyrean Jet1 barebones, ASSIST-default-like",
@@ -4567,12 +4567,12 @@ fn build_part2_timing_t1(results: &[ValidationResult]) -> String {
     }
     h.push_str(&group("propagation · whole call", BOUND_B));
     for (lbl, arm) in [
-        ("empyrean f64", "f64_detection_on"),
+        ("empyrean f64", "none_detection_on"),
         ("empyrean first-order + 6×6", "first_order_detection_on"),
         ("empyrean auto cascade", "auto_detection_on"),
         ("empyrean second-order (Jet2)", "second_order_detection_on"),
         ("empyrean sigma-point", "sigma_point_detection_on"),
-        ("empyrean Monte Carlo", "monte_carlo_100_detection_on"),
+        ("empyrean Monte Carlo", "monte_carlo_detection_on"),
     ] {
         let (s, core) = emp("propagation", Some(arm));
         h.push_str(&row(lbl, if core { Some(CORE_NOTE) } else { None }, s));
@@ -4826,7 +4826,7 @@ fn build_timing_grids(
     let (eph_ch, eph_fallback) = emp_eph;
     let (od_ch, od_fallback) = emp_od;
     let g1: Vec<TimingCol> = vec![
-        TimingCol::timed("emp f64", rust_arm("f64_detection_on"), BOUND_B),
+        TimingCol::timed("emp f64", rust_arm("none_detection_on"), BOUND_B),
         TimingCol::timed("emp Jet1", rust_arm("first_order_detection_on"), BOUND_B),
         TimingCol::timed("ASSIST", assist_prop_getter(), BOUND_A),
         TimingCol::timed(
@@ -6085,7 +6085,7 @@ pub fn generate_report(
   <div class="heatmap-container"><div id="assist-arms-timing"></div></div>
   <div class="panel-title" title="Position agreement vs empyrean at 3 and 15 years, per configuration">Position agreement vs empyrean</div>
   <div class="heatmap-container"><div id="assist-arms-pos"></div></div>
-  <div class="disclosures"><details><summary>{disc_summary}</summary><div class="disc-body">Median |empyrean &minus; ASSIST| in km at |dt| = 3 yr and 15 yr; the propagated position is independent of the variational particles, so this is per configuration. empyrean is its own <code>f64_detection_on</code> reference. Marsden &Delta;T objects are excluded from each median and counted separately (see &Delta;T exclusion); the all-rows median is in parentheses.</div></details></div>
+  <div class="disclosures"><details><summary>{disc_summary}</summary><div class="disc-body">Median |empyrean &minus; ASSIST| in km at |dt| = 3 yr and 15 yr; the propagated position is independent of the variational particles, so this is per configuration. empyrean is its own <code>none_detection_on</code> reference. Marsden &Delta;T objects are excluded from each median and counted separately (see &Delta;T exclusion); the all-rows median is in parentheses.</div></details></div>
   <div class="panel-title" title="STM agreement vs empyrean, per variational arm">STM agreement vs empyrean</div>
   <div class="heatmap-container"><div id="assist-arms-stm"></div></div>
   <div class="disclosures"><details><summary>{disc_summary}</summary><div class="disc-body">Median relative Frobenius difference |emp &minus; ast|/|emp| between empyrean's Jet1 STM and each configuration's ASSIST variational STM, over all horizons.</div></details></div>
@@ -6713,8 +6713,8 @@ const popNames = uniq(propResults.map(r => r.population));
 // Propagation rows to read the pairwise diff off: core carries every external
 // diff (emp_vs_assist_km, oorb_vs_horizons_km, …) AND its own emp_vs_horizons_km,
 // so prefer it; fall back to rust when the core channel is absent.
-// The `f64_detection_off` arms are timing-only: their propagated state is that
-// of `f64_detection_on` (bit-identical), so they must never enter the accuracy
+// The `none_detection_off` arms are timing-only: their propagated state is that
+// of `none_detection_on` (bit-identical), so they must never enter the accuracy
 // / error-growth views, where an extra
 // near-duplicate row per (object, dt, tier) would inflate counts without
 // adding an independent measurement. They surface only in the timing panels.
@@ -8933,7 +8933,7 @@ mod tests {
         let mut rows = Vec::new();
         for (o, p) in [("Apophis", "NEO"), ("Bennu", "NEO")] {
             for dt in [0.0_f64, 30.0] {
-                for arm in ["f64_detection_on", "first_order_detection_on"] {
+                for arm in ["none_detection_on", "first_order_detection_on"] {
                     let mut r = synthetic_rust_prop_row(o, dt);
                     r.population = p.to_string();
                     r.propagation_uncertainty = Some(arm.to_string());

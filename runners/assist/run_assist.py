@@ -402,7 +402,7 @@ def propagate_assist(
     # creation, Extras binding, adding the particle, variational setup)
     # through the end of sim.integrate. The ephemeris object is created by the
     # caller and stays outside this timer, matching empyrean's Context. This
-    # is the symmetric partner of empyrean's whole-propagate() f64_detection_on
+    # is the symmetric partner of empyrean's whole-propagate() none_detection_on
     # timing; the narrower `elapsed_ms` below times only sim.integrate.
     t_call0 = time.perf_counter()
     sim = rebound.Simulation()
@@ -721,7 +721,7 @@ def main():
     )
     parser.add_argument(
         "--prev-timings", type=str, default=None,
-        help="Prior ASSIST results JSON. Its single-particle (f64_detection_on) "
+        help="Prior ASSIST results JSON. Its single-particle (none_detection_on) "
              "assist_time_ms per (object, dt) seeds the per-row wall-clock cap "
              "(cap = max(floor, factor x previous single-particle time)). When "
              "absent, every row's cap is the floor.",
@@ -841,13 +841,13 @@ def main():
     n_runs = args.n_timing_runs
 
     # Per-row wall-clock caps seeded from a prior run's single-particle timings.
-    # Map (object, round(dt)) -> previous f64_detection_on assist_time_ms.
+    # Map (object, round(dt)) -> previous none_detection_on assist_time_ms.
     prev_ms = {}
     if args.prev_timings:
         try:
             with open(args.prev_timings) as pf:
                 for r in json.load(pf):
-                    if r.get("propagation_uncertainty") == "f64_detection_on" \
+                    if r.get("propagation_uncertainty") == "none_detection_on" \
                             and r.get("assist_time_ms") is not None:
                         prev_ms[(r["object"], round(r["dt_days"]))] = float(r["assist_time_ms"])
             print(f"Wall-clock caps seeded from {len(prev_ms)} prior single-particle timings "

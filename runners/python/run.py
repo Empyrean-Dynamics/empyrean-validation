@@ -64,13 +64,15 @@ _AU_KM = 149_597_870.700
 
 # ── Uncertainty-method axis (0.11 per-method products) ──────────────────────
 #
-# Schema `uncertainty_modes` tag → (attach_covariance, empyrean UncertaintyMethod).
-# Mirrors the rust channel's `build_uncertainty_axes` and the cli channel's
-# `method_for_tag`: `none` is the covariance-free first-order path; every
-# other tag attaches the synthetic covariance and runs its named rung. The
-# method is lowered to the low-level `_propagate` wire int via the
-# distribution's own `UncertaintyMethod` map, so the python channel asks for
-# the identical method the rust / cli channels ask for.
+# Schema `uncertainty_modes` method prefix → (attach_covariance, empyrean
+# UncertaintyMethod). Mirrors the rust channel's `build_uncertainty_axes` and
+# the cli channel's `method_for_tag`: `none` is the covariance-free first-order
+# path; every other method attaches the synthetic covariance and runs its named
+# rung. The method is lowered to the low-level `_propagate` wire int via the
+# distribution's own `UncertaintyMethod` map, so the python channel asks for the
+# identical method the rust / cli channels ask for. Keyed on the method PREFIX —
+# the plan's `propagation_uncertainty` is a composite `<method>_<arm>` tag, so
+# the arm is split off first (`_method_of`).
 _METHOD_BY_TAG: dict[str, tuple[bool, UncertaintyMethod]] = {
     "none": (False, UncertaintyMethod.FIRST_ORDER),
     "first_order": (True, UncertaintyMethod.FIRST_ORDER),
@@ -80,6 +82,43 @@ _METHOD_BY_TAG: dict[str, tuple[bool, UncertaintyMethod]] = {
     "monte_carlo": (True, UncertaintyMethod.MONTE_CARLO),
     "gaussian_mixture": (True, UncertaintyMethod.GAUSSIAN_MIXTURE),
 }
+
+# The composite uncertainty-tag vocabulary, a LITERAL mirror of
+# empyrean_validation::schema::uncertainty_modes (src/schema.rs): the seven
+# method prefixes (the `_METHOD_BY_TAG` keys, reused so the two can never drift)
+# × three detection/timing arms, spelled `<method>_<arm>`.
+_UNCERTAINTY_METHODS = tuple(_METHOD_BY_TAG)
+_UNCERTAINTY_ARMS = (
+    "detection_on",
+    "detection_off",
+    "detection_off_assist_default_like",
+)
+
+
+def _split_tag(tag: str | None) -> tuple[str | None, str | None]:
+    """Split a composite ``<method>_<arm>`` tag into ``(method, arm)``, or
+    ``(None, None)`` for any tag outside the vocabulary. No prefix guessing: the
+    method must be a whole ``_UNCERTAINTY_METHODS`` entry and the remainder a
+    whole ``_UNCERTAINTY_ARMS`` entry (mirrors ``uncertainty_modes::method_of``
+    / ``arm_of``).
+    """
+    if tag is None:
+        return (None, None)
+    for method in _UNCERTAINTY_METHODS:
+        if tag.startswith(method) and tag[len(method) : len(method) + 1] == "_":
+            arm = tag[len(method) + 1 :]
+            if arm in _UNCERTAINTY_ARMS:
+                return (method, arm)
+    return (None, None)
+
+
+def _method_of(tag: str | None) -> str | None:
+    return _split_tag(tag)[0]
+
+
+def _arm_of(tag: str | None) -> str | None:
+    return _split_tag(tag)[1]
+
 
 # Sampling methods cost ~100-120 propagations per call, so — like the rust
 # channel's `timing_runs = 1` — they are timed once rather than best-of-N.
@@ -293,7 +332,11 @@ def _fill_propagation_products(row: dict, result: dict, attach_cov: bool) -> Non
             pj = tagged.covariance.joint(0)
         tri = None if pj is None else np.asarray(pj.tri, dtype=np.float64)
         if pj is not None and tri is not None and np.isfinite(tri).all():
-            row["resolved_method"] = _RESOLVED_METHOD_TAG[pj.kind]
+            # The delivered kind is a bare method name; compose it with this
+            # row's detection arm so resolved_method is a composite tag too.
+            delivered = _RESOLVED_METHOD_TAG[pj.kind]
+            arm = _arm_of(row.get("propagation_uncertainty"))
+            row["resolved_method"] = f"{delivered}_{arm}" if arm is not None else delivered
             row["cov_kind"] = _COV_KIND_WIRE[pj.kind]
             row["cov_joint_width"] = int(pj.width)
             row["cov_tri"] = [float(v) for v in tri]
@@ -393,7 +436,7 @@ def _propagate_one(
     tier = _TIER_TO_INT.get(force_model)
     if tier is None:
         return None
-    method_entry = _METHOD_BY_TAG.get(method_tag)
+    method_entry = _METHOD_BY_TAG.get(_method_of(method_tag))
     if method_entry is None:
         # Refuse an unknown method by name rather than silently substituting
         # one (the no-silent-substitution invariant).
@@ -458,11 +501,11 @@ def _propagate_one(
     # rust channel's sigma_point() / gaussian_mixture() / auto().
     mc_kwargs = (
         {"mc_n_samples": _MONTE_CARLO_SAMPLE_COUNT, "mc_seed": _MONTE_CARLO_SEED}
-        if method_tag == "monte_carlo"
+        if _method_of(method_tag) == "monte_carlo"
         else {}
     )
     # Sampling methods cost ~100-120 propagations per call — time once.
-    runs = 1 if method_tag in _SAMPLING_TAGS else max(1, n_timing_runs)
+    runs = 1 if _method_of(method_tag) in _SAMPLING_TAGS else max(1, n_timing_runs)
     timings_ms = []
     last_result = None
     for _ in range(runs):
@@ -549,7 +592,7 @@ def _ephemeris_one(
     tier = _TIER_TO_INT.get(force_model)
     if tier is None:
         return None
-    method_entry = _METHOD_BY_TAG.get(method_tag)
+    method_entry = _METHOD_BY_TAG.get(_method_of(method_tag))
     if method_entry is None:
         print(
             f"  {object_id} ephemeris: SKIP unknown uncertainty_method {method_tag!r}",
@@ -560,7 +603,7 @@ def _ephemeris_one(
     um_int = _UNCERTAINTY_METHOD_TO_INT[method]
     mc_kwargs = (
         {"mc_n_samples": _MONTE_CARLO_SAMPLE_COUNT, "mc_seed": _MONTE_CARLO_SEED}
-        if method_tag == "monte_carlo"
+        if _method_of(method_tag) == "monte_carlo"
         else {}
     )
 
@@ -1044,7 +1087,7 @@ def main() -> int:
                 new["emp_vs_horizons_km"] = d * _AU_KM
             # 0.11 per-method products off the delivered packed joint, the
             # per-orbit outcome table, and the retained mixture components.
-            attach_cov = _METHOD_BY_TAG[r["propagation_uncertainty"]][0]
+            attach_cov = _METHOD_BY_TAG[_method_of(r["propagation_uncertainty"])][0]
             _fill_propagation_products(new, prop_result, attach_cov)
 
         elif r["test_type"] == "orbit_determination":

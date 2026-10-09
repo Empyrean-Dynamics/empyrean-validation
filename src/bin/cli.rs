@@ -11,7 +11,7 @@
 //! - [`arm-plan`](ArmPlanArgs) — clone every propagation row of a source
 //!   arm (`--from`) into one or more destination arms (`--to`), rewriting
 //!   only `propagation_uncertainty`. Used to derive the detection-off /
-//!   tolerance / prebuilt-system timing arms from the `f64_detection_on`
+//!   tolerance / prebuilt-system timing arms from the `none_detection_on`
 //!   and `first_order_detection_on` grids.
 //! - [`merge-external`](MergeExternalArgs) — fold ASSIST and find_orb
 //!   per-channel JSONs into a base channel JSON (typically the rust
@@ -195,12 +195,12 @@ struct ArmPlanArgs {
     #[arg(short, long)]
     output: PathBuf,
     /// Source arm: clone every propagation row whose `propagation_uncertainty`
-    /// equals this (e.g. `f64_detection_on`, `first_order_detection_on`).
+    /// equals this (e.g. `none_detection_on`, `first_order_detection_on`).
     #[arg(long)]
     from: String,
     /// Destination arm(s): each source row is cloned once per value, with
     /// `propagation_uncertainty` rewritten to it (e.g.
-    /// `f64_detection_off,f64_detection_off_eps1e-6`).
+    /// `none_detection_off,none_detection_off_eps1e-6`).
     #[arg(long, value_delimiter = ',', required = true)]
     to: Vec<String>,
     /// Emit ONLY the newly cloned rows (the subset the core replay runs
@@ -979,7 +979,7 @@ type CoreF64Snapshot = ([f64; 3], Option<f64>, String);
 ///
 /// 1. **Backward-compatible fold.** The `assist_asteroid_institute` arms (the
 ///    configuration the report's ASSIST panels were built on) fold onto the
-///    matching core `f64_detection_on` / `first_order_detection_on` rows exactly
+///    matching core `none_detection_on` / `first_order_detection_on` rows exactly
 ///    as before, so every existing empyrean-vs-ASSIST panel renders unchanged.
 /// 2. **Standalone arm rows.** ALL six arms (three configurations × variational
 ///    off/on) are appended as `channel = "assist"` rows carrying their own
@@ -1012,7 +1012,7 @@ fn merge_assist(
         }
         let key = (r.object.clone(), r.dt_days as i64);
         match r.propagation_uncertainty.as_deref() {
-            Some("f64_detection_on") => {
+            Some("none_detection_on") => {
                 if let Some(pos) = r.emp_pos_au {
                     core_f64.insert(key, (pos, r.emp_time_ms, r.population.clone()));
                 }
@@ -1050,7 +1050,7 @@ fn merge_assist(
             Some(other) => other,
             None => continue,
         };
-        let arm = if core_arm == "f64_detection_on" {
+        let arm = if core_arm == "none_detection_on" {
             format!("{ASSIST_BACKCOMPAT_CONFIG}_variational_off")
         } else if core_arm == "first_order_detection_on" {
             format!("{ASSIST_BACKCOMPAT_CONFIG}_variational_on")

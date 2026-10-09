@@ -32,14 +32,21 @@
 //!
 //! # Method-tag vocabulary
 //!
-//! The uncertainty-method tags are the suffix-free vocabulary in
-//! [`crate::schema::uncertainty_modes`] (`none`, `first_order`,
-//! `second_order`, `auto`, `sigma_point`, `monte_carlo`, `gaussian_mixture`).
-//! A result file written before this vocabulary landed carries the previous,
-//! longer tag spellings (the covariance-suffixed names and the sample-counted
-//! Monte-Carlo tag); the report keys the method matrix on the tag, so those
-//! rows read as an unknown method — "not produced" at every method cell —
-//! until the run is regenerated. Re-run the plan and channels to refresh them.
+//! Each row's `propagation_uncertainty` is a composite `<method>_<arm>` tag
+//! (see [`crate::schema::uncertainty_modes`]): a method prefix — `none`,
+//! `first_order`, `second_order`, `auto`, `sigma_point`, `monte_carlo`,
+//! `gaussian_mixture` — and a detection/timing arm — `detection_on`,
+//! `detection_off`, `detection_off_assist_default_like`. The canonical plan
+//! carries the `detection_on` arm of every method ([`PLAN_UNCERTAINTY_AXES`]);
+//! the `detection_off` / tolerance arms are derived from it by the `arm-plan`
+//! CLI command for the two methods main benchmarked (`none`, `first_order`).
+//!
+//! A result file written before the composite vocabulary landed carries the
+//! previous tag spellings (main's `f64_`-prefixed and sample-counted
+//! Monte-Carlo names, or the widening's bare suffix-free method tags); the
+//! report keys the method matrix on the tag, so those rows read as an unknown
+//! method — "not produced" at every method cell — until the run is
+//! regenerated. Re-run the plan and channels to refresh them.
 
 use std::collections::HashMap;
 
@@ -55,11 +62,12 @@ pub struct PlanConfig {
     /// its own row per (object, dt) combination.
     pub tiers: Vec<String>,
     /// When `true`, emit one prop+eph row per uncertainty method — the full
-    /// engine method axis (`f64`, first- and second-order, `auto`,
+    /// engine method axis (`none`, first- and second-order, `auto`,
     /// sigma-point, Monte-Carlo, plus Gaussian-mixture on the close-approach
-    /// objects) — so the replay channels exercise every method. When `false`,
-    /// only `none` rows are emitted (benchmark mode for head-to-head
-    /// comparison with external propagators that don't propagate covariance).
+    /// objects), each under its `detection_on` arm — so the replay channels
+    /// exercise every method. When `false`, only `none_detection_on` rows are
+    /// emitted (benchmark mode for head-to-head comparison with external
+    /// propagators that don't propagate covariance).
     /// The exact per-object method set is [`plan_methods_for_object`].
     pub uncertainty_axis: bool,
 }
@@ -85,9 +93,9 @@ impl Default for PlanConfig {
 ///    (`W84` — CTIO 4m).
 /// 4. Emit propagation plan rows for every `(object, dt, tier, method)` and
 ///    ephemeris plan rows for every `(object, observer, dt != 0, method)`,
-///    where `method` ranges over [`plan_methods_for_object`] — the full
-///    uncertainty-method axis when `config.uncertainty_axis` is true, `f64`
-///    only otherwise.
+///    where `method` ranges over [`plan_methods_for_object`] (composed with
+///    the `detection_on` arm) — the full uncertainty-method axis when
+///    `config.uncertainty_axis` is true, `none` only otherwise.
 /// 5. For objects with `skip_od == false`, emit one OD plan row per
 ///    tier.
 ///
@@ -247,6 +255,7 @@ pub fn build_plan(
                     continue;
                 };
                 for &method in &methods {
+                    let tag = uncertainty_modes::compose(method, uncertainty_modes::DETECTION_ON);
                     plan.push(propagation_plan_row(
                         obj,
                         epoch,
@@ -258,7 +267,7 @@ pub fn build_plan(
                         ref_pos,
                         ref_vel,
                         sun_vectors.get(&(dt as i64)).copied(),
-                        Some(method),
+                        Some(&tag),
                         &timestamp,
                     ));
                 }
@@ -277,6 +286,7 @@ pub fn build_plan(
                     continue;
                 };
                 for &method in &methods {
+                    let tag = uncertainty_modes::compose(method, uncertainty_modes::DETECTION_ON);
                     plan.push(ephemeris_plan_row(
                         obj,
                         epoch,
@@ -286,7 +296,7 @@ pub fn build_plan(
                         ic_vel,
                         (a1, a2, a3, g_alpha, g_r0, g_m, g_n, g_k, ng_dt),
                         hor,
-                        Some(method),
+                        Some(&tag),
                         &timestamp,
                     ));
                 }
@@ -318,7 +328,12 @@ pub fn build_plan(
     plan
 }
 
-/// The uncertainty-method axis the plan emits for one object.
+/// The uncertainty **methods** the plan emits for one object.
+///
+/// Returns bare method prefixes; the caller composes each with
+/// [`uncertainty_modes::DETECTION_ON`] to form the row's composite tag, so the
+/// emitted tags are exactly the [`PLAN_UNCERTAINTY_AXES`] whitelist (and every
+/// row survives [`strip_to_plan`]).
 ///
 /// Every object carries the deterministic and sampled methods; the Gaussian
 /// mixture is added only for a close-approach object ([`is_close_approach`]),
@@ -326,11 +341,8 @@ pub fn build_plan(
 /// approach — an
 /// unsplit object delivers a single second-order Gaussian, which the
 /// `second_order` row already covers. In benchmark mode
-/// (`uncertainty_axis == false`) only the covariance-free `f64` method is
+/// (`uncertainty_axis == false`) only the covariance-free `none` method is
 /// emitted, matching the head-to-head external-propagator comparison.
-///
-/// The returned tags are a subset of [`PLAN_UNCERTAINTY_AXES`], the plan's
-/// method whitelist, so every row this produces survives [`strip_to_plan`].
 pub fn plan_methods_for_object(
     obj: &ValidationObject,
     uncertainty_axis: bool,
@@ -394,18 +406,19 @@ fn od_plan_rows(
     )];
     if uncertainty_axis {
         for &method in &plan_methods_for_object(obj, true) {
+            let tag = uncertainty_modes::compose(method, uncertainty_modes::DETECTION_ON);
             rows.push(od_plan_row(
                 obj,
                 tier,
                 test_types::ORBIT_DETERMINATION,
-                Some(method),
+                Some(&tag),
                 timestamp,
             ));
             rows.push(od_plan_row(
                 obj,
                 tier,
                 test_types::ORBIT_DETERMINATION_TRANSPORT,
-                Some(method),
+                Some(&tag),
                 timestamp,
             ));
         }
@@ -690,31 +703,35 @@ pub const PLAN_CLEARED_KEYS: [&str; 23] = [
     "findorb_n_obs_rejected",
 ];
 
-/// The uncertainty methods the canonical plan carries — the full engine
-/// method axis.
+/// The composite tags the canonical plan carries — the `detection_on` arm of
+/// the full engine method axis.
 ///
-/// A plan row's [`ValidationResult::propagation_uncertainty`] tag names the
-/// method every replay channel reproduces for that row; the plan is the
-/// contract they consume. All seven engine methods are listed, so a row under
-/// any of them survives [`strip_to_plan`] into the plan.
+/// A plan row's [`ValidationResult::propagation_uncertainty`] is a composite
+/// `<method>_<arm>` tag (see [`uncertainty_modes`]); the canonical plan is the
+/// `detection_on` arm of all seven methods — the only arm with an accuracy
+/// signal and the grid every replay channel reproduces. The `detection_off` /
+/// tolerance arms are derived from this grid *after* the strip, by the
+/// `arm-plan` CLI command, for the methods main benchmarked (`none`,
+/// `first_order`); they are not part of the canonical plan, so [`strip_to_plan`]
+/// keeps only the `detection_on` arm here.
 ///
 /// This stays a **whitelist**, not an open gate: a method the rust runner
-/// might gain later is not on the plan's axis until it is named here, so it
-/// cannot silently become an unreplayable row every channel is asked — and
-/// fails — to match. The whitelist governs which method *tags* may appear;
-/// [`build_plan`] (via [`plan_methods_for_object`]) governs which objects emit
-/// which of them — `gaussian_mixture` reaches the plan only for the
-/// close-approach objects ([`crate::catalog::CLOSE_APPROACH_OBJECTS`]).
+/// might gain later is not on the plan's axis until its `detection_on` tag is
+/// named here, so it cannot silently become an unreplayable row every channel
+/// is asked — and fails — to match. The whitelist governs which *tags* may
+/// appear; [`build_plan`] (via [`plan_methods_for_object`]) governs which
+/// objects emit which of them — `gaussian_mixture` reaches the plan only for
+/// the close-approach objects ([`crate::catalog::CLOSE_APPROACH_OBJECTS`]).
 ///
-/// `None` (OD rows carry no uncertainty tag) is always in the plan.
+/// `None` (the legacy untagged OD fit row) is always in the plan.
 pub const PLAN_UNCERTAINTY_AXES: [&str; 7] = [
-    uncertainty_modes::NONE,
-    uncertainty_modes::FIRST_ORDER,
-    uncertainty_modes::SECOND_ORDER,
-    uncertainty_modes::AUTO,
-    uncertainty_modes::SIGMA_POINT,
-    uncertainty_modes::MONTE_CARLO,
-    uncertainty_modes::GAUSSIAN_MIXTURE,
+    uncertainty_modes::NONE_DETECTION_ON,
+    uncertainty_modes::FIRST_ORDER_DETECTION_ON,
+    uncertainty_modes::SECOND_ORDER_DETECTION_ON,
+    uncertainty_modes::AUTO_DETECTION_ON,
+    uncertainty_modes::SIGMA_POINT_DETECTION_ON,
+    uncertainty_modes::MONTE_CARLO_DETECTION_ON,
+    uncertainty_modes::GAUSSIAN_MIXTURE_DETECTION_ON,
 ];
 
 /// Test types no replay channel can reproduce, and so must never reach the
@@ -1082,13 +1099,18 @@ mod tests {
         );
         assert!(m_apophis.contains(&uncertainty_modes::GAUSSIAN_MIXTURE));
 
-        // Every emitted method is on the plan's whitelist (so it survives the
-        // strip into the plan the replay channels consume).
+        // Every emitted method, composed with its detection_on arm, is on the
+        // plan's whitelist (so it survives the strip into the plan the replay
+        // channels consume).
         for &m in m_apophis.iter().chain(m_eros.iter()) {
-            assert!(PLAN_UNCERTAINTY_AXES.contains(&m), "{m} is not whitelisted");
+            let tag = uncertainty_modes::compose(m, uncertainty_modes::DETECTION_ON);
+            assert!(
+                PLAN_UNCERTAINTY_AXES.contains(&tag.as_str()),
+                "{tag} is not whitelisted"
+            );
         }
 
-        // Benchmark mode stays f64-only on every object.
+        // Benchmark mode stays none-only on every object.
         assert_eq!(
             plan_methods_for_object(apophis, false),
             vec![uncertainty_modes::NONE]
@@ -1117,24 +1139,26 @@ mod tests {
                 .count();
             assert_eq!(legacy, 1, "{} legacy untagged fit row", obj.name);
 
-            // One tagged fit row and one transport row per method.
+            // One tagged fit row and one transport row per method, under the
+            // method's composite detection_on tag.
             for &m in &plan_methods_for_object(obj, true) {
+                let tag = uncertainty_modes::compose(m, uncertainty_modes::DETECTION_ON);
                 let fit = rows
                     .iter()
                     .filter(|r| {
                         r.test_type == test_types::ORBIT_DETERMINATION
-                            && r.propagation_uncertainty.as_deref() == Some(m)
+                            && r.propagation_uncertainty.as_deref() == Some(tag.as_str())
                     })
                     .count();
-                assert_eq!(fit, 1, "{}: one fit row for {m}", obj.name);
+                assert_eq!(fit, 1, "{}: one fit row for {tag}", obj.name);
                 let transport = rows
                     .iter()
                     .filter(|r| {
                         r.test_type == test_types::ORBIT_DETERMINATION_TRANSPORT
-                            && r.propagation_uncertainty.as_deref() == Some(m)
+                            && r.propagation_uncertainty.as_deref() == Some(tag.as_str())
                     })
                     .count();
-                assert_eq!(transport, 1, "{}: one transport row for {m}", obj.name);
+                assert_eq!(transport, 1, "{}: one transport row for {tag}", obj.name);
             }
 
             // Every transport row carries the runner-filled epoch placeholders
@@ -1363,7 +1387,9 @@ mod tests {
 
     #[test]
     fn plan_from_rows_with_unknown_fields_deserializes_against_the_pinned_schema() {
-        let rows = vec![rust_row_with_unknown_fields(Some(uncertainty_modes::NONE))];
+        let rows = vec![rust_row_with_unknown_fields(Some(
+            uncertainty_modes::NONE_DETECTION_ON,
+        ))];
         let (plan, drops) = strip_to_plan(&rows).expect("strip");
         assert_eq!(drops.total(), 0);
         assert_eq!(plan.len(), 1);
@@ -1480,21 +1506,13 @@ mod tests {
     #[test]
     fn all_seven_engine_methods_are_whitelisted_into_the_plan() {
         // The method contract named explicitly: each of the seven engine
-        // methods must survive the strip into the plan. Dropping one from
-        // PLAN_UNCERTAINTY_AXES regresses exactly here.
-        for method in [
-            uncertainty_modes::NONE,
-            uncertainty_modes::FIRST_ORDER,
-            uncertainty_modes::SECOND_ORDER,
-            uncertainty_modes::AUTO,
-            uncertainty_modes::SIGMA_POINT,
-            uncertainty_modes::MONTE_CARLO,
-            uncertainty_modes::GAUSSIAN_MIXTURE,
-        ] {
-            let (plan, drops) =
-                strip_to_plan(&[rust_row_with_unknown_fields(Some(method))]).unwrap();
-            assert_eq!(plan.len(), 1, "{method} stripped out of the plan");
-            assert_eq!(drops.uncertainty_axis, 0, "{method} counted as a drop");
+        // methods, under its detection_on arm, must survive the strip into the
+        // plan. Dropping one from PLAN_UNCERTAINTY_AXES regresses exactly here.
+        for method in uncertainty_modes::METHODS {
+            let tag = uncertainty_modes::compose(method, uncertainty_modes::DETECTION_ON);
+            let (plan, drops) = strip_to_plan(&[rust_row_with_unknown_fields(Some(&tag))]).unwrap();
+            assert_eq!(plan.len(), 1, "{tag} stripped out of the plan");
+            assert_eq!(drops.uncertainty_axis, 0, "{tag} counted as a drop");
         }
         assert_eq!(PLAN_UNCERTAINTY_AXES.len(), 7);
     }

@@ -999,8 +999,11 @@ def run_plan_pass(ctx, plan: list[dict], fixtures_dir: Path) -> list[dict]:
         if tt not in _PLAN_TEST_TYPES:
             continue
         # One GRSS row per (object, test type, dt, observer): see the module
-        # docstring on the uncertainty axis.
-        if row.get("propagation_uncertainty") not in (None, "none"):
+        # docstring on the uncertainty axis. The tag is a composite
+        # `<method>_<arm>`, so the method is read off the prefix: a `None` tag
+        # (OD rows) and every arm of `none` are covariance-free; skip the rest.
+        _u = row.get("propagation_uncertainty")
+        if _u is not None and not (_u == "none" or _u.startswith("none_")):
             continue
         out = dict(row)
         out["channel"] = "grss"

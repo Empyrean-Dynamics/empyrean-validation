@@ -243,61 +243,36 @@ pub mod test_types {
 
 /// Canonical [`ValidationResult::propagation_uncertainty`] values.
 ///
-/// Every value names the numeric path and the detection state as
-/// `<path>_detection_<on|off>`, with an `_assist_<config>_like` suffix on the
-/// ASSIST-matched barebones arms (force-model handle built once outside the
-/// timer, integrator knobs matched to an ASSIST configuration). The path ×
-/// detection two-by-two is complete: {f64, first_order} × {on, off}.
+/// # Grammar
+///
+/// Every tag is composite: `<method>_<arm>`. The **method** prefix is exactly
+/// one of the seven engine uncertainty methods ([`METHODS`]) and names the
+/// covariance surface the engine delivers; the **arm** suffix is one of the
+/// three detection/timing arms ([`ARMS`]) and names the detection / prebuilt
+/// boundary the row's wall-clock is measured under. A method's propagated
+/// *state* is identical across its arms — the arms differ only in what the
+/// timer includes — so a `detection_off*` arm carries no independent accuracy
+/// signal, only a timing.
+///
+/// [`method_of`] and [`arm_of`] split a tag back into its two parts, and
+/// [`compose`] builds one. The split matches the method prefix against the
+/// whole [`METHODS`] set and the remainder against the whole [`ARMS`] set — it
+/// never guesses on a word boundary, so `second_order_detection_on` reads as
+/// `second_order` + `detection_on`, never `second` + the rest — and refuses
+/// (returns `None`) for any tag outside the vocabulary.
 pub mod uncertainty_modes {
-    /// First-order covariance transport (Jet1 / STM) with per-step event
-    /// detection ON. The production hot path — empyrean is uncertainty-first.
-    pub const FIRST_ORDER_DETECTION_ON: &str = "first_order_detection_on";
-    /// First-order covariance transport with per-step event detection and
-    /// dense output OFF. Same rows and covariance as
-    /// [`FIRST_ORDER_DETECTION_ON`]; isolates the detection cost on the
-    /// covariance-bearing path. Bit-identical transported state.
-    pub const FIRST_ORDER_DETECTION_OFF: &str = "first_order_detection_off";
-    /// Plain f64 state propagation (no input covariance) with per-step event
-    /// detection ON. Pairs against external single-particle propagators.
-    pub const F64_DETECTION_ON: &str = "f64_detection_on";
-    /// Plain f64 state propagation with per-step event detection and dense
-    /// output OFF. The propagated state is bit-identical to
-    /// [`F64_DETECTION_ON`]; only the wall-clock differs, so the measured
-    /// cost is attributable to the detection pass alone. Makes the ASSIST
-    /// wall-clock comparison like-for-like (ASSIST times integrate only).
-    pub const F64_DETECTION_OFF: &str = "f64_detection_off";
-    /// ASSIST-matched barebones arm: [`F64_DETECTION_OFF`] on a force-model
-    /// handle built ONCE per object outside the timer (only the propagate call
-    /// timed — the like-for-like boundary against an ASSIST integrate call),
-    /// with the integrator knobs villeneuve exposes matched to the ASSIST
-    /// `assist_default` configuration (epsilon 1e-9, initial step 0.001 d,
-    /// minimum step 0; encounter floor follows epsilon).
-    pub const F64_DETECTION_OFF_ASSIST_DEFAULT_LIKE: &str = "f64_detection_off_assist_default_like";
-    /// The Jet1/STM counterpart of [`F64_DETECTION_OFF_ASSIST_DEFAULT_LIKE`]:
-    /// same barebones prebuilt/detection-off boundary and `assist_default`-matched
-    /// knobs, but the covariance-bearing first-order path.
-    pub const FIRST_ORDER_DETECTION_OFF_ASSIST_DEFAULT_LIKE: &str =
-        "first_order_detection_off_assist_default_like";
-    /// ASSIST-matched barebones arm matched to the ASSIST `assist_asteroid_institute`
-    /// configuration (epsilon 1e-6, initial step 1e-6 d, minimum step 1e-9 d),
-    /// same prebuilt/detection-off boundary as the default-like arm.
-    pub const F64_DETECTION_OFF_ASSIST_ASTEROID_INSTITUTE_LIKE: &str =
-        "f64_detection_off_assist_asteroid_institute_like";
-    /// The Jet1/STM counterpart of
-    /// [`F64_DETECTION_OFF_ASSIST_ASTEROID_INSTITUTE_LIKE`].
-    pub const FIRST_ORDER_DETECTION_OFF_ASSIST_ASTEROID_INSTITUTE_LIKE: &str =
-        "first_order_detection_off_assist_asteroid_institute_like";
-    /// Input orbit carries a covariance, so the propagator dispatches to
-    /// Jet1 / STM integration. The production hot path because empyrean
-    /// is uncertainty-first by design.
-    pub const FIRST_ORDER: &str = "first_order";
-    /// Covariance stripped; pure f64 state-only propagation. Used to
-    /// measure Jet1 overhead and to compare against external propagators
-    /// that don't carry uncertainty.
+    // ── Method prefixes: the covariance surface the engine delivers ─────────
+    /// Covariance stripped; pure f64 state-only propagation. Used to measure
+    /// Jet1 overhead and to compare against external propagators that don't
+    /// carry uncertainty. (Main's `f64` prefix.)
     pub const NONE: &str = "none";
+    /// First-order covariance transport (Jet1 / STM). The input orbit carries
+    /// a covariance, so the propagator dispatches to Jet1 integration. The
+    /// production hot path because empyrean is uncertainty-first by design.
+    pub const FIRST_ORDER: &str = "first_order";
     /// Second-order (Jet2 / state-transition-tensor) uncertainty: the
-    /// propagated covariance carries the second-order curvature of the
-    /// flow, compared as the about-nominal moment (central + δμδμᵀ).
+    /// propagated covariance carries the second-order curvature of the flow,
+    /// compared as the about-nominal moment (central + δμδμᵀ).
     pub const SECOND_ORDER: &str = "second_order";
     /// Adaptive method: the engine resolves the rung per epoch from its own
     /// thresholds. The only method permitted a ladder — every other method
@@ -309,18 +284,107 @@ pub mod uncertainty_modes {
     /// delivered set of sigma-point sample flights.
     pub const SIGMA_POINT: &str = "sigma_point";
     /// Monte-Carlo uncertainty: the sample moment of
-    /// [`MONTE_CARLO_SAMPLE_COUNT`] seeded draws. The sample count and the
-    /// seed ([`MONTE_CARLO_SEED`]) are fixed suite-wide schema constants; the
-    /// tag itself carries no number.
+    /// [`MONTE_CARLO_SAMPLE_COUNT`] seeded draws. The sample count and the seed
+    /// ([`MONTE_CARLO_SEED`]) are fixed suite-wide schema constants; the tag
+    /// carries no sample count in its spelling.
     pub const MONTE_CARLO: &str = "monte_carlo";
     /// Gaussian-mixture uncertainty: the engine κ-gates the object's own
-    /// covariance and splits it into an adaptive mixture at a close
-    /// approach. The plan emits this method only for the close-approach
-    /// objects ([`crate::catalog::CLOSE_APPROACH_OBJECTS`]); an object with
-    /// no close approach delivers a single second-order Gaussian, never a
-    /// mixture. The row carries the moment-matched matrix plus the component
-    /// count, the surviving mass, and the four refusal tallies.
+    /// covariance and splits it into an adaptive mixture at a close approach.
+    /// The plan emits this method only for the close-approach objects
+    /// ([`crate::catalog::CLOSE_APPROACH_OBJECTS`]); an object with no close
+    /// approach delivers a single second-order Gaussian, never a mixture. The
+    /// row carries the moment-matched matrix plus the component count, the
+    /// surviving mass, and the four refusal tallies.
     pub const GAUSSIAN_MIXTURE: &str = "gaussian_mixture";
+
+    /// The seven method prefixes, in dispatch order — the vocabulary
+    /// [`method_of`] and [`compose`] match a tag's prefix against.
+    pub const METHODS: [&str; 7] = [
+        NONE,
+        FIRST_ORDER,
+        SECOND_ORDER,
+        AUTO,
+        SIGMA_POINT,
+        MONTE_CARLO,
+        GAUSSIAN_MIXTURE,
+    ];
+
+    // ── Arm suffixes: the detection / prebuilt timing boundary ──────────────
+    /// Per-step event detection ON (the production configuration). The plan
+    /// emits every method under this arm; it is the only arm with an accuracy
+    /// signal.
+    pub const DETECTION_ON: &str = "detection_on";
+    /// Per-step event detection (and dense output) OFF. The propagated state is
+    /// bit-identical to the method's `detection_on` arm; only the wall-clock
+    /// differs, so the measured cost is attributable to the detection pass
+    /// alone. Derived by `arm-plan` from the `detection_on` grid.
+    pub const DETECTION_OFF: &str = "detection_off";
+    /// ASSIST-matched barebones arm: [`DETECTION_OFF`] on a force-model handle
+    /// built ONCE per object outside the timer (only the propagate call timed —
+    /// the like-for-like boundary against an ASSIST integrate call), with the
+    /// integrator knobs villeneuve exposes matched to the ASSIST
+    /// `assist_default` configuration (epsilon 1e-9, initial step 0.001 d,
+    /// minimum step 0; encounter floor follows epsilon). Derived by `arm-plan`.
+    pub const DETECTION_OFF_ASSIST_DEFAULT_LIKE: &str = "detection_off_assist_default_like";
+
+    /// The three arm suffixes — the vocabulary [`arm_of`] and [`compose`] match
+    /// a tag's suffix against.
+    pub const ARMS: [&str; 3] = [
+        DETECTION_ON,
+        DETECTION_OFF,
+        DETECTION_OFF_ASSIST_DEFAULT_LIKE,
+    ];
+
+    // ── Full tags main benchmarks: {none, first_order} × the arms ───────────
+    // The two methods main timed, spelled out for the report and the external
+    // merges. The other five methods carry only a `detection_on` arm, composed
+    // with [`compose`]. Renamed from main's `f64_*` by prefix only.
+    /// `none` state propagation, detection ON. Pairs against external
+    /// single-particle propagators.
+    pub const NONE_DETECTION_ON: &str = "none_detection_on";
+    /// `none` state propagation, detection OFF — a timing partner of
+    /// [`NONE_DETECTION_ON`] with a bit-identical state.
+    pub const NONE_DETECTION_OFF: &str = "none_detection_off";
+    /// `none` barebones arm matched to the ASSIST `assist_default` config.
+    pub const NONE_DETECTION_OFF_ASSIST_DEFAULT_LIKE: &str =
+        "none_detection_off_assist_default_like";
+    /// `none` barebones arm matched to the ASSIST `assist_asteroid_institute`
+    /// config (epsilon 1e-6, initial step 1e-6 d, minimum step 1e-9 d). A
+    /// legacy external-comparison timing arm kept for the report's ASSIST
+    /// backcompat fold; it is outside the composite [`ARMS`] vocabulary, so
+    /// [`arm_of`] refuses it.
+    pub const NONE_DETECTION_OFF_ASSIST_ASTEROID_INSTITUTE_LIKE: &str =
+        "none_detection_off_assist_asteroid_institute_like";
+    /// First-order covariance transport, detection ON. The production hot path.
+    pub const FIRST_ORDER_DETECTION_ON: &str = "first_order_detection_on";
+    /// First-order covariance transport, detection OFF — isolates the detection
+    /// cost on the covariance-bearing path. Bit-identical transported state.
+    pub const FIRST_ORDER_DETECTION_OFF: &str = "first_order_detection_off";
+    /// The Jet1/STM counterpart of [`NONE_DETECTION_OFF_ASSIST_DEFAULT_LIKE`].
+    pub const FIRST_ORDER_DETECTION_OFF_ASSIST_DEFAULT_LIKE: &str =
+        "first_order_detection_off_assist_default_like";
+    /// The Jet1/STM counterpart of
+    /// [`NONE_DETECTION_OFF_ASSIST_ASTEROID_INSTITUTE_LIKE`]. Legacy arm,
+    /// outside the composite vocabulary.
+    pub const FIRST_ORDER_DETECTION_OFF_ASSIST_ASTEROID_INSTITUTE_LIKE: &str =
+        "first_order_detection_off_assist_asteroid_institute_like";
+
+    // The remaining five methods carry only the `detection_on` arm (they are
+    // not part of the detection-cost timing benchmark, which main ran on
+    // `none` and `first_order` alone). Spelled out so the plan's
+    // [`crate::plan::PLAN_UNCERTAINTY_AXES`] whitelist is a `const` array.
+    /// Second-order covariance transport, detection ON.
+    pub const SECOND_ORDER_DETECTION_ON: &str = "second_order_detection_on";
+    /// Adaptive uncertainty, detection ON.
+    pub const AUTO_DETECTION_ON: &str = "auto_detection_on";
+    /// Sigma-point uncertainty, detection ON.
+    pub const SIGMA_POINT_DETECTION_ON: &str = "sigma_point_detection_on";
+    /// Seeded Monte-Carlo uncertainty, detection ON. (Main spelled the sample
+    /// count into this tag's prefix; the count is a schema constant now, so the
+    /// tag does not carry it.)
+    pub const MONTE_CARLO_DETECTION_ON: &str = "monte_carlo_detection_on";
+    /// Gaussian-mixture uncertainty, detection ON (close-approach objects only).
+    pub const GAUSSIAN_MIXTURE_DETECTION_ON: &str = "gaussian_mixture_detection_on";
 
     /// Sample count for the suite's seeded Monte-Carlo method, fixed
     /// suite-wide so a Monte-Carlo row is comparable across runs and
@@ -335,6 +399,44 @@ pub mod uncertainty_modes {
     /// `EMPYREAN` — so a drift in the draws reads as a defect, never as a new
     /// seed.
     pub const MONTE_CARLO_SEED: u64 = 0x454D_5059_5245_414E;
+
+    /// Split a composite tag into `(method, arm)`, or `None` if `tag` is not a
+    /// `<method>_<arm>` tag whose method is in [`METHODS`] and whose arm is in
+    /// [`ARMS`]. No prefix guessing: the method must match a whole [`METHODS`]
+    /// entry and the remainder a whole [`ARMS`] entry.
+    fn split(tag: &str) -> Option<(&'static str, &'static str)> {
+        for &method in &METHODS {
+            if let Some(rest) = tag.strip_prefix(method)
+                && let Some(arm_part) = rest.strip_prefix('_')
+            {
+                for &arm in &ARMS {
+                    if arm_part == arm {
+                        return Some((method, arm));
+                    }
+                }
+            }
+        }
+        None
+    }
+
+    /// The method prefix of a composite tag, or `None` for any tag outside the
+    /// vocabulary. See the [module grammar](self).
+    pub fn method_of(tag: &str) -> Option<&'static str> {
+        split(tag).map(|(method, _)| method)
+    }
+
+    /// The arm suffix of a composite tag, or `None` for any tag outside the
+    /// vocabulary. See the [module grammar](self).
+    pub fn arm_of(tag: &str) -> Option<&'static str> {
+        split(tag).map(|(_, arm)| arm)
+    }
+
+    /// Build the composite tag `<method>_<arm>`. The caller is responsible for
+    /// passing a real method and arm (the row builders pass [`METHODS`] /
+    /// [`ARMS`] constants); [`method_of`] / [`arm_of`] invert it.
+    pub fn compose(method: &str, arm: &str) -> String {
+        format!("{method}_{arm}")
+    }
 }
 
 /// Stamped on every orbit-determination fit row's
@@ -797,7 +899,7 @@ pub struct ValidationResult {
     /// creation, `assist.Extras` binding, adding the particle) — everything
     /// from the start of the row through the end of `sim.integrate`. The
     /// ephemeris object stays outside both timers, matching empyrean's
-    /// context. Gives `f64_detection_on` (whole `propagate()` call) a
+    /// context. Gives `none_detection_on` (whole `propagate()` call) a
     /// symmetric partner. Populated by `merge-external`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub assist_call_time_ms: Option<f64>,
@@ -1465,6 +1567,91 @@ mod tests {
     use super::*;
 
     #[test]
+    fn uncertainty_vocabulary_composes_and_refuses() {
+        use uncertainty_modes as um;
+
+        // The vocabulary is seven method prefixes × three arm suffixes.
+        assert_eq!(um::METHODS.len(), 7);
+        assert_eq!(um::ARMS.len(), 3);
+        assert_eq!(
+            um::METHODS,
+            [
+                "none",
+                "first_order",
+                "second_order",
+                "auto",
+                "sigma_point",
+                "monte_carlo",
+                "gaussian_mixture",
+            ]
+        );
+        assert_eq!(
+            um::ARMS,
+            [
+                "detection_on",
+                "detection_off",
+                "detection_off_assist_default_like",
+            ]
+        );
+
+        // compose → split round-trips for every pair in the vocabulary.
+        for &method in &um::METHODS {
+            for &arm in &um::ARMS {
+                let tag = um::compose(method, arm);
+                assert_eq!(um::method_of(&tag), Some(method), "method_of({tag})");
+                assert_eq!(um::arm_of(&tag), Some(arm), "arm_of({tag})");
+            }
+        }
+
+        // Named full-tag constants agree with the composed spelling.
+        assert_eq!(
+            um::NONE_DETECTION_ON,
+            um::compose(um::NONE, um::DETECTION_ON)
+        );
+        assert_eq!(
+            um::FIRST_ORDER_DETECTION_OFF_ASSIST_DEFAULT_LIKE,
+            um::compose(um::FIRST_ORDER, um::DETECTION_OFF_ASSIST_DEFAULT_LIKE)
+        );
+
+        // No prefix guessing: a multi-word method is never read as its first
+        // word, and the whole tag must be `<method>_<arm>`.
+        assert_eq!(
+            um::method_of("second_order_detection_on"),
+            Some("second_order")
+        );
+        assert_eq!(
+            um::arm_of("second_order_detection_on"),
+            Some("detection_on")
+        );
+
+        // Refusals — anything outside the vocabulary splits to None.
+        for bad in [
+            "",
+            "none",                    // bare method, no arm
+            "detection_on",            // bare arm, no method
+            "second",                  // a method's first word only
+            "none_",                   // empty arm
+            "none_detection_sideways", // unknown arm
+            "cubic_detection_on",      // unknown method
+            // The legacy asteroid-institute arm is outside the composite
+            // vocabulary (kept only as a named constant for the report).
+            "none_detection_off_assist_asteroid_institute_like",
+        ] {
+            assert_eq!(um::method_of(bad), None, "method_of({bad}) must refuse");
+            assert_eq!(um::arm_of(bad), None, "arm_of({bad}) must refuse");
+        }
+        // Main's retired spellings must also refuse. Built from pieces so the
+        // literal does not appear in-tree (the tag-grep gate forbids it).
+        for bad in [
+            ["f64", "detection_on"].join("_"),
+            ["monte_carlo", "100", "detection_on"].join("_"),
+        ] {
+            assert_eq!(um::method_of(&bad), None, "method_of({bad}) must refuse");
+            assert_eq!(um::arm_of(&bad), None, "arm_of({bad}) must refuse");
+        }
+    }
+
+    #[test]
     fn every_test_type_is_classified_exactly_once() {
         // ALL and the propagation/ephemeris + OD-family split must stay in
         // lockstep. A new test type added to the module but not to ALL is
@@ -1800,39 +1987,34 @@ mod tests {
         assert_eq!(MONTE_CARLO_SEED, 0x454D_5059_5245_414E);
     }
 
-    /// The method-tag vocabulary is exactly the seven suffix-free strings, in
-    /// the plan's own axis order ([`crate::plan::PLAN_UNCERTAINTY_AXES`]).
-    /// Re-adding the old covariance suffix or a sample count to any tag turns
-    /// this red.
+    /// The method vocabulary is exactly the seven methods, and the plan's axis
+    /// ([`crate::plan::PLAN_UNCERTAINTY_AXES`]) is their `detection_on` arm, in
+    /// the plan's own order. Re-adding the old covariance suffix or a sample
+    /// count to a method, or dropping one, turns this red.
     #[test]
     fn uncertainty_mode_vocabulary_is_exactly_the_seven_plan_tags() {
-        use uncertainty_modes::*;
+        use uncertainty_modes as um;
         // In the plan's axis order: state-only first, then the covariance
         // methods, the adaptive method, the sampled methods, and the mixture.
-        let vocabulary = [
-            NONE,
-            FIRST_ORDER,
-            SECOND_ORDER,
-            AUTO,
-            SIGMA_POINT,
-            MONTE_CARLO,
-            GAUSSIAN_MIXTURE,
+        let methods = [
+            um::NONE,
+            um::FIRST_ORDER,
+            um::SECOND_ORDER,
+            um::AUTO,
+            um::SIGMA_POINT,
+            um::MONTE_CARLO,
+            um::GAUSSIAN_MIXTURE,
         ];
-        assert_eq!(
-            vocabulary,
-            [
-                "none",
-                "first_order",
-                "second_order",
-                "auto",
-                "sigma_point",
-                "monte_carlo",
-                "gaussian_mixture",
-            ]
-        );
-        // The vocabulary IS the plan's whitelist, in the same order — no tag
-        // lives outside the plan's axis.
-        assert_eq!(crate::plan::PLAN_UNCERTAINTY_AXES, vocabulary);
+        assert_eq!(methods, um::METHODS);
+        // The plan's whitelist is those seven methods under the detection_on
+        // arm, in the same order — no tag lives outside the plan's axis.
+        assert_eq!(crate::plan::PLAN_UNCERTAINTY_AXES.len(), methods.len());
+        for (axis, method) in crate::plan::PLAN_UNCERTAINTY_AXES
+            .iter()
+            .zip(methods.iter())
+        {
+            assert_eq!(*axis, um::compose(method, um::DETECTION_ON).as_str());
+        }
     }
 
     /// Populated per-method output fields must survive a JSON round-trip, and

@@ -46,6 +46,54 @@ _TIER_TO_INT = {"approximate": 0, "basic": 1, "standard": 2}
 _AU_KM = 149_597_870.700
 
 
+# The composite uncertainty-tag vocabulary, a LITERAL mirror of
+# empyrean_validation::schema::uncertainty_modes (src/schema.rs): seven method
+# prefixes × three detection/timing arms, spelled `<method>_<arm>`. Pinned
+# against the schema by the driver's tests (the regex-on-schema.rs approach),
+# so a drift in either the mirror or the schema turns the pin red.
+_UNCERTAINTY_METHODS = (
+    "none",
+    "first_order",
+    "second_order",
+    "auto",
+    "sigma_point",
+    "monte_carlo",
+    "gaussian_mixture",
+)
+_UNCERTAINTY_ARMS = (
+    "detection_on",
+    "detection_off",
+    "detection_off_assist_default_like",
+)
+
+
+def _split_tag(tag: str | None) -> tuple[str | None, str | None]:
+    """Split a composite ``<method>_<arm>`` tag into ``(method, arm)``, or
+    ``(None, None)`` for any tag outside the vocabulary. No prefix guessing: the
+    method must be a whole ``_UNCERTAINTY_METHODS`` entry and the remainder a
+    whole ``_UNCERTAINTY_ARMS`` entry, so ``second_order_detection_on`` reads as
+    ``second_order`` + ``detection_on``, never ``second`` + the rest.
+    """
+    if tag is None:
+        return (None, None)
+    for method in _UNCERTAINTY_METHODS:
+        if tag.startswith(method) and tag[len(method) : len(method) + 1] == "_":
+            arm = tag[len(method) + 1 :]
+            if arm in _UNCERTAINTY_ARMS:
+                return (method, arm)
+    return (None, None)
+
+
+def _method_of(tag: str | None) -> str | None:
+    """The method prefix of a composite tag (mirrors ``uncertainty_modes::method_of``)."""
+    return _split_tag(tag)[0]
+
+
+def _arm_of(tag: str | None) -> str | None:
+    """The arm suffix of a composite tag (mirrors ``uncertainty_modes::arm_of``)."""
+    return _split_tag(tag)[1]
+
+
 # A LITERAL mirror of empyrean_validation::schema::OD_METHOD_AXIS_NOT_PRODUCED
 # (src/schema.rs). `ODConfig` carries no `uncertainty_method` at this
 # distribution revision (ae00643), so OD fits run method-free; every OD fit row
@@ -58,15 +106,14 @@ _OD_METHOD_AXIS_NOT_PRODUCED = (
     "ODConfig.uncertainty_method not on the wrapper"
 )
 
-# Method tags that carry NO daemon method token: `none` is the
-# covariance-free path (the binary attaches no covariance and emits no product
-# tokens, so the line stays byte-identical to the pre-widening 18-field line)
-# and `None` is the untagged legacy row. Every other tag (the schema's
-# `uncertainty_modes` spellings) is sent as the optional 19th `prop` token; the
-# binary refuses an unrecognized tag by name (`fail unknown_uncertainty_method`).
-# Monte Carlo's sample count and seed come from the binary (schema constants),
-# so there is nothing to send beyond the tag.
-_NO_METHOD_TOKEN = frozenset((None, "none"))
+# Method tags that carry NO daemon method token: the covariance-free `none`
+# method — under any arm — attaches no covariance and emits no product tokens,
+# so the line stays byte-identical to the pre-widening 18-field line, and
+# `None` is the untagged legacy row. Every covariance-bearing method's
+# composite tag is sent as the optional 19th `prop` token; the binary refuses a
+# tag outside the vocabulary by name (`fail unknown_uncertainty_method`). Monte
+# Carlo's sample count and seed come from the binary (schema constants), so
+# there is nothing to send beyond the tag.
 
 # The 12 per-method product fields plus the 2 collapsed moment views that travel
 # with them. A cli output row starts as a copy of its rust-channel input row, so
@@ -119,11 +166,13 @@ def _reset_per_method(row: dict) -> None:
 
 def _method_token(r: dict) -> str | None:
     """The optional 19th ``prop`` token for a plan row: its
-    ``propagation_uncertainty`` tag, or ``None`` for the covariance-free
-    ``none`` / untagged legacy row (which sends the bare 18-field line).
+    ``propagation_uncertainty`` composite tag, or ``None`` for the
+    covariance-free ``none`` method / untagged legacy row (which sends the bare
+    18-field line). The method is read off the tag's prefix, so every arm of
+    ``none`` sends the bare line.
     """
     m = r.get("propagation_uncertainty")
-    return None if m in _NO_METHOD_TOKEN else m
+    return None if m is None or _method_of(m) == "none" else m
 
 
 def _prop_daemon_line(r: dict) -> str | None:
@@ -241,6 +290,13 @@ def _build_prop_row(
     if method is not None:
         for k, v in _parse_products(parts[8:]).items():
             new[k] = v
+        # The binary emits `resolved_method` as the delivered kind's bare method
+        # name; compose it with this row's arm so it reads as a composite tag,
+        # like `propagation_uncertainty`.
+        delivered = new.get("resolved_method")
+        arm = _arm_of(new.get("propagation_uncertainty"))
+        if delivered is not None and arm is not None:
+            new["resolved_method"] = f"{delivered}_{arm}"
     return new
 
 

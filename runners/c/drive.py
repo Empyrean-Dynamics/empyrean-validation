@@ -183,10 +183,13 @@ def main() -> int:
 
     for r in rust_rows:
         tt = r.get("test_type")
-        # Uncertainty axis: skip Jet1 rows. The C runner stdin protocol
-        # does not yet accept a covariance for the input orbit; the
-        # cross-channel Jet1 parity comparison is a follow-up.
-        if r.get("propagation_uncertainty") not in (None, "none"):
+        # Uncertainty axis: skip covariance-bearing rows. The C runner stdin
+        # protocol does not yet accept a covariance for the input orbit; the
+        # cross-channel Jet1 parity comparison is a follow-up. The tag is a
+        # composite `<method>_<arm>`, so the method is read off the prefix: a
+        # `None` tag (OD rows) and every arm of `none` are covariance-free.
+        _u = r.get("propagation_uncertainty")
+        if _u is not None and not (_u == "none" or _u.startswith("none_")):
             n_skipped += 1
             continue
         if tt == "propagation":

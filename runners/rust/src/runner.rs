@@ -515,7 +515,11 @@ fn published_sky_covariance(
     delivered: Option<[[f64; 2]; 2]>,
 ) -> (Option<[[f64; 2]; 2]>, Option<String>) {
     use empyrean_validation::schema::uncertainty_modes as um;
-    let first_order_pinned = uncertainty_tag == um::FIRST_ORDER || uncertainty_tag == um::NONE;
+    // The first-order golden is kept on the covariance-free (`none`) and
+    // `first_order` rows; keyed on the tag's method PREFIX so it holds under
+    // any arm of those two methods.
+    let method = um::method_of(uncertainty_tag);
+    let first_order_pinned = method == Some(um::FIRST_ORDER) || method == Some(um::NONE);
     if first_order_pinned {
         (projected, sky_covariance_diagnostic(projected, delivered))
     } else {
@@ -842,6 +846,7 @@ pub fn run_propagation_validation(
         obj_data
             .par_iter()
             .map(|data| {
+                use empyrean_validation::schema::uncertainty_modes as um;
                 let mut results: Vec<ValidationResult> = Vec::new();
                 let modes = build_uncertainty_axes(
                     config.attach_covariance,
@@ -872,7 +877,10 @@ pub fn run_propagation_validation(
                 } else {
                     None
                 };
-                let uncertainty_tag = axis.tag;
+                // The row's composite tag: this axis's method under the
+                // detection_on arm (the rust runner measures detection on only;
+                // the detection_off / tolerance arms are derived by `arm-plan`).
+                let uncertainty_tag = um::compose(axis.tag, um::DETECTION_ON);
                 let state = CoordinateState {
                     epoch: Epoch::from_mjd_tdb(data.epoch),
                     elements: [
@@ -1112,7 +1120,8 @@ pub fn run_propagation_validation(
                             // outcome channel is `outcomes[0]`. The mixture
                             // side-table tallies are populated below when the
                             // engine delivered a Mixture.
-                            resolved_method: resolved_method_for(axis.tag, resolved_kind),
+                            resolved_method: resolved_method_for(axis.tag, resolved_kind)
+                                .map(|m| um::compose(&m, um::DETECTION_ON)),
                             cov_kind: cov_joint.as_ref().map(|j| cov_kind_wire(j.kind)),
                             cov_joint_width: cov_joint.as_ref().map(|j| j.width as u32),
                             cov_tri: cov_joint.as_ref().map(|j| j.tri.clone()),
@@ -1365,7 +1374,7 @@ pub fn run_propagation_validation(
                                 .covariance
                                 .map(|c| delivered_sky_covariance(&c, emp_dec_rad));
                             let (emp_radec_cov, sky_cov_diag) =
-                                published_sky_covariance(uncertainty_tag, projected, delivered);
+                                published_sky_covariance(&uncertainty_tag, projected, delivered);
                             // Carry the object's free-form notes, plus the
                             // first-order delivered-vs-projection σ diagnostic
                             // when one was recorded (first-order rows only).
@@ -2111,6 +2120,7 @@ fn od_transport_rows(
     let excluded_naif: Vec<i32> = excluded.iter().copied().map(Origin::naif_id).collect();
     // Same axis as the propagation sweep and the plan's transport rows
     // (`plan_methods_for_object`): a close-approach object adds the mixture arm.
+    use empyrean_validation::schema::uncertainty_modes as um;
     let axes = build_uncertainty_axes(true, is_close_approach);
     let mut rows: Vec<ValidationResult> = Vec::with_capacity(axes.len());
 
@@ -2178,9 +2188,12 @@ fn od_transport_rows(
         row.emp_pos_cov_au2 = emp_pos_cov;
         row.emp_time_ms = emp_ms;
         row.excluded_perturbers_naif = excluded_naif.clone();
-        row.propagation_uncertainty = Some(axis.tag.to_string());
+        row.propagation_uncertainty = Some(um::compose(axis.tag, um::DETECTION_ON));
         // Per-method products, read off the 0.11 wrapper (never recomputed).
-        row.resolved_method = resolved_method_for(axis.tag, resolved_kind);
+        // resolved_method is the delivered kind's method, composed with the
+        // row's detection arm.
+        row.resolved_method =
+            resolved_method_for(axis.tag, resolved_kind).map(|m| um::compose(&m, um::DETECTION_ON));
         row.cov_kind = cov_joint.as_ref().map(|j| cov_kind_wire(j.kind));
         row.cov_joint_width = cov_joint.as_ref().map(|j| j.width as u32);
         row.cov_tri = cov_joint.as_ref().map(|j| j.tri.clone());
@@ -3356,7 +3369,8 @@ mod tests {
 
         // First-order: the projection is published; the delivered covariance
         // is a diagnostic only (its σ difference against the projection).
-        let (published, diag) = published_sky_covariance(um::FIRST_ORDER, Some(proj), Some(deliv));
+        let (published, diag) =
+            published_sky_covariance(um::FIRST_ORDER_DETECTION_ON, Some(proj), Some(deliv));
         assert_eq!(published, Some(proj));
         assert!(
             diag.is_some(),
@@ -3365,18 +3379,20 @@ mod tests {
 
         // A non-first-order method publishes the delivered covariance, no
         // diagnostic.
-        let (published, diag) = published_sky_covariance(um::SECOND_ORDER, Some(proj), Some(deliv));
+        let (published, diag) =
+            published_sky_covariance(um::SECOND_ORDER_DETECTION_ON, Some(proj), Some(deliv));
         assert_eq!(published, Some(deliv));
         assert!(diag.is_none());
 
         // A non-first-order method with no delivered covariance falls back to
         // the projection.
-        let (published, _) = published_sky_covariance(um::SIGMA_POINT, Some(proj), None);
+        let (published, _) =
+            published_sky_covariance(um::SIGMA_POINT_DETECTION_ON, Some(proj), None);
         assert_eq!(published, Some(proj));
 
-        // f64 row carries no delivered covariance: the projection (itself
+        // none row carries no delivered covariance: the projection (itself
         // None without an attached covariance) is published, no diagnostic.
-        let (published, diag) = published_sky_covariance(um::NONE, None, None);
+        let (published, diag) = published_sky_covariance(um::NONE_DETECTION_ON, None, None);
         assert_eq!(published, None);
         assert!(diag.is_none());
     }
@@ -3773,11 +3789,11 @@ mod tests {
         }
         let second = rows
             .iter()
-            .find(|r| r.propagation_uncertainty.as_deref() == Some(um::SECOND_ORDER))
+            .find(|r| r.propagation_uncertainty.as_deref() == Some(um::SECOND_ORDER_DETECTION_ON))
             .expect("a second_order transport row");
         assert_eq!(
             second.resolved_method.as_deref(),
-            Some(um::SECOND_ORDER),
+            Some(um::SECOND_ORDER_DETECTION_ON),
             "SecondOrder transport must deliver the SecondOrder kind, not Linear"
         );
         assert_eq!(
@@ -3839,7 +3855,7 @@ mod tests {
         // A deterministic (sensitivity-chain) row reads a clean "delivered".
         let first = rows
             .iter()
-            .find(|r| r.propagation_uncertainty.as_deref() == Some(um::FIRST_ORDER))
+            .find(|r| r.propagation_uncertainty.as_deref() == Some(um::FIRST_ORDER_DETECTION_ON))
             .expect("a first_order transport row");
         assert_eq!(first.orbit_status.as_deref(), Some("delivered"));
     }
@@ -3856,9 +3872,12 @@ mod tests {
         };
         let first = rows
             .iter()
-            .find(|r| r.propagation_uncertainty.as_deref() == Some(um::FIRST_ORDER))
+            .find(|r| r.propagation_uncertainty.as_deref() == Some(um::FIRST_ORDER_DETECTION_ON))
             .expect("a first_order transport row");
-        assert_eq!(first.resolved_method.as_deref(), Some(um::FIRST_ORDER));
+        assert_eq!(
+            first.resolved_method.as_deref(),
+            Some(um::FIRST_ORDER_DETECTION_ON)
+        );
         assert_eq!(first.cov_kind, Some(cov_kind_wire(CovarianceKind::Linear)));
         let w = first.cov_joint_width.expect("a delivered joint width") as usize;
         assert!(w >= 6, "the state block is present at minimum");
@@ -3936,11 +3955,11 @@ mod tests {
         };
         let sp = rows
             .iter()
-            .find(|r| r.propagation_uncertainty.as_deref() == Some(um::SIGMA_POINT))
+            .find(|r| r.propagation_uncertainty.as_deref() == Some(um::SIGMA_POINT_DETECTION_ON))
             .expect("a sigma_point transport row");
         assert_eq!(
             sp.resolved_method.as_deref(),
-            Some(um::SIGMA_POINT),
+            Some(um::SIGMA_POINT_DETECTION_ON),
             "the SigmaPoint transport delivers the SigmaPoint kind"
         );
         assert_eq!(sp.cov_kind, Some(cov_kind_wire(CovarianceKind::SigmaPoint)));

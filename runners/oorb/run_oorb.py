@@ -551,11 +551,15 @@ def main() -> int:
     n_computed = 0
 
     for r in plan:
-        # Uncertainty axis: skip Jet1 rows. oorb supports propagating a
-        # full 6×6 covariance via `--cov-format` but cross-tool Jet1
-        # parity needs a separate handshake on the covariance
-        # representation. Out of scope for this propagation-only pass.
-        if r.get("propagation_uncertainty") not in (None, "none"):
+        # Uncertainty axis: skip covariance-bearing rows. oorb supports
+        # propagating a full 6×6 covariance via `--cov-format` but cross-tool
+        # Jet1 parity needs a separate handshake on the covariance
+        # representation. Out of scope for this propagation-only pass. The tag
+        # is a composite `<method>_<arm>`, so the method is read off the
+        # prefix: a `None` tag (OD rows) and every arm of `none` are
+        # covariance-free.
+        _u = r.get("propagation_uncertainty")
+        if _u is not None and not (_u == "none" or _u.startswith("none_")):
             n_skipped += 1
             continue
         new = dict(r)

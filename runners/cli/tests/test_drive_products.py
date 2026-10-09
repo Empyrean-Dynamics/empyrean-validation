@@ -181,8 +181,8 @@ def test_legacy_prop_row_keeps_per_method_null_and_resets_leak() -> None:
     exactly as before, and an inherited foreign product is cleared (no leak).
     Mutation: default a per-method field to 0 instead of null, or set-to-null
     (adding a key) instead of delete → red here or in the byte diff."""
-    r = _prop_row("none", leak=True)
-    assert drive._method_token(r) is None  # f64 sends no token
+    r = _prop_row("none_detection_on", leak=True)
+    assert drive._method_token(r) is None  # the none method sends no token
     parts = _LEGACY_LINE.split()
     assert len(parts) == 8
     row = drive._build_prop_row(r, parts, None, "TS", "VER")
@@ -211,11 +211,12 @@ def test_second_order_prop_row_populates_products() -> None:
     """A SecondOrder row populates the 12 fields from the binary tokens; the
     collapsed moment view stays None (the cli binary emits no 6x6 — named gap).
     Mutation: ignore the parsed tokens → the fields stay null → red."""
-    r = _prop_row("second_order")
-    assert drive._method_token(r) == "second_order"
+    r = _prop_row("second_order_detection_on")
+    assert drive._method_token(r) == "second_order_detection_on"
     parts = _SECOND_ORDER_LINE.split()
-    row = drive._build_prop_row(r, parts, "second_order", "TS", "VER")
-    assert row["resolved_method"] == "second_order"
+    row = drive._build_prop_row(r, parts, "second_order_detection_on", "TS", "VER")
+    # The binary's bare `second_order` is composed with the row's detection arm.
+    assert row["resolved_method"] == "second_order_detection_on"
     assert row["cov_kind"] == 1
     assert row["cov_joint_width"] == 6
     assert len(row["cov_tri"]) == 21
@@ -233,23 +234,24 @@ def test_method_token_sent_for_non_f64_absent_for_f64() -> None:
     and omits it for f64 / the untagged row. Mutation: a ``_method_token`` that
     always returned None → the SecondOrder line loses its tag → red (and the
     SecondOrder binary response would report linear end-to-end)."""
-    so_line = drive._prop_daemon_line(_prop_row("second_order"))
-    assert so_line.endswith(" second_order")
+    so_line = drive._prop_daemon_line(_prop_row("second_order_detection_on"))
+    assert so_line.endswith(" second_order_detection_on")
     assert len(so_line.split()) == 20  # "prop" + 18 fields + method token
 
     for tag in (
-        "first_order",
-        "auto",
-        "sigma_point",
-        "monte_carlo",
-        "gaussian_mixture",
+        "first_order_detection_on",
+        "auto_detection_on",
+        "sigma_point_detection_on",
+        "monte_carlo_detection_on",
+        "gaussian_mixture_detection_on",
     ):
         line = drive._prop_daemon_line(_prop_row(tag))
         assert line.endswith(f" {tag}"), tag
         assert len(line.split()) == 20, tag
 
-    f64_line = drive._prop_daemon_line(_prop_row("none"))
-    assert not f64_line.endswith(" none")  # the state-only tag is never appended
+    f64_line = drive._prop_daemon_line(_prop_row("none_detection_on"))
+    # The covariance-free none tag is never appended as a token.
+    assert not f64_line.endswith(" none_detection_on")
     assert len(f64_line.split()) == 19  # "prop" + 18 fields, no method token
 
 
@@ -302,7 +304,7 @@ def test_end_to_end_second_order_through_binary() -> None:
     ``_prop_daemon_line`` and the binary returns the 8-field f64 line, so the
     len==20 / resolved_method assertions go red."""
     binary = _binary()
-    line = drive._prop_daemon_line(_prop_row("second_order"))
+    line = drive._prop_daemon_line(_prop_row("second_order_detection_on"))
     proc = subprocess.Popen(
         [str(binary), "--daemon", "--data-dir", str(_DATA_DIR)],
         stdin=subprocess.PIPE,

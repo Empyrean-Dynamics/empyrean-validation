@@ -209,17 +209,21 @@ fn synthetic_covariance() -> [[f64; 6]; 6] {
     c
 }
 
-/// Map a plan `propagation_uncertainty` tag to `(attach_covariance, method)`.
+/// Map a plan `propagation_uncertainty` composite tag to
+/// `(attach_covariance, method)`.
 ///
-/// `none` is the covariance-free path — first order, no covariance
-/// attached. Every other known tag attaches the synthetic covariance and runs
-/// its named rung. `monte_carlo` carries the suite-wide sample
-/// count and seed from the schema — never the engine's per-call convenience
-/// seed — so a seeded Monte-Carlo row is a cross-channel bit check. An
-/// unrecognized tag yields `None` so the caller refuses it by name rather than
-/// silently substituting a method (the no-silent-substitution invariant).
+/// The engine method is the tag's method **prefix** ([`um::method_of`]) — the
+/// detection/timing arm is irrelevant to which rung the engine runs, so the
+/// cli channel keys the rung on the prefix alone. `none` is the covariance-free
+/// path — first order, no covariance attached. Every other method attaches the
+/// synthetic covariance and runs its named rung. `monte_carlo` carries the
+/// suite-wide sample count and seed from the schema — never the engine's
+/// per-call convenience seed — so a seeded Monte-Carlo row is a cross-channel
+/// bit check. A tag outside the vocabulary yields `None` so the caller refuses
+/// it by name rather than silently substituting a method (the
+/// no-silent-substitution invariant).
 fn method_for_tag(tag: &str) -> Option<(bool, UncertaintyMethod)> {
-    let m = match tag {
+    let m = match um::method_of(tag)? {
         um::NONE => (false, UncertaintyMethod::FirstOrder),
         um::FIRST_ORDER => (true, UncertaintyMethod::FirstOrder),
         um::SECOND_ORDER => (true, UncertaintyMethod::SecondOrder),
@@ -1140,25 +1144,34 @@ mod tests {
     // always returned FirstOrder turns the SecondOrder assertion red.
     #[test]
     fn method_for_tag_selects_the_requested_rung() {
+        // The composite tag's method prefix selects the rung; the detection
+        // arm is irrelevant to which rung runs.
         assert!(matches!(
-            method_for_tag(um::SECOND_ORDER),
+            method_for_tag(um::SECOND_ORDER_DETECTION_ON),
             Some((true, UncertaintyMethod::SecondOrder))
         ));
         assert!(matches!(
-            method_for_tag(um::FIRST_ORDER),
+            method_for_tag(um::FIRST_ORDER_DETECTION_ON),
             Some((true, UncertaintyMethod::FirstOrder))
         ));
         // none is the covariance-free path: first order, no covariance.
         assert!(matches!(
-            method_for_tag(um::NONE),
+            method_for_tag(um::NONE_DETECTION_ON),
             Some((false, UncertaintyMethod::FirstOrder))
         ));
         // auto / sigma-point / gaussian-mixture attach a covariance and are
         // requestable; their inner shape is the engine's own concern.
-        for tag in [um::AUTO, um::SIGMA_POINT, um::GAUSSIAN_MIXTURE] {
+        for tag in [
+            um::AUTO_DETECTION_ON,
+            um::SIGMA_POINT_DETECTION_ON,
+            um::GAUSSIAN_MIXTURE_DETECTION_ON,
+        ] {
             let (attach, _) = method_for_tag(tag).expect("tag must be requestable");
             assert!(attach, "{tag} must attach a covariance");
         }
+        // A bare method (no arm) is NOT a plan tag and is refused — the rung is
+        // keyed on a full composite tag, never a lone prefix.
+        assert!(method_for_tag(um::SECOND_ORDER).is_none());
     }
 
     // MonteCarlo must carry the suite-wide sample count and seed from the
@@ -1168,7 +1181,7 @@ mod tests {
     #[test]
     fn monte_carlo_carries_the_suite_sample_count_and_seed() {
         assert!(matches!(
-            method_for_tag(um::MONTE_CARLO),
+            method_for_tag(um::MONTE_CARLO_DETECTION_ON),
             Some((true, UncertaintyMethod::MonteCarlo { n_samples: 100, seed: Some(s) }))
                 if s == um::MONTE_CARLO_SEED
         ));

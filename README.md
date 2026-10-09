@@ -69,13 +69,17 @@ derivatives, so empyrean's second-order rows have no external counterpart.
 
 **Uncertainty methods** — the canonical plan carries a method axis so the
 replay channels can reproduce every way the engine propagates uncertainty. Each
-propagation and ephemeris row is emitted under each method: `f64` (no
-covariance), first-order (STM), second-order (STT), `auto` (the engine resolves
-the method per epoch), sigma-point, seeded Monte-Carlo (100 samples), and — on
-the close-approach objects — a Gaussian mixture. Orbit determination carries
-the axis on two row kinds, the fit and the post-fit transport of its
-covariance, under the same methods. The plan is the contract the channels
-consume; the external tools stay first-order comparators.
+row's `propagation_uncertainty` is a composite `<method>_<arm>` tag: a method —
+`none` (no covariance), first-order (STM), second-order (STT), `auto` (the
+engine resolves the method per epoch), sigma-point, seeded Monte-Carlo (100
+samples), and — on the close-approach objects — a Gaussian mixture — and a
+detection/timing arm. Each propagation and ephemeris row is emitted under every
+method's `detection_on` arm; the `detection_off` and prebuilt-system timing
+arms are derived from that grid (for the `none` and first-order methods) by the
+`arm-plan` command. Orbit determination carries the axis on two row kinds, the
+fit and the post-fit transport of its covariance, under the same methods. The
+plan is the contract the channels consume; the external tools stay first-order
+comparators.
 
 ## What lives here
 
