@@ -5,12 +5,30 @@ the empyrean-cli-runner binary in daemon mode (loaded once, one row
 per stdin line), and emits a cli-channel JSON in the same schema.
 
 The runner protocol is one row per stdin line, prefixed with mode:
-- "prop EPOCH IC[6] A1-3 G[5] FORCE TARGET"
+- "prop EPOCH IC[6] A1-3 G[5] FORCE TARGET [METHOD]"
 - "eph  EPOCH IC[6] A1-3 G[5] FORCE TARGET OBS_CODE"
 - "od   FORCE ADES_PATH"
 
 This mirrors the C runner's protocol (validation/runners/c/drive.py),
 so both channels use the same fork-once-stream-many model.
+
+Per-method uncertainty axis
+---------------------------
+Each plan row carries a ``propagation_uncertainty`` method tag. For every
+tag but ``f64_no_cov`` (and the untagged legacy row) the driver appends the
+tag as the optional 19th ``prop`` token, so the binary attaches the synthetic
+covariance, requests that rung, and appends its delivered 0.11 products after
+the 8 fixed fields as whitespace-free ``key=value`` tokens (the binary's
+``Products::render``; see ``runners/cli/src/main.rs``). The driver parses those
+tokens into the schema's 12 per-method fields (``resolved_method``,
+``cov_kind``, ``cov_joint_width``, ``cov_tri``, ``orbit_delivered``,
+``orbit_status`` and the six ``mix_*``), reading what the engine *delivered*,
+never the request. A token-less response (the ``f64_no_cov`` / legacy line, the
+ephemeris line) leaves all 12 fields null, byte-identical to the pre-widening
+row. The cli binary emits no collapsed moment view and ``ODConfig`` carries no
+``uncertainty_method`` at this distribution revision, so ephemeris rows keep
+``resolved_method`` / ``cov_kind`` null (named gap) and OD fit rows record the
+shared [`OD_METHOD_AXIS_NOT_PRODUCED`] note by name rather than a blank.
 """
 
 from __future__ import annotations
@@ -24,9 +42,206 @@ from datetime import datetime, timezone
 from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
 
-
 _TIER_TO_INT = {"approximate": 0, "basic": 1, "standard": 2}
 _AU_KM = 149_597_870.700
+
+
+# A LITERAL mirror of empyrean_validation::schema::OD_METHOD_AXIS_NOT_PRODUCED
+# (src/schema.rs). `ODConfig` carries no `uncertainty_method` at this
+# distribution revision (ae00643), so OD fits run method-free; every OD fit row
+# records this by name rather than a blank or a silent first-order default. The
+# literal is pinned against the schema const by the driver's tests (the same
+# regex-on-schema.rs approach runners/python/tests/test_run_products.py uses),
+# so a drift in either the mirror or the schema turns the pin red.
+_OD_METHOD_AXIS_NOT_PRODUCED = (
+    "OD method axis not produced at this pin: "
+    "ODConfig.uncertainty_method not on the wrapper"
+)
+
+# Method tags that carry NO daemon method token: `f64_no_cov` is the
+# covariance-free path (the binary attaches no covariance and emits no product
+# tokens, so the line stays byte-identical to the pre-widening 18-field line)
+# and `None` is the untagged legacy row. Every other tag (the schema's
+# `uncertainty_modes` spellings) is sent as the optional 19th `prop` token; the
+# binary refuses an unrecognized tag by name (`fail unknown_uncertainty_method`).
+# Monte Carlo's sample count and seed come from the binary (schema constants),
+# so there is nothing to send beyond the tag.
+_NO_METHOD_TOKEN = frozenset((None, "f64_no_cov"))
+
+# The 12 per-method product fields plus the 2 collapsed moment views that travel
+# with them. A cli output row starts as a copy of its rust-channel input row, so
+# each must be CLEARED before the cli channel repopulates it from ITS OWN binary
+# delivery — otherwise the input channel's products ride out under this
+# channel's name (a leak). Cleared by DELETE (not set-to-null) so a token-less
+# row stays byte-identical to the pre-widening output, which omitted these keys,
+# rather than gaining explicit `null`s. The cli binary emits no collapsed moment
+# view, so emp_pos_cov_au2 / emp_radec_cov_arcsec2 are reset and never
+# repopulated here (a named cli gap). Mirrors runners/python/run.py
+# `_PER_METHOD_FIELDS`.
+_PER_METHOD_FIELDS = (
+    "resolved_method",
+    "cov_kind",
+    "cov_joint_width",
+    "cov_tri",
+    "orbit_delivered",
+    "orbit_status",
+    "mix_n_components_total",
+    "mix_weight_delivered",
+    "mix_n_failed",
+    "mix_n_unresolved",
+    "mix_n_curvature_refused",
+    "mix_n_sky_linearization_refused",
+    "emp_pos_cov_au2",
+    "emp_radec_cov_arcsec2",
+)
+
+
+def _with_od_method_note(base: str) -> str:
+    """Append the OD method-axis note to an OD fit row's base note so the row
+    records the missing axis by name — never a blank, never a silent
+    first-order default. An empty base yields the marker alone. Mirrors the
+    rust / python channels' ``with_od_method_note``.
+    """
+    if not base:
+        return _OD_METHOD_AXIS_NOT_PRODUCED
+    return f"{base}; {_OD_METHOD_AXIS_NOT_PRODUCED}"
+
+
+def _reset_per_method(row: dict) -> None:
+    """Delete every inherited per-method product field (and the moment views
+    that travel with them) from a cli output row, so the input channel's
+    products never ride out under this channel's name. Delete rather than
+    null-out so a token-less row serializes byte-identically to before.
+    """
+    for k in _PER_METHOD_FIELDS:
+        row.pop(k, None)
+
+
+def _method_token(r: dict) -> str | None:
+    """The optional 19th ``prop`` token for a plan row: its
+    ``propagation_uncertainty`` tag, or ``None`` for the covariance-free
+    ``f64_no_cov`` / untagged legacy row (which sends the bare 18-field line).
+    """
+    m = r.get("propagation_uncertainty")
+    return None if m in _NO_METHOD_TOKEN else m
+
+
+def _prop_daemon_line(r: dict) -> str | None:
+    """The daemon ``prop`` line for a plan row: the 18 fixed fields plus, for a
+    covariance-bearing method, the optional 19th method token. Returns ``None``
+    when the row has no usable IC (the caller skips it). The ``f64_no_cov`` /
+    untagged row yields the bare 18-field line — byte-identical to the
+    pre-widening driver — so its response stays the 8-field ``ok`` line.
+    """
+    ic = _ic_line(r)
+    if ic is None:
+        return None
+    method = _method_token(r)
+    return f"prop {ic}" + (f" {method}" if method else "")
+
+
+def _product_bool(v: str) -> bool | None:
+    """Parse the binary's ``orbit_delivered`` flag (``1`` / ``0``); the literal
+    ``na`` (never emitted for this field, handled defensively) → ``None``.
+    """
+    return None if v == "na" else (v == "1")
+
+
+def _product_int(v: str) -> int | None:
+    """Parse an integer product token (``cov_kind`` / ``cov_joint_width`` / the
+    ``mix_n_*`` tallies); the literal ``na`` → ``None``."""
+    return None if v == "na" else int(v)
+
+
+def _product_float(v: str) -> float | None:
+    """Parse a float product token (``mix_weight_delivered``); ``na`` → ``None``."""
+    return None if v == "na" else float(v)
+
+
+def _product_str(v: str) -> str | None:
+    """Parse a string product token (``resolved_method`` / ``orbit_status``);
+    ``na`` → ``None``."""
+    return None if v == "na" else v
+
+
+def _product_tri(v: str) -> list[float] | None:
+    """Parse the ``cov_tri`` token: a comma-separated packed lower triangle, or
+    the literal ``na`` → ``None``.
+    """
+    return None if v == "na" else [float(x) for x in v.split(",")]
+
+
+# One parser per per-method product token the binary's ``Products::render``
+# appends after the 8 fixed prop fields (runners/cli/src/main.rs). The token
+# keys ARE the schema field names, so a parsed token maps straight onto the
+# JSON row. The literal ``na`` (absent scalar / absent triangle) becomes null;
+# ``cov_tri`` is a list of floats; ``orbit_delivered`` is a bool.
+_PRODUCT_TOKEN_PARSERS = {
+    "resolved_method": _product_str,
+    "cov_kind": _product_int,
+    "cov_joint_width": _product_int,
+    "cov_tri": _product_tri,
+    "orbit_delivered": _product_bool,
+    "orbit_status": _product_str,
+    "mix_n_components_total": _product_int,
+    "mix_weight_delivered": _product_float,
+    "mix_n_failed": _product_int,
+    "mix_n_unresolved": _product_int,
+    "mix_n_curvature_refused": _product_int,
+    "mix_n_sky_linearization_refused": _product_int,
+}
+
+
+def _parse_products(tokens: list[str]) -> dict:
+    """Parse the per-method product tokens the binary appends after the 8 fixed
+    prop fields into the schema's 12 per-method JSON fields. Each token is a
+    whitespace-free ``key=value``; an absent scalar is the literal ``na`` → JSON
+    null, ``cov_tri`` a comma list of floats, ``orbit_delivered`` a bool. An
+    unknown key or a missing field is refused by name (no hidden fallback), so a
+    wire/driver drift surfaces loudly instead of silently dropping a product.
+    """
+    out: dict = {}
+    for tok in tokens:
+        key, sep, val = tok.partition("=")
+        if not sep:
+            raise ValueError(f"malformed product token (no '='): {tok!r}")
+        parser = _PRODUCT_TOKEN_PARSERS.get(key)
+        if parser is None:
+            raise ValueError(f"unknown product token key: {key!r}")
+        out[key] = parser(val)
+    missing = set(_PRODUCT_TOKEN_PARSERS) - set(out)
+    if missing:
+        raise ValueError(f"missing product tokens: {sorted(missing)}")
+    return out
+
+
+def _build_prop_row(
+    r: dict, parts: list[str], method: str | None, timestamp: str, source_version: str
+) -> dict:
+    """Assemble a cli-channel propagation output row from the daemon response
+    ``parts`` (already split + validated). The 8 fixed fields (state + timing)
+    are set exactly as the covariance-free path did; the per-method fields are
+    reset — so a leaked input product never rides out under this channel — and,
+    when a method token was sent, repopulated from the binary's product tokens.
+    A token-less (``f64_no_cov`` / legacy) response leaves all 12 null,
+    byte-identical to the pre-widening row.
+    """
+    x, y, z, _vx, _vy, _vz, ms = map(float, parts[1:8])
+    new = dict(r)
+    new["channel"] = "cli"
+    new["timestamp"] = timestamp
+    new["source_version"] = source_version
+    _reset_per_method(new)
+    new["emp_pos_au"] = [x, y, z]
+    new["emp_time_ms"] = ms
+    ref = r.get("ref_pos_au")
+    if ref:
+        d = math.sqrt(sum(([x, y, z][i] - ref[i]) ** 2 for i in range(3)))
+        new["emp_vs_horizons_km"] = d * _AU_KM
+    if method is not None:
+        for k, v in _parse_products(parts[8:]).items():
+            new[k] = v
+    return new
 
 
 def _driver_source_version() -> str:
@@ -214,34 +429,25 @@ def main() -> int:
 
     for r in rust_rows:
         tt = r.get("test_type")
-        # Uncertainty axis: skip Jet1 rows. The CLI runner daemon
-        # protocol does not yet accept a covariance for the input orbit;
-        # cross-channel Jet1 parity is a follow-up.
-        #
-        # Also skip every detection-off timing arm and the first-order
-        # (covariance) arms. The CLI protocol propagates only plain f64 with
-        # detection ON: it cannot attach a covariance and cannot disable
-        # per-step event detection, so any other arm would measure the wrong
-        # thing under that arm's label. Those arms are core-only; skip them
-        # explicitly, never silently and never with detection on. (OD rows
-        # carry a null propagation_uncertainty and are not caught here.)
-        if r.get("propagation_uncertainty") in (
-            "first_order_detection_on",
-            "first_order_detection_off",
-            "f64_detection_off",
-            "f64_detection_off_assist_default_like",
-            "first_order_detection_off_assist_default_like",
-            "f64_detection_off_assist_asteroid_institute_like",
-            "first_order_detection_off_assist_asteroid_institute_like",
-        ):
+        # Per-method OD transport rows are `not produced` on this channel at
+        # this pin (the core channel produces them); skipping them leaves their
+        # cell reading `not produced` in the report — never a blank row.
+        # Mirrors the rust / python channels.
+        if tt == "orbit_determination_transport":
             n_skipped += 1
             continue
         if tt == "propagation":
-            ic = _ic_line(r)
-            if ic is None:
+            # Build the daemon line (18 fixed fields + optional method token).
+            # `f64_no_cov` / untagged rows send the bare 18-field line, so their
+            # response is the 8-field `ok` line; every other method sends its
+            # tag so the binary attaches the synthetic covariance and appends
+            # the delivered products.
+            line = _prop_daemon_line(r)
+            if line is None:
                 n_skipped += 1
                 continue
-            proc.stdin.write(f"prop {ic}\n")
+            method = _method_token(r)
+            proc.stdin.write(f"{line}\n")
             proc.stdin.flush()
             out_line = _read_line(proc)
             if not out_line or out_line.startswith("fail"):
@@ -252,22 +458,16 @@ def main() -> int:
                 n_skipped += 1
                 continue
             parts = out_line.split()
-            if len(parts) != 8 or parts[0] != "ok":
+            # A method row carries the 12 product tokens after the 8 fixed
+            # fields; a token-less (f64 / legacy) row is the 8-field line.
+            expected = 20 if method is not None else 8
+            if len(parts) != expected or parts[0] != "ok":
                 print(f"  unexpected prop output: {out_line!r}", file=sys.stderr)
                 n_skipped += 1
                 continue
-            x, y, z, _vx, _vy, _vz, ms = map(float, parts[1:])
-            new = dict(r)
-            new["channel"] = "cli"
-            new["timestamp"] = timestamp
-            new["source_version"] = source_version
-            new["emp_pos_au"] = [x, y, z]
-            new["emp_time_ms"] = ms
-            ref = r.get("ref_pos_au")
-            if ref:
-                d = math.sqrt(sum(([x, y, z][i] - ref[i]) ** 2 for i in range(3)))
-                new["emp_vs_horizons_km"] = d * _AU_KM
-            out_rows.append(new)
+            out_rows.append(
+                _build_prop_row(r, parts, method, timestamp, source_version)
+            )
 
         elif tt == "ephemeris":
             ic = _ic_line(r)
@@ -309,6 +509,12 @@ def main() -> int:
             new["channel"] = "cli"
             new["timestamp"] = timestamp
             new["source_version"] = source_version
+            # The cli ephemeris leg is covariance-free first order at this pin
+            # (no method token, no product tokens on the eph line), so the 12
+            # per-method fields are reset and left null — a named gap matching
+            # the rust channel's None ephemeris products. Reset also clears any
+            # per-method product inherited from the input row (no leak).
+            _reset_per_method(new)
             new["emp_time_ms"] = ms
             ref_ra = r.get("ref_ra_rad")
             ref_dec = r.get("ref_dec_rad")
@@ -402,10 +608,18 @@ def main() -> int:
             new["channel"] = "cli"
             new["timestamp"] = timestamp
             new["source_version"] = source_version
+            # OD fits run method-free at this pin — ODConfig carries no
+            # uncertainty_method on the wrapper (ae00643) — so the 12 per-method
+            # fields are reset and left null, and every OD fit row records the
+            # missing method axis by name (never a blank or a silent first-order
+            # default). The non_grav_recovery row below is a dict(r) copy that
+            # carries the same note.
+            _reset_per_method(new)
             new["emp_pos_au"] = [x, y, z]
             new["emp_time_ms"] = ms
             new["od_iterations"] = iters
             new["od_rms_combined_arcsec"] = od_rms
+            new["notes"] = _with_od_method_note(new.get("notes") or "")
             out_rows.append(new)
 
             # Second OD pass: state + non-grav (9-param) on the same optical
@@ -429,6 +643,11 @@ def main() -> int:
                 ng["channel"] = "cli"
                 ng["timestamp"] = timestamp
                 ng["source_version"] = source_version
+                # Mirrors the OD fit row: method-free at this pin, so the 12
+                # per-method fields are reset and the shared OD method-axis note
+                # is recorded by name.
+                _reset_per_method(ng)
+                ng["notes"] = _with_od_method_note(ng.get("notes") or "")
                 ng["test_type"] = "non_grav_recovery"
                 # Position + rms of the NON-GRAV fit, not the optical-only one.
                 ng["emp_pos_au"] = [ng_px, ng_py, ng_pz]
