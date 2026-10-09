@@ -224,9 +224,9 @@ fn parse_prop_args(rest: &str) -> Result<(Orbit, ForceModelTier, Epoch), String>
         epoch: Epoch::from_mjd_tdb(f[0]),
         elements: [pos[0], pos[1], pos[2], vel[0], vel[1], vel[2]],
         covariance: None,
-        // No covariance at all on a plan IC, so there is no state↔Marsden
-        // border to accompany it.
-        non_grav_cross: None,
+        // 0.11 CoordinateState is state-only (6×6); the state↔parameter
+        // border now lives on the engine-side packed joint, not the input
+        // state, so there is nothing to carry here.
         representation: Representation::Cartesian,
         frame: Frame::ICRF,
         origin: Origin::SSB,
@@ -308,9 +308,9 @@ fn daemon_eph(ctx: &Context, rest: &str) -> Result<String, String> {
         epoch: Epoch::from_mjd_tdb(floats[0]),
         elements: [pos[0], pos[1], pos[2], vel[0], vel[1], vel[2]],
         covariance: None,
-        // No covariance at all on a plan IC, so there is no state↔Marsden
-        // border to accompany it.
-        non_grav_cross: None,
+        // 0.11 CoordinateState is state-only (6×6); the state↔parameter
+        // border now lives on the engine-side packed joint, not the input
+        // state, so there is nothing to carry here.
         representation: Representation::Cartesian,
         frame: Frame::ICRF,
         origin: Origin::SSB,
@@ -534,9 +534,9 @@ fn build_orbit(cli: &Cli) -> Orbit {
         epoch: Epoch::from_mjd_tdb(cli.epoch.expect("--epoch required for prop/eph")),
         elements: [pos[0], pos[1], pos[2], vel[0], vel[1], vel[2]],
         covariance: None,
-        // No covariance at all on a plan IC, so there is no state↔Marsden
-        // border to accompany it.
-        non_grav_cross: None,
+        // 0.11 CoordinateState is state-only (6×6); the state↔parameter
+        // border now lives on the engine-side packed joint, not the input
+        // state, so there is nothing to carry here.
         representation: Representation::Cartesian,
         frame: Frame::ICRF,
         origin: Origin::SSB,

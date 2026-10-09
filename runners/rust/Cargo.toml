@@ -28,7 +28,7 @@ noise-model = []
 # checkout of a validation tag reproduces the validation-of-record for
 # that release. Dev-tree validation is an uncommitted local override —
 # see "Local development overrides" in the README.
-empyrean = "=0.10.0"
+empyrean = "=0.11.0"
 # Shared validation framework: schema (`ValidationResult`,
 # `ValidationPlan`), test object catalog, position-error / angular-
 # separation metric helpers, and the HTML report renderer. Owned
