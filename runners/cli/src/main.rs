@@ -15,14 +15,57 @@
 //! lived process with warm caches), this binary is fork-exec'd once
 //! per row by drive.py. The reported `time_ms` includes only the
 //! relevant API call — not process startup.
+//!
+//! # Per-method uncertainty axis (prop mode)
+//!
+//! The plan row's `propagation_uncertainty` method is threaded into the
+//! propagation config exactly as the rust channel's `build_uncertainty_axes`
+//! does: `--uncertainty-method <tag>` in one-shot mode, or an **optional**
+//! 19th token after the 18 `prop` fields in daemon mode. The tag is one of the
+//! schema's `uncertainty_modes` spellings (`f64_no_cov`,
+//! `first_order_with_cov`, `second_order_with_cov`, `auto`,
+//! `sigma_point_with_cov`, `monte_carlo_100_with_cov`,
+//! `gaussian_mixture_with_cov`); Monte Carlo carries the suite-wide
+//! `MONTE_CARLO_SAMPLE_COUNT` / `MONTE_CARLO_SEED`, and an unrecognized tag is
+//! refused by name (`fail unknown_uncertainty_method:<tag>`), never
+//! substituted. Every tag but `f64_no_cov` attaches the same synthetic
+//! covariance the rust channel uses, which is what makes the propagator
+//! dispatch to Jet1 / STM integration.
+//!
+//! When a method is requested the prop output line carries the delivered 0.11
+//! products after `time_ms`, as whitespace-free `key=value` tokens:
+//! `resolved_method` (the delivered covariance kind's tag, never the request),
+//! `cov_kind` (the wire discriminant), `cov_joint_width`, `cov_tri` (the packed
+//! lower triangle, comma-separated), `orbit_delivered` / `orbit_status` (off
+//! `outcomes[0]`), and the six `mix_*` tallies over the retained mixture
+//! components. Absent scalars render `na`. **Without** a method the line stays
+//! byte-identical to before (`x y z vx vy vz time_ms`, or `ok …` in daemon
+//! mode), so the existing driver and the first-order goldens are unchanged.
+//!
+//! Gaps at this pin, named rather than back-filled:
+//! - **OD method axis** — `ODConfig` carries no `uncertainty_method` at this
+//!   distribution revision, so OD fit rows run method-free; the shared
+//!   [`empyrean_validation::schema::OD_METHOD_AXIS_NOT_PRODUCED`] note is the
+//!   carrier (recorded by the driver), and the per-method OD transport rows
+//!   are `not produced` here, exactly as the rust and core channels.
+//! - **Ephemeris method axis** — the cli ephemeris one-shot stays
+//!   covariance-free first order at this pin (the per-method ephemeris leg is a
+//!   follow-up), matching the rust channel's `None` ephemeris products.
+//! - **Driver wiring** — this commit extends only the cli runner binary
+//!   (`runners/cli/src`); carrying the emitted products into the schema's
+//!   per-method JSON fields is a `drive.py` follow-up (out of this commit's
+//!   scope, which is the `src` runner).
 
 use clap::{Parser, ValueEnum};
 use std::time::Instant;
 
+use empyrean::propagate::{ComponentStatus, MixtureComponent};
 use empyrean::{
-    Context, CoordinateState, EphemerisConfig, Epoch, ForceModelTier, Frame, ODConfig, Orbit,
-    Origin, PropagationConfig, Representation, SolveForParams, UncertaintyMethod,
+    Context, CoordinateState, CovarianceKind, EphemerisConfig, Epoch, ForceModelTier, Frame,
+    ODConfig, Orbit, OrbitOutcome, Origin, PropagationConfig, Representation, SolveForParams,
+    UncertaintyMethod,
 };
+use empyrean_validation::schema::uncertainty_modes as um;
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq, ValueEnum)]
 enum Mode {
@@ -74,6 +117,18 @@ struct Cli {
     /// g(r) parameters: "alpha,r0,m,n,k". All-zeros → inverse_square.
     #[arg(long, value_parser = parse_quintuple, default_value = "0,0,0,0,0")]
     g: [f64; 5],
+    /// Per-method uncertainty axis (prop mode): a `propagation_uncertainty`
+    /// plan tag — `f64_no_cov`, `first_order_with_cov`,
+    /// `second_order_with_cov`, `auto`, `sigma_point_with_cov`,
+    /// `monte_carlo_100_with_cov`, or `gaussian_mixture_with_cov`. When set,
+    /// the synthetic covariance is attached (all tags except `f64_no_cov`),
+    /// the named rung is requested (MonteCarlo at the suite-wide N and seed),
+    /// and the delivered 0.11 per-method products are appended to the prop
+    /// output line. An unrecognized tag is refused by name — never silently
+    /// substituted. Omitted → the covariance-free first-order path, with the
+    /// output byte-identical to before.
+    #[arg(long)]
+    uncertainty_method: Option<String>,
 
     // ── shared ────────────────────────────────────────────────
     /// Force-model tier: 0=Approximate, 1=Basic, 2=Standard.
@@ -124,6 +179,285 @@ fn parse_quintuple(s: &str) -> Result<[f64; 5], String> {
     let v: Result<Vec<f64>, _> = parts.iter().map(|p| p.parse::<f64>()).collect();
     let v = v.map_err(|e| e.to_string())?;
     Ok([v[0], v[1], v[2], v[3], v[4]])
+}
+
+// ── Per-method uncertainty axis ─────────────────────────────────────
+//
+// The cli channel threads the plan row's `propagation_uncertainty` method
+// into the propagation config exactly as the rust channel's
+// `build_uncertainty_axes` does, reads the delivered 0.11 products off the
+// wrapper (never recomputed), and emits them beside the state so the driver
+// can carry them into the schema's per-method fields. The method tags, the
+// Monte-Carlo sample count and seed, and the wire covariance-kind values all
+// come from `empyrean_validation::schema` so this channel requests the same
+// surfaces and records the same strings the rust and core channels do.
+
+/// The suite's synthetic 6×6 Cartesian covariance — 1 km position σ, 1 mm/s
+/// velocity σ, uncorrelated — byte-identical to the rust channel's
+/// `build_uncertainty_axes` covariance, so a same-method cross-channel compare
+/// sees the same input uncertainty. Units are AU and AU/day.
+fn synthetic_covariance() -> [[f64; 6]; 6] {
+    let pos_var_au = (1.0 / 149_597_870.700_f64).powi(2);
+    let vel_var_au_d = (1e-6 / 149_597_870.700_f64 * 86_400.0).powi(2);
+    let mut c = [[0.0_f64; 6]; 6];
+    c[0][0] = pos_var_au;
+    c[1][1] = pos_var_au;
+    c[2][2] = pos_var_au;
+    c[3][3] = vel_var_au_d;
+    c[4][4] = vel_var_au_d;
+    c[5][5] = vel_var_au_d;
+    c
+}
+
+/// Map a plan `propagation_uncertainty` tag to `(attach_covariance, method)`.
+///
+/// `f64_no_cov` is the covariance-free path — first order, no covariance
+/// attached. Every other known tag attaches the synthetic covariance and runs
+/// its named rung. `monte_carlo_100_with_cov` carries the suite-wide sample
+/// count and seed from the schema — never the engine's per-call convenience
+/// seed — so a seeded Monte-Carlo row is a cross-channel bit check. An
+/// unrecognized tag yields `None` so the caller refuses it by name rather than
+/// silently substituting a method (the no-silent-substitution invariant).
+fn method_for_tag(tag: &str) -> Option<(bool, UncertaintyMethod)> {
+    let m = match tag {
+        um::F64_NO_COV => (false, UncertaintyMethod::FirstOrder),
+        um::FIRST_ORDER_WITH_COV => (true, UncertaintyMethod::FirstOrder),
+        um::SECOND_ORDER_WITH_COV => (true, UncertaintyMethod::SecondOrder),
+        um::AUTO => (true, UncertaintyMethod::auto()),
+        um::SIGMA_POINT_WITH_COV => (true, UncertaintyMethod::sigma_point()),
+        um::MONTE_CARLO_100_WITH_COV => (
+            true,
+            UncertaintyMethod::MonteCarlo {
+                n_samples: um::MONTE_CARLO_SAMPLE_COUNT as usize,
+                seed: Some(um::MONTE_CARLO_SEED),
+            },
+        ),
+        um::GAUSSIAN_MIXTURE_WITH_COV => (true, UncertaintyMethod::gaussian_mixture()),
+        _ => return None,
+    };
+    Some(m)
+}
+
+/// The C-ABI wire discriminant for a delivered covariance kind — the `cov_kind`
+/// the schema carries (linear 0, second-order 1, mixture 3, monte-carlo 4,
+/// sigma-point 5). Mirrors the rust channel's `cov_kind_wire` and the core
+/// channel's `kind.wire_discriminant()`; pinned by the unit test so the
+/// restated map cannot drift from the `EMPYREAN_COVARIANCE_KIND_*` tags.
+fn cov_kind_wire(kind: CovarianceKind) -> u8 {
+    match kind {
+        CovarianceKind::Linear => 0,
+        CovarianceKind::SecondOrder => 1,
+        CovarianceKind::Mixture => 3,
+        CovarianceKind::MonteCarlo => 4,
+        CovarianceKind::SigmaPoint => 5,
+    }
+}
+
+/// The `resolved_method` tag a propagation row reports: the tag of the
+/// covariance **kind the engine delivered**, never the request — so a silent
+/// substitution under an explicit method is caught by the cross-channel
+/// compare. Mirrors the rust channel's `resolved_method_for`.
+fn resolved_method_tag(kind: CovarianceKind) -> &'static str {
+    match kind {
+        CovarianceKind::Linear => um::FIRST_ORDER_WITH_COV,
+        CovarianceKind::SecondOrder => um::SECOND_ORDER_WITH_COV,
+        CovarianceKind::Mixture => um::GAUSSIAN_MIXTURE_WITH_COV,
+        CovarianceKind::MonteCarlo => um::MONTE_CARLO_100_WITH_COV,
+        CovarianceKind::SigmaPoint => um::SIGMA_POINT_WITH_COV,
+    }
+}
+
+/// Name an `EMPYREAN_PROPAGATE_FAILURE_*` classification code. Mirrors the rust
+/// channel's `propagate_failure_variant`; an unrecognized code falls back to
+/// the engine's own message so no failure is ever a bare number.
+fn propagate_failure_variant(code: i32, message: &str) -> String {
+    match code {
+        1 => "integration".to_string(),
+        2 => "kepler_dt_backprop".to_string(),
+        3 => "transform".to_string(),
+        4 => "covariance_input".to_string(),
+        5 => "sigma_point".to_string(),
+        6 => "sampled_parameter".to_string(),
+        7 => "ensemble_member".to_string(),
+        8 => "output_assembly".to_string(),
+        99 => "other".to_string(),
+        other => format!("code_{other}({message})"),
+    }
+}
+
+/// Per-orbit delivery outcome read off `outcomes[0]` — the sole delivery
+/// discriminator, never a row count. Mirrors the rust channel's
+/// `orbit_outcome_channel`. Returns `(orbit_delivered, orbit_status)`.
+fn outcome_channel(outcome: &OrbitOutcome, withheld: Option<&str>) -> (bool, String) {
+    match outcome {
+        OrbitOutcome::Delivered { .. } => match withheld {
+            Some(reason) => (true, format!("cov_withheld:{reason}")),
+            None => (true, "delivered".to_string()),
+        },
+        OrbitOutcome::Failed { code, message } => (
+            false,
+            format!("failed:{}", propagate_failure_variant(*code, message)),
+        ),
+    }
+}
+
+/// The six Gaussian-mixture tallies over the engine's RETAINED mixture
+/// components (one entry per surviving sub-Gaussian), tallied by
+/// `ComponentStatus`. Mirrors the rust channel's `populate_mixture_tallies`;
+/// an empty component set yields `None` — never a fabricated zero — so an
+/// unsplit (second-order-delivered) row carries no mixture tally. The counts
+/// are over retained components (the wrapper surface), matching the rust
+/// channel; the core channel reads villeneuve's pre-retention tallies, so a
+/// cross-channel difference is a surface difference, not physics.
+struct MixTallies {
+    total: u32,
+    weight: f64,
+    failed: u32,
+    unresolved: u32,
+    curvature: u32,
+    sky: u32,
+}
+
+fn mixture_tallies(components: &[MixtureComponent]) -> Option<MixTallies> {
+    if components.is_empty() {
+        return None;
+    }
+    let (mut failed, mut unresolved, mut curvature, mut sky) = (0u32, 0u32, 0u32, 0u32);
+    let mut weight = 0.0;
+    for c in components {
+        weight += c.weight;
+        match c.status {
+            ComponentStatus::Resolved => {}
+            ComponentStatus::CurvatureRefused { .. } => curvature += 1,
+            ComponentStatus::Unresolved => unresolved += 1,
+            ComponentStatus::Failed => failed += 1,
+            ComponentStatus::SkyLinearizationRefused { .. } => sky += 1,
+        }
+    }
+    Some(MixTallies {
+        total: components.len() as u32,
+        weight,
+        failed,
+        unresolved,
+        curvature,
+        sky,
+    })
+}
+
+/// The 0.11 per-method products carried on a propagation row, extracted from
+/// the wrapper's delivered result (never recomputed). All fields are `None`
+/// when the engine delivered no covariance (`f64_no_cov`), except the outcome
+/// channel which is always read off `outcomes[0]`.
+struct Products {
+    resolved_method: Option<&'static str>,
+    cov_kind: Option<u8>,
+    cov_joint_width: Option<u32>,
+    cov_tri: Option<Vec<f64>>,
+    orbit_delivered: bool,
+    orbit_status: String,
+    mix: Option<MixTallies>,
+}
+
+impl Products {
+    /// Read the per-method products off a delivered propagation result.
+    /// `expected_cov` is true when the method attached a covariance, so a
+    /// delivered-but-unreadable covariance is reported as `cov_withheld:…`
+    /// on the outcome rather than silently dropped.
+    fn from_result(result: &empyrean::PropagationResult, expected_cov: bool) -> Self {
+        let mut resolved_method = None;
+        let mut cov_kind = None;
+        let mut cov_joint_width = None;
+        let mut cov_tri = None;
+        let mut withheld: Option<String> = None;
+        match result.covariance_at_cartesian(0, 0) {
+            Ok(tc) => {
+                resolved_method = Some(resolved_method_tag(tc.kind()));
+                cov_kind = Some(cov_kind_wire(tc.joint.kind));
+                cov_joint_width = Some(tc.joint.width as u32);
+                cov_tri = Some(tc.joint.tri.clone());
+            }
+            Err(e) => {
+                if expected_cov {
+                    withheld = Some(e.to_string());
+                }
+            }
+        }
+        let (orbit_delivered, orbit_status) = match result.outcomes.first() {
+            Some(oc) => outcome_channel(oc, withheld.as_deref()),
+            None => (false, "no_outcome".to_string()),
+        };
+        let mix = result.mixtures.first().and_then(|chain| {
+            let comps: Vec<MixtureComponent> = chain.components.iter().flatten().cloned().collect();
+            mixture_tallies(&comps)
+        });
+        Products {
+            resolved_method,
+            cov_kind,
+            cov_joint_width,
+            cov_tri,
+            orbit_delivered,
+            orbit_status,
+            mix,
+        }
+    }
+
+    /// Render the products as whitespace-free `key=value` tokens appended to a
+    /// prop output line. Absent scalars render as `na`; the packed triangle is
+    /// a comma-separated list of `{:.18e}` doubles (empty list when absent).
+    /// Every value is a single token so the whole line stays positionally
+    /// splittable by the driver. The schema fields each token feeds:
+    /// `resolved_method`, `cov_kind`, `cov_joint_width`, `cov_tri`,
+    /// `orbit_delivered`, `orbit_status`, and the six `mix_*`.
+    fn render(&self) -> String {
+        let na = || "na".to_string();
+        let tri = match &self.cov_tri {
+            Some(v) => v
+                .iter()
+                .map(|x| format!("{x:.18e}"))
+                .collect::<Vec<_>>()
+                .join(","),
+            None => na(),
+        };
+        // The status can carry the engine's free-form withheld/failure text,
+        // which may contain spaces; collapse any whitespace to `_` so the
+        // token stays single.
+        let status: String = self
+            .orbit_status
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join("_");
+        let (mt, mw, mf, mu, mc, ms) = match &self.mix {
+            Some(m) => (
+                m.total.to_string(),
+                format!("{:.18e}", m.weight),
+                m.failed.to_string(),
+                m.unresolved.to_string(),
+                m.curvature.to_string(),
+                m.sky.to_string(),
+            ),
+            None => (na(), na(), na(), na(), na(), na()),
+        };
+        format!(
+            "resolved_method={} cov_kind={} cov_joint_width={} orbit_delivered={} \
+             orbit_status={} mix_n_components_total={} mix_weight_delivered={} \
+             mix_n_failed={} mix_n_unresolved={} mix_n_curvature_refused={} \
+             mix_n_sky_linearization_refused={} cov_tri={}",
+            self.resolved_method.unwrap_or("na"),
+            self.cov_kind.map(|k| k.to_string()).unwrap_or_else(na),
+            self.cov_joint_width
+                .map(|w| w.to_string())
+                .unwrap_or_else(na),
+            if self.orbit_delivered { 1 } else { 0 },
+            status,
+            mt,
+            mw,
+            mf,
+            mu,
+            mc,
+            ms,
+            tri,
+        )
+    }
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -200,16 +534,45 @@ fn run_daemon(ctx: &Context) -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-fn parse_prop_args(rest: &str) -> Result<(Orbit, ForceModelTier, Epoch), String> {
+#[allow(clippy::type_complexity)]
+fn parse_prop_args(
+    rest: &str,
+) -> Result<
+    (
+        Orbit,
+        ForceModelTier,
+        Epoch,
+        Option<(bool, UncertaintyMethod)>,
+    ),
+    String,
+> {
     // Layout (matches runner.c handle_prop): epoch x y z vx vy vz
-    // a1 a2 a3 g0 g1 g2 g3 g4 force_model target non_grav_dt  (18 fields)
-    let f: Vec<f64> = rest
-        .split_whitespace()
-        .map(|t| t.parse::<f64>().map_err(|e| e.to_string()))
-        .collect::<Result<_, _>>()?;
-    if f.len() != 18 {
-        return Err(format!("prop_parse_{}_fields", f.len()));
+    // a1 a2 a3 g0 g1 g2 g3 g4 force_model target non_grav_dt  (18 fields),
+    // plus an OPTIONAL 19th token: a `propagation_uncertainty` method tag.
+    // The driver's 18-field line leaves the method absent → covariance-free
+    // first order, output byte-identical to before. A 19th token requests
+    // that method and attaches the synthetic covariance (all tags but
+    // `f64_no_cov`); an unrecognized tag is refused by name.
+    let mut tokens = rest.split_whitespace();
+    let mut f: Vec<f64> = Vec::with_capacity(18);
+    for _ in 0..18 {
+        match tokens.next() {
+            Some(t) => f.push(t.parse::<f64>().map_err(|e| e.to_string())?),
+            None => return Err(format!("prop_parse_{}_fields", f.len())),
+        }
     }
+    let method = match tokens.next() {
+        Some(tag) => {
+            Some(method_for_tag(tag).ok_or_else(|| format!("unknown_uncertainty_method:{tag}"))?)
+        }
+        None => None,
+    };
+    // Any further token is a malformed line — fail loudly, never ignore.
+    if tokens.next().is_some() {
+        return Err("prop_parse_extra_fields".to_string());
+    }
+    let attach_cov = method.as_ref().map(|(a, _)| *a).unwrap_or(false);
+
     let pos = [f[1], f[2], f[3]];
     let vel = [f[4], f[5], f[6]];
     let a1 = f[7];
@@ -223,10 +586,13 @@ fn parse_prop_args(rest: &str) -> Result<(Orbit, ForceModelTier, Epoch), String>
     let state = CoordinateState {
         epoch: Epoch::from_mjd_tdb(f[0]),
         elements: [pos[0], pos[1], pos[2], vel[0], vel[1], vel[2]],
-        covariance: None,
-        // 0.11 CoordinateState is state-only (6×6); the state↔parameter
-        // border now lives on the engine-side packed joint, not the input
-        // state, so there is nothing to carry here.
+        // Attached only when a covariance-bearing method was requested; the
+        // 18-field (no method) line keeps `None`, byte-identical to before.
+        covariance: if attach_cov {
+            Some(synthetic_covariance())
+        } else {
+            None
+        },
         representation: Representation::Cartesian,
         frame: Frame::ICRF,
         origin: Origin::SSB,
@@ -238,14 +604,18 @@ fn parse_prop_args(rest: &str) -> Result<(Orbit, ForceModelTier, Epoch), String>
     if non_grav_dt.is_finite() {
         orbit = orbit.with_non_grav_dt(Some(non_grav_dt));
     }
-    Ok((orbit, tier_from_int(force_model), target))
+    Ok((orbit, tier_from_int(force_model), target, method))
 }
 
 fn daemon_prop(ctx: &Context, rest: &str, warmed_up: &mut bool) -> Result<String, String> {
-    let (orbit, force, target) = parse_prop_args(rest)?;
+    let (orbit, force, target, method) = parse_prop_args(rest)?;
+    let (attach_cov, umethod) = match &method {
+        Some((a, m)) => (*a, m.clone()),
+        None => (false, UncertaintyMethod::FirstOrder),
+    };
     let cfg = PropagationConfig {
         force_model: force,
-        uncertainty_method: UncertaintyMethod::FirstOrder,
+        uncertainty_method: umethod,
         frame: Frame::ICRF,
         // Daemon mode also single-threaded: each call is one orbit, so
         // a Rayon pool buys nothing and avoids contention if multiple
@@ -265,6 +635,7 @@ fn daemon_prop(ctx: &Context, rest: &str, warmed_up: &mut bool) -> Result<String
     let mut best_ms = f64::INFINITY;
     let mut last_pos = [0.0f64; 3];
     let mut last_vel = [0.0f64; 3];
+    let mut last_result: Option<empyrean::PropagationResult> = None;
     for _ in 0..3 {
         let t0 = Instant::now();
         let result = ctx
@@ -278,11 +649,34 @@ fn daemon_prop(ctx: &Context, rest: &str, warmed_up: &mut bool) -> Result<String
         if ms < best_ms {
             best_ms = ms;
         }
+        last_result = Some(result);
     }
-    Ok(format!(
-        "ok {:.18e} {:.18e} {:.18e} {:.18e} {:.18e} {:.18e} {:.6}",
-        last_pos[0], last_pos[1], last_pos[2], last_vel[0], last_vel[1], last_vel[2], best_ms,
-    ))
+    // No method → byte-identical to before. A method → append the delivered
+    // per-method products so the driver can carry them into the schema's
+    // per-method fields.
+    match method {
+        None => Ok(format!(
+            "ok {:.18e} {:.18e} {:.18e} {:.18e} {:.18e} {:.18e} {:.6}",
+            last_pos[0], last_pos[1], last_pos[2], last_vel[0], last_vel[1], last_vel[2], best_ms,
+        )),
+        Some(_) => {
+            let products = last_result
+                .as_ref()
+                .map(|r| Products::from_result(r, attach_cov).render())
+                .unwrap_or_default();
+            Ok(format!(
+                "ok {:.18e} {:.18e} {:.18e} {:.18e} {:.18e} {:.18e} {:.6} {}",
+                last_pos[0],
+                last_pos[1],
+                last_pos[2],
+                last_vel[0],
+                last_vel[1],
+                last_vel[2],
+                best_ms,
+                products,
+            ))
+        }
+    }
 }
 
 fn daemon_eph(ctx: &Context, rest: &str) -> Result<String, String> {
@@ -527,16 +921,21 @@ fn daemon_od(ctx: &Context, rest: &str) -> Result<String, String> {
     ))
 }
 
-fn build_orbit(cli: &Cli) -> Orbit {
+fn build_orbit(cli: &Cli, attach_cov: bool) -> Orbit {
     let pos = cli.pos.expect("--pos required for prop/eph");
     let vel = cli.vel.expect("--vel required for prop/eph");
     let state = CoordinateState {
         epoch: Epoch::from_mjd_tdb(cli.epoch.expect("--epoch required for prop/eph")),
         elements: [pos[0], pos[1], pos[2], vel[0], vel[1], vel[2]],
-        covariance: None,
-        // 0.11 CoordinateState is state-only (6×6); the state↔parameter
-        // border now lives on the engine-side packed joint, not the input
-        // state, so there is nothing to carry here.
+        // The synthetic covariance is attached only when a covariance-bearing
+        // uncertainty method was requested; it is what makes the propagator
+        // dispatch to Jet1 / STM integration (empyrean is uncertainty-first).
+        // `None` leaves the covariance-free f64 path, byte-identical to before.
+        covariance: if attach_cov {
+            Some(synthetic_covariance())
+        } else {
+            None
+        },
         representation: Representation::Cartesian,
         frame: Frame::ICRF,
         origin: Origin::SSB,
@@ -553,11 +952,21 @@ fn run_prop(
     cli: &Cli,
     force: ForceModelTier,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let orbit = build_orbit(cli);
     let target = Epoch::from_mjd_tdb(cli.target.expect("--target required for prop"));
+    // Resolve the per-method uncertainty axis. Omitted → covariance-free
+    // first order (output byte-identical to before); an unrecognized tag is
+    // refused by name rather than silently substituted.
+    let requested = cli.uncertainty_method.is_some();
+    let (attach_cov, method) = match cli.uncertainty_method.as_deref() {
+        None => (false, UncertaintyMethod::FirstOrder),
+        Some(tag) => {
+            method_for_tag(tag).ok_or_else(|| format!("unknown_uncertainty_method:{tag}"))?
+        }
+    };
+    let orbit = build_orbit(cli, attach_cov);
     let cfg = PropagationConfig {
         force_model: force,
-        uncertainty_method: UncertaintyMethod::FirstOrder,
+        uncertainty_method: method,
         frame: Frame::ICRF,
         // Per-row fork-exec runner: only one orbit per invocation, so
         // a Rayon pool buys nothing and burns thread budget when the
@@ -577,10 +986,12 @@ fn run_prop(
         let _ = ctx.propagate(std::slice::from_ref(&orbit), &[target], &cfg);
     }
 
-    // Best-of-3 — keeps timing comparable to rust/python/c channels.
+    // Best-of-3 — keeps timing comparable to rust/python/c channels. The last
+    // result is kept so the delivered per-method products can be read off it.
     let mut best_ms = f64::INFINITY;
     let mut last_pos = [0.0f64; 3];
     let mut last_vel = [0.0f64; 3];
+    let mut last_result: Option<empyrean::PropagationResult> = None;
     for _ in 0..3 {
         let t0 = Instant::now();
         let result = ctx.propagate(std::slice::from_ref(&orbit), &[target], &cfg)?;
@@ -592,13 +1003,35 @@ fn run_prop(
         if ms < best_ms {
             best_ms = ms;
         }
+        last_result = Some(result);
     }
 
-    // Output: x y z vx vy vz time_ms
-    println!(
-        "{:.18e} {:.18e} {:.18e} {:.18e} {:.18e} {:.18e} {:.6}",
-        last_pos[0], last_pos[1], last_pos[2], last_vel[0], last_vel[1], last_vel[2], best_ms,
-    );
+    // Output: x y z vx vy vz time_ms. When a method was requested, the
+    // delivered per-method products (resolved_method, packed joint, outcome,
+    // mixture tallies) are appended as key=value tokens; without a method the
+    // line stays byte-identical to before.
+    if requested {
+        let products = last_result
+            .as_ref()
+            .map(|r| Products::from_result(r, attach_cov).render())
+            .unwrap_or_default();
+        println!(
+            "{:.18e} {:.18e} {:.18e} {:.18e} {:.18e} {:.18e} {:.6} {}",
+            last_pos[0],
+            last_pos[1],
+            last_pos[2],
+            last_vel[0],
+            last_vel[1],
+            last_vel[2],
+            best_ms,
+            products,
+        );
+    } else {
+        println!(
+            "{:.18e} {:.18e} {:.18e} {:.18e} {:.18e} {:.18e} {:.6}",
+            last_pos[0], last_pos[1], last_pos[2], last_vel[0], last_vel[1], last_vel[2], best_ms,
+        );
+    }
     Ok(())
 }
 
@@ -607,7 +1040,10 @@ fn run_eph(
     cli: &Cli,
     force: ForceModelTier,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let orbit = build_orbit(cli);
+    // The cli ephemeris one-shot keeps the covariance-free first-order path at
+    // this pin; the per-method ephemeris axis is a follow-up (see the module
+    // doc). `false` → no covariance attached, output unchanged.
+    let orbit = build_orbit(cli, false);
     let target = Epoch::from_mjd_tdb(cli.target.expect("--target required for eph"));
     let obs_code = cli
         .observer
@@ -692,4 +1128,191 @@ fn run_od(
         ms,
     );
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ── Method threading (brief item 1) ──────────────────────────────
+    // The plan row's `propagation_uncertainty` tag must select the engine's
+    // matching rung. Mutation: a `method_for_tag` that ignored the tag and
+    // always returned FirstOrder turns the SecondOrder assertion red.
+    #[test]
+    fn method_for_tag_selects_the_requested_rung() {
+        assert!(matches!(
+            method_for_tag(um::SECOND_ORDER_WITH_COV),
+            Some((true, UncertaintyMethod::SecondOrder))
+        ));
+        assert!(matches!(
+            method_for_tag(um::FIRST_ORDER_WITH_COV),
+            Some((true, UncertaintyMethod::FirstOrder))
+        ));
+        // f64_no_cov is the covariance-free path: first order, no covariance.
+        assert!(matches!(
+            method_for_tag(um::F64_NO_COV),
+            Some((false, UncertaintyMethod::FirstOrder))
+        ));
+        // auto / sigma-point / gaussian-mixture attach a covariance and are
+        // requestable; their inner shape is the engine's own concern.
+        for tag in [
+            um::AUTO,
+            um::SIGMA_POINT_WITH_COV,
+            um::GAUSSIAN_MIXTURE_WITH_COV,
+        ] {
+            let (attach, _) = method_for_tag(tag).expect("tag must be requestable");
+            assert!(attach, "{tag} must attach a covariance");
+        }
+    }
+
+    // MonteCarlo must carry the suite-wide sample count and seed from the
+    // harness schema — never the engine's per-call convenience seed — so a
+    // seeded MC row is a cross-channel bit check. Mutation: dropping the seed
+    // (seed: None) turns this red.
+    #[test]
+    fn monte_carlo_carries_the_suite_sample_count_and_seed() {
+        assert!(matches!(
+            method_for_tag(um::MONTE_CARLO_100_WITH_COV),
+            Some((true, UncertaintyMethod::MonteCarlo { n_samples: 100, seed: Some(s) }))
+                if s == um::MONTE_CARLO_SEED
+        ));
+        assert_eq!(um::MONTE_CARLO_SAMPLE_COUNT, 100);
+    }
+
+    // An unrecognized tag is refused by name (None) rather than silently
+    // substituted — the no-silent-substitution invariant (brief item 5).
+    #[test]
+    fn unknown_method_tag_is_refused_by_name() {
+        assert!(method_for_tag("not_a_method").is_none());
+    }
+
+    // The synthetic covariance must match the rust channel's
+    // `build_uncertainty_axes` covariance bit-for-bit (1 km position σ, 1 mm/s
+    // velocity σ, uncorrelated), or a same-method cross-channel compare sees a
+    // different input. Mutation: any scale change turns this red.
+    #[test]
+    fn synthetic_covariance_matches_the_rust_channel() {
+        let c = synthetic_covariance();
+        let pos_var_au = (1.0 / 149_597_870.700_f64).powi(2);
+        let vel_var_au_d = (1e-6 / 149_597_870.700_f64 * 86_400.0).powi(2);
+        assert_eq!(c[0][0], pos_var_au);
+        assert_eq!(c[1][1], pos_var_au);
+        assert_eq!(c[2][2], pos_var_au);
+        assert_eq!(c[3][3], vel_var_au_d);
+        assert_eq!(c[4][4], vel_var_au_d);
+        assert_eq!(c[5][5], vel_var_au_d);
+        // Uncorrelated: every off-diagonal is exactly zero.
+        for (i, row) in c.iter().enumerate() {
+            for (j, &v) in row.iter().enumerate() {
+                if i != j {
+                    assert_eq!(v, 0.0, "off-diagonal ({i},{j}) must be zero");
+                }
+            }
+        }
+    }
+
+    // The restated wire covariance-kind map must match the
+    // EMPYREAN_COVARIANCE_KIND_* tags (and the rust / core channels):
+    // linear 0, second-order 1, mixture 3, monte-carlo 4, sigma-point 5.
+    // Mutation: any swapped value turns this red.
+    #[test]
+    fn cov_kind_wire_matches_the_c_abi_tags() {
+        assert_eq!(cov_kind_wire(CovarianceKind::Linear), 0);
+        assert_eq!(cov_kind_wire(CovarianceKind::SecondOrder), 1);
+        assert_eq!(cov_kind_wire(CovarianceKind::Mixture), 3);
+        assert_eq!(cov_kind_wire(CovarianceKind::MonteCarlo), 4);
+        assert_eq!(cov_kind_wire(CovarianceKind::SigmaPoint), 5);
+    }
+
+    // The reported `resolved_method` is the DELIVERED kind's tag — so a silent
+    // substitution under an explicit request is caught by the compare.
+    #[test]
+    fn resolved_method_tag_names_the_delivered_kind() {
+        assert_eq!(
+            resolved_method_tag(CovarianceKind::SecondOrder),
+            um::SECOND_ORDER_WITH_COV
+        );
+        assert_eq!(
+            resolved_method_tag(CovarianceKind::Linear),
+            um::FIRST_ORDER_WITH_COV
+        );
+        assert_eq!(
+            resolved_method_tag(CovarianceKind::Mixture),
+            um::GAUSSIAN_MIXTURE_WITH_COV
+        );
+    }
+
+    // The outcome channel is read off the per-orbit outcome, never a row
+    // count: a delivered orbit whose covariance was withheld reads
+    // `cov_withheld:<reason>`, and a failed orbit names its failure variant.
+    #[test]
+    fn outcome_channel_reports_withheld_and_failure_by_name() {
+        let delivered = OrbitOutcome::Delivered {
+            first_row: 0,
+            num_rows: 1,
+        };
+        assert_eq!(
+            outcome_channel(&delivered, None),
+            (true, "delivered".to_string())
+        );
+        assert_eq!(
+            outcome_channel(&delivered, Some("no cov")),
+            (true, "cov_withheld:no cov".to_string())
+        );
+        let failed = OrbitOutcome::Failed {
+            code: 1,
+            message: "boom".to_string(),
+        };
+        assert_eq!(
+            outcome_channel(&failed, None),
+            (false, "failed:integration".to_string())
+        );
+    }
+
+    // The rendered products line carries the method tag and the per-method
+    // fields as single tokens; absent scalars render `na`. Mutation: a render
+    // that dropped `resolved_method` (or emitted first_order for a second-order
+    // row) turns the token assertion red.
+    #[test]
+    fn products_render_carries_the_method_and_fields() {
+        let p = Products {
+            resolved_method: Some(um::SECOND_ORDER_WITH_COV),
+            cov_kind: Some(1),
+            cov_joint_width: Some(6),
+            cov_tri: Some(vec![1.0, 0.0, 1.0]),
+            orbit_delivered: true,
+            orbit_status: "delivered".to_string(),
+            mix: None,
+        };
+        let s = p.render();
+        assert!(s.contains("resolved_method=second_order_with_cov"), "{s}");
+        assert!(s.contains("cov_kind=1"), "{s}");
+        assert!(s.contains("cov_joint_width=6"), "{s}");
+        assert!(s.contains("orbit_delivered=1"), "{s}");
+        assert!(s.contains("orbit_status=delivered"), "{s}");
+        // An unsplit row carries no mixture tally: the six mix_* read `na`.
+        assert!(s.contains("mix_n_components_total=na"), "{s}");
+        assert!(s.contains("mix_n_sky_linearization_refused=na"), "{s}");
+        // Every value is a single whitespace-free token.
+        assert!(!s.contains("resolved_method= "), "{s}");
+    }
+
+    // An f64 (covariance-free) row renders every covariance field `na` and the
+    // orbit_delivered flag from the outcome — never a fabricated covariance.
+    #[test]
+    fn products_render_f64_row_is_all_na() {
+        let p = Products {
+            resolved_method: None,
+            cov_kind: None,
+            cov_joint_width: None,
+            cov_tri: None,
+            orbit_delivered: true,
+            orbit_status: "delivered".to_string(),
+            mix: None,
+        };
+        let s = p.render();
+        assert!(s.contains("resolved_method=na"), "{s}");
+        assert!(s.contains("cov_kind=na"), "{s}");
+        assert!(s.contains("cov_tri=na"), "{s}");
+    }
 }

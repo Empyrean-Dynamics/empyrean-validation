@@ -335,6 +335,23 @@ pub mod uncertainty_modes {
     pub const MONTE_CARLO_SEED: u64 = 0x454D_5059_5245_414E;
 }
 
+/// Stamped on every orbit-determination fit row's
+/// [`notes`](ValidationResult::notes) while the distribution's `ODConfig`
+/// carries no `uncertainty_method` (the wrapper revision the harness pins —
+/// `ae00643` — has no OD method axis; it is being added separately). The OD
+/// fit rows under each method therefore run method-free: no per-fit packed
+/// joint and no OD method axis. Rather than leave those rows blank or silently
+/// default them to first order, every channel records this string by name so a
+/// report reader — and the per-channel unit tests — can find it.
+///
+/// Shared across the rust, c, python, cli and core channels so the text is
+/// written once and every channel's OD fit row carries the identical note (no
+/// duplicated spellings that can drift). The Rust channels import it; the C and
+/// Python channels mirror the identical literal with a comment pointing here as
+/// the source of truth.
+pub const OD_METHOD_AXIS_NOT_PRODUCED: &str =
+    "OD method axis not produced at this pin: ODConfig.uncertainty_method not on the wrapper";
+
 /// One row in the validation result table.
 ///
 /// Every channel runner emits a `Vec<ValidationResult>` as JSON. The plan

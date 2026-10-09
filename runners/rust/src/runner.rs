@@ -104,7 +104,7 @@ use empyrean_validation::catalog::{
 use empyrean_validation::compare;
 use empyrean_validation::orbit_compare::compare_orbits;
 use empyrean_validation::schema::{
-    CapturedOrbit, OrbitComparison, ValidationResult, orbit_sources,
+    CapturedOrbit, OD_METHOD_AXIS_NOT_PRODUCED, OrbitComparison, ValidationResult, orbit_sources,
 };
 
 /// Runner config.
@@ -195,14 +195,6 @@ fn project_sky_covariance(
     let c_dec_dec = quad(hdec, hdec) * deg2_to_arcsec2;
     Some([[c_ra_ra, c_ra_dec], [c_ra_dec, c_dec_dec]])
 }
-
-/// Stamped on every OD fit row's `notes`: the OD method axis and per-fit
-/// packed joint are not produced at this pin because ae00643's `ODConfig`
-/// carries no `uncertainty_method` (added to the wrapper separately). Named so
-/// a report reader — and the unit test — can find it, and so an OD fit row is
-/// never silently blank or defaulted to first order.
-const OD_METHOD_AXIS_NOT_PRODUCED: &str =
-    "OD method axis not produced at this pin: ODConfig.uncertainty_method not on the wrapper";
 
 /// Append [`OD_METHOD_AXIS_NOT_PRODUCED`] to an OD fit row's base note so the
 /// row records the missing method axis by name — never a blank cell, never a
