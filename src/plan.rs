@@ -1047,6 +1047,12 @@ mod tests {
             covariance: None,
             aberrated_state: [0.0; 6],
             aberrated_covariance: None,
+            // 0.11.0 carriers: the row's own kind + packed joint + mixture
+            // tally. This filler row carries no covariance, so the joint and
+            // tally are absent and the kind is the first-order default.
+            cov_kind: empyrean::CovarianceKind::Linear,
+            joint: None,
+            mixture_tally: None,
         };
         let r = ephemeris_plan_row(
             pallas,

@@ -58,7 +58,18 @@
 //!   six Gaussian-mixture tallies off the retained-component status table (see
 //!   [`populate_mixture_tallies`]). The 6×6 the harness compares is still the
 //!   wrapper's state covariance.
-//! - **Ephemeris rows** carry the per-orbit outcome (`outcomes[0]`).
+//! - **Ephemeris rows** carry the delivered sky covariance as one packed joint
+//!   — the per-row covariance home the engine carries beside the bare 6×6 —
+//!   read off the entry's own `joint`: `cov_kind` (the wire discriminant via
+//!   [`cov_kind_wire`]), `cov_joint_width`, `cov_tri` (the packed lower
+//!   triangle), and `resolved_method` (the joint's kind composed with the row's
+//!   arm, `None` on a covariance-free row). They also carry the per-orbit
+//!   outcome (`outcomes[0]`) and, on a row the engine derived as a mixture, the
+//!   six pre-retention Gaussian-mixture tallies off the entry's `mixture_tally`
+//!   (absent → unset, never a fabricated zero). The published sky 2×2 the
+//!   harness compares still follows [`published_sky_covariance`] (the
+//!   first-order golden stays the harness projection, the delivered joint a
+//!   `notes` diagnostic beside it). See [`read_eph_products`].
 //! - **OD transport rows** (`orbit_determination_transport`) carry, per method,
 //!   the post-fit transport of the fitted covariance, reading the same wrapper
 //!   products (delivered packed joint, resolved kind, per-orbit outcome,
@@ -67,36 +78,35 @@
 //!   packed joint, which the wrapper carries for every kind, so a sampling
 //!   method (SigmaPoint / MonteCarlo), whose sample covariance lives on the
 //!   propagated state, delivers its joint here exactly as the sweep's sampling
-//!   rows do. The
-//!   OD method axis rides this transport, not the fit (design ruling 9): the
-//!   fit stays first-order (the OD-method gap below), but propagating the
-//!   fitted covariance runs every method, so SecondOrder / SigmaPoint /
-//!   MonteCarlo / GaussianMixture produce a joint on the OD seam here. The plan
+//!   rows do. The post-fit transport covariance rides every method (design
+//!   ruling 9): propagating the fitted covariance runs SecondOrder / SigmaPoint
+//!   / MonteCarlo / GaussianMixture even where the fit itself refuses them, so
+//!   each produces a joint on the OD seam here. The plan
 //!   row carries no transport target, so the transport is taken at the FIT
 //!   EPOCH (dt = 0) and named so in `notes`; the dispatch and delivered kinds
 //!   are real while the cross-method numeric diagnostic is degenerate at a zero
 //!   offset (design ruling 13). See [`od_transport_rows`].
+//! - **OD fit rows** (`orbit_determination`, method-tagged) run the fit itself
+//!   under each method via `ODConfig.uncertainty_method`, a config that differs
+//!   from the legacy fit's by that one field (config parity). The fit is
+//!   first-order by construction, so `first_order` / `auto` deliver (their joint
+//!   and resolved kind read off the `DetermineResult` — `auto` resolves to first
+//!   order), `none` publishes the same fit covariance-free, and every richer
+//!   method (`second_order` / `sigma_point` / `monte_carlo` /
+//!   `gaussian_mixture`) is refused by the engine by name, carried in
+//!   `orbit_status` with `orbit_delivered = false`. The `first_order`-tagged fit
+//!   is bit-identical to the legacy untagged fit. See [`od_fit_method_rows`].
 //!
-//! Three gaps at this pin, each left `None` or recorded by name rather than
-//! back-filled — three products the 0.11 wrapper does **not** expose:
+//! One gap at this pin, recorded by name rather than back-filled — one product
+//! the 0.11 wrapper does **not** expose on the **propagation / OD** seam:
 //!
-//! - **Ephemeris resolved kind / packed joint.** The ephemeris seam
-//!   (`EphemerisEntry` / `EphemerisResult`) flattens the delivered sky
-//!   covariance to a bare 6×6 with no resolved-kind tag and no packed joint, so
-//!   an ephemeris row's `resolved_method` / `cov_kind` / `cov_joint_*` cannot
-//!   be read off the delivered row; back-filling them from the request would be
-//!   a silent substitution, so they stay `None`. (The sky covariance itself is
-//!   still published per the rule above.)
-//! - **OD method axis.** `ODConfig` carries no `uncertainty_method` at this
-//!   distribution revision (being added to the wrapper separately), so the OD
-//!   fit runs method-free: no OD method axis, no per-fit packed joint. Every OD
-//!   fit row records [`OD_METHOD_AXIS_NOT_PRODUCED`] in `notes` rather than a
-//!   blank or a first-order default.
-//! - **Pre-retention mixture tallies.** The wrapper exposes only the retained
-//!   component status table, so the mixture tallies here count retained
-//!   components; the core channel reads villeneuve's pre-aggregated tallies
-//!   (which count sub-Gaussians before retention). A cross-channel compare
-//!   attributes that difference to the wrapper surface, not physics.
+//! - **Pre-retention mixture tallies on the propagation and OD rows.** For
+//!   those rows the wrapper exposes only the retained-component status table, so
+//!   the mixture tallies there count retained components; the core channel reads
+//!   villeneuve's pre-aggregated tallies (which count sub-Gaussians before
+//!   retention). A cross-channel compare attributes that difference to the
+//!   wrapper surface, not physics. (The ephemeris rows carry the engine's
+//!   pre-retention `mixture_tally` directly, so they do not share this gap.)
 
 use std::collections::HashMap;
 use std::time::Instant;
@@ -114,7 +124,7 @@ use empyrean_validation::catalog::{
 use empyrean_validation::compare;
 use empyrean_validation::orbit_compare::compare_orbits;
 use empyrean_validation::schema::{
-    CapturedOrbit, OD_METHOD_AXIS_NOT_PRODUCED, OrbitComparison, ValidationResult, orbit_sources,
+    CapturedOrbit, OrbitComparison, ValidationResult, orbit_sources,
 };
 
 /// Runner config.
@@ -204,17 +214,6 @@ fn project_sky_covariance(
     let c_ra_dec = quad(hra, hdec) * cosd * deg2_to_arcsec2;
     let c_dec_dec = quad(hdec, hdec) * deg2_to_arcsec2;
     Some([[c_ra_ra, c_ra_dec], [c_ra_dec, c_dec_dec]])
-}
-
-/// Append [`OD_METHOD_AXIS_NOT_PRODUCED`] to an OD fit row's base note so the
-/// row records the missing method axis by name — never a blank cell, never a
-/// silent first-order default. An empty base yields the marker alone.
-fn with_od_method_note(base: String) -> String {
-    if base.is_empty() {
-        OD_METHOD_AXIS_NOT_PRODUCED.to_string()
-    } else {
-        format!("{base}; {OD_METHOD_AXIS_NOT_PRODUCED}")
-    }
 }
 
 fn tier_from_str(s: &str) -> ForceModelTier {
@@ -524,6 +523,67 @@ fn published_sky_covariance(
         (projected, sky_covariance_diagnostic(projected, delivered))
     } else {
         (delivered.or(projected), None)
+    }
+}
+
+/// The 0.11 per-method ephemeris products read off a delivered
+/// [`EphemerisEntry`] — the single readback the ephemeris record spreads and
+/// the mutation test asserts on, so the two cannot drift (the ephemeris twin of
+/// [`read_prop_products`]). The row's sky covariance is delivered as one packed
+/// joint (the per-row covariance home the engine carries beside the bare 6×6),
+/// so every per-method field reads off `entry.joint`, exactly as the
+/// propagation sweep reads them off `states[0].joint`.
+struct EphProducts {
+    /// The delivered kind's tag composed with the row's arm; `None` when no
+    /// covariance was delivered.
+    resolved_method: Option<String>,
+    /// The joint's kind, wire-encoded; `None` when no covariance was delivered.
+    cov_kind: Option<u8>,
+    /// The joint's width; `None` when no covariance was delivered.
+    cov_joint_width: Option<u32>,
+    /// The joint's packed lower triangle; `None` when no covariance was delivered.
+    cov_tri: Option<Vec<f64>>,
+    /// The six pre-retention mixture tallies off `entry.mixture_tally`, each
+    /// `None` on a non-mixture row (never a fabricated zero).
+    mix_n_components_total: Option<u32>,
+    mix_weight_delivered: Option<f64>,
+    mix_n_failed: Option<u32>,
+    mix_n_unresolved: Option<u32>,
+    mix_n_curvature_refused: Option<u32>,
+    mix_n_sky_linearization_refused: Option<u32>,
+}
+
+/// Read the delivered per-method products off an ephemeris `entry` — see
+/// [`EphProducts`].
+///
+/// `resolved_method` is keyed on the delivered joint, never on `entry.cov_kind`
+/// (whose `Linear` default on a covariance-free row names no delivery), and is
+/// composed with the arm the row carries (read off `uncertainty_tag` via
+/// `arm_of`, like the propagation and OD rows). The pre-retention mixture
+/// tallies ride WITH a mixture covariance only; unlike the propagation sweep's
+/// retained-component tallies they are pre-retention counts, matching the core
+/// channel 1:1.
+fn read_eph_products(entry: &EphemerisEntry, uncertainty_tag: &str) -> EphProducts {
+    use empyrean_validation::schema::uncertainty_modes as um;
+    let joint = entry.joint.as_ref();
+    let resolved_method = resolved_method_for(uncertainty_tag, joint.map(|j| j.kind)).map(|m| {
+        match um::arm_of(uncertainty_tag) {
+            Some(arm) => um::compose(&m, arm),
+            None => m,
+        }
+    });
+    let tally = entry.mixture_tally.as_ref();
+    EphProducts {
+        resolved_method,
+        cov_kind: joint.map(|j| cov_kind_wire(j.kind)),
+        cov_joint_width: joint.map(|j| j.width as u32),
+        cov_tri: joint.map(|j| j.tri.clone()),
+        mix_n_components_total: tally.map(|t| t.n_components_total),
+        mix_weight_delivered: tally.map(|t| t.weight_delivered),
+        mix_n_failed: tally.and_then(|t| t.n_failed),
+        mix_n_unresolved: tally.and_then(|t| t.n_unresolved),
+        mix_n_curvature_refused: tally.and_then(|t| t.n_curvature_refused),
+        mix_n_sky_linearization_refused: tally.and_then(|t| t.n_sky_linearization_refused),
     }
 }
 
@@ -1397,6 +1457,12 @@ pub fn run_propagation_validation(
                                 data.name,
                             );
 
+                            // The 0.11 per-method products off the entry's own
+                            // packed joint + pre-retention tally (see
+                            // `read_eph_products`), spread into the row fields
+                            // below exactly as the propagation sweep spreads
+                            // `read_prop_products`.
+                            let ep = read_eph_products(entry, &uncertainty_tag);
                             results.push(ValidationResult {
                                 object: data.name.clone(),
                                 population: data.population.clone(),
@@ -1485,35 +1551,28 @@ pub fn run_propagation_validation(
                                 od_disposition_thrust: Vec::new(),
                                 od_warnings: Vec::new(),
                                 propagation_uncertainty: Some(uncertainty_tag.to_string()),
-                                // Per-method output. STOP (0.11 wrapper gap):
-                                // the ephemeris seam (`EphemerisEntry` /
-                                // `EphemerisResult`) flattens the delivered sky
-                                // covariance to a bare 6×6 and carries NO
-                                // resolved-kind tag and NO packed joint, so
-                                // `resolved_method` / `cov_kind` / `cov_joint_*`
-                                // cannot be read off the delivered ephemeris row
-                                // at this pin — left `None` rather than
-                                // back-filled from the request (which would be a
-                                // silent substitution). The sky covariance is
-                                // the harness projection on first-order rows
-                                // (the delivered covariance a `notes`
-                                // diagnostic) and the engine's delivered
-                                // per-method product on every other method — see
-                                // `published_sky_covariance`. The per-orbit
-                                // outcome channel IS carried (`outcomes[0]`).
-                                // See the module doc.
-                                resolved_method: None,
-                                cov_kind: None,
-                                cov_joint_width: None,
-                                cov_tri: None,
+                                // Per-method output read off the delivered entry
+                                // (`read_eph_products`, above): the resolved kind
+                                // + packed joint off `entry.joint`, and — on a
+                                // row the engine split — the pre-retention
+                                // mixture tallies off `entry.mixture_tally`. The
+                                // per-orbit outcome channel is `outcomes[0]`; the
+                                // published sky 2×2 stays the first-order
+                                // projection with the delivered joint a `notes`
+                                // diagnostic beside it — see
+                                // `published_sky_covariance`.
+                                resolved_method: ep.resolved_method,
+                                cov_kind: ep.cov_kind,
+                                cov_joint_width: ep.cov_joint_width,
+                                cov_tri: ep.cov_tri,
                                 orbit_delivered: eph_outcome.as_ref().map(|(d, _)| *d),
                                 orbit_status: eph_outcome.as_ref().map(|(_, s)| s.clone()),
-                                mix_n_components_total: None,
-                                mix_weight_delivered: None,
-                                mix_n_failed: None,
-                                mix_n_unresolved: None,
-                                mix_n_curvature_refused: None,
-                                mix_n_sky_linearization_refused: None,
+                                mix_n_components_total: ep.mix_n_components_total,
+                                mix_weight_delivered: ep.mix_weight_delivered,
+                                mix_n_failed: ep.mix_n_failed,
+                                mix_n_unresolved: ep.mix_n_unresolved,
+                                mix_n_curvature_refused: ep.mix_n_curvature_refused,
+                                mix_n_sky_linearization_refused: ep.mix_n_sky_linearization_refused,
                                 assist_vs_horizons_km: None,
                                 emp_vs_assist_km: None,
                                 assist_time_ms: None,
@@ -1977,11 +2036,10 @@ fn run_radar_od(
         od_warnings: meta_r.warnings,
         od_joint_covariance_width: meta_r.joint_width,
         propagation_uncertainty: None,
-        // Per-method uncertainty output — NOT PRODUCED at this pin. The OD fit
-        // runs method-free: ae00643's `ODConfig` carries no `uncertainty_method`
-        // (being added to the wrapper separately), so there is no OD method
-        // axis and no per-fit packed joint to read. Recorded by name in `notes`
-        // rather than left silently blank or defaulted to first order.
+        // The optical+radar fit is a single untagged row (the plan emits no
+        // per-method axis on the radar seam), so it carries no OD method axis
+        // and no per-fit packed joint — the per-method OD fit rows ride the
+        // optical `orbit_determination` seam (see `od_fit_method_rows`).
         resolved_method: None,
         cov_kind: None,
         cov_joint_width: None,
@@ -2055,7 +2113,7 @@ fn run_radar_od(
         grss_error: None,
         source_version: engine_version.clone(),
         timestamp: timestamp.to_string(),
-        notes: with_od_method_note(format!("optical+radar ({} radar obs)", obs_r.radar_len())),
+        notes: format!("optical+radar ({} radar obs)", obs_r.radar_len()),
     });
     results
 }
@@ -2070,13 +2128,14 @@ fn run_radar_od(
 const OD_TRANSPORT_FIT_EPOCH_NOTE: &str = "transport at the fit epoch (plan row carries no target; \
      the far-epoch target is the OD runner's paired-orbit epoch)";
 
-/// The post-fit OD transport leg (design ruling 9): the OD method axis rides
-/// the *transport* of the fitted covariance, not the fit. The wrapper's
-/// `ODConfig` refuses a non-first-order *fit* by name (so the OD fit rows carry
-/// [`OD_METHOD_AXIS_NOT_PRODUCED`]), but a *propagation* of the fitted
-/// covariance runs every method — so this is where SecondOrder / SigmaPoint /
-/// MonteCarlo / GaussianMixture produce a joint on the OD seam, closing the
-/// fourth gap commit 3 named.
+/// The post-fit OD transport leg (design ruling 9): the *transport* of the
+/// fitted covariance runs every method, independent of what the fit itself
+/// delivers. The wrapper's `ODConfig` refuses a non-first-order *fit* by name
+/// (the method-tagged OD fit rows carry that refusal — see
+/// [`od_fit_method_rows`]), but a *propagation* of the fitted covariance runs
+/// every method, so this is where SecondOrder / SigmaPoint / MonteCarlo /
+/// GaussianMixture produce a joint on the OD seam even where the fit refuses
+/// them.
 ///
 /// For one fitted orbit it emits one `orbit_determination_transport` row per
 /// method the plan carries ([`build_uncertainty_axes`], the same axis the
@@ -2191,9 +2250,15 @@ fn od_transport_rows(
         row.propagation_uncertainty = Some(um::compose(axis.tag, um::DETECTION_ON));
         // Per-method products, read off the 0.11 wrapper (never recomputed).
         // resolved_method is the delivered kind's method, composed with the
-        // row's detection arm.
-        row.resolved_method =
-            resolved_method_for(axis.tag, resolved_kind).map(|m| um::compose(&m, um::DETECTION_ON));
+        // arm this row actually carries (read off `propagation_uncertainty`
+        // via `arm_of`, like the python and cli channels) rather than a
+        // hardcoded `detection_on`; a tag with no arm stays bare.
+        row.resolved_method = resolved_method_for(axis.tag, resolved_kind).map(|m| {
+            match row.propagation_uncertainty.as_deref().and_then(um::arm_of) {
+                Some(arm) => um::compose(&m, arm),
+                None => m,
+            }
+        });
         row.cov_kind = cov_joint.as_ref().map(|j| cov_kind_wire(j.kind));
         row.cov_joint_width = cov_joint.as_ref().map(|j| j.width as u32);
         row.cov_tri = cov_joint.as_ref().map(|j| j.tri.clone());
@@ -2211,6 +2276,184 @@ fn od_transport_rows(
         // tally `None`, matching the propagation sweep and the core channel.
         if resolved_kind == Some(CovarianceKind::Mixture) {
             populate_mixture_tallies(&mixture_components, &mut row);
+        }
+        rows.push(row);
+    }
+    rows
+}
+
+/// The per-method OD fit config: the legacy fit's config with ONLY
+/// [`ODConfig::uncertainty_method`] swapped to the method a row's tag names.
+/// Config parity — every other field inherited unchanged — is the whole point:
+/// a per-method fit differs from the legacy fit by the method alone, so a
+/// `FirstOrder` request is byte-identical to the legacy (default-method) config
+/// and delivers a bit-identical fit.
+fn od_fit_config(base: &ODConfig, method: &UncertaintyMethod) -> ODConfig {
+    ODConfig {
+        uncertainty_method: method.clone(),
+        ..base.clone()
+    }
+}
+
+/// Fill the fit-outcome fields of a method-tagged OD fit row off a delivered
+/// [`DetermineResult`](empyrean::DetermineResult) — used for a FRESH fit (e.g.
+/// `auto`) whose metrics the cloned legacy row does not already carry. Mirrors
+/// the legacy OD fit row's field assignments exactly, so a reused-legacy row
+/// and a freshly-filled row of the same method agree field for field.
+fn set_od_fit_metrics(row: &mut ValidationResult, dr: &empyrean::DetermineResult, ms: f64) {
+    let orbit = dr.state();
+    let meta = SolveMetadata::from_fit(dr);
+    let epoch = orbit.epoch.mjd_tdb().unwrap_or(f64::NAN);
+    row.epoch_mjd_tdb = epoch;
+    row.t_mjd_tdb = epoch;
+    row.emp_pos_au = Some(orbit.position);
+    row.emp_time_ms = Some(ms);
+    row.n_obs_used = Some(dr.summary.num_selected as u32);
+    row.od_iterations = Some(dr.iterations);
+    row.od_converged = Some(dr.converged);
+    row.od_rms_ra_arcsec = Some(dr.summary.rms_ra_arcsec);
+    row.od_rms_dec_arcsec = Some(dr.summary.rms_dec_arcsec);
+    row.od_rms_combined_arcsec = Some(dr.summary.rms_combined_arcsec);
+    row.od_chi2 = Some(dr.summary.chi2);
+    row.od_reduced_chi2 = Some(dr.summary.reduced_chi2);
+    row.od_disposition_marsden = meta.marsden;
+    row.od_disposition_dt = meta.dt;
+    row.od_disposition_amrat = meta.amrat;
+    row.od_disposition_thrust = meta.thrust;
+    row.od_solve_for_used = meta.solve_for_used;
+    row.od_warnings = meta.warnings;
+    row.od_joint_covariance_width = meta.joint_width;
+}
+
+/// Reset the fit-outcome fields a *refused* per-method OD fit row must not carry
+/// (the engine produced no fit): the fitted state, the residual/convergence
+/// metrics, and the solve dispositions all go to their empty forms. The row
+/// keeps its identity (object, epoch, force model, method tag). Timing is set by
+/// the caller (a refusal still costs a measurable call).
+fn clear_od_fit_metrics(row: &mut ValidationResult) {
+    row.emp_pos_au = None;
+    row.n_obs_used = None;
+    row.od_iterations = None;
+    row.od_converged = None;
+    row.od_rms_ra_arcsec = None;
+    row.od_rms_dec_arcsec = None;
+    row.od_rms_combined_arcsec = None;
+    row.od_chi2 = None;
+    row.od_reduced_chi2 = None;
+    row.od_disposition_marsden = None;
+    row.od_disposition_dt = None;
+    row.od_disposition_amrat = None;
+    row.od_disposition_thrust = Vec::new();
+    row.od_solve_for_used = None;
+    row.od_warnings = Vec::new();
+    row.od_joint_covariance_width = None;
+}
+
+/// Overlay a delivered OD fit's per-method products onto a row: the delivery
+/// outcome (`orbit_delivered = true`, `orbit_status = "delivered"`) and, when
+/// the method attaches a covariance (every method but `none`), the resolved
+/// kind (composed with the row's arm, like the transport rows) and the fitted
+/// packed joint (`cov_kind` / `cov_joint_width` / `cov_tri`). The `none` row
+/// publishes the first-order fit covariance-free — its joint fields stay `None`
+/// (cloned from the legacy row), mirroring a `none` propagation row.
+fn fill_delivered_od_products(
+    row: &mut ValidationResult,
+    dr: &empyrean::DetermineResult,
+    attach: bool,
+    method_tag: &str,
+) {
+    use empyrean_validation::schema::uncertainty_modes as um;
+    row.orbit_delivered = Some(true);
+    row.orbit_status = Some("delivered".to_string());
+    if attach {
+        let joint = dr.state().joint;
+        let arm = row.propagation_uncertainty.as_deref().and_then(um::arm_of);
+        row.resolved_method =
+            resolved_method_for(method_tag, Some(dr.resolved_method)).map(|m| match arm {
+                Some(a) => um::compose(&m, a),
+                None => m,
+            });
+        row.cov_kind = joint.as_ref().map(|j| cov_kind_wire(j.kind));
+        row.cov_joint_width = joint.as_ref().map(|j| j.width as u32);
+        row.cov_tri = joint.as_ref().map(|j| j.tri.clone());
+    }
+}
+
+/// The method-tagged OD fit rows (`orbit_determination`): the same fit the
+/// legacy untagged row ran, now under each uncertainty method the plan carries
+/// ([`build_uncertainty_axes`], crossed with the `detection_on` arm). Each row
+/// runs `determine` with the per-method [`od_fit_config`] — the legacy config
+/// with `uncertainty_method` swapped, nothing else — and records:
+///
+/// - `first_order` / `auto` (and `none`, covariance-free) deliver the fit; the
+///   `first_order` / `auto` rows carry the resolved kind and the fitted joint,
+///   `none` publishes covariance-free. The fit is first-order by construction,
+///   so `auto` resolves to first order and its `resolved_method` says so.
+/// - `second_order` / `sigma_point` / `monte_carlo` / `gaussian_mixture` are
+///   refused by the engine by name: `orbit_delivered = false`, the engine's
+///   refusal text in `orbit_status`, and the method named in `notes`.
+///
+/// The `none` / `first_order` configs are byte-identical to the legacy config,
+/// so those rows REUSE the legacy fit (`legacy_fit`) — bit-identical by
+/// construction and no redundant solve — while every other method runs a fresh
+/// `determine`. The row starts as a clone of the legacy fit row so identity and
+/// (for the reused rows) the fit metrics carry over unchanged.
+#[allow(clippy::too_many_arguments)]
+fn od_fit_method_rows(
+    ctx: &Context,
+    observations: &empyrean::Observations,
+    od_config: &ODConfig,
+    legacy_fit: &empyrean::DetermineResult,
+    legacy_row: &ValidationResult,
+    is_close_approach: bool,
+    timestamp: &str,
+) -> Vec<ValidationResult> {
+    use empyrean_validation::schema::uncertainty_modes as um;
+    let axes = build_uncertainty_axes(true, is_close_approach);
+    let base_notes = legacy_row.notes.clone();
+    let mut rows: Vec<ValidationResult> = Vec::with_capacity(axes.len());
+    for axis in &axes {
+        let tag = um::compose(axis.tag, um::DETECTION_ON);
+        let method_config = od_fit_config(od_config, &axis.method);
+        // `none` / `first_order` → byte-identical to the legacy config → reuse
+        // the legacy fit (bit-identical, no redundant solve). Everything else
+        // runs its own fit.
+        let reuse = method_config == *od_config;
+
+        let mut row = legacy_row.clone();
+        row.propagation_uncertainty = Some(tag.clone());
+        row.timestamp = timestamp.to_string();
+
+        if reuse {
+            fill_delivered_od_products(&mut row, legacy_fit, axis.attach, axis.tag);
+        } else {
+            let t0 = Instant::now();
+            let res = ctx
+                .determine(observations, None, &method_config)
+                .and_then(|batch| batch.into_single());
+            let ms = t0.elapsed().as_secs_f64() * 1000.0;
+            match res {
+                Ok(dr) => {
+                    set_od_fit_metrics(&mut row, &dr, ms);
+                    fill_delivered_od_products(&mut row, &dr, axis.attach, axis.tag);
+                }
+                Err(e) => {
+                    clear_od_fit_metrics(&mut row);
+                    row.emp_time_ms = Some(ms);
+                    row.orbit_delivered = Some(false);
+                    // The engine's refusal text, which names the method — carried
+                    // verbatim, never downgraded to a first-order posterior.
+                    row.orbit_status = Some(e.to_string());
+                    row.notes = if base_notes.is_empty() {
+                        format!("uncertainty method {} refused by the engine", axis.tag)
+                    } else {
+                        format!(
+                            "{base_notes}; uncertainty method {} refused by the engine",
+                            axis.tag
+                        )
+                    };
+                }
+            }
         }
         rows.push(row);
     }
@@ -2609,7 +2852,7 @@ pub fn run_od_validation(
                     }
                 }
             }
-            results.push(ValidationResult {
+            let legacy_fit_row = ValidationResult {
                 object: obj.name.to_string(),
                 population: obj.population.to_string(),
                 epoch_mjd_tdb: orbit.epoch.mjd_tdb().unwrap_or(f64::NAN),
@@ -2694,13 +2937,12 @@ pub fn run_od_validation(
                 od_warnings: meta.warnings,
                 od_joint_covariance_width: meta.joint_width,
                 propagation_uncertainty: None,
-                // Per-method uncertainty output — NOT PRODUCED at this pin on
-                // OD fit rows: ae00643's `ODConfig` carries no
-                // `uncertainty_method` (being added to the wrapper separately),
-                // so the fit is method-free with no OD method axis and no
-                // per-fit packed joint to read. Recorded by name in `notes`
-                // (OD_METHOD_AXIS_NOT_PRODUCED), never silently blank or
-                // defaulted to first order.
+                // The legacy UNTAGGED OD fit row (the report labels it legacy):
+                // no `propagation_uncertainty` key, so its bytes match the
+                // pinned pre-widening consumer. It carries no per-method joint —
+                // the OD method axis rides the method-TAGGED fit rows that
+                // follow (`od_fit_method_rows`), whose `first_order` row
+                // reproduces this one bit-for-bit.
                 resolved_method: None,
                 cov_kind: None,
                 cov_joint_width: None,
@@ -2774,8 +3016,23 @@ pub fn run_od_validation(
                 grss_error: None,
                 source_version: empy_version.clone(),
                 timestamp: timestamp.clone(),
-                notes: with_od_method_note(obj.notes.to_string()),
-            });
+                notes: obj.notes.to_string(),
+            };
+            // The method-tagged OD fit rows: the same fit under each method the
+            // plan carries, built off the legacy row (identity + fit metrics)
+            // with the per-method config and products overlaid. Emitted before
+            // the legacy row is pushed so the legacy fit (and its row) are still
+            // owned for reuse on the byte-identical FirstOrder-family configs.
+            results.extend(od_fit_method_rows(
+                ctx,
+                &observations,
+                &od_config,
+                &determine_result,
+                &legacy_fit_row,
+                is_close_approach(obj.name),
+                &timestamp,
+            ));
+            results.push(legacy_fit_row);
 
             // ── Post-fit transport under every method (design ruling 9) ──
             // The OD method axis rides the transport of the fitted covariance,
@@ -3038,10 +3295,10 @@ pub fn run_od_validation(
                             grss_error: None,
                             source_version: empy_version.clone(),
                             timestamp: timestamp.clone(),
-                            notes: with_od_method_note(format!(
+                            notes: format!(
                                 "non-grav recovery (solve_for=StateAndNonGrav, 9x9={})",
                                 dr.covariance_9x9.is_some()
-                            )),
+                            ),
                         });
                     }
                     Err(e) => {
@@ -3097,6 +3354,11 @@ fn propagate_and_capture(
         // Only a strict-offline context construction populates this; a
         // propagation that returned no states names no absent files.
         missing_data_files: Vec::new(),
+        // Synthetic error raised in the harness, not captured from the
+        // engine: it names no single orbit, batch index or epoch.
+        orbit_index: None,
+        orbit_id: None,
+        epoch_mjd_tdb: None,
     })?;
     let propagated_coord = propagated_state_to_coord(propagated);
     capture_orbit(ctx, object, source, source_version, &propagated_coord)
@@ -3397,6 +3659,119 @@ mod tests {
         assert!(diag.is_none());
     }
 
+    /// Generate a single ephemeris entry for the synthetic NEO orbit under the
+    /// plan axis `tag`, against the local data tier (geocentric observer).
+    /// `None` to skip off a missing data tier, like the propagation helpers, so
+    /// the from-engine assertions below are provably exercised when the suite's
+    /// offline fixtures are present.
+    fn ephemeris_entry_under_axis(tag: &str, target: Epoch) -> Option<EphemerisEntry> {
+        let ctx = test_ctx()?;
+        let fitted = synthetic_neo_orbit();
+        let axes = build_uncertainty_axes(true, true);
+        let axis = axes
+            .iter()
+            .find(|a| a.tag == tag)
+            .unwrap_or_else(|| panic!("no {tag} axis in the plan"));
+        let observers = ctx
+            .get_observers(&["500"], &[target], Frame::ICRF, Origin::SSB)
+            .ok()?;
+        if observers.is_empty() {
+            return None;
+        }
+        let mut cfg = EphemerisConfig::with_force_model(ForceModelTier::Standard);
+        cfg.propagation.uncertainty_method = axis.method.clone();
+        let eph = ctx
+            .generate_ephemeris(std::slice::from_ref(&fitted), &observers, &cfg)
+            .ok()?;
+        eph.entries.into_iter().next()
+    }
+
+    /// An ephemeris row under `second_order_detection_on` carries the delivered
+    /// sky covariance as the packed joint read off the entry's own `joint`: kind
+    /// 1 (SecondOrder), width 6, a 21-cell lower triangle, and
+    /// `resolved_method = second_order_detection_on` (the joint's kind composed
+    /// with the row's arm). A SecondOrder row is not a mixture, so every `mix_*`
+    /// tally is ABSENT (`None`, never 0). This is the re-bind of the ephemeris
+    /// method rows to the per-row joint the 0.11 engine delivers. Mutation:
+    /// make `read_eph_products` read `entry.covariance` only (leave every field
+    /// `None`) → every assertion below goes red.
+    #[test]
+    fn ephemeris_second_order_row_carries_the_delivered_joint_and_absent_tallies() {
+        use empyrean_validation::schema::uncertainty_modes as um;
+        let target = Epoch::from_mjd_tdb(59_030.0);
+        let Some(entry) = ephemeris_entry_under_axis(um::SECOND_ORDER, target) else {
+            return;
+        };
+        let ep = read_eph_products(&entry, um::SECOND_ORDER_DETECTION_ON);
+        assert_eq!(
+            ep.cov_kind,
+            Some(cov_kind_wire(CovarianceKind::SecondOrder)),
+            "the delivered sky joint is tagged SecondOrder (wire 1)"
+        );
+        assert_eq!(ep.cov_joint_width, Some(6), "state-only sky joint width");
+        assert_eq!(
+            ep.cov_tri.as_ref().map(|t| t.len()),
+            Some(21),
+            "6×6 packed lower triangle"
+        );
+        assert_eq!(
+            ep.resolved_method.as_deref(),
+            Some(um::SECOND_ORDER_DETECTION_ON),
+            "resolved kind composed with the row's arm"
+        );
+        // A SecondOrder row is not a mixture: every tally ABSENT, never 0.
+        assert_eq!(ep.mix_n_components_total, None);
+        assert_eq!(ep.mix_weight_delivered, None);
+        assert_eq!(ep.mix_n_failed, None);
+        assert_eq!(ep.mix_n_unresolved, None);
+        assert_eq!(ep.mix_n_curvature_refused, None);
+        assert_eq!(ep.mix_n_sky_linearization_refused, None);
+    }
+
+    /// A `first_order_detection_on` ephemeris row's delivered joint is tagged
+    /// kind 0 (Linear) and its `resolved_method` is `first_order_detection_on`.
+    /// Ruling 12: the rust channel keeps the harness projection as the published
+    /// first-order golden with the delivered-vs-projection σ diagnostic riding
+    /// in `notes` BESIDE the delivered joint — confirmed here by
+    /// `published_sky_covariance` returning that diagnostic under the
+    /// first-order tag. Mutation: as above (`read_eph_products` → all `None`) →
+    /// the kind / resolved_method assertions go red.
+    #[test]
+    fn ephemeris_first_order_row_kind_zero_with_the_projection_diagnostic() {
+        use empyrean_validation::schema::uncertainty_modes as um;
+        let target = Epoch::from_mjd_tdb(59_030.0);
+        let Some(entry) = ephemeris_entry_under_axis(um::FIRST_ORDER, target) else {
+            return;
+        };
+        let ep = read_eph_products(&entry, um::FIRST_ORDER_DETECTION_ON);
+        assert_eq!(
+            ep.cov_kind,
+            Some(cov_kind_wire(CovarianceKind::Linear)),
+            "the first-order sky joint is tagged Linear (wire 0)"
+        );
+        assert_eq!(ep.cov_joint_width, Some(6));
+        assert_eq!(ep.cov_tri.as_ref().map(|t| t.len()), Some(21));
+        assert_eq!(
+            ep.resolved_method.as_deref(),
+            Some(um::FIRST_ORDER_DETECTION_ON)
+        );
+        // The projection diagnostic still rides beside the delivered joint: the
+        // published value stays the projection and the σ difference is recorded.
+        let proj = [[1.0, 0.0], [0.0, 2.0]];
+        let deliv = [[9.0, 0.0], [0.0, 16.0]];
+        let (published, diag) =
+            published_sky_covariance(um::FIRST_ORDER_DETECTION_ON, Some(proj), Some(deliv));
+        assert_eq!(
+            published,
+            Some(proj),
+            "first-order publishes the projection"
+        );
+        assert!(
+            diag.is_some(),
+            "the delivered-vs-projection diagnostic rides"
+        );
+    }
+
     /// `resolved_method` is the tag of the covariance KIND the engine
     /// delivered, on every covariance-bearing row. An `auto` row reports the
     /// rung auto chose; an honoured explicit row reports its own tag; a
@@ -3650,21 +4025,144 @@ mod tests {
         assert_eq!(blank.mix_n_sky_linearization_refused, None);
     }
 
-    /// Every OD fit row records the missing OD method axis by name, never a
-    /// blank cell — appended after any base note. (Mutation: returning the
-    /// base note unchanged drops the marker and fails the asserts below.)
+    /// Config parity pin: the per-method OD fit config differs from the legacy
+    /// fit's config by [`ODConfig::uncertainty_method`] ALONE. The `FirstOrder`
+    /// request is byte-identical to the legacy (default-method) config, so its
+    /// fit is bit-identical to the legacy untagged fit; a richer method differs
+    /// only by that one field. (Mutation: perturbing [`od_fit_config`] to touch
+    /// any other field makes `first_order != legacy` → red.)
     #[test]
-    fn od_fit_rows_record_the_missing_method_axis_by_name() {
-        // Empty base → the marker stands alone (never an empty note).
+    fn od_fit_under_first_order_is_bit_identical_to_the_legacy_fit() {
+        let legacy = ODConfig {
+            force_model: ForceModelTier::Standard,
+            max_iterations: 100,
+            ..ODConfig::default()
+        };
+        // The legacy config's method is the default FirstOrder, so the
+        // FirstOrder (and `none`, which maps to FirstOrder) per-method config is
+        // byte-identical → the fit is bit-identical by construction.
+        let first_order = od_fit_config(&legacy, &UncertaintyMethod::FirstOrder);
         assert_eq!(
-            with_od_method_note(String::new()),
-            OD_METHOD_AXIS_NOT_PRODUCED
+            first_order, legacy,
+            "the FirstOrder per-method config must equal the legacy config byte for byte"
         );
-        // A base note keeps its text and gains the marker.
-        let noted = with_od_method_note("optical+radar (50 radar obs)".to_string());
-        assert!(noted.starts_with("optical+radar (50 radar obs); "));
-        assert!(noted.contains(OD_METHOD_AXIS_NOT_PRODUCED));
-        assert!(OD_METHOD_AXIS_NOT_PRODUCED.contains("ODConfig.uncertainty_method"));
+        // A richer method differs ONLY by uncertainty_method — swap it back and
+        // the two configs are equal again, proving config parity.
+        let second = od_fit_config(&legacy, &UncertaintyMethod::SecondOrder);
+        assert_ne!(second, legacy, "SecondOrder must change the config");
+        let reverted = ODConfig {
+            uncertainty_method: legacy.uncertainty_method.clone(),
+            ..second
+        };
+        assert_eq!(
+            reverted, legacy,
+            "uncertainty_method is the only field a per-method config changes"
+        );
+    }
+
+    /// From-engine: an OD fit requested under `second_order` is refused by the
+    /// engine BY NAME — `orbit_delivered = false`, the engine's refusal text
+    /// (which names `SecondOrder`) in `orbit_status`, no joint, and the method
+    /// in `notes` — rather than silently composing a first-order posterior under
+    /// the method's name. The `first_order` row in the same sweep delivers.
+    /// (Mutation: swallowing the refusal into a delivered row — `orbit_delivered
+    /// = Some(true)` in the refusal arm — fails the `Some(false)` assert below.)
+    /// Skips when the offline data tier / fixture is unavailable, exactly as the
+    /// `radar_regression` integration test does.
+    #[test]
+    fn od_fit_under_second_order_carries_the_engine_refusal_by_name() {
+        let Some(ctx) = test_ctx() else {
+            return;
+        };
+        let psv_path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../fixtures/psv/2018 LA.psv"
+        );
+        let psv = match std::fs::read_to_string(psv_path) {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("SKIP: 2018 LA fixture unavailable ({e})");
+                return;
+            }
+        };
+        let observations = ctx.read_ades(&psv).expect("read the 2018 LA PSV fixture");
+        let od_config = ODConfig {
+            max_iterations: 100,
+            ..ODConfig::default()
+        };
+
+        // Direct from-engine refusal, independent of any fit: the SecondOrder
+        // config is refused and the message names the method.
+        let refused = ctx
+            .determine(
+                &observations,
+                None,
+                &od_fit_config(&od_config, &UncertaintyMethod::SecondOrder),
+            )
+            .and_then(|batch| batch.into_single());
+        let err = refused.expect_err("the engine must refuse a SecondOrder OD fit");
+        assert!(
+            err.to_string().contains("SecondOrder"),
+            "the engine refusal must name the method: {err}"
+        );
+
+        // End to end through od_fit_method_rows: the refusal lands on the
+        // second_order row, and the first_order row still delivers.
+        let legacy = ctx
+            .determine(&observations, None, &od_config)
+            .and_then(|batch| batch.into_single())
+            .expect("the first-order fit must deliver");
+        let mut legacy_row = ValidationResult::empty();
+        legacy_row.object = "2018 LA".to_string();
+        legacy_row.notes = "catalog note".to_string();
+        let rows = od_fit_method_rows(
+            &ctx,
+            &observations,
+            &od_config,
+            &legacy,
+            &legacy_row,
+            false,
+            "ts",
+        );
+
+        let so = rows
+            .iter()
+            .find(|r| r.propagation_uncertainty.as_deref() == Some("second_order_detection_on"))
+            .expect("the second_order_detection_on fit row must be present");
+        assert_eq!(
+            so.orbit_delivered,
+            Some(false),
+            "a refused method must not deliver a fit row"
+        );
+        assert!(
+            so.orbit_status
+                .as_deref()
+                .unwrap_or("")
+                .contains("SecondOrder"),
+            "orbit_status must carry the engine refusal by name: {:?}",
+            so.orbit_status
+        );
+        assert!(so.cov_kind.is_none(), "a refused fit publishes no joint");
+        assert!(
+            so.resolved_method.is_none(),
+            "a refused fit resolves no method"
+        );
+        assert!(
+            so.notes.contains("second_order"),
+            "notes must name the refused method: {}",
+            so.notes
+        );
+
+        let fo = rows
+            .iter()
+            .find(|r| r.propagation_uncertainty.as_deref() == Some("first_order_detection_on"))
+            .expect("the first_order_detection_on fit row must be present");
+        assert_eq!(fo.orbit_delivered, Some(true), "first_order must deliver");
+        assert_eq!(
+            fo.resolved_method.as_deref(),
+            Some("first_order_detection_on"),
+            "first_order resolves to the linear kind, composed with the arm"
+        );
     }
 
     /// A usable `Context` from the local data tier, or `None` to skip — the
@@ -3756,6 +4254,49 @@ mod tests {
             .propagate(std::slice::from_ref(&fitted), &[target], &config)
             .expect("propagation under the requested method");
         Some((result, axis.attach))
+    }
+
+    /// walk.rs builds each Monte-Carlo variant as a state-only orbit: the
+    /// engine-delivered packed joint and the state 6×6 are both dropped and the
+    /// sampled offset is baked into the elements, so a variant is identical in
+    /// its covariance channels to the engine's own `Orbit::new`. Guards the
+    /// 0.11.0 cross-term → packed-joint re-bind (`synth.rs` / `walk.rs`, where
+    /// the removed `non_grav_cross` / `ng_covariance` / `wide_cross` became the
+    /// single `Orbit::covariance` joint). Mutations (each → red): drop
+    /// `v.covariance = None` in `state_only_variant` and the variant keeps the
+    /// parent's joint; drop `v.state.covariance = None` and it keeps the 6×6;
+    /// drop the offset loop and the element is unchanged.
+    #[test]
+    fn walk_mc_variant_is_a_state_only_orbit_like_the_engine() {
+        use empyrean_validation::schema::uncertainty_modes as um;
+        let target = Epoch::from_mjd_tdb(59_030.0);
+        let Some((result, _attach)) = propagate_under_axis(um::FIRST_ORDER, target) else {
+            return;
+        };
+        // A real engine-delivered packed joint, attached to the parent orbit.
+        let joint = result
+            .states
+            .first()
+            .and_then(|s| s.joint.clone())
+            .expect("first-order propagation delivers a per-state joint");
+        let parent = synthetic_neo_orbit().with_covariance(joint);
+        assert!(
+            parent.covariance.is_some() && parent.state.covariance.is_some(),
+            "the parent carries both covariance channels before the variant drops them"
+        );
+        let offset = [1e-7, 0.0, 0.0, 0.0, 0.0, 0.0];
+        let v = crate::walk::state_only_variant(&parent, &offset);
+        assert_eq!(
+            v.state.elements[0],
+            parent.state.elements[0] + 1e-7,
+            "the sampled offset is baked into the elements"
+        );
+        assert!(v.covariance.is_none(), "the packed joint is dropped");
+        assert!(v.state.covariance.is_none(), "the state 6×6 is dropped");
+        assert!(
+            empyrean::Orbit::new(v.state).covariance.is_none(),
+            "the engine's own state-only orbit also carries no joint"
+        );
     }
 
     /// The post-fit transport leg emits one `orbit_determination_transport` row

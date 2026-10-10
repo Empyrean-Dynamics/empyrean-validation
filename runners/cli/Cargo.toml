@@ -20,9 +20,7 @@ empyrean = "=0.11.0"
 clap = { version = "4", features = ["derive"] }
 # The validation schema crate supplies the canonical method tags
 # (`uncertainty_modes`) plus the suite-wide Monte-Carlo sample count and
-# seed and the shared `OD_METHOD_AXIS_NOT_PRODUCED` note, so the cli
-# channel requests the same methods and records the same strings the rust
-# and core channels do — one spelling of each fact, never a local copy
-# that can drift.
+# seed, so the cli channel requests the same methods the rust and core
+# channels do — one spelling of each fact, never a local copy that can drift.
 empyrean-validation = { path = "../.." }
 

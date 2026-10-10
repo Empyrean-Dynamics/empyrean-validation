@@ -38,10 +38,18 @@ from empyrean._empyrean_rs import (
     _propagate,
 )
 
+# The per-row packed-joint column: the ephemeris result's `joint` wire list
+# parses to this (the same column the propagation rows carry). The ephemeris
+# method rows read their delivered kind / width / triangle off it.
+from empyrean.orbits.joint import PackedJoints
+
 # The distribution's own canonical uncertainty-method → wire-int map, so this
 # channel lowers an `UncertaintyMethod` to the int the low-level `_propagate`
 # expects exactly as `empyrean.propagate` does (no restated encoding to drift).
-from empyrean.propagation.config import _UNCERTAINTY_METHOD_TO_INT
+from empyrean.propagation.config import (
+    _UNCERTAINTY_METHOD_TO_INT,
+    _uncertainty_method_to_wire,
+)
 
 # The 0.11 per-method product builders — the SAME functions `empyrean.propagate`
 # runs on the result dict, so the python channel reads its products off the
@@ -134,16 +142,6 @@ _SAMPLING_TAGS = frozenset(
 _MONTE_CARLO_SAMPLE_COUNT = 100
 _MONTE_CARLO_SEED = 0x454D_5059_5245_414E
 
-# The OD-fit method-axis note. A LITERAL mirror of
-# `empyrean_validation::schema::OD_METHOD_AXIS_NOT_PRODUCED` (src/schema.rs):
-# `ODConfig` carries no `uncertainty_method` at this distribution revision
-# (ae00643), so OD fits run method-free — every OD fit row records this by name
-# rather than a blank or a silent first-order default. Pinned in the tests.
-_OD_METHOD_AXIS_NOT_PRODUCED = (
-    "OD method axis not produced at this pin: "
-    "ODConfig.uncertainty_method not on the wrapper"
-)
-
 # The 12 per-method output fields the plan/rust input carries. A python row is
 # built as a copy of its input row, so each must be CLEARED before the python
 # channel repopulates it from ITS OWN delivery — otherwise the input channel's
@@ -206,6 +204,10 @@ _RESOLVED_METHOD_TAG = {
     CovarianceKind.MONTE_CARLO: "monte_carlo",
     CovarianceKind.SIGMA_POINT: "sigma_point",
 }
+
+# Inverse of `_COV_KIND_WIRE`: the delivered-kind wire code the OD entry carries
+# (`resolved_method`, always the linear kind 0 on the OD seam) → CovarianceKind.
+_WIRE_TO_COV_KIND = {code: kind for kind, code in _COV_KIND_WIRE.items()}
 
 
 def _propagate_failure_variant(code: int | None, message: str) -> str:
@@ -293,17 +295,6 @@ def _delivered_sky_cov_arcsec2(cov6: np.ndarray, dec_rad: float) -> list[list[fl
     return [[c_ra_ra, c_ra_dec], [c_ra_dec, c_dec_dec]]
 
 
-def _with_od_method_note(base: str) -> str:
-    """Append the OD method-axis note to an OD fit row's base note so the row
-    records the missing axis by name — never a blank, never a silent
-    first-order default. An empty base yields the marker alone. Mirrors the
-    rust channel's ``with_od_method_note``.
-    """
-    if not base:
-        return _OD_METHOD_AXIS_NOT_PRODUCED
-    return f"{base}; {_OD_METHOD_AXIS_NOT_PRODUCED}"
-
-
 def _fill_propagation_products(row: dict, result: dict, attach_cov: bool) -> None:
     """Populate a propagation row's 0.11 per-method products from the wrapper
     result dict: the per-orbit delivery outcome, the delivered packed joint
@@ -352,13 +343,49 @@ def _fill_propagation_products(row: dict, result: dict, attach_cov: bool) -> Non
     _populate_mixture_tallies(result, row)
 
 
+def _fill_ephemeris_mixture_tallies(result: dict, row: dict) -> None:
+    """Fill a row's six Gaussian-mixture tallies from the ephemeris entry's own
+    PRE-RETENTION ``mixture_tally`` (the six ``mix_*`` columns ride WITH a
+    mixture covariance). Absent on every non-mixture row — the wire sentinel is
+    ``-1`` for the counts, ``NaN`` for the delivered weight — surfaced as
+    ``None``, never a fabricated 0. Unlike the propagation channel's
+    ``_populate_mixture_tallies`` (the retained-component status table), these
+    are the engine's pre-retention tallies, so they match the core channel 1:1.
+    """
+
+    def _int(key: str) -> int | None:
+        arr = np.asarray(result.get(key, []), dtype=np.int64)
+        if arr.size == 0 or arr[0] < 0:
+            return None
+        return int(arr[0])
+
+    def _float(key: str) -> float | None:
+        arr = np.asarray(result.get(key, []), dtype=np.float64)
+        if arr.size == 0 or not np.isfinite(arr[0]):
+            return None
+        return float(arr[0])
+
+    total = _int("mix_n_components_total")
+    if total is None:
+        return
+    row["mix_n_components_total"] = total
+    row["mix_weight_delivered"] = _float("mix_weight_delivered")
+    row["mix_n_failed"] = _int("mix_n_failed")
+    row["mix_n_unresolved"] = _int("mix_n_unresolved")
+    row["mix_n_curvature_refused"] = _int("mix_n_curvature_refused")
+    row["mix_n_sky_linearization_refused"] = _int("mix_n_sky_linearization_refused")
+
+
 def _fill_ephemeris_products(row: dict, result: dict, dec_rad: float) -> None:
-    """Populate an ephemeris row's products: the per-orbit delivery outcome and
-    the delivered sky covariance (projected to the RA·cosδ / Dec 2×2).
-    `resolved_method` / `cov_kind` stay ``None`` — the wrapper flattens the
-    delivered sky covariance to a bare 6×6 with no resolved-kind tag and no
-    packed joint, so back-filling them from the request would be a silent
-    substitution (the named gap, exactly as the rust channel).
+    """Populate an ephemeris row's 0.11 per-method products off the delivered
+    entry, filling like ``_fill_propagation_products``: the per-orbit delivery
+    outcome, the delivered sky covariance (projected to the RA·cosδ / Dec 2×2),
+    the resolved kind + packed joint read off the entry's own ``joint`` column
+    (``resolved_method`` / ``cov_kind`` / ``cov_joint_width`` / ``cov_tri``),
+    and — on a row the engine derived as a mixture — the six pre-retention
+    tallies. Keyed on the delivered joint, so a covariance-free (``none``) row
+    carries no kind, joint or resolved method, mirroring a ``none`` propagation
+    row.
 
     The published covariance is the engine-DELIVERED one on every row
     including first order (grouping this channel with the core channel; the
@@ -377,9 +404,68 @@ def _fill_ephemeris_products(row: dict, result: dict, dec_rad: float) -> None:
         if np.isfinite(cov6).all():
             row["emp_radec_cov_arcsec2"] = _delivered_sky_cov_arcsec2(cov6, dec_rad)
 
+    # The resolved kind + packed joint, read off the entry's own `joint` column
+    # (the per-row covariance home) exactly as the propagation path reads its
+    # tagged covariance. Present only on a row that carried a covariance; a
+    # covariance-free row keeps these None.
+    joints = PackedJoints.from_wire_list(result.get("joint"))
+    pj = joints.joint(0) if joints is not None and len(joints) > 0 else None
+    if pj is not None:
+        tri = np.asarray(pj.tri, dtype=np.float64)
+        if np.isfinite(tri).all():
+            delivered = _RESOLVED_METHOD_TAG[pj.kind]
+            arm = _arm_of(row.get("propagation_uncertainty"))
+            row["resolved_method"] = f"{delivered}_{arm}" if arm is not None else delivered
+            row["cov_kind"] = _COV_KIND_WIRE[pj.kind]
+            row["cov_joint_width"] = int(pj.width)
+            row["cov_tri"] = [float(v) for v in tri]
+
+    _fill_ephemeris_mixture_tallies(result, row)
+
     row["orbit_delivered"], row["orbit_status"] = _orbit_outcome_channel(
         outcome, err_code, err_msg, None
     )
+
+
+def _fill_delivered_od_products(
+    row: dict, raw: dict, attach: bool, method_tag: str | None
+) -> None:
+    """Overlay a delivered OD fit's per-method products onto a row. The fit is
+    first-order by construction, so the entry's ``resolved_method`` is the
+    linear kind; ``attach`` is False only for the covariance-free ``none`` view
+    (its joint fields stay ``None``, mirroring a ``none`` propagation row). The
+    packed lower triangle is read off the fitted covariance in the same
+    row-major lower-triangular order the engine's ``PackedJoint`` uses
+    (``idx = i·(i+1)/2 + j``), so ``cov_tri`` agrees with the rust channel's
+    ``joint.tri`` for the same fit.
+    """
+    row["orbit_delivered"] = True
+    row["orbit_status"] = "delivered"
+    if not attach:
+        return
+    code = raw.get("resolved_method")
+    kind = _WIRE_TO_COV_KIND.get(int(code)) if code is not None else None
+    if kind is None:
+        return
+    delivered = _RESOLVED_METHOD_TAG[kind]
+    arm = _arm_of(method_tag)
+    row["resolved_method"] = f"{delivered}_{arm}" if arm is not None else delivered
+    row["cov_kind"] = _COV_KIND_WIRE[kind]
+    # Width + triangle off the fitted covariance: the 9×9 when a non-grav solve
+    # delivered one (auto escalation), else the state 6×6.
+    cov9 = raw.get("covariance_9x9")
+    if cov9 is not None and len(cov9) == 81:
+        width, flat = 9, cov9
+    else:
+        flat = raw.get("covariance")
+        if flat is None or len(flat) != 36:
+            return
+        width = 6
+    cov = np.asarray(flat, dtype=np.float64).reshape(width, width)
+    if not np.isfinite(cov).all():
+        return
+    row["cov_joint_width"] = width
+    row["cov_tri"] = [float(cov[i][j]) for i in range(width) for j in range(i + 1)]
 
 
 def _wheel_source_version() -> str:
@@ -783,8 +869,18 @@ def _determine_one(
     force_model: str,
     max_iterations: int,
     excluded_perturbers_naif: list[int] | None = None,
+    uncertainty_method: UncertaintyMethod | None = None,
 ) -> tuple[list[float], dict, float] | None:
     """Run OD on the PSV PSV-text via the wheel.
+
+    ``uncertainty_method`` requests the OD covariance method on the config
+    (``None`` leaves the engine default, FirstOrder — byte-identical to the
+    legacy untagged fit). It is lowered to the wire sub-dict the low-level
+    ``_determine`` expects via the distribution's own
+    ``_uncertainty_method_to_wire``, so this channel asks for exactly the method
+    the rust / cli channels ask for. The fit is first-order by construction, so
+    the engine refuses any richer method by name — surfaced as the exception the
+    caller turns into a refused row (``orbit_delivered = False``).
 
     Returns (fitted_orbit_pos_au, raw_result_dict, time_ms) or None.
     """
@@ -801,6 +897,12 @@ def _determine_one(
         "max_iterations": max_iterations,
         "solve_for": "auto",
     }
+    if uncertainty_method is not None:
+        # Config parity: the only field a per-method fit changes is the
+        # uncertainty method — everything else matches the legacy config.
+        config_dict["uncertainty_method"] = _uncertainty_method_to_wire(
+            uncertainty_method
+        )
     if excluded_perturbers_naif:
         config_dict["excluded_perturbers_naif"] = list(excluded_perturbers_naif)
     t0 = time.perf_counter()
@@ -1110,21 +1212,54 @@ def main() -> int:
                 n_skipped += 1
                 continue
             psv_text = psv_path.read_text()
+            # The OD method axis: the input row's `propagation_uncertainty` tag
+            # selects the fit's `ODConfig.uncertainty_method`. An untagged row
+            # (`tag is None`) is the legacy first-order fit (no products, no
+            # stamp); a method-tagged row runs that method. The fit is
+            # first-order by construction, so `first_order` / `auto` deliver,
+            # `none` delivers covariance-free, and every richer method is refused
+            # by the engine by name.
+            tag = r.get("propagation_uncertainty")
+            if tag is None:
+                attach, method = False, None
+                method_name = None
+            else:
+                method_name = _method_of(tag)
+                if method_name is None or method_name not in _METHOD_BY_TAG:
+                    print(
+                        f"  {r['object']} OD: SKIP unknown uncertainty_method {tag!r}",
+                        file=sys.stderr,
+                    )
+                    n_skipped += 1
+                    continue
+                attach, method = _METHOD_BY_TAG[method_name]
             ret = _determine_one(
                 object_id=r["object"],
                 psv_text=psv_text,
                 force_model=r["force_model"],
                 max_iterations=100,
                 excluded_perturbers_naif=r.get("excluded_perturbers_naif"),
+                uncertainty_method=method,
             )
             if isinstance(ret, BaseException):
-                # Non-converged / failed OD: emit a FAIL row carrying the
-                # engine's message, exactly as the rust and core channels do,
-                # instead of silently dropping the object.
-                new["od_converged"] = False
-                new["notes"] = f"determine FAIL: {ret}"
-                out_rows.append(new)
-                n_skipped += 1
+                if tag is None:
+                    # Non-converged / failed legacy OD: emit a FAIL row carrying
+                    # the engine's message, exactly as the rust and core channels
+                    # do, instead of silently dropping the object.
+                    new["od_converged"] = False
+                    new["notes"] = f"determine FAIL: {ret}"
+                    out_rows.append(new)
+                    n_skipped += 1
+                else:
+                    # A method-tagged fit the engine refused BY NAME (the richer
+                    # methods have no honest first-order implementation): record
+                    # the refusal, never a silent downgrade or a dropped row.
+                    new["orbit_delivered"] = False
+                    new["orbit_status"] = str(ret)
+                    base = new.get("notes") or ""
+                    refused = f"uncertainty method {method_name} refused by the engine"
+                    new["notes"] = refused if not base else f"{base}; {refused}"
+                    out_rows.append(new)
                 continue
             if ret is None:
                 n_skipped += 1
@@ -1145,25 +1280,23 @@ def main() -> int:
                 raw.get("summary_reduced_chi2", float("nan"))
             )
             new.update(_solve_metadata(raw))
-            # OD fits run method-free at this pin — ODConfig carries no
-            # uncertainty_method on the wrapper (ae00643) — so every OD fit row
-            # records the missing method axis by name rather than a blank or a
-            # silent first-order default; the 12 per-method fields stay None
-            # (reset above). The non_grav_recovery row is a dict(new) copy, so
-            # it inherits this note.
-            new["notes"] = _with_od_method_note(new.get("notes") or "")
+            # Per-method products on a method-tagged delivered row; the untagged
+            # legacy row keeps its base note and no products (the 12 per-method
+            # fields were reset above).
+            if tag is not None:
+                _fill_delivered_od_products(new, raw, attach, tag)
 
-            # ── Second OD: state + non-grav recovery ──────────────────────
+            # ── Second OD: state + non-grav recovery (untagged legacy row only)
             # For objects whose JPL SBDB reference carries a non-grav signal
             # (the Yarkovsky NEOs and the comets — looked up by object name
             # since the optical-only OD row itself carries ic_a1/a2/a3 = None),
             # run a second determine with solve_for=state_and_nongrav on the
             # SAME optical fixture and emit a separate non_grav_recovery row
             # carrying the FITTED A1/A2/A3 ± their 1σ so the report can compare
-            # fitted-vs-JPL in σ. Mirrors the rust runner's reference-non-grav
-            # check and the radar second-pass precedent. Objects with no
-            # reference non-grav (the bulk of the catalog) are untouched.
-            if r["object"] in ref_non_grav:
+            # fitted-vs-JPL in σ. Gated to the untagged row so it fires once per
+            # object, not once per method. Mirrors the rust runner's
+            # reference-non-grav check and the radar second-pass precedent.
+            if tag is None and r["object"] in ref_non_grav:
                 ret_ng = _determine_nongrav_one(
                     object_id=r["object"],
                     psv_text=psv_text,
@@ -1332,9 +1465,9 @@ def main() -> int:
             if ref_lt is not None and not math.isnan(lt_d):
                 new["d_light_time_s"] = (lt_d - ref_lt) * 86400.0
             # Per-orbit outcome + the delivered sky covariance (projected to
-            # RA·cosδ / Dec). resolved_method / cov_kind stay None — the
-            # ephemeris seam delivers a bare 6×6 with no resolved-kind tag and
-            # no packed joint (the named gap, exactly as the rust channel).
+            # RA·cosδ / Dec), plus the delivered kind / packed joint / tallies
+            # read off the entry's own `joint` column, exactly as the rust
+            # channel reads them off `entry.joint`.
             _fill_ephemeris_products(new, eph_result, dec_rad)
 
         out_rows.append(new)

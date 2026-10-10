@@ -191,6 +191,25 @@ fn second_order_moment(
 /// \( \pm\sqrt{6} \) times each Cholesky column; Monte Carlo:
 /// \( Lz \) with standard-normal \( z \) from a seeded LCG +
 /// Box–Muller (deterministic — `Date`-free reruns reproduce bit-for-bit).
+/// Build one Monte-Carlo variant orbit: the parent with a single state-space
+/// offset baked into its elements and every covariance channel dropped.
+///
+/// 0.11.0: the packed [`Orbit::covariance`](empyrean::Orbit) joint is the
+/// single covariance home — the old `state.non_grav_cross` / `ng_covariance`
+/// / `wide_cross` cross terms are gone. A sampled variant carries no
+/// uncertainty of its own (the ensemble's spread IS the covariance), so it is
+/// a pure state-only orbit, identical in its covariance channels to a freshly
+/// engine-built [`empyrean::Orbit::new`]: no state 6×6, no packed joint.
+pub(crate) fn state_only_variant(parent: &Orbit, offset: &[f64; 6]) -> Orbit {
+    let mut v = parent.clone();
+    v.state.covariance = None;
+    v.covariance = None;
+    for (e, di) in v.state.elements.iter_mut().zip(offset.iter()) {
+        *e += di;
+    }
+    v
+}
+
 fn state_offsets(
     mode: UncertaintyMode,
     l: &[[f64; 6]; 6],
@@ -1516,17 +1535,7 @@ fn predict_window(
         let offsets = state_offsets(mode, &l, seed, mc_samples);
         let variants: Vec<Orbit> = offsets
             .iter()
-            .map(|d| {
-                let mut v = orbit.clone();
-                v.state.covariance = None;
-                v.state.non_grav_cross = None;
-                v.ng_covariance = None;
-                v.wide_cross = None;
-                for (e, di) in v.state.elements.iter_mut().zip(d.iter()) {
-                    *e += di;
-                }
-                v
-            })
+            .map(|d| state_only_variant(orbit, d))
             .collect();
         let eph = ctx
             .generate_ephemeris(&variants, &observers, eph_cfg)

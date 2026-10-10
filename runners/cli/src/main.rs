@@ -42,28 +42,53 @@
 //! byte-identical to before (`x y z vx vy vz time_ms`, or `ok …` in daemon
 //! mode), so the existing driver and the first-order goldens are unchanged.
 //!
-//! Gaps at this pin, named rather than back-filled:
-//! - **OD method axis** — `ODConfig` carries no `uncertainty_method` at this
-//!   distribution revision, so OD fit rows run method-free; the shared
-//!   [`empyrean_validation::schema::OD_METHOD_AXIS_NOT_PRODUCED`] note is the
-//!   carrier (recorded by the driver), and the per-method OD transport rows
-//!   are `not produced` here, exactly as the rust and core channels.
-//! - **Ephemeris method axis** — the cli ephemeris one-shot stays
-//!   covariance-free first order at this pin (the per-method ephemeris leg is a
-//!   follow-up), matching the rust channel's `None` ephemeris products.
-//! - **Driver wiring** — this commit extends only the cli runner binary
-//!   (`runners/cli/src`); carrying the emitted products into the schema's
-//!   per-method JSON fields is a `drive.py` follow-up (out of this commit's
-//!   scope, which is the `src` runner).
+//! # Per-method OD fit (od mode)
+//!
+//! The `od` daemon command takes a method token (`od FORCE EXCLUDE METHOD
+//! PATH`): `-` for the legacy untagged fit (first-order + non-grav recovery,
+//! the 20-field line, byte-identical to before) or a composite uncertainty tag
+//! for a per-method fit, which binds `ODConfig.uncertainty_method` exactly as
+//! the distribution CLI's `determine --uncertainty-method` does (commit
+//! `9e1b38b` carried the field across every layer). The fit is first-order by
+//! construction, so `first_order` / `auto` deliver the fit with its products,
+//! `none` delivers covariance-free, and every richer method is refused BY NAME
+//! — emitted as a `refused <engine text>` line the driver maps to
+//! `orbit_delivered = false`. The one-shot `--mode od --uncertainty-method`
+//! path mirrors it.
+//!
+//! # Per-method ephemeris line (eph mode)
+//!
+//! The ephemeris LINE carries the same per-method products as the prop line:
+//! an **optional** method token after the observer in daemon mode (`eph … OBS
+//! METHOD`), or `--uncertainty-method <tag>` in one-shot mode, attaches the
+//! same synthetic covariance and requests that rung, so the delivered
+//! `EphemerisEntry` carries a packed joint. When a method is requested the line
+//! appends the 12 product tokens after `… time_ms` — `resolved_method`,
+//! `cov_kind`, `cov_joint_width`, `cov_tri`, `orbit_delivered` / `orbit_status`
+//! (off `outcomes[0]`), and the six `mix_*` tallies off the entry's
+//! PRE-RETENTION `mixture_tally` (absent → `na`, never a fabricated zero), all
+//! read off the entry's own `joint` exactly as the prop line reads them off the
+//! propagated state. **Without** a method the line stays byte-identical to
+//! before (`ra_deg dec_deg rho_au lt_d time_ms`), so the first-order goldens are
+//! unchanged.
+//!
+//! # Ephemeris file (eph mode, `--out`)
+//!
+//! `--mode eph --out <path>` writes the generated ephemeris as a 28-column CSV
+//! through the engine's own `write_ephemeris_csv`, carrying each row's
+//! `cov_kind` and the six `mix_*` tallies (the 0.11 ephemeris-file columns).
+//! The covariance is attached and the `--uncertainty-method` rung requested so
+//! each row carries a real delivered kind; the cli driver's file reader
+//! (`drive._read_ephemeris_csv`) round-trips those columns.
 
 use clap::{Parser, ValueEnum};
 use std::time::Instant;
 
 use empyrean::propagate::{ComponentStatus, MixtureComponent};
 use empyrean::{
-    Context, CoordinateState, CovarianceKind, EphemerisConfig, Epoch, ForceModelTier, Frame,
-    ODConfig, Orbit, OrbitOutcome, Origin, PropagationConfig, Representation, SolveForParams,
-    UncertaintyMethod,
+    Context, CoordinateState, CovarianceKind, EphemerisConfig, EphemerisEntry, Epoch,
+    ForceModelTier, Frame, ODConfig, Orbit, OrbitOutcome, Origin, PropagationConfig,
+    Representation, SolveForParams, UncertaintyMethod,
 };
 use empyrean_validation::schema::uncertainty_modes as um;
 
@@ -145,6 +170,14 @@ struct Cli {
     /// MPC observer code (eph mode only).
     #[arg(long, required_if_eq("mode", "eph"))]
     observer: Option<String>,
+    /// When set (eph mode), write the generated ephemeris to this path as a
+    /// 28-column CSV (the engine's own `write_ephemeris_csv`, carrying
+    /// `cov_kind` and the six `mix_*` tallies) instead of printing the one-line
+    /// summary. The covariance is attached and the `--uncertainty-method` rung
+    /// requested so the file carries a real per-row kind for the driver's file
+    /// reader to round-trip.
+    #[arg(long)]
+    out: Option<std::path::PathBuf>,
 
     // ── od only ───────────────────────────────────────────────
     /// ADES PSV file (od mode only).
@@ -316,10 +349,14 @@ fn outcome_channel(outcome: &OrbitOutcome, withheld: Option<&str>) -> (bool, Str
 struct MixTallies {
     total: u32,
     weight: f64,
-    failed: u32,
-    unresolved: u32,
-    curvature: u32,
-    sky: u32,
+    // Per-field optional: the retained-component tally (prop) always fills them
+    // (a count is 0 or more), but the ephemeris entry's pre-retention
+    // `mixture_tally` carries each count as absent-or-present, so an absent
+    // count surfaces as `na` rather than a fabricated zero.
+    failed: Option<u32>,
+    unresolved: Option<u32>,
+    curvature: Option<u32>,
+    sky: Option<u32>,
 }
 
 fn mixture_tallies(components: &[MixtureComponent]) -> Option<MixTallies> {
@@ -341,10 +378,10 @@ fn mixture_tallies(components: &[MixtureComponent]) -> Option<MixTallies> {
     Some(MixTallies {
         total: components.len() as u32,
         weight,
-        failed,
-        unresolved,
-        curvature,
-        sky,
+        failed: Some(failed),
+        unresolved: Some(unresolved),
+        curvature: Some(curvature),
+        sky: Some(sky),
     })
 }
 
@@ -430,14 +467,15 @@ impl Products {
             .split_whitespace()
             .collect::<Vec<_>>()
             .join("_");
+        let count = |v: Option<u32>| v.map(|x| x.to_string()).unwrap_or_else(na);
         let (mt, mw, mf, mu, mc, ms) = match &self.mix {
             Some(m) => (
                 m.total.to_string(),
                 format!("{:.18e}", m.weight),
-                m.failed.to_string(),
-                m.unresolved.to_string(),
-                m.curvature.to_string(),
-                m.sky.to_string(),
+                count(m.failed),
+                count(m.unresolved),
+                count(m.curvature),
+                count(m.sky),
             ),
             None => (na(), na(), na(), na(), na(), na()),
         };
@@ -461,6 +499,92 @@ impl Products {
             ms,
             tri,
         )
+    }
+
+    /// Read the per-method products off a delivered OD fit. The fit is
+    /// first-order by construction, so `resolved_method` is the delivered kind
+    /// (the linear kind) and the joint is the fitted packed joint. `attach` is
+    /// false only for the covariance-free `none` view, which publishes the fit
+    /// without its joint (mirroring a `none` propagation row). An OD fit is
+    /// never a mixture, so the `mix_*` tallies are always absent.
+    fn from_od(dr: &empyrean::DetermineResult, attach: bool) -> Self {
+        let mut resolved_method = None;
+        let mut cov_kind = None;
+        let mut cov_joint_width = None;
+        let mut cov_tri = None;
+        if attach {
+            resolved_method = Some(resolved_method_tag(dr.resolved_method));
+            if let Some(joint) = dr.state().joint {
+                cov_kind = Some(cov_kind_wire(joint.kind));
+                cov_joint_width = Some(joint.width as u32);
+                cov_tri = Some(joint.tri.clone());
+            }
+        }
+        Products {
+            resolved_method,
+            cov_kind,
+            cov_joint_width,
+            cov_tri,
+            orbit_delivered: true,
+            orbit_status: "delivered".to_string(),
+            mix: None,
+        }
+    }
+
+    /// Read the per-method products off a delivered ephemeris ENTRY — the twin
+    /// of [`Products::from_result`] for the ephemeris seam. The row's sky
+    /// covariance is delivered as one packed joint (`entry.joint`, the per-row
+    /// covariance home beside the bare 6×6), so `resolved_method` / `cov_kind` /
+    /// `cov_joint_width` / `cov_tri` read off it — keyed on the joint, never on
+    /// `entry.cov_kind` (whose `Linear` default on a covariance-free row names no
+    /// delivery). The six mix tallies are the engine's PRE-RETENTION
+    /// `entry.mixture_tally`, present only on a row it derived as a mixture;
+    /// absent → `na`, never a fabricated zero. `expected_cov` names a withheld
+    /// covariance on the outcome rather than dropping it.
+    fn from_ephemeris(
+        entry: &EphemerisEntry,
+        outcome: Option<&OrbitOutcome>,
+        expected_cov: bool,
+    ) -> Self {
+        let mut resolved_method = None;
+        let mut cov_kind = None;
+        let mut cov_joint_width = None;
+        let mut cov_tri = None;
+        let mut withheld: Option<String> = None;
+        match entry.joint.as_ref() {
+            Some(j) => {
+                resolved_method = Some(resolved_method_tag(j.kind));
+                cov_kind = Some(cov_kind_wire(j.kind));
+                cov_joint_width = Some(j.width as u32);
+                cov_tri = Some(j.tri.clone());
+            }
+            None => {
+                if expected_cov {
+                    withheld = Some("covariance absent from the ephemeris entry".to_string());
+                }
+            }
+        }
+        let (orbit_delivered, orbit_status) = match outcome {
+            Some(oc) => outcome_channel(oc, withheld.as_deref()),
+            None => (false, "no_outcome".to_string()),
+        };
+        let mix = entry.mixture_tally.as_ref().map(|t| MixTallies {
+            total: t.n_components_total,
+            weight: t.weight_delivered,
+            failed: t.n_failed,
+            unresolved: t.n_unresolved,
+            curvature: t.n_curvature_refused,
+            sky: t.n_sky_linearization_refused,
+        });
+        Products {
+            resolved_method,
+            cov_kind,
+            cov_joint_width,
+            cov_tri,
+            orbit_delivered,
+            orbit_status,
+            mix,
+        }
     }
 }
 
@@ -696,6 +820,23 @@ fn daemon_eph(ctx: &Context, rest: &str) -> Result<String, String> {
     let obs_code = tokens
         .next()
         .ok_or_else(|| "eph_parse_missing_observer".to_string())?;
+    // Optional method token after the observer (exactly like `parse_prop_args`):
+    // a composite uncertainty tag → attach the synthetic covariance and request
+    // that rung, so the entry carries a delivered joint; absent → the
+    // covariance-free line, byte-identical to before.
+    let method = match tokens.next() {
+        Some(tag) => {
+            Some(method_for_tag(tag).ok_or_else(|| format!("unknown_uncertainty_method:{tag}"))?)
+        }
+        None => None,
+    };
+    if tokens.next().is_some() {
+        return Err("eph_parse_extra_fields".to_string());
+    }
+    let (attach_cov, umethod) = match &method {
+        Some((a, m)) => (*a, m.clone()),
+        None => (false, UncertaintyMethod::FirstOrder),
+    };
     let pos = [floats[1], floats[2], floats[3]];
     let vel = [floats[4], floats[5], floats[6]];
     let g = [floats[10], floats[11], floats[12], floats[13], floats[14]];
@@ -705,10 +846,13 @@ fn daemon_eph(ctx: &Context, rest: &str) -> Result<String, String> {
     let state = CoordinateState {
         epoch: Epoch::from_mjd_tdb(floats[0]),
         elements: [pos[0], pos[1], pos[2], vel[0], vel[1], vel[2]],
-        covariance: None,
-        // 0.11 CoordinateState is state-only (6×6); the state↔parameter
-        // border now lives on the engine-side packed joint, not the input
-        // state, so there is nothing to carry here.
+        // Attached only when a covariance-bearing method was requested; the
+        // 18-field (no method) line keeps `None`, byte-identical to before.
+        covariance: if attach_cov {
+            Some(synthetic_covariance())
+        } else {
+            None
+        },
         representation: Representation::Cartesian,
         frame: Frame::ICRF,
         origin: Origin::SSB,
@@ -727,12 +871,14 @@ fn daemon_eph(ctx: &Context, rest: &str) -> Result<String, String> {
         .map_err(|e| e.to_string())?;
     let mut cfg = EphemerisConfig::with_force_model(force);
     cfg.propagation.num_threads = std::num::NonZeroUsize::new(1);
+    cfg.propagation.uncertainty_method = umethod;
     let _ = ctx.generate_ephemeris(std::slice::from_ref(&orbit), &observers, &cfg);
     let mut best_ms = f64::INFINITY;
     let mut last_ra = f64::NAN;
     let mut last_dec = f64::NAN;
     let mut last_rho = f64::NAN;
     let mut last_lt = f64::NAN;
+    let mut last_eph: Option<empyrean::EphemerisResult> = None;
     for _ in 0..3 {
         let t0 = Instant::now();
         let entries = ctx
@@ -748,19 +894,42 @@ fn daemon_eph(ctx: &Context, rest: &str) -> Result<String, String> {
         if ms < best_ms {
             best_ms = ms;
         }
+        last_eph = Some(entries);
     }
-    Ok(format!(
-        "ok {:.18e} {:.18e} {:.18e} {:.18e} {:.6}",
-        last_ra, last_dec, last_rho, last_lt, best_ms,
-    ))
+    // No method → byte-identical to before. A method → append the delivered
+    // per-method products read off the entry's own packed joint + pre-retention
+    // tally, exactly as the prop line does off the propagated state.
+    match method {
+        None => Ok(format!(
+            "ok {:.18e} {:.18e} {:.18e} {:.18e} {:.6}",
+            last_ra, last_dec, last_rho, last_lt, best_ms,
+        )),
+        Some(_) => {
+            let products = last_eph
+                .as_ref()
+                .and_then(|eph| {
+                    eph.entries.first().map(|e| {
+                        Products::from_ephemeris(e, eph.outcomes.first(), attach_cov).render()
+                    })
+                })
+                .unwrap_or_default();
+            Ok(format!(
+                "ok {:.18e} {:.18e} {:.18e} {:.18e} {:.6} {}",
+                last_ra, last_dec, last_rho, last_lt, best_ms, products,
+            ))
+        }
+    }
 }
 
 fn daemon_od(ctx: &Context, rest: &str) -> Result<String, String> {
-    // Protocol: `od FORCE EXCLUDE_NAIF PATH` where:
+    // Protocol: `od FORCE EXCLUDE_NAIF METHOD PATH` where:
     //   - FORCE: integer tier (0/1/2)
     //   - EXCLUDE_NAIF: integer NAIF id of perturber to exclude (0 = none).
     //     Used by SB441-N16 self-perturbers so the body's own gravity does
     //     not act on itself during integration.
+    //   - METHOD: `-` for the legacy untagged fit (first-order + non-grav
+    //     recovery, the 20-field line) or a composite uncertainty tag for a
+    //     per-method fit (the fit under `ODConfig.uncertainty_method`).
     //   - PATH: ADES PSV filename (may contain spaces; trailing field).
     let (force_str, after_force) = rest
         .split_once(char::is_whitespace)
@@ -769,13 +938,17 @@ fn daemon_od(ctx: &Context, rest: &str) -> Result<String, String> {
         .parse()
         .map_err(|_| "od_parse_force".to_string())?;
     let force = tier_from_int(force_model);
-    let (exclude_str, path) = after_force
+    let (exclude_str, after_exclude) = after_force
         .trim_start()
         .split_once(char::is_whitespace)
         .ok_or_else(|| "od_parse_exclude".to_string())?;
     let exclude_naif: i32 = exclude_str
         .parse()
         .map_err(|_| "od_parse_exclude".to_string())?;
+    let (method_str, path) = after_exclude
+        .trim_start()
+        .split_once(char::is_whitespace)
+        .ok_or_else(|| "od_parse_method".to_string())?;
     let path = path.trim();
     let content = std::fs::read_to_string(path).map_err(|e| format!("od_open_{path}: {e}"))?;
     let observations = ctx.read_ades(&content).map_err(|e| e.to_string())?;
@@ -787,6 +960,54 @@ fn daemon_od(ctx: &Context, rest: &str) -> Result<String, String> {
             None => return Err(format!("od_unknown_naif_{exclude_naif}")),
         }
     };
+
+    // ── Per-method fit (a composite tag, not `-`) ──────────────────────────
+    // Run the fit under the tag's `uncertainty_method`; the config differs from
+    // the legacy fit by that field alone (config parity). The fit is
+    // first-order by construction, so `first_order` / `auto` deliver, `none`
+    // delivers covariance-free, and every richer method is refused BY NAME —
+    // emitted as a `refused <text>` line (trailing, so the refusal keeps its
+    // spaces), which the driver maps to `orbit_delivered = false`. No non-grav
+    // second pass (that rides the legacy untagged fit, once per object).
+    if method_str != "-" {
+        let (attach, method) = method_for_tag(method_str)
+            .ok_or_else(|| format!("unknown_uncertainty_method:{method_str}"))?;
+        let cfg = ODConfig {
+            force_model: force,
+            num_threads: 1,
+            excluded_perturbers,
+            uncertainty_method: method,
+            ..ODConfig::default()
+        };
+        let t0 = Instant::now();
+        let res = ctx
+            .determine(&observations, None, &cfg)
+            .and_then(|batch| batch.into_single());
+        let ms = t0.elapsed().as_secs_f64() * 1000.0;
+        return match res {
+            Ok(result) => {
+                let s = result.state();
+                let products = Products::from_od(&result, attach);
+                Ok(format!(
+                    "ok {:.18e} {:.18e} {:.18e} {:.18e} {:.18e} {:.18e} {} {:.6} {}",
+                    s.position[0],
+                    s.position[1],
+                    s.position[2],
+                    s.velocity[0],
+                    s.velocity[1],
+                    s.velocity[2],
+                    result.iterations,
+                    ms,
+                    products.render(),
+                ))
+            }
+            // The engine's refusal text names the method — carried verbatim as
+            // the trailing field (spaces preserved), never a silent downgrade.
+            Err(e) => Ok(format!("refused {e}")),
+        };
+    }
+
+    // ── Legacy untagged fit: first-order + non-grav recovery ───────────────
     let cfg = ODConfig {
         force_model: force,
         num_threads: 1,
@@ -1044,10 +1265,52 @@ fn run_eph(
     cli: &Cli,
     force: ForceModelTier,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    // The cli ephemeris one-shot keeps the covariance-free first-order path at
-    // this pin; the per-method ephemeris axis is a follow-up (see the module
-    // doc). `false` → no covariance attached, output unchanged.
-    let orbit = build_orbit(cli, false);
+    // ── Ephemeris FILE: write a 28-column CSV via the engine's own writer ──
+    // The covariance is attached and the requested rung set so each row carries
+    // a real `cov_kind` (+ the six mixture tallies, present as the absent
+    // sentinel off a non-mixture row). This is the write side the cli driver's
+    // file reader round-trips (`drive._read_ephemeris_csv`).
+    if let Some(out) = cli.out.as_deref() {
+        let method = match cli.uncertainty_method.as_deref() {
+            None => UncertaintyMethod::FirstOrder,
+            Some(tag) => {
+                method_for_tag(tag)
+                    .ok_or_else(|| format!("unknown_uncertainty_method:{tag}"))?
+                    .1
+            }
+        };
+        let orbit = build_orbit(cli, true);
+        let target = Epoch::from_mjd_tdb(cli.target.expect("--target required for eph"));
+        let obs_code = cli
+            .observer
+            .as_deref()
+            .expect("--observer required for eph");
+        let observers = ctx.get_observers(&[obs_code], &[target], Frame::ICRF, Origin::SSB)?;
+        let mut cfg = EphemerisConfig::with_force_model(force);
+        cfg.propagation.num_threads = std::num::NonZeroUsize::new(1);
+        cfg.propagation.uncertainty_method = method;
+        let result = ctx.generate_ephemeris(std::slice::from_ref(&orbit), &observers, &cfg)?;
+        empyrean::write_ephemeris_csv(out, &result.entries)?;
+        println!(
+            "wrote {} entries to {}",
+            result.entries.len(),
+            out.display()
+        );
+        return Ok(());
+    }
+
+    // The one-shot ephemeris LINE carries the delivered per-method products too
+    // (the same `EphemerisEntry` the daemon line reads): `--uncertainty-method`
+    // attaches the synthetic covariance and requests that rung, so the entry
+    // delivers a joint; absent (or `none`) → covariance-free, output unchanged.
+    let method = match cli.uncertainty_method.as_deref() {
+        None => None,
+        Some(tag) => {
+            Some(method_for_tag(tag).ok_or_else(|| format!("unknown_uncertainty_method:{tag}"))?)
+        }
+    };
+    let attach_cov = method.as_ref().map(|(a, _)| *a).unwrap_or(false);
+    let orbit = build_orbit(cli, attach_cov);
     let target = Epoch::from_mjd_tdb(cli.target.expect("--target required for eph"));
     let obs_code = cli
         .observer
@@ -1061,6 +1324,9 @@ fn run_eph(
     let mut cfg = EphemerisConfig::with_force_model(force);
     // Per-row fork-exec runner — pin to 1 thread (see run_prop comment).
     cfg.propagation.num_threads = std::num::NonZeroUsize::new(1);
+    if let Some((_, m)) = &method {
+        cfg.propagation.uncertainty_method = m.clone();
+    }
 
     // Best-of-3 with one warm-up.
     let _ = ctx.generate_ephemeris(std::slice::from_ref(&orbit), &observers, &cfg);
@@ -1069,6 +1335,7 @@ fn run_eph(
     let mut last_dec = f64::NAN;
     let mut last_rho = f64::NAN;
     let mut last_lt = f64::NAN;
+    let mut last_eph: Option<empyrean::EphemerisResult> = None;
     for _ in 0..3 {
         let t0 = Instant::now();
         let entries = ctx.generate_ephemeris(std::slice::from_ref(&orbit), &observers, &cfg)?;
@@ -1082,13 +1349,31 @@ fn run_eph(
         if ms < best_ms {
             best_ms = ms;
         }
+        last_eph = Some(entries);
     }
 
-    // Output: ra_deg dec_deg rho_au lt_d time_ms
-    println!(
-        "{:.18e} {:.18e} {:.18e} {:.18e} {:.6}",
-        last_ra, last_dec, last_rho, last_lt, best_ms,
-    );
+    // Output: ra_deg dec_deg rho_au lt_d time_ms, plus the delivered product
+    // tokens when a method was requested (byte-identical without one).
+    match method {
+        None => println!(
+            "{:.18e} {:.18e} {:.18e} {:.18e} {:.6}",
+            last_ra, last_dec, last_rho, last_lt, best_ms,
+        ),
+        Some(_) => {
+            let products = last_eph
+                .as_ref()
+                .and_then(|eph| {
+                    eph.entries.first().map(|e| {
+                        Products::from_ephemeris(e, eph.outcomes.first(), attach_cov).render()
+                    })
+                })
+                .unwrap_or_default();
+            println!(
+                "{:.18e} {:.18e} {:.18e} {:.18e} {:.6} {}",
+                last_ra, last_dec, last_rho, last_lt, best_ms, products,
+            );
+        }
+    }
     Ok(())
 }
 
@@ -1103,34 +1388,73 @@ fn run_od(
     // FFI layer), so we slurp the file here.
     let content = std::fs::read_to_string(ades_path)?;
     let observations = ctx.read_ades(&content)?;
+    // The per-method uncertainty axis, mirroring `run_prop`: omitted → the
+    // covariance-free first-order fit (output byte-identical to before); a tag
+    // selects `ODConfig.uncertainty_method`; an unrecognized tag is refused by
+    // name. The fit is first-order by construction, so a richer method is
+    // refused by the engine.
+    let (attach, method) = match cli.uncertainty_method.as_deref() {
+        None => (false, UncertaintyMethod::FirstOrder),
+        Some(tag) => {
+            method_for_tag(tag).ok_or_else(|| format!("unknown_uncertainty_method:{tag}"))?
+        }
+    };
     let cfg = ODConfig {
         force_model: force,
         max_iterations: cli.max_iterations,
         // Per-row fork-exec runner — pin to 1 thread (see run_prop comment).
         num_threads: 1,
+        uncertainty_method: method,
         ..ODConfig::default()
     };
     let t0 = Instant::now();
-    let result = ctx
+    let fit = ctx
         .determine(&observations, None, &cfg)
-        .and_then(|batch| batch.into_single())?;
+        .and_then(|batch| batch.into_single());
     let ms = t0.elapsed().as_secs_f64() * 1000.0;
+
+    let result = match fit {
+        Ok(r) => r,
+        // A richer method the engine refuses prints the refusal by name rather
+        // than a bare state line — never a silent downgrade.
+        Err(e) if cli.uncertainty_method.is_some() => {
+            println!("refused {e}");
+            return Ok(());
+        }
+        Err(e) => return Err(e.into()),
+    };
 
     // `DetermineResult.orbit` is now a re-feedable `Orbit`; take the flat
     // state snapshot for the position/velocity output.
     let s = result.state();
-    // Output: x y z vx vy vz iterations time_ms
-    println!(
-        "{:.18e} {:.18e} {:.18e} {:.18e} {:.18e} {:.18e} {} {:.6}",
-        s.position[0],
-        s.position[1],
-        s.position[2],
-        s.velocity[0],
-        s.velocity[1],
-        s.velocity[2],
-        result.iterations,
-        ms,
-    );
+    // Output: x y z vx vy vz iterations time_ms, plus the per-method products
+    // when a method was requested (byte-identical to before when it was not).
+    if cli.uncertainty_method.is_some() {
+        println!(
+            "{:.18e} {:.18e} {:.18e} {:.18e} {:.18e} {:.18e} {} {:.6} {}",
+            s.position[0],
+            s.position[1],
+            s.position[2],
+            s.velocity[0],
+            s.velocity[1],
+            s.velocity[2],
+            result.iterations,
+            ms,
+            Products::from_od(&result, attach).render(),
+        );
+    } else {
+        println!(
+            "{:.18e} {:.18e} {:.18e} {:.18e} {:.18e} {:.18e} {} {:.6}",
+            s.position[0],
+            s.position[1],
+            s.position[2],
+            s.velocity[0],
+            s.velocity[1],
+            s.velocity[2],
+            result.iterations,
+            ms,
+        );
+    }
     Ok(())
 }
 

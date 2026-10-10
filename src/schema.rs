@@ -439,23 +439,6 @@ pub mod uncertainty_modes {
     }
 }
 
-/// Stamped on every orbit-determination fit row's
-/// [`notes`](ValidationResult::notes) while the distribution's `ODConfig`
-/// carries no `uncertainty_method` (the wrapper revision the harness pins —
-/// `ae00643` — has no OD method axis; it is being added separately). The OD
-/// fit rows under each method therefore run method-free: no per-fit packed
-/// joint and no OD method axis. Rather than leave those rows blank or silently
-/// default them to first order, every channel records this string by name so a
-/// report reader — and the per-channel unit tests — can find it.
-///
-/// Shared across the rust, c, python, cli and core channels so the text is
-/// written once and every channel's OD fit row carries the identical note (no
-/// duplicated spellings that can drift). The Rust channels import it; the C and
-/// Python channels mirror the identical literal with a comment pointing here as
-/// the source of truth.
-pub const OD_METHOD_AXIS_NOT_PRODUCED: &str =
-    "OD method axis not produced at this pin: ODConfig.uncertainty_method not on the wrapper";
-
 /// One row in the validation result table.
 ///
 /// Every channel runner emits a `Vec<ValidationResult>` as JSON. The plan
@@ -816,6 +799,29 @@ pub struct ValidationResult {
     /// respectively. `None` only on the one legacy untagged OD fit row the plan
     /// keeps per object for byte-identity with the pinned consumer. What
     /// actually ran is [`resolved_method`](Self::resolved_method).
+    ///
+    /// **OD fit row outcome under a method.** The engine's `ODConfig` carries an
+    /// `uncertainty_method`, and the fit is first-order by construction, so each
+    /// channel runs the fit under the tag's method with a config that differs
+    /// from the legacy fit's by that field alone (config parity) and records:
+    /// - `first_order` / `auto` → the delivered fit, with
+    ///   [`resolved_method`](Self::resolved_method) (the resolved kind composed
+    ///   with the row's arm — `auto` resolves to first order today),
+    ///   [`cov_kind`](Self::cov_kind), [`cov_joint_width`](Self::cov_joint_width)
+    ///   and [`cov_tri`](Self::cov_tri) off the fitted joint, and
+    ///   [`orbit_delivered`](Self::orbit_delivered) `= true`;
+    /// - `none` → the same first-order fit published covariance-free (the
+    ///   per-method joint fields stay `None`), mirroring a `none` propagation
+    ///   row;
+    /// - `second_order` / `sigma_point` / `monte_carlo` / `gaussian_mixture` →
+    ///   [`orbit_delivered`](Self::orbit_delivered) `= false` with the engine's
+    ///   refusal text by name in [`orbit_status`](Self::orbit_status) and the
+    ///   method named in `notes` — the fit is refused rather than silently
+    ///   downgraded to a first-order posterior under the method's name.
+    ///
+    /// The `first_order` fit is bit-identical to the legacy untagged fit (same
+    /// config, default method); the legacy untagged row keeps its meaning and
+    /// the report labels it legacy.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub propagation_uncertainty: Option<String>,
 
@@ -860,7 +866,11 @@ pub struct ValidationResult {
     pub orbit_delivered: Option<bool>,
     /// The per-orbit outcome as a string: `delivered`, `failed:<variant>`, or
     /// `cov_withheld:<reason>`. Keeps a refusal visible by name instead of
-    /// collapsing into a blank cell.
+    /// collapsing into a blank cell. On an OD fit row refused for its
+    /// uncertainty method (`second_order` / `sigma_point` / `monte_carlo` /
+    /// `gaussian_mixture`) it carries the engine's refusal text verbatim, which
+    /// names the method, with [`orbit_delivered`](Self::orbit_delivered)
+    /// `= false`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub orbit_status: Option<String>,
     /// Retained mixture component count (`gaussian_mixture` rows).

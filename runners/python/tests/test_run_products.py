@@ -11,10 +11,12 @@ These tests run the real dist-stable engine through the wheel. They pin:
 * the 12 inherited per-method fields are reset — a bogus input ``cov_kind`` does
   not ride out under this channel's name;
 * the per-orbit outcome is the status table's string, not a row count;
-* OD fit rows carry the shared method-axis note;
+* an OD fit row runs the fit under its tag's method: ``first_order`` delivers
+  and is bit-identical to the legacy untagged fit, while ``second_order`` is
+  refused by the engine BY NAME (``orbit_delivered = False``);
 * the restated schema constants (method ints, cov-kind wire codes, the MC
-  sample count + seed, the OD note text) match the distribution / schema so the
-  literals cannot drift silently.
+  sample count + seed) match the distribution / schema so the literals cannot
+  drift silently.
 
 Mutation-proven (cp backup → edit run.py → red → restore → cmp) in the build
 report; here the assertions are the green side.
@@ -47,10 +49,9 @@ _SCHEMA_RS = _REPO / "src" / "schema.rs"
 
 
 def _parse_schema_constants(schema_path: Path) -> dict[str, object]:
-    """Parse ``MONTE_CARLO_SAMPLE_COUNT``, ``MONTE_CARLO_SEED`` and
-    ``OD_METHOD_AXIS_NOT_PRODUCED`` out of a ``schema.rs`` by a small regex on
-    the ``pub const`` lines (the seed's ``0x..._...`` hex is parsed to an int;
-    the note's string literal may sit on the line after the ``=``).
+    """Parse ``MONTE_CARLO_SAMPLE_COUNT`` and ``MONTE_CARLO_SEED`` out of a
+    ``schema.rs`` by a small regex on the ``pub const`` lines (the seed's
+    ``0x..._...`` hex is parsed to an int).
     """
     text = Path(schema_path).read_text()
 
@@ -62,10 +63,7 @@ def _parse_schema_constants(schema_path: Path) -> dict[str, object]:
     count = int(_group(r"pub const MONTE_CARLO_SAMPLE_COUNT:\s*u32\s*=\s*(\d+)\s*;"))
     seed_hex = _group(r"pub const MONTE_CARLO_SEED:\s*u64\s*=\s*(0x[0-9A-Fa-f_]+)\s*;")
     seed = int(seed_hex.replace("_", ""), 16)
-    note = _group(
-        r'pub const OD_METHOD_AXIS_NOT_PRODUCED:\s*&str\s*=\s*"((?:[^"\\]|\\.)*)"\s*;'
-    )
-    return {"count": count, "seed": seed, "note": note}
+    return {"count": count, "seed": seed}
 
 # A valid heliocentric ICRF/SSB Cartesian state (the runner builds every orbit
 # in Frame::ICRF, Origin::SSB), epoch MJD 61200 TDB — a real NEO state.
@@ -196,31 +194,153 @@ def test_outcome_from_status_table_not_row_count(propagation_rows) -> None:
         assert row["orbit_status"] == "delivered"
 
 
-def test_od_fit_rows_carry_the_method_axis_note(tmp_path) -> None:
-    """An OD fit row records the shared OD_METHOD_AXIS_NOT_PRODUCED note (the OD
-    method axis is not on the wrapper at this pin) and leaves the 12 per-method
-    fields None. Uses a short-arc impactor fixture so the fit is fast."""
-    obj = "2018 LA"
-    assert (_FIXTURES / f"{obj}.psv").exists(), "expected the 2018 LA PSV fixture"
-    od_row = {
-        "object": obj,
+# ── Ephemeris method rows ───────────────────────────────────────────────────
+
+_EPH_METHOD_TAGS = ["first_order_detection_on", "second_order_detection_on"]
+
+
+def _eph_row(tag: str) -> dict:
+    """One synthetic geocentric (``500``) ephemeris plan row, carrying BOGUS
+    inherited per-method fields so the fill can be observed to overwrite them."""
+    return {
+        "object": "TestNEO",
+        "population": "NEO",
+        "epoch_mjd_tdb": _EPOCH,
+        "t_mjd_tdb": _EPOCH + 30.0,
+        "dt_days": 30.0,
+        "force_model": "standard",
+        "test_type": "ephemeris",
+        "propagation_uncertainty": tag,
+        "ic_pos_au": _IC_POS,
+        "ic_vel_au_d": _IC_VEL,
+        "observer": "500",
+        "notes": "",
+        # The leak the reset must clear — a foreign channel's products:
+        "cov_kind": 5,
+        "cov_joint_width": 99,
+        "cov_tri": [1.0, 2.0, 3.0],
+        "resolved_method": "sigma_point",
+    }
+
+
+@pytest.fixture(scope="module")
+def ephemeris_rows(tmp_path_factory) -> dict[str, dict]:
+    """Run one geocentric ephemeris row under first_order + second_order."""
+    tmp = tmp_path_factory.mktemp("eph")
+    rows = _run([_eph_row(t) for t in _EPH_METHOD_TAGS], tmp)
+    by_tag = {r["propagation_uncertainty"]: r for r in rows}
+    assert set(by_tag) == set(_EPH_METHOD_TAGS), "one ephemeris row per method"
+    return by_tag
+
+
+def test_ephemeris_second_order_row_carries_the_delivered_joint(ephemeris_rows) -> None:
+    """From-engine: the second_order ephemeris row carries the delivered sky
+    joint read off the entry's own ``joint`` column — kind 1 (second-order),
+    width 6, a 21-cell lower triangle, ``resolved_method``
+    ``second_order_detection_on`` — and, being a non-mixture row, every ``mix_*``
+    tally ABSENT (``None``, never 0). This is the re-bind of the ephemeris method
+    rows; before it these 12 fields were null (the old named gap). The bogus
+    inherited ``cov_kind=5`` must not survive. Mutation: make
+    ``_fill_ephemeris_products`` skip the joint read → ``cov_kind`` null → red."""
+    so = ephemeris_rows["second_order_detection_on"]
+    assert so["cov_kind"] == 1, "input cov_kind=5 leaked or the joint was not read"
+    assert so["cov_joint_width"] == 6
+    assert len(so["cov_tri"]) == 21  # 6*7/2 packed lower triangle
+    assert so["resolved_method"] == "second_order_detection_on"
+    # A second-order row is not a mixture: every tally ABSENT (None), never 0.
+    assert so["mix_n_components_total"] is None
+    assert so["mix_weight_delivered"] is None
+    assert so["mix_n_failed"] is None
+    assert so["mix_n_unresolved"] is None
+    assert so["mix_n_curvature_refused"] is None
+    assert so["mix_n_sky_linearization_refused"] is None
+
+
+def test_ephemeris_first_order_row_kind_zero(ephemeris_rows) -> None:
+    """The first_order ephemeris row's delivered joint is tagged kind 0 (linear)
+    and its ``resolved_method`` is ``first_order_detection_on`` — the delivered
+    joint rides beside the published sky covariance (this channel publishes the
+    engine-delivered covariance; the diagnostic lives on the rust channel)."""
+    fo = ephemeris_rows["first_order_detection_on"]
+    assert fo["cov_kind"] == 0
+    assert fo["cov_joint_width"] == 6
+    assert len(fo["cov_tri"]) == 21
+    assert fo["resolved_method"] == "first_order_detection_on"
+
+
+def _od_row(tag) -> dict:
+    """One OD fit plan row for the 2018 LA short-arc impactor fixture (a fast
+    fit), carrying the given method tag (``None`` = the legacy untagged row)."""
+    return {
+        "object": "2018 LA",
         "population": "NEO",
         "epoch_mjd_tdb": _EPOCH,
         "t_mjd_tdb": _EPOCH,
         "dt_days": 0.0,
         "force_model": "standard",
         "test_type": "orbit_determination",
-        "propagation_uncertainty": None,
+        "propagation_uncertainty": tag,
         "notes": "catalog note",
     }
-    out = _run([od_row], tmp_path)
+
+
+def test_od_fit_under_first_order_is_bit_identical_to_the_legacy_fit(tmp_path) -> None:
+    """From-engine: the ``first_order`` OD fit delivers and is bit-identical to
+    the legacy untagged fit (same config, default method) — the fitted position,
+    χ² and residual RMS match field for field — while carrying the first-order
+    products (``resolved_method`` / ``cov_kind`` / the joint). The ``none`` row
+    delivers the same fit covariance-free."""
+    assert (_FIXTURES / "2018 LA.psv").exists(), "expected the 2018 LA PSV fixture"
+    out = _run(
+        [_od_row(None), _od_row("first_order_detection_on"), _od_row("none_detection_on")],
+        tmp_path,
+    )
+    fits = {r["propagation_uncertainty"]: r for r in out if r["test_type"] == "orbit_determination"}
+    legacy = fits[None]
+    fo = fits["first_order_detection_on"]
+    none = fits["none_detection_on"]
+
+    assert legacy["od_converged"] is True
+    # Bit-identity of the FIT: the per-method config differs from the legacy
+    # config by the method name alone, and FirstOrder is the default, so the
+    # delivered numbers are identical.
+    assert fo["emp_pos_au"] == legacy["emp_pos_au"], "fitted state must match the legacy fit"
+    assert fo["od_chi2"] == legacy["od_chi2"]
+    assert fo["od_rms_combined_arcsec"] == legacy["od_rms_combined_arcsec"]
+    assert fo["n_obs_used"] == legacy["n_obs_used"]
+    # The first_order row carries the first-order products; the legacy row does
+    # not (no method tag).
+    assert fo["orbit_delivered"] is True
+    assert fo["resolved_method"] == "first_order_detection_on"
+    assert fo["cov_kind"] == 0
+    assert fo["cov_joint_width"] == 6
+    assert len(fo["cov_tri"]) == 21
+    assert legacy["resolved_method"] is None and legacy["cov_kind"] is None
+    # `none` delivers the same fit covariance-free.
+    assert none["emp_pos_au"] == legacy["emp_pos_au"]
+    assert none["orbit_delivered"] is True
+    assert none["resolved_method"] is None and none["cov_tri"] is None
+
+
+def test_od_fit_under_second_order_carries_the_engine_refusal_by_name(tmp_path) -> None:
+    """From-engine: the ``second_order`` OD fit is refused by the engine BY NAME
+    — ``orbit_delivered`` False, the engine's refusal text (which names
+    ``SecondOrder``) in ``orbit_status``, no joint, and the method in ``notes`` —
+    rather than silently composing a first-order posterior under the method's
+    name. (Mutation: swallowing the refusal into a delivered row drops
+    ``orbit_delivered = False``.)"""
+    assert (_FIXTURES / "2018 LA.psv").exists(), "expected the 2018 LA PSV fixture"
+    out = _run([_od_row("second_order_detection_on")], tmp_path)
     fits = [r for r in out if r["test_type"] == "orbit_determination"]
-    assert fits, "the OD fit row was dropped"
-    for r in fits:
-        assert run._OD_METHOD_AXIS_NOT_PRODUCED in r["notes"]
-        assert "catalog note" in r["notes"], "the base note must be preserved"
-        assert r["resolved_method"] is None
-        assert r["cov_kind"] is None
+    assert fits, "the refused OD fit row was dropped (must be a row, never silent)"
+    so = fits[0]
+    assert so["orbit_delivered"] is False, "a refused method must not deliver a row"
+    assert "SecondOrder" in (so["orbit_status"] or ""), (
+        f"orbit_status must carry the engine refusal by name: {so['orbit_status']!r}"
+    )
+    assert so["cov_kind"] is None and so["resolved_method"] is None
+    assert "second_order" in so["notes"], "notes must name the refused method"
+    assert "catalog note" in so["notes"], "the base note must be preserved"
 
 
 # ── Restated-constant pins (no silent drift from the schema / distribution) ──
@@ -256,13 +376,6 @@ def test_monte_carlo_constants_match_the_schema() -> None:
     assert run._MONTE_CARLO_SEED == consts["seed"]
 
 
-def test_od_note_text_matches_the_schema_literal() -> None:
-    """run.py's OD method-axis note equals OD_METHOD_AXIS_NOT_PRODUCED parsed out
-    of src/schema.rs, byte for byte."""
-    consts = _parse_schema_constants(_SCHEMA_RS)
-    assert run._OD_METHOD_AXIS_NOT_PRODUCED == consts["note"]
-
-
 def test_schema_pins_detect_schema_drift(tmp_path) -> None:
     """Tripwire: the pins read the live schema.rs, so a drift there turns them
     red. Parse a scratch copy whose constants are mutated and confirm the parsed
@@ -272,14 +385,13 @@ def test_schema_pins_detect_schema_drift(tmp_path) -> None:
     mutated = text.replace(
         "pub const MONTE_CARLO_SAMPLE_COUNT: u32 = 100;",
         "pub const MONTE_CARLO_SAMPLE_COUNT: u32 = 101;",
-    ).replace("not on the wrapper", "now on the wrapper")
+    )
     assert mutated != text, "the scratch mutation did not apply"
     scratch.write_text(mutated)
 
     consts = _parse_schema_constants(scratch)
     assert consts["count"] == 101
     assert run._MONTE_CARLO_SAMPLE_COUNT != consts["count"]
-    assert run._OD_METHOD_AXIS_NOT_PRODUCED != consts["note"]
 
 
 def test_synthetic_covariance_matches_the_rust_channel() -> None:

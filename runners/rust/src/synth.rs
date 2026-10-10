@@ -258,9 +258,11 @@ fn truth_for_object(
     let mut nominal = truth.clone();
     // The ephemeris is a point prediction; the truth carries no uncertainty.
     nominal.state.covariance = None;
-    nominal.state.non_grav_cross = None;
-    nominal.ng_covariance = None;
-    nominal.wide_cross = None;
+    // 0.11.0: the packed `covariance` joint is the single covariance home
+    // (the old `state.non_grav_cross` / `ng_covariance` / `wide_cross` cross
+    // terms are gone). A truth ephemeris is a point prediction, so the orbit
+    // carries no joint at all.
+    nominal.covariance = None;
     let eph_cfg = EphemerisConfig {
         propagation: empyrean::PropagationConfig {
             force_model: args.tier,
