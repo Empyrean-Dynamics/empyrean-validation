@@ -3050,6 +3050,7 @@ mod tests {
                 median: 1.0,
                 frac_below_half: 0.0,
             },
+            stations: Vec::new(),
         });
         w
     }

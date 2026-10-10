@@ -329,6 +329,58 @@ pub struct RobustWeightSummary {
     pub frac_below_half: f64,
 }
 
+/// The weighting resolution the engine delivered for one per-station rule —
+/// the `sigma_source`, delivered error law, effective σ and robust weight the
+/// fit actually gave that station's rows, rolled up from the per-row residual
+/// readback. One entry per station an arm's `stations` rules named; this is
+/// where the engine's per-observation `sigma_source` / `noise_model` /
+/// `sigma_eff_*` / `robust_weight` land once summarised to the per-station
+/// level the window record writes at.
+///
+/// A station the arm named but whose rows all fell out of the fit (or were
+/// absent) carries `n_selected == 0` with the delivered fields omitted —
+/// never guessed. The delivered law and σ source are read from the station's
+/// selected rows and must agree across them, or the window fails loudly: a
+/// per-station summary that silently averaged a split resolution would be a
+/// hidden fallback.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct DeliveredStationResolution {
+    /// MPC observatory code the arm's rule named.
+    pub obs_code: String,
+    /// Selected rows from this station in the fit. `0` means the station
+    /// contributed none (absent or fully rejected); the delivered fields
+    /// below are then absent rather than invented.
+    pub n_selected: u32,
+    /// The error law the engine delivered for this station's rows: the
+    /// rule's per-station law, or the arm's global law when the rule
+    /// inherits. `None` when `n_selected == 0`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub noise_model: Option<AssumedErrorModel>,
+    /// Which weighting branch supplied this station's base σ, as the engine
+    /// delivered it: `"layer"` (the arm's own rule won, first-match-wins ahead
+    /// of the preset), `"preset"` (a published floors-table entry supplied it —
+    /// expected only where no rule named the station), `"reported"`,
+    /// `"default"`, `"not_weighted"` or `"unknown:<tag>"`. `None` when
+    /// `n_selected == 0`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sigma_source: Option<String>,
+    /// Median effective 1σ (RA·cos δ, arcsec) over this station's selected
+    /// rows — σ_used inflated by the law's robust down-weighting. `None` when
+    /// `n_selected == 0`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sigma_eff_ra_arcsec: Option<f64>,
+    /// Median effective 1σ (Dec, arcsec) over this station's selected rows;
+    /// see [`sigma_eff_ra_arcsec`](Self::sigma_eff_ra_arcsec). `None` when
+    /// `n_selected == 0`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sigma_eff_dec_arcsec: Option<f64>,
+    /// Robust-weight summary over this station's selected rows (all `1.0`
+    /// under the Gaussian law). `None` when `n_selected == 0`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub robust_weight: Option<RobustWeightSummary>,
+}
+
 /// Per-fit covariance-realism provenance carried on a [`WalkWindowRecord`].
 /// Every field is the engine's own reported value for the window — nothing
 /// is defaulted or zeroed where the engine gives a real number (a Gaussian
@@ -359,6 +411,15 @@ pub struct FitCovarianceProvenance {
     pub n_eff: f64,
     /// Per-row robust-weight summary over the selected observations.
     pub robust_weight: RobustWeightSummary,
+    /// The delivered weighting resolution for each per-station rule the arm's
+    /// `stations` axis named, in listed order — where the engine's per-row
+    /// `sigma_source` / `noise_model` / `sigma_eff_*` / `robust_weight`
+    /// readback lands, summarised per station. Empty, and omitted from the
+    /// serialization, when the arm lists no per-station rules, so an arm
+    /// without `stations` writes a record byte-identical to before this field
+    /// existed.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub stations: Vec<DeliveredStationResolution>,
 }
 
 /// Per-(object, config-arm, window) fit record — the runner side.
@@ -1130,6 +1191,74 @@ mod tests {
         let back: PredictedObservation =
             serde_json::from_str(&serde_json::to_string(&p).unwrap()).unwrap();
         assert_eq!(p, back);
+    }
+
+    #[test]
+    fn covariance_provenance_without_stations_omits_the_field() {
+        // An arm with no per-station rules must serialize a provenance record
+        // byte-identical to before the `stations` field existed: the field is
+        // omitted entirely (not an empty array) and round-trips back equal.
+        let p = FitCovarianceProvenance {
+            error_model: AssumedErrorModel {
+                law: "normal".into(),
+                nu: None,
+            },
+            covariance_information: "observed".into(),
+            rejection_kind: "adaptive".into(),
+            rejection_enabled: true,
+            expected_median_d2: 1.386,
+            expected_tail: 0.05,
+            n_eff: 42.0,
+            robust_weight: RobustWeightSummary {
+                min: 1.0,
+                median: 1.0,
+                frac_below_half: 0.0,
+            },
+            stations: Vec::new(),
+        };
+        let json = serde_json::to_string(&p).unwrap();
+        assert!(
+            !json.contains("stations"),
+            "a no-stations provenance must omit the field entirely: {json}"
+        );
+        let back: FitCovarianceProvenance = serde_json::from_str(&json).unwrap();
+        assert_eq!(p, back);
+
+        // A provenance that DOES carry per-station resolutions round-trips, and
+        // a zero-row station keeps its delivered fields absent (never guessed).
+        let with = FitCovarianceProvenance {
+            stations: vec![
+                DeliveredStationResolution {
+                    obs_code: "F51".into(),
+                    n_selected: 61,
+                    noise_model: Some(AssumedErrorModel {
+                        law: "student-t".into(),
+                        nu: Some(4.0),
+                    }),
+                    sigma_source: Some("layer".into()),
+                    sigma_eff_ra_arcsec: Some(0.31),
+                    sigma_eff_dec_arcsec: Some(0.29),
+                    robust_weight: Some(RobustWeightSummary {
+                        min: 0.2,
+                        median: 0.8,
+                        frac_below_half: 0.1,
+                    }),
+                },
+                DeliveredStationResolution {
+                    obs_code: "250".into(),
+                    n_selected: 0,
+                    noise_model: None,
+                    sigma_source: None,
+                    sigma_eff_ra_arcsec: None,
+                    sigma_eff_dec_arcsec: None,
+                    robust_weight: None,
+                },
+            ],
+            ..p
+        };
+        let back: FitCovarianceProvenance =
+            serde_json::from_str(&serde_json::to_string(&with).unwrap()).unwrap();
+        assert_eq!(with, back);
     }
 
     #[test]

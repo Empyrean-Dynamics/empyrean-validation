@@ -12,6 +12,32 @@
 //! is cold and later fits warm-start from the previous window's solution
 //! (state only — `determine` re-runs selection from a clean slate every
 //! call, which is the design's fairness requirement).
+//!
+//! # Per-station weighting
+//!
+//! A `--config-set` arm can carry per-station weighting rules in `stations`
+//! — the arm-config mirror of the distribution's observatory-rule layer — so
+//! one arm fits a chosen station under a different law while every other
+//! station keeps the arm's global law:
+//!
+//! ```json
+//! {
+//!   "name": "per-station-mixed",
+//!   "error_model": "normal",
+//!   "stations": [
+//!     { "obs_code": "W74", "sigma_arcsec": [0.3, 0.3],
+//!       "start_epoch_mjd_tdb": 60310.0,
+//!       "noise_model": { "law": "student-t", "nu": 4.0 } },
+//!     { "obs_code": "I41", "sigma_arcsec": [0.5, 0.5], "scale": 1.5 }
+//!   ]
+//! }
+//! ```
+//!
+//! W74 is fit under a Student-t law (ν = 4) from 2024-01-01 on; I41 keeps the
+//! global Gaussian law with a 1.5× weight scale; every unlisted station takes
+//! the arm's global law. A caller's rule wins its station ahead of the preset
+//! (first-match-wins), and the delivered per-station law and σ source ride
+//! back on each window's covariance provenance.
 
 use std::path::{Path, PathBuf};
 use std::time::Instant;
@@ -23,7 +49,9 @@ use empyrean_validation::predict_schema::{
 };
 // Used only by the feature-gated covariance-realism provenance path.
 #[cfg(feature = "noise-model")]
-use empyrean_validation::predict_schema::{AssumedErrorModel, RobustWeightSummary};
+use empyrean_validation::predict_schema::{
+    AssumedErrorModel, DeliveredStationResolution, RobustWeightSummary,
+};
 use empyrean_validation::schema::{ValidationResult, orbit_sources, test_types};
 use rayon::prelude::*;
 use serde::Deserialize;
@@ -368,6 +396,65 @@ pub struct ArmSpec {
     /// failure with that named reason — never retried under `expected`.
     #[serde(default = "default_covariance_information")]
     pub covariance_information: String,
+    /// Per-station weighting rules — the arm-config mirror of the
+    /// distribution's [`empyrean::WeightingLayer::ObservatoryRule`], one entry
+    /// per observatory. Each overrides, for one MPC station over an optional
+    /// time range, the arm's global law / σ / scale, so an arm can fit (say)
+    /// `F51` under a Student-t law while every other station keeps the global
+    /// law. Empty by default — an arm with no `stations` behaves and
+    /// serializes exactly as before this axis existed. Requires the
+    /// `noise-model` feature (the per-station [`empyrean::NoiseModel`]
+    /// override); the released-wrapper build refuses a non-empty list by name.
+    #[serde(default)]
+    pub stations: Vec<StationRule>,
+}
+
+/// A per-station observation-error law inside a [`StationRule`] — the shape
+/// axis for one observatory. Mirrors the global [`ArmSpec::error_model`] +
+/// [`ArmSpec::nu`] vocabulary and is validated by the same rules, so `"normal"`
+/// / `"student-t"` (needs `nu` > 2) resolve and `"night-scale"` is refused by
+/// name as engine-gated.
+#[derive(Debug, Clone, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct StationNoiseModel {
+    /// `"normal"` (Gaussian) | `"student-t"` (`"night-scale"` engine-gated).
+    pub law: String,
+    /// Degrees of freedom \\( \nu > 2 \\) for `student-t`; `None` (and
+    /// refused if present) under `normal`.
+    #[serde(default)]
+    pub nu: Option<f64>,
+}
+
+/// One per-station weighting rule, field-for-field the arm-config mirror of
+/// [`empyrean::WeightingLayer::ObservatoryRule`].
+///
+/// There is deliberately **no per-station `preset`**: the engine's
+/// `ObservatoryRule` carries none. A named preset (VFCC2017 / NEODyS) is a
+/// *config-level* selector on the whole weighting pipeline, not a per-station
+/// field — inventing one here would be a config knob with no engine caller.
+#[derive(Debug, Clone, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct StationRule {
+    /// MPC observatory code (e.g. `"F51"`). Matched exactly, case-sensitive.
+    pub obs_code: String,
+    /// 1σ `(RA·cos δ, Dec)` in arcseconds the rule assigns this station.
+    pub sigma_arcsec: [f64; 2],
+    /// Weight scale factor folded into this station's final weight.
+    /// Default `1.0`.
+    #[serde(default = "default_station_scale")]
+    pub scale: f64,
+    /// Start of the rule's applicable range (MJD TDB); `None` = unbounded.
+    #[serde(default)]
+    pub start_epoch_mjd_tdb: Option<f64>,
+    /// End of the rule's applicable range (MJD TDB); `None` = unbounded.
+    #[serde(default)]
+    pub end_epoch_mjd_tdb: Option<f64>,
+    /// Per-station error law, or `None` to inherit the arm's global law
+    /// ([`ArmSpec::error_model`]). The engine resolves the per-station law on
+    /// a pass separate from σ, so a rule's law lands even where the preset
+    /// still wins the station's σ.
+    #[serde(default)]
+    pub noise_model: Option<StationNoiseModel>,
 }
 
 /// The FIT-side error law an arm ASSUMES — the resolved, validated form of
@@ -418,6 +505,53 @@ fn fmt_nu(nu: f64) -> String {
     }
 }
 
+/// Resolve a `(law, nu)` pair to a validated [`ErrorModel`], refusing an
+/// unknown or engine-gated law, a missing `nu`, or a degenerate `nu` by name.
+/// `context` names the offender in every message (`arm "x"`, or
+/// `arm "x" station "F51"`), so the arm's global law and a per-station law
+/// read the same refusals. The returned substrings are depended on by
+/// [`ArmSpec::error_model_axis_resolves_and_refuses_by_name`]'s assertions.
+fn resolve_error_law(law: &str, nu: Option<f64>, context: &str) -> Result<ErrorModel, String> {
+    match law {
+        "normal" | "gaussian" => {
+            if nu.is_some() {
+                return Err(format!(
+                    "{context}: nu is set but error_model is \"normal\" (nu applies only to \
+                     student-t)"
+                ));
+            }
+            Ok(ErrorModel::Normal)
+        }
+        "student-t" | "student_t" => {
+            let nu = nu.ok_or_else(|| {
+                format!(
+                    "{context}: error_model \"student-t\" needs nu (the assumed degrees of \
+                     freedom)"
+                )
+            })?;
+            if !nu.is_finite() || nu <= 2.0 {
+                return Err(format!(
+                    "{context}: student-t nu = {nu}: the fitted law has no finite covariance at \
+                     nu <= 2"
+                ));
+            }
+            Ok(ErrorModel::StudentT { nu })
+        }
+        "night-scale" | "night_scale" => Err(format!(
+            "{context}: error_model \"night-scale\" is engine-gated — the nightly-scaled noise \
+             law is not yet validated for fitting (ODError::NightScaleNotYetValidated); it joins \
+             the axis when the engine clears it"
+        )),
+        other => Err(format!(
+            "{context}: unknown error_model {other:?} (normal | student-t)"
+        )),
+    }
+}
+
+fn default_station_scale() -> f64 {
+    1.0
+}
+
 fn default_rejection() -> String {
     "adaptive".into()
 }
@@ -451,6 +585,7 @@ impl ArmSpec {
             && self.sigma_policy == "preset"
             && self.error_model == "normal"
             && self.covariance_information == "observed"
+            && self.stations.is_empty()
     }
 
     /// Resolve the validated fit-side error law from [`error_model`] +
@@ -461,45 +596,7 @@ impl ArmSpec {
     /// [`nu`]: Self::nu
     /// [`validate`]: Self::validate
     pub fn error_model_resolved(&self) -> Result<ErrorModel, String> {
-        match self.error_model.as_str() {
-            "normal" | "gaussian" => {
-                if self.nu.is_some() {
-                    return Err(format!(
-                        "arm {:?}: nu is set but error_model is \"normal\" (nu applies only to \
-                         student-t)",
-                        self.name
-                    ));
-                }
-                Ok(ErrorModel::Normal)
-            }
-            "student-t" | "student_t" => {
-                let nu = self.nu.ok_or_else(|| {
-                    format!(
-                        "arm {:?}: error_model \"student-t\" needs nu (the assumed degrees of \
-                         freedom)",
-                        self.name
-                    )
-                })?;
-                if !nu.is_finite() || nu <= 2.0 {
-                    return Err(format!(
-                        "arm {:?}: student-t nu = {nu}: the fitted law has no finite covariance \
-                         at nu <= 2",
-                        self.name
-                    ));
-                }
-                Ok(ErrorModel::StudentT { nu })
-            }
-            "night-scale" | "night_scale" => Err(format!(
-                "arm {:?}: error_model \"night-scale\" is engine-gated — the nightly-scaled \
-                 noise law is not yet validated for fitting (ODError::NightScaleNotYetValidated); \
-                 it joins the axis when the engine clears it",
-                self.name
-            )),
-            other => Err(format!(
-                "arm {:?}: unknown error_model {other:?} (normal | student-t)",
-                self.name
-            )),
-        }
+        resolve_error_law(&self.error_model, self.nu, &format!("arm {:?}", self.name))
     }
 
     /// The resolved fit-side law code (`n` / `t4`) for series naming.
@@ -581,7 +678,67 @@ impl ArmSpec {
                 self.name
             ));
         }
+        // Per-station weighting rules: resolve each station's law by name
+        // (unknown / engine-gated / missing-or-degenerate nu refused) and
+        // reject a non-finite or non-positive σ / scale naming the station —
+        // the no-hidden-fallbacks contract applied at the config layer, ahead
+        // of the engine's own construction-time refusal.
+        for rule in &self.stations {
+            rule.resolved_law(&self.name)?;
+            for (axis, s) in [("ra", rule.sigma_arcsec[0]), ("dec", rule.sigma_arcsec[1])] {
+                if !s.is_finite() || s <= 0.0 {
+                    return Err(format!(
+                        "arm {:?} station {:?}: {axis} sigma_arcsec = {s} must be finite and \
+                         positive",
+                        self.name, rule.obs_code
+                    ));
+                }
+            }
+            if !rule.scale.is_finite() || rule.scale <= 0.0 {
+                return Err(format!(
+                    "arm {:?} station {:?}: scale = {} must be finite and positive",
+                    self.name, rule.obs_code, rule.scale
+                ));
+            }
+        }
         Ok(())
+    }
+}
+
+impl StationRule {
+    /// Resolve this rule's per-station law: `Ok(None)` inherits the arm's
+    /// global law; `Ok(Some(_))` is the validated per-station law. Refusals
+    /// name the arm and station and share [`resolve_error_law`]'s wording.
+    fn resolved_law(&self, arm_name: &str) -> Result<Option<ErrorModel>, String> {
+        match &self.noise_model {
+            None => Ok(None),
+            Some(nm) => Ok(Some(resolve_error_law(
+                &nm.law,
+                nm.nu,
+                &format!("arm {arm_name:?} station {:?}", self.obs_code),
+            )?)),
+        }
+    }
+
+    /// Build the engine weighting layer for this rule — one
+    /// [`empyrean::WeightingLayer::ObservatoryRule`] through its own
+    /// constructor and fields, no re-implementation. The per-station law packs
+    /// into the layer (`None` inherits the arm's global law); σ-source
+    /// resolution against the preset chain stays the engine's to decide.
+    #[cfg(feature = "noise-model")]
+    fn to_weighting_layer(&self, arm_name: &str) -> Result<empyrean::WeightingLayer, String> {
+        let noise_model = self.resolved_law(arm_name)?.map(|law| match law {
+            ErrorModel::Normal => empyrean::NoiseModel::Gaussian,
+            ErrorModel::StudentT { nu } => empyrean::NoiseModel::StudentT { nu },
+        });
+        Ok(empyrean::WeightingLayer::ObservatoryRule {
+            obs_code: self.obs_code.clone(),
+            sigma: self.sigma_arcsec,
+            start_epoch_mjd_tdb: self.start_epoch_mjd_tdb,
+            end_epoch_mjd_tdb: self.end_epoch_mjd_tdb,
+            scale: self.scale,
+            noise_model,
+        })
     }
 }
 
@@ -604,6 +761,7 @@ pub fn grid_arms() -> Vec<ArmSpec> {
                     error_model: "normal".into(),
                     nu: None,
                     covariance_information: "observed".into(),
+                    stations: Vec::new(),
                 });
             }
         }
@@ -626,6 +784,7 @@ pub fn builtin_arms() -> Vec<ArmSpec> {
             error_model: "normal".into(),
             nu: None,
             covariance_information: "observed".into(),
+            stations: Vec::new(),
         },
         ArmSpec {
             name: "no-rejection".into(),
@@ -637,6 +796,7 @@ pub fn builtin_arms() -> Vec<ArmSpec> {
             error_model: "normal".into(),
             nu: None,
             covariance_information: "observed".into(),
+            stations: Vec::new(),
         },
         ArmSpec {
             name: "no-nightly".into(),
@@ -648,6 +808,7 @@ pub fn builtin_arms() -> Vec<ArmSpec> {
             error_model: "normal".into(),
             nu: None,
             covariance_information: "observed".into(),
+            stations: Vec::new(),
         },
     ]
 }
@@ -739,6 +900,32 @@ fn arm_config(
         // Assigning the field REPLACES the default [NightlyDeweighting]
         // list — an empty list is exactly the nightly-off arm.
         cfg.weighting.additional_layers = vec![];
+    }
+    // Per-station weighting rules ride into `cfg.weighting.additional_layers`
+    // as one `ObservatoryRule` each, PREPENDED (in the order listed) ahead of
+    // the nightly layer: a caller's layers resolve ahead of the preset chain,
+    // first-match-wins in the order given. The global law stays on
+    // `cfg.weighting.noise_model`; a rule's own law overrides it for its
+    // station. An arm with no `stations` leaves the list exactly as set above
+    // — byte-identical to before this axis existed.
+    #[cfg(feature = "noise-model")]
+    if !arm.stations.is_empty() {
+        let mut layers =
+            Vec::with_capacity(arm.stations.len() + cfg.weighting.additional_layers.len());
+        for rule in &arm.stations {
+            layers.push(rule.to_weighting_layer(&arm.name)?);
+        }
+        layers.append(&mut cfg.weighting.additional_layers);
+        cfg.weighting.additional_layers = layers;
+    }
+    #[cfg(not(feature = "noise-model"))]
+    if !arm.stations.is_empty() {
+        return Err(format!(
+            "arm {:?}: per-station weighting rules (stations: …) require the `noise-model` \
+             feature — the released empyrean =0.10.0 wrapper exposes no per-station NoiseModel \
+             override",
+            arm.name
+        ));
     }
     if arm.debias == "off" {
         cfg.debiasing.enabled = false;
@@ -856,6 +1043,7 @@ fn build_covariance_provenance(
     let min = weights[0];
     let frac_below_half =
         weights.iter().filter(|&&w| w < 0.5).count() as f64 / weights.len() as f64;
+    let stations = build_station_resolutions(arm, r)?;
     Ok(FitCovarianceProvenance {
         error_model,
         covariance_information: arm.covariance_information.clone(),
@@ -869,7 +1057,136 @@ fn build_covariance_provenance(
             median,
             frac_below_half,
         },
+        stations,
     })
+}
+
+/// Roll the engine's per-row weighting readback up to one
+/// [`DeliveredStationResolution`] per station the arm's `stations` rules
+/// named, in listed order. For each station: the delivered error law and base
+/// σ source over its SELECTED rows (which must agree across them, or the
+/// window fails loudly — a split per-station resolution is never silently
+/// averaged), the median effective σ, and the robust-weight summary. A station
+/// the arm named but with no selected rows in this fit is recorded with
+/// `n_selected == 0` and its delivered fields absent, never invented.
+#[cfg(feature = "noise-model")]
+fn build_station_resolutions(
+    arm: &ArmSpec,
+    r: &empyrean::DetermineResult,
+) -> Result<Vec<DeliveredStationResolution>, String> {
+    let mut out = Vec::with_capacity(arm.stations.len());
+    for rule in &arm.stations {
+        let rows: Vec<_> = r
+            .residuals
+            .iter()
+            .filter(|res| res.obs_code == rule.obs_code && res.selected)
+            .collect();
+        if rows.is_empty() {
+            out.push(DeliveredStationResolution {
+                obs_code: rule.obs_code.clone(),
+                n_selected: 0,
+                noise_model: None,
+                sigma_source: None,
+                sigma_eff_ra_arcsec: None,
+                sigma_eff_dec_arcsec: None,
+                robust_weight: None,
+            });
+            continue;
+        }
+        let law = delivered_law_to_assumed(&rows[0].noise_model, &rule.obs_code)?;
+        let source = sigma_source_label(rows[0].sigma_source);
+        // Every selected row of one station must deliver the same law + source;
+        // a split resolution (e.g. a time-bounded rule covering only some of
+        // the station's rows) is surfaced loudly rather than averaged into a
+        // figure that misrepresents either regime.
+        for res in &rows {
+            let law_i = delivered_law_to_assumed(&res.noise_model, &rule.obs_code)?;
+            let src_i = sigma_source_label(res.sigma_source);
+            if law_i != law || src_i != source {
+                return Err(format!(
+                    "arm {:?} station {:?}: the engine delivered a split per-station resolution \
+                     over the station's selected rows — {}/{} vs {}/{} — a per-station summary \
+                     cannot represent it; bound the rule so a window sees one regime",
+                    arm.name, rule.obs_code, law.law, source, law_i.law, src_i
+                ));
+            }
+        }
+        let mut w: Vec<f64> = rows.iter().map(|res| res.robust_weight).collect();
+        w.sort_by(|a, b| a.partial_cmp(b).expect("robust weights are finite"));
+        out.push(DeliveredStationResolution {
+            obs_code: rule.obs_code.clone(),
+            n_selected: rows.len() as u32,
+            noise_model: Some(law),
+            sigma_source: Some(source),
+            sigma_eff_ra_arcsec: Some(median_of(rows.iter().map(|res| res.sigma_eff_ra_arcsec))),
+            sigma_eff_dec_arcsec: Some(median_of(rows.iter().map(|res| res.sigma_eff_dec_arcsec))),
+            robust_weight: Some(RobustWeightSummary {
+                min: w[0],
+                median: w[w.len() / 2],
+                frac_below_half: w.iter().filter(|&&x| x < 0.5).count() as f64 / w.len() as f64,
+            }),
+        });
+    }
+    Ok(out)
+}
+
+/// Upper median of a set of finite values (the same `len / 2` index the
+/// robust-weight summary uses).
+#[cfg(feature = "noise-model")]
+fn median_of(vals: impl Iterator<Item = f64>) -> f64 {
+    let mut v: Vec<f64> = vals.collect();
+    v.sort_by(|a, b| {
+        a.partial_cmp(b)
+            .expect("sigma_eff over selected optical rows is finite")
+    });
+    v[v.len() / 2]
+}
+
+/// The schema label for a delivered [`empyrean::SigmaSource`].
+#[cfg(feature = "noise-model")]
+fn sigma_source_label(s: empyrean::SigmaSource) -> String {
+    match s {
+        empyrean::SigmaSource::Reported => "reported",
+        empyrean::SigmaSource::Preset => "preset",
+        empyrean::SigmaSource::Layer => "layer",
+        empyrean::SigmaSource::Default => "default",
+        empyrean::SigmaSource::NotWeighted => "not_weighted",
+        empyrean::SigmaSource::Unknown => "unknown",
+    }
+    .to_string()
+}
+
+/// Map a delivered noise law to the family's [`AssumedErrorModel`] schema.
+/// An unknown tag or a (fit-invalid) delivered night-scale law fails loudly:
+/// neither may be recorded as a settled per-station law.
+#[cfg(feature = "noise-model")]
+fn delivered_law_to_assumed(
+    nm: &empyrean::DeliveredNoiseModel,
+    obs_code: &str,
+) -> Result<AssumedErrorModel, String> {
+    match nm {
+        empyrean::DeliveredNoiseModel::Known(empyrean::NoiseModel::Gaussian) => {
+            Ok(AssumedErrorModel {
+                law: "normal".to_string(),
+                nu: None,
+            })
+        }
+        empyrean::DeliveredNoiseModel::Known(empyrean::NoiseModel::StudentT { nu }) => {
+            Ok(AssumedErrorModel {
+                law: "student-t".to_string(),
+                nu: Some(*nu),
+            })
+        }
+        empyrean::DeliveredNoiseModel::Known(empyrean::NoiseModel::NightScale { nu }) => {
+            Err(format!(
+                "station {obs_code:?}: engine delivered a night-scale law (ν={nu}) that is not \
+             fit-validated — refusing to record it as a settled per-station law"
+            ))
+        }
+        empyrean::DeliveredNoiseModel::Unknown(tag) => Err(format!(
+            "station {obs_code:?}: engine delivered unknown noise-law tag {tag}"
+        )),
+    }
 }
 
 /// Per-window products, accumulated per shard and flattened at the end.
@@ -1710,6 +2027,7 @@ mod tests {
             error_model: "normal".into(),
             nu: None,
             covariance_information: "observed".into(),
+            stations: Vec::new(),
         };
         assert!(gated.validate().unwrap_err().contains("engine-gated"));
         assert!(
@@ -1739,6 +2057,7 @@ mod tests {
             error_model: em.into(),
             nu,
             covariance_information: ci.into(),
+            stations: Vec::new(),
         };
         // Normal resolves and codes as `n`; a stray nu is refused.
         let normal = mk("normal", None, "adaptive", "observed");
@@ -1854,6 +2173,460 @@ mod tests {
                 .law_code()
                 .unwrap(),
             "t4.5"
+        );
+    }
+
+    /// Per-station weighting rules: vocabulary + resolution, the by-name
+    /// refusals (unknown law, missing / degenerate nu, engine-gated
+    /// night-scale, degenerate σ / scale, each naming the station), the
+    /// no-per-station-`preset` shape, and the full round-trip.
+    #[test]
+    fn station_rules_resolve_and_refuse_by_name() {
+        let arm_with = |stations: Vec<StationRule>| ArmSpec {
+            name: "s".into(),
+            rejection: "adaptive".into(),
+            nightly: "vfc2017".into(),
+            debias: "efcc".into(),
+            solve_for: "auto".into(),
+            sigma_policy: "preset".into(),
+            error_model: "normal".into(),
+            nu: None,
+            covariance_information: "observed".into(),
+            stations,
+        };
+        let rule = |obs: &str, law: Option<(&str, Option<f64>)>, sigma: [f64; 2], scale: f64| {
+            StationRule {
+                obs_code: obs.into(),
+                sigma_arcsec: sigma,
+                scale,
+                start_epoch_mjd_tdb: None,
+                end_epoch_mjd_tdb: None,
+                noise_model: law.map(|(l, nu)| StationNoiseModel { law: l.into(), nu }),
+            }
+        };
+
+        // A clean mixed-law arm validates; a station that inherits (law None)
+        // resolves to None; stations make the arm non-default.
+        let ok = arm_with(vec![
+            rule("F51", Some(("student-t", Some(4.0))), [0.3, 0.3], 1.0),
+            rule("568", Some(("normal", None)), [0.5, 0.5], 1.5),
+            rule("645", None, [0.4, 0.4], 1.0),
+        ]);
+        assert!(ok.validate().is_ok());
+        assert!(
+            !ok.is_default_config(),
+            "an arm carrying per-station rules is not the default config"
+        );
+        assert_eq!(
+            ok.stations[0].resolved_law("s").unwrap(),
+            Some(ErrorModel::StudentT { nu: 4.0 })
+        );
+        assert_eq!(
+            ok.stations[1].resolved_law("s").unwrap(),
+            Some(ErrorModel::Normal)
+        );
+        assert_eq!(ok.stations[2].resolved_law("s").unwrap(), None);
+
+        // student-t without nu, a stray nu on normal, an unknown law, and
+        // engine-gated night-scale each refuse by name AND name the station.
+        let needs_nu = arm_with(vec![rule(
+            "F51",
+            Some(("student-t", None)),
+            [0.3, 0.3],
+            1.0,
+        )]);
+        let e = needs_nu.validate().unwrap_err();
+        assert!(
+            e.contains("needs nu") && e.contains("station \"F51\""),
+            "{e}"
+        );
+        let stray = arm_with(vec![rule(
+            "F51",
+            Some(("normal", Some(4.0))),
+            [0.3, 0.3],
+            1.0,
+        )]);
+        assert!(
+            stray
+                .validate()
+                .unwrap_err()
+                .contains("nu applies only to student-t")
+        );
+        let unknown = arm_with(vec![rule("F51", Some(("cauchy", None)), [0.3, 0.3], 1.0)]);
+        assert!(
+            unknown
+                .validate()
+                .unwrap_err()
+                .contains("unknown error_model")
+        );
+        let gated = arm_with(vec![rule(
+            "F51",
+            Some(("night-scale", Some(6.0))),
+            [0.3, 0.3],
+            1.0,
+        )]);
+        assert!(gated.validate().unwrap_err().contains("engine-gated"));
+
+        // Degenerate σ / scale refuse by name, naming the station.
+        let bad_sigma = arm_with(vec![rule("F51", None, [0.0, 0.3], 1.0)]);
+        let se = bad_sigma.validate().unwrap_err();
+        assert!(
+            se.contains("sigma_arcsec") && se.contains("station \"F51\""),
+            "{se}"
+        );
+        let bad_scale = arm_with(vec![rule("F51", None, [0.3, 0.3], -1.0)]);
+        assert!(bad_scale.validate().unwrap_err().contains("scale"));
+
+        // deny_unknown_fields: a rule inventing a per-station `preset` key (the
+        // engine's ObservatoryRule has none) fails loudly at parse.
+        let bad = r#"{"obs_code":"F51","sigma_arcsec":[0.3,0.3],"preset":"vfcc2017"}"#;
+        assert!(
+            serde_json::from_str::<StationRule>(bad).is_err(),
+            "there is no per-station preset field"
+        );
+        // The full ObservatoryRule shape round-trips through JSON.
+        let full = r#"{"obs_code":"W74","sigma_arcsec":[0.3,0.3],"scale":1.2,"start_epoch_mjd_tdb":60310.0,"noise_model":{"law":"student-t","nu":4.0}}"#;
+        let parsed: StationRule = serde_json::from_str(full).unwrap();
+        assert_eq!(parsed.obs_code, "W74");
+        assert_eq!(parsed.scale, 1.2);
+        assert_eq!(parsed.start_epoch_mjd_tdb, Some(60310.0));
+        assert_eq!(parsed.noise_model.as_ref().unwrap().law, "student-t");
+        // The default scale is 1.0 and an absent noise_model inherits.
+        let minimal: StationRule =
+            serde_json::from_str(r#"{"obs_code":"250","sigma_arcsec":[0.6,0.6]}"#).unwrap();
+        assert_eq!(minimal.scale, 1.0);
+        assert!(minimal.noise_model.is_none());
+    }
+
+    /// A Gaussian-global arm (explicit adaptive rejection) carrying the given
+    /// per-station rules — the harness shape a mixed-law arm takes.
+    #[cfg(feature = "noise-model")]
+    fn mixed_law_arm(stations: Vec<StationRule>) -> ArmSpec {
+        ArmSpec {
+            name: "mixed".into(),
+            rejection: "adaptive".into(),
+            nightly: "vfc2017".into(),
+            debias: "efcc".into(),
+            solve_for: "auto".into(),
+            sigma_policy: "preset".into(),
+            error_model: "normal".into(),
+            nu: None,
+            covariance_information: "observed".into(),
+            stations,
+        }
+    }
+
+    /// A per-station rule assigning one station a law (`σ = 0.3″`, scale 1).
+    #[cfg(feature = "noise-model")]
+    fn station_law_rule(obs: &str, law: &str, nu: Option<f64>) -> StationRule {
+        StationRule {
+            obs_code: obs.into(),
+            sigma_arcsec: [0.3, 0.3],
+            scale: 1.0,
+            start_epoch_mjd_tdb: None,
+            end_epoch_mjd_tdb: None,
+            noise_model: Some(StationNoiseModel {
+                law: law.into(),
+                nu,
+            }),
+        }
+    }
+
+    /// `arm_config` lowers the `stations` axis to one
+    /// `empyrean::WeightingLayer::ObservatoryRule` per rule, in the LISTED
+    /// order, PREPENDED ahead of the nightly layer; the global law stays on
+    /// `cfg.weighting.noise_model`; an arm with no stations is left exactly at
+    /// the default list. (Fast, engine-free — a mutation of the layer build
+    /// trips this before any fit runs.)
+    #[cfg(feature = "noise-model")]
+    #[test]
+    fn arm_config_builds_station_layers_in_order() {
+        let arm = mixed_law_arm(vec![
+            station_law_rule("084", "student-t", Some(4.0)),
+            station_law_rule("J47", "normal", None),
+        ]);
+        let cfg = arm_config(&arm, empyrean::ForceModelTier::Standard, 60000.0, &[]).unwrap();
+        assert_eq!(cfg.weighting.additional_layers.len(), 3);
+        match &cfg.weighting.additional_layers[0] {
+            empyrean::WeightingLayer::ObservatoryRule {
+                obs_code,
+                sigma,
+                scale,
+                noise_model,
+                ..
+            } => {
+                assert_eq!(obs_code, "084");
+                assert_eq!(*sigma, [0.3, 0.3]);
+                assert_eq!(*scale, 1.0);
+                assert!(matches!(
+                    noise_model,
+                    Some(empyrean::NoiseModel::StudentT { nu }) if *nu == 4.0
+                ));
+            }
+            other => panic!("layer 0 should be the 084 ObservatoryRule, got {other:?}"),
+        }
+        match &cfg.weighting.additional_layers[1] {
+            empyrean::WeightingLayer::ObservatoryRule {
+                obs_code,
+                noise_model,
+                ..
+            } => {
+                assert_eq!(obs_code, "J47");
+                // An explicit `normal` per-station law packs as Gaussian — a
+                // deliberate per-station Gaussian, distinct from inherit-None.
+                assert!(matches!(noise_model, Some(empyrean::NoiseModel::Gaussian)));
+            }
+            other => panic!("layer 1 should be the J47 ObservatoryRule, got {other:?}"),
+        }
+        assert!(matches!(
+            cfg.weighting.additional_layers[2],
+            empyrean::WeightingLayer::NightlyDeweighting { .. }
+        ));
+        assert!(matches!(
+            cfg.weighting.noise_model,
+            empyrean::NoiseModel::Gaussian
+        ));
+
+        // Nightly off → station layers only, no trailing nightly layer.
+        let mut no_night = arm.clone();
+        no_night.nightly = "off".into();
+        let cfg2 = arm_config(&no_night, empyrean::ForceModelTier::Standard, 60000.0, &[]).unwrap();
+        assert_eq!(cfg2.weighting.additional_layers.len(), 2);
+        assert!(
+            cfg2.weighting
+                .additional_layers
+                .iter()
+                .all(|l| matches!(l, empyrean::WeightingLayer::ObservatoryRule { .. }))
+        );
+
+        // No stations → exactly the default nightly layer (byte-identical path).
+        let plain = mixed_law_arm(vec![]);
+        let cfg3 = arm_config(&plain, empyrean::ForceModelTier::Standard, 60000.0, &[]).unwrap();
+        assert_eq!(
+            cfg3.weighting.additional_layers,
+            vec![empyrean::WeightingLayer::NightlyDeweighting { max_gap_days: 0.5 }]
+        );
+    }
+
+    /// The suite's `2008 TC3` optical fixture (883 rows, ≥ 25 stations),
+    /// loaded + fit through the same wrapper → C-ABI → core path as the suite.
+    /// Skips only if the ephemeris data tier is unavailable.
+    #[cfg(feature = "noise-model")]
+    fn tc3_fit(
+        arm: &ArmSpec,
+        preset: empyrean::WeightingPreset,
+    ) -> Option<empyrean::DetermineResult> {
+        let ctx = match empyrean::Context::from_data_dir(None) {
+            Ok(c) => c,
+            Err(e) => {
+                eprintln!("SKIP: ephemeris data tier unavailable ({e})");
+                return None;
+            }
+        };
+        let psv = std::fs::read_to_string(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../fixtures/psv/2008 TC3.psv"
+        ))
+        .expect("read 2008 TC3 fixture");
+        let obs = ctx.read_ades(&psv).expect("parse 2008 TC3 PSV");
+        let mut cfg = arm_config(arm, empyrean::ForceModelTier::Standard, 54745.5, &[]).unwrap();
+        cfg.weighting.preset = preset;
+        let r = ctx
+            .determine(&obs, None, &cfg)
+            .and_then(|b| b.into_single())
+            .expect("mixed-law determine must converge through the channel");
+        assert!(r.converged, "2008 TC3 mixed-law fit must converge");
+        Some(r)
+    }
+
+    /// The delivered (law, σ-source, n) for one station's SELECTED rows,
+    /// requiring the station to resolve uniformly (what the per-station
+    /// provenance rollup records).
+    #[cfg(feature = "noise-model")]
+    fn delivered_for(
+        r: &empyrean::DetermineResult,
+        stn: &str,
+    ) -> (empyrean::DeliveredNoiseModel, empyrean::SigmaSource, usize) {
+        let rows: Vec<_> = r
+            .residuals
+            .iter()
+            .filter(|res| res.obs_code == stn && res.selected)
+            .collect();
+        assert!(
+            !rows.is_empty(),
+            "station {stn} contributed no selected rows"
+        );
+        let law = rows[0].noise_model;
+        let src = rows[0].sigma_source;
+        for res in &rows {
+            assert_eq!(res.noise_model, law, "station {stn} split law");
+            assert_eq!(res.sigma_source, src, "station {stn} split sigma_source");
+        }
+        (law, src, rows.len())
+    }
+
+    /// From-engine mixed-law corpus: two listed stations under DIFFERENT laws
+    /// plus unlisted stations under the global law, with NO preset. Each
+    /// listed station's delivered law equals its rule's law and its σ comes
+    /// from the `Layer`; every unlisted station keeps the global Gaussian law.
+    /// This is the test the layer-build mutations trip (drop the build → the
+    /// listed stations fall to the global law; swap the two laws → the per-
+    /// station laws disagree).
+    #[cfg(feature = "noise-model")]
+    #[test]
+    fn mixed_law_per_station_resolution_lands_without_a_preset() {
+        let arm = mixed_law_arm(vec![
+            station_law_rule("084", "student-t", Some(4.0)),
+            station_law_rule("J47", "student-t", Some(8.0)),
+        ]);
+        let Some(r) = tc3_fit(&arm, empyrean::WeightingPreset::None) else {
+            return;
+        };
+
+        // Listed stations: the rule's law, from the Layer (no preset to shadow).
+        let (law084, src084, _) = delivered_for(&r, "084");
+        assert_eq!(
+            law084,
+            empyrean::DeliveredNoiseModel::Known(empyrean::NoiseModel::StudentT { nu: 4.0 })
+        );
+        assert_eq!(src084, empyrean::SigmaSource::Layer);
+        let (law_j47, src_j47, _) = delivered_for(&r, "J47");
+        assert_eq!(
+            law_j47,
+            empyrean::DeliveredNoiseModel::Known(empyrean::NoiseModel::StudentT { nu: 8.0 })
+        );
+        assert_eq!(src_j47, empyrean::SigmaSource::Layer);
+
+        // An unlisted station keeps the arm's global Gaussian law.
+        let (law_a77, _, _) = delivered_for(&r, "A77");
+        assert_eq!(
+            law_a77,
+            empyrean::DeliveredNoiseModel::Known(empyrean::NoiseModel::Gaussian)
+        );
+
+        // The per-station readback rides into the provenance the family writes:
+        // one DeliveredStationResolution per listed station, its delivered law
+        // and σ-source, while the global error law stays `normal`.
+        let prov = build_covariance_provenance(&arm, &r).unwrap();
+        assert_eq!(prov.error_model.law, "normal");
+        assert_eq!(prov.stations.len(), 2);
+        let s084 = &prov.stations[0];
+        assert_eq!(s084.obs_code, "084");
+        assert_eq!(s084.noise_model.as_ref().unwrap().law, "student-t");
+        assert_eq!(s084.noise_model.as_ref().unwrap().nu, Some(4.0));
+        assert_eq!(s084.sigma_source.as_deref(), Some("layer"));
+        assert!(s084.n_selected > 0 && s084.robust_weight.is_some());
+        assert_eq!(prov.stations[1].obs_code, "J47");
+        assert_eq!(prov.stations[1].noise_model.as_ref().unwrap().nu, Some(8.0));
+    }
+
+    /// With a named preset set (VFCC2017), a caller's per-station rule STILL
+    /// wins its station's σ: the delivered `sigma_source` is `Layer`, not
+    /// `Preset`, for `G96` — a station the preset's floors table knows (it
+    /// resolves `Preset` when unlisted). This pins the resolution contract's
+    /// clause 2 (user layers resolve AHEAD of the preset) as the dist-stable
+    /// engine delivers it at this pin; the scott precedence fix is already in,
+    /// so a regression BACK to preset-first is exactly what flips this test.
+    /// The per-station LAW lands regardless of preset (the law resolves on a
+    /// pass separate from σ).
+    #[cfg(feature = "noise-model")]
+    #[test]
+    fn with_a_preset_a_user_rule_wins_its_station_layer_first() {
+        let arm = mixed_law_arm(vec![
+            station_law_rule("G96", "student-t", Some(4.0)),
+            station_law_rule("084", "student-t", Some(8.0)),
+        ]);
+        let Some(r) = tc3_fit(&arm, empyrean::WeightingPreset::VFCC2017) else {
+            return;
+        };
+
+        // G96 is in the VFCC2017 floors table, yet the user's rule wins: its σ
+        // comes from the Layer, and its law is the rule's — NOT the preset.
+        let (law_g96, src_g96, _) = delivered_for(&r, "G96");
+        assert_eq!(
+            src_g96,
+            empyrean::SigmaSource::Layer,
+            "a user rule for a preset-known station must win its σ (clause 2); \
+             Preset here would be the pre-fix precedence bug"
+        );
+        assert_eq!(
+            law_g96,
+            empyrean::DeliveredNoiseModel::Known(empyrean::NoiseModel::StudentT { nu: 4.0 })
+        );
+
+        // A control unlisted station the preset KNOWS still draws Preset σ —
+        // proving the VFCC2017 table is active, so G96's Layer result above is
+        // the rule winning, not an inert preset.
+        let g96_unlisted = {
+            let plain = mixed_law_arm(vec![station_law_rule("084", "student-t", Some(8.0))]);
+            let r2 = tc3_fit(&plain, empyrean::WeightingPreset::VFCC2017).unwrap();
+            delivered_for(&r2, "G96").1
+        };
+        assert_eq!(
+            g96_unlisted,
+            empyrean::SigmaSource::Preset,
+            "unlisted G96 must draw the preset floor — the VFCC2017 table is active"
+        );
+
+        // The provenance records G96 under the layer, law student-t.
+        let prov = build_covariance_provenance(&arm, &r).unwrap();
+        let g96 = prov.stations.iter().find(|s| s.obs_code == "G96").unwrap();
+        assert_eq!(g96.sigma_source.as_deref(), Some("layer"));
+        assert_eq!(g96.noise_model.as_ref().unwrap().law, "student-t");
+    }
+
+    /// A time-bounded rule that covers only PART of a station's selected rows
+    /// splits that station into two regimes (the rule's law from the `Layer`
+    /// for in-range rows, the arm's global law from the `Default` for the
+    /// rest). The per-station rollup must refuse to summarise that, failing
+    /// loudly and naming the station and both resolutions — never averaging or
+    /// taking the first. The bound is the median of the station's own
+    /// selected-row epochs (measured from a prior unbounded fit), so the split
+    /// is guaranteed to land on both sides.
+    #[cfg(feature = "noise-model")]
+    #[test]
+    fn a_time_split_station_resolution_fails_loudly() {
+        // Unbounded fit first: learn 084's selected-row epoch span.
+        let unbounded = mixed_law_arm(vec![station_law_rule("084", "student-t", Some(4.0))]);
+        let Some(r0) = tc3_fit(&unbounded, empyrean::WeightingPreset::None) else {
+            return;
+        };
+        let mut epochs: Vec<f64> = r0
+            .residuals
+            .iter()
+            .filter(|res| res.obs_code == "084" && res.selected)
+            .map(|res| {
+                res.epoch
+                    .mjd_tdb()
+                    .expect("084 optical epoch converts to TDB")
+            })
+            .collect();
+        epochs.sort_by(|a, b| a.partial_cmp(b).expect("finite epochs"));
+        assert!(epochs.len() >= 4, "need several 084 rows to split");
+        let split = epochs[epochs.len() / 2];
+
+        // Bound the rule to [split, ∞): only the LATER half of 084 matches it.
+        let mut rule = station_law_rule("084", "student-t", Some(4.0));
+        rule.start_epoch_mjd_tdb = Some(split);
+        let bounded = mixed_law_arm(vec![rule]);
+        let r = tc3_fit(&bounded, empyrean::WeightingPreset::None).unwrap();
+
+        let err = build_station_resolutions(&bounded, &r)
+            .expect_err("a station split across two regimes must fail the rollup");
+        assert!(err.contains("084"), "error must name the station: {err}");
+        assert!(
+            err.contains("split per-station resolution"),
+            "error must name the condition: {err}"
+        );
+        // Both regimes are named: the rule's Student-t from the Layer for the
+        // in-range rows; the global normal from the Default for the rest.
+        assert!(
+            err.contains("student-t") && err.contains("normal"),
+            "error must name both laws: {err}"
+        );
+        assert!(
+            err.contains("layer") && err.contains("default"),
+            "error must name both σ sources: {err}"
         );
     }
 
