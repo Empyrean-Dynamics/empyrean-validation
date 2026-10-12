@@ -113,7 +113,10 @@ generator uses, and `hyperjet` supplies the linear-algebra kernels the
 covariance comparison uses. It has no private dependencies — the private
 repos enter only as the optional `core` reference channel (built from a
 sibling `empyrean-core` checkout when present) and as the things being
-validated.
+validated. The distribution crate itself is behind the default
+`distribution` feature: a consumer of the library's schema, catalog and
+metric helpers (empyrean-core's `validate` channel) builds it with
+`default-features = false` and carries no distribution crate at all.
 
 ## Versioning and local development overrides
 

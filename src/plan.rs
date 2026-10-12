@@ -1,10 +1,13 @@
 //! Canonical-plan generator.
 //!
-//! [`build_plan`] reads the [`crate::catalog`], queries JPL SBDB for
+//! `build_plan` reads the [`crate::catalog`], queries JPL SBDB for
 //! initial conditions and non-gravitational parameters, queries JPL
 //! Horizons for reference state vectors and reference ephemerides at
-//! every `(object, dt)`, and emits a [`ValidationPlan`] (`Vec<ValidationResult>`
-//! with `channel = "plan"`) that every replay channel consumes.
+//! every `(object, dt)`, and emits a `ValidationPlan`
+//! (`Vec<ValidationResult>` with `channel = "plan"`) that every replay channel
+//! consumes. The generator is the distribution channel (it needs the
+//! JPL query clients), so it is gated behind the `distribution` feature;
+//! the plan-contract constants and [`strip_to_plan`] below are not.
 //!
 //! # Network behaviour
 //!
@@ -48,12 +51,28 @@
 //! method — "not produced" at every method cell — until the run is
 //! regenerated. Re-run the plan and channels to refresh them.
 
+// `HashMap`, the `empyrean` query-client types, and the catalog's dt grid /
+// observer codes are used only by the plan GENERATOR (`build_plan` and its row
+// builders), which is the distribution channel; the rest of this module (the
+// method-axis helpers, the plan-contract constants and `strip_to_plan`) is
+// consumer-facing and builds with no distribution crate in the graph.
+#[cfg(feature = "distribution")]
 use std::collections::HashMap;
 
+#[cfg(feature = "distribution")]
 use empyrean::EphemerisEntry;
 
-use crate::catalog::{DEFAULT_DT_DAYS, OBSERVER_CODES, ValidationObject, is_close_approach};
-use crate::schema::{ValidationPlan, ValidationResult, channels, test_types, uncertainty_modes};
+#[cfg(feature = "distribution")]
+use crate::catalog::{DEFAULT_DT_DAYS, OBSERVER_CODES};
+use crate::catalog::{ValidationObject, is_close_approach};
+#[cfg(feature = "distribution")]
+use crate::schema::ValidationPlan;
+use crate::schema::{channels, test_types, uncertainty_modes};
+// Built by the generator, and used by this module's own tests (the strip tests
+// construct `ValidationResult` rows), so it is needed whenever either the
+// feature or `cfg(test)` is on.
+#[cfg(any(feature = "distribution", test))]
+use crate::schema::ValidationResult;
 
 /// Plan-generation configuration.
 #[derive(Debug, Clone)]
@@ -106,6 +125,7 @@ impl Default for PlanConfig {
 ///
 /// Network errors on individual objects are logged to stderr and skip
 /// that object — the plan continues with whatever objects responded.
+#[cfg(feature = "distribution")]
 pub fn build_plan(
     objects: &[&ValidationObject],
     config: &PlanConfig,
@@ -391,6 +411,7 @@ pub fn plan_methods_for_object(
 ///
 /// In benchmark mode (`uncertainty_axis == false`) only the legacy untagged fit
 /// row is emitted — the method axis is off, as it is for prop/eph.
+#[cfg(feature = "distribution")]
 fn od_plan_rows(
     obj: &ValidationObject,
     tier: &str,
@@ -427,6 +448,7 @@ fn od_plan_rows(
 }
 
 /// Build a single propagation plan row.
+#[cfg(feature = "distribution")]
 #[allow(clippy::too_many_arguments)]
 fn propagation_plan_row(
     obj: &ValidationObject,
@@ -475,6 +497,7 @@ fn propagation_plan_row(
 }
 
 /// Build a single ephemeris plan row.
+#[cfg(feature = "distribution")]
 #[allow(clippy::too_many_arguments)]
 fn ephemeris_plan_row(
     obj: &ValidationObject,
@@ -533,6 +556,7 @@ fn ephemeris_plan_row(
 /// derives its target from the paired orbit, exactly as the orbit-vs-orbit
 /// transport leg does today). `uncertainty == None` is the legacy untagged OD
 /// fit row kept for byte-identity.
+#[cfg(feature = "distribution")]
 fn od_plan_row(
     obj: &ValidationObject,
     tier: &str,
@@ -567,6 +591,7 @@ fn od_plan_row(
 /// same configuration, differing only in the observation set they load, which
 /// is exactly the apples-to-apples optical-vs-radar comparison the report
 /// pairs.
+#[cfg(feature = "distribution")]
 fn od_radar_plan_row(obj: &ValidationObject, tier: &str, timestamp: &str) -> ValidationResult {
     let mut r = ValidationResult::empty();
     r.object = obj.name.to_string();
@@ -706,7 +731,7 @@ pub const PLAN_CLEARED_KEYS: [&str; 23] = [
 /// The composite tags the canonical plan carries — the `detection_on` arm of
 /// the full engine method axis.
 ///
-/// A plan row's [`ValidationResult::propagation_uncertainty`] is a composite
+/// A plan row's [`ValidationResult::propagation_uncertainty`](crate::schema::ValidationResult::propagation_uncertainty) is a composite
 /// `<method>_<arm>` tag (see [`uncertainty_modes`]); the canonical plan is the
 /// `detection_on` arm of all seven methods — the only arm with an accuracy
 /// signal and the grid every replay channel reproduces. The `detection_off` /
@@ -719,7 +744,7 @@ pub const PLAN_CLEARED_KEYS: [&str; 23] = [
 /// might gain later is not on the plan's axis until its `detection_on` tag is
 /// named here, so it cannot silently become an unreplayable row every channel
 /// is asked — and fails — to match. The whitelist governs which *tags* may
-/// appear; [`build_plan`] (via [`plan_methods_for_object`]) governs which
+/// appear; `build_plan` (via [`plan_methods_for_object`]) governs which
 /// objects emit which of them — `gaussian_mixture` reaches the plan only for
 /// the close-approach objects ([`crate::catalog::CLOSE_APPROACH_OBJECTS`]).
 ///
@@ -927,6 +952,7 @@ mod tests {
         assert!(cfg.uncertainty_axis);
     }
 
+    #[cfg(feature = "distribution")]
     #[test]
     fn propagation_plan_row_carries_test_identity_and_ic() {
         let obj = catalog::filter_by_name(&["Apophis"])[0];
@@ -955,6 +981,7 @@ mod tests {
         assert_eq!(r.propagation_uncertainty.as_deref(), Some("none"),);
     }
 
+    #[cfg(feature = "distribution")]
     #[test]
     fn od_plan_row_marks_self_perturbers() {
         let pallas = catalog::filter_by_name(&["Pallas"])[0];
@@ -971,6 +998,7 @@ mod tests {
         assert!(r.propagation_uncertainty.is_none());
     }
 
+    #[cfg(feature = "distribution")]
     #[test]
     fn od_radar_plan_row_is_the_radar_test_type() {
         // Apophis has a radar fixture; its radar plan row is a distinct test
@@ -997,6 +1025,7 @@ mod tests {
     /// this, prop/eph rows carried an empty exclusion set, which left the
     /// engine's ephemeris-overlap short-circuit in play and made the row a
     /// resample of the body's own SPK rather than an integration.
+    #[cfg(feature = "distribution")]
     #[test]
     fn propagation_plan_row_marks_self_perturbers() {
         let pallas = catalog::filter_by_name(&["Pallas"])[0];
@@ -1017,6 +1046,7 @@ mod tests {
         assert_eq!(r.excluded_perturbers_naif, vec![2_000_002]);
     }
 
+    #[cfg(feature = "distribution")]
     #[test]
     fn ephemeris_plan_row_marks_self_perturbers() {
         let pallas = catalog::filter_by_name(&["Pallas"])[0];
@@ -1123,6 +1153,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "distribution")]
     #[test]
     fn od_rows_carry_both_kinds_under_every_method() {
         // Ruling 9: each object's OD seam carries the fit AND the post-fit
@@ -1192,6 +1223,7 @@ mod tests {
         assert!(rows[0].propagation_uncertainty.is_none());
     }
 
+    #[cfg(feature = "distribution")]
     #[test]
     fn first_order_and_f64_rows_carry_no_new_method_fields() {
         // Byte-identity of the existing rows: the per-method output fields are

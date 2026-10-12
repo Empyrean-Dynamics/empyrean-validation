@@ -22,6 +22,9 @@ name = "empyrean_validation"
 [[bin]]
 name = "empyrean-validation"
 path = "src/bin/cli.rs"
+# The CLI drives the plan generator (JPL SBDB / Horizons query clients) and
+# the distribution channel, so it only builds with the `distribution` feature.
+required-features = ["distribution"]
 
 [package.metadata.docs.rs]
 rustdoc-args = ["--html-in-header", "docs/katex-header.html"]
@@ -31,13 +34,23 @@ chrono = { version = "0.4", default-features = false, features = ["clock"] }
 clap = { version = "4", features = ["derive"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-# The harness consumes only PUBLIC crates: the published `empyrean`
-# wrapper supplies the SBDB / Horizons query clients (disk-cached via
-# `cache_dir`) used by the plan generator, and `hyperjet` supplies the
-# linear-algebra kernels the covariance comparison uses. Both are pinned
-# exactly to the release generation this harness version validates, so a
-# checkout of a validation tag reproduces the validation-of-record.
-empyrean = "=0.11.0"
+# The harness LIBRARY — schema, test catalog, metric helpers, plan
+# strip, report renderer — carries NO distribution crate in its graph.
+# That is what lets empyrean-core's `validate` channel consume this crate
+# without depending on the `empyrean` wrapper, which is published only
+# AFTER core is released (a circular dependency) and whose published
+# `0.10.0-rc.0` does not even compile against the matching `empyrean-sys`.
+# The optional `empyrean` dep is gated behind the `distribution` feature
+# (on by default): it supplies the disk-cached JPL SBDB / Horizons query
+# clients (`cache_dir`-keyed) the plan GENERATOR needs, and backs the CLI
+# binary and the distribution replay channel. `cargo build
+# --no-default-features` drops it from the graph entirely; the generator
+# and CLI are then configured out, and everything core consumes remains.
+# `hyperjet` supplies the linear-algebra kernels the covariance comparison
+# uses. Both are pinned exactly to the release generation this harness
+# version validates, so a checkout of a validation tag reproduces the
+# validation-of-record.
+empyrean = { version = "=0.11.0", optional = true }
 hyperjet = "=1.15.0"
 # EFCC2020 star-catalog debiasing (covariance-realism family): same
 # HEALPix crate the engine's own debiasing uses, so the harness and the
@@ -46,3 +59,15 @@ cdshealpix = "0.9"
 
 [dev-dependencies]
 tempfile = "3"
+
+[features]
+# On by default so a plain `cargo build`/`cargo test` and the published
+# harness tag behave exactly as before. `distribution` pulls in the
+# `empyrean` wrapper (the plan generator's JPL query clients, the CLI
+# binary, and the distribution replay channel). Turn it off
+# (`--no-default-features`) to build the consumer-facing library alone —
+# schema, catalog, metric helpers, plan strip and report renderer — with
+# no distribution crate in the dependency graph, which is how
+# empyrean-core's `validate` channel builds against this crate.
+default = ["distribution"]
+distribution = ["dep:empyrean"]
