@@ -22,6 +22,7 @@ flags.
 |---|---|---|---|
 | [`assist/`](assist/) | [ASSIST](https://github.com/matthewholman/assist) (REBOUND-based N-body propagator) | GPL-3.0 | Propagation. ASSIST is GPL and never linked into empyrean — runs in its own venv. |
 | [`layup/`](layup/) | [layup](https://github.com/Smithsonian/layup) (Holman / Smithsonian, ASSIST-backed orbit fitter) | MIT | Orbit determination from ADES PSV astrometry. Runs by default (`WITH_LAYUP=` to skip); folds χ² / reduced-χ² / n_obs / convergence onto the OD rows. Runs in its own venv (heavy C-extension + `sorcha`/`jax` dep graph). |
+| [`adamcore/`](adamcore/) | [adam_core](https://github.com/B612-Asteroid-Institute/adam_core) + [adam-assist](https://github.com/B612-Asteroid-Institute/adam-assist) (Asteroid Institute; Rust-backed, ASSIST propagation) | MIT (adam_core) / GPL-3.0 (adam-assist, venv-isolated) | Propagation, ephemeris and orbit determination from ADES PSV, plus the walk. One channel `adamcore`: adam-core with its shipped defaults (`run_od models="default"` = SigmaFill(v2_sigma_fill) → EFCC18 → EmpiricalCovariance(v2_full) → night-batch) on the Institute's proprietary observatory-uncertainty tables. **Local-only** (private git+ssh data package; CI skips it; results not published). Self-perturbers run planets-only. |
 | [`findorb/`](findorb/) | [find_orb](https://github.com/Bill-Gray/find_orb) (Bill Gray) | GPL-2.0 | Orbit determination from MPC astrometry; with `--plan`, its fitted orbit is also propagated by fo itself to the plan's epochs (state vectors + per-site RA/Dec — fit-then-propagate, not an IC replay). Built from source, runs as a CLI subprocess. |
 | [`orbfit/`](orbfit/) | [OrbFit](https://adams.dm.unipi.it/orbfit/) (OrbFit Consortium / IAU Minor Planet Center, `neofit2.x`) | GPL-3.0 | Orbit determination — the MPC's production NEO refit. Seeds neofit2.x with empyrean's IC as a heliocentric Cartesian orbit (`epoch/<desig>.eq0`), then runs its differential correction against the ADES astrometry (a *refit from empyrean's seed*, not a blind IOD — OrbFit's workflow always refines a prior orbit). Canonical implementation of CMC2003 χ²-with-hysteresis rejection; folds post-fit RMS + used/rejected counts onto the OD rows. Runs via the MPC's Docker container (`minorplanetcenter/orbfit`, amd64), never linked into empyrean. Default-on (`WITH_ORBFIT=` to skip). |
 | [`oorb/`](oorb/) | [OpenOrb](https://github.com/oorb/oorb) (Granvik et al., Fortran orbit-computation library) | GPL-3.0 | Propagation and ephemeris generation — full n-body (Bulirsch–Stoer, planets + Moon + Pluto, relativity; the stock conf's 2-body default is force-patched, and the plan's SSB states are converted to/from OpenOrb's heliocentric convention using the Sun state carried on plan rows). Built from upstream Fortran source via `setup.sh`; the runner shells out to the `oorb` CLI binary. The pip-installable Python wrapper (`pyoorb`) is intentionally not used — it has the same Fortran build dependency anyway and its sdist breaks on Python 3.12. OD skipped (Ranging/LSL doesn't fit per-row replay). |
@@ -45,6 +46,7 @@ implementation, and writes its own per-channel JSON.
 ./oorb/setup.sh
 ./jorbit/setup.sh
 ./layup/setup.sh
+./adamcore/setup.sh                      # local-only; installs the private adam-observatory-uncertainties tables (git+ssh)
 ./grss/setup.sh
 
 # Fixtures. The ADES PSV astrometry is NOT in the checkout — it lives in the
@@ -61,6 +63,7 @@ make -C .. fixtures
 python3                   oorb/run_oorb.py       --input validation_plan.json --output validation_oorb.json
 ./jorbit/.venv/bin/python jorbit/run_jorbit.py   --input validation_plan.json --output validation_jorbit.json
 ./layup/.venv/bin/python  layup/run_layup.py     ../fixtures/psv           --output validation_layup.json
+./adamcore/.venv/bin/python adamcore/run_adamcore.py --input validation_plan.json --fixtures-dir ../fixtures/psv --output validation_adamcore.json
 ./grss/.venv/bin/python   grss/run_grss.py       --input validation_plan.json --output validation_grss.json
 ./grss/.venv/bin/python   grss/run_grss.py --radar --input validation_plan.json --output validation_grss_radar.json
 ```
