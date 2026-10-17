@@ -471,7 +471,7 @@ WALK_PREDICTIONS := $(RESULTS_DIR)/validation_rust_walk_predictions.jsonl
 WALK_SCORED := $(RESULTS_DIR)/validation_predict_scored.jsonl
 WALK_AGG := $(RESULTS_DIR)/validation_predict_agg.json
 
-.PHONY: walk-manifest walk walk-score
+.PHONY: walk-manifest walk walk-score walk-report
 walk-manifest: | fixtures
 	@echo "──── Covariance realism: window manifest ───────────────"
 	@cargo run --release --bin empyrean-validation -- windows 	    --fixtures-dir $(FIXTURES_PSV) --output $(WALK_MANIFEST) 	    --debias-dir $(DATA_DIR)
@@ -484,6 +484,19 @@ walk: $(RUST_BIN) | fixtures
 walk-score:
 	@echo "──── Covariance realism: scoring ───────────────────────"
 	@cargo run --release --bin empyrean-validation -- score-predictions 	    --manifest $(WALK_MANIFEST) 	    --predictions $(WALK_PREDICTIONS) --windows $(WALK_WINDOWS) 	    --out-scored $(WALK_SCORED) --out-agg $(WALK_AGG)
+
+
+# Render the report with Part 4.2 fed from this walk's aggregate.
+walk-report: $(EMP_VAL_BIN)
+	@echo "──── Covariance realism: report (Part 4.2) ─────────────"
+	@test -f $(WALK_AGG) || { \
+	    echo "ERROR: no walk aggregate at $(WALK_AGG) — run 'make walk-score'."; \
+	    exit 1; }
+	@$(EMP_VAL_BIN) report \
+	    --results $(REPORT_INPUTS) \
+	    --output $(REPORT) \
+	    --summary $(SUMMARY) \
+	    --predict-agg $(WALK_AGG)
 
 # ── Synthetic (perfect-model) lane of the covariance-realism family ──────
 # One truth fit + truth ephemeris per object, then per noise law a fixture
@@ -1155,7 +1168,8 @@ report: $(RUST) $(PYTHON) $(C_OUT) $(CLI_OUT) $(if $(WITH_CORE),$(CORE_MERGED),$
 	@$(EMP_VAL_BIN) report \
 	    --results $(REPORT_INPUTS) \
 	    --output $(REPORT) \
-	    --summary $(SUMMARY)
+	    --summary $(SUMMARY) \
+	    $(if $(wildcard $(WALK_AGG)),--predict-agg $(WALK_AGG),)
 	@echo
 	@echo "Report: $(REPORT)"
 	@echo "Summary: $(SUMMARY)"
@@ -1214,7 +1228,8 @@ reduce: build-empyrean-validation
 	@$(EMP_VAL_BIN) report \
 	    --results $(REPORT_INPUTS) \
 	    --output $(REPORT) \
-	    --summary $(SUMMARY)
+	    --summary $(SUMMARY) \
+	    $(if $(wildcard $(WALK_AGG)),--predict-agg $(WALK_AGG),)
 	@echo "Report: $(REPORT)"
 	@echo "Summary: $(SUMMARY)"
 
