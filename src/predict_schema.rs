@@ -536,6 +536,38 @@ pub struct ScoredPrediction {
     /// along-track; the honest long-horizon realism statistic).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub z_ct: Option<f64>,
+    /// 1-dof normalized along-track residual, built identically to
+    /// [`z_ct`](Self::z_ct) but through the along-track unit vector of the same
+    /// shared position angle: the residual projected on \\( \hat e_{AT} \\)
+    /// over \\( \sqrt{\hat e_{AT}^\top(\Sigma_{obs}+\Sigma_{pred})\hat e_{AT}} \\).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub z_at: Option<f64>,
+    /// The shared (reference-channel) position angle used for the along/cross
+    /// decomposition, degrees East of North. `None` when no shared PA was
+    /// available (the row then carries no AT/CT residual).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pa_shared_deg: Option<f64>,
+    /// Joint inside-ellipse flags \\( d^2 \le 1, 4, 9 \\) (the 1σ/2σ/3σ ellipses
+    /// of 2 dof; expected 0.3935 / 0.8647 / 0.9889 under the normal law).
+    /// `None` when no \\( d^2 \\) was formed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub inside_joint: Option<[bool; 3]>,
+    /// Along-track inside flags \\( |z_{AT}| \le 1, 2, 3 \\) (expected 0.6827 /
+    /// 0.9545 / 0.9973 under the normal law). `None` when no \\( z_{AT} \\).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub inside_at: Option<[bool; 3]>,
+    /// Cross-track inside flags \\( |z_{CT}| \le 1, 2, 3 \\). `None` when no
+    /// \\( z_{CT} \\).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub inside_ct: Option<[bool; 3]>,
+    /// Whether the joint inside-ellipse expected fractions this row is judged
+    /// against are law-aware (the scored law's own CDF at \\( d^2 \le 1,4,9 \\),
+    /// recorded where a \\( d^2 \\) was formed) or fell back to the normal-law
+    /// \\( \chi^2_2 \\) constants. The directional expected fractions are the
+    /// normal-law \\( \chi^2_1 \\) constants under a normal scoring law.
+    /// Defaulted `false` for older files.
+    #[serde(default)]
+    pub coverage_law_aware: bool,
     /// Observation noise dominates the prediction term:
     /// \( \mathrm{tr}\,\Sigma_{obs} > \mathrm{tr}\,\Sigma_{pred} \).
     /// Such a row's d² measures the scoring σ table, not the tool's
@@ -600,6 +632,14 @@ pub fn default_scoring_law() -> String {
     "normal".into()
 }
 
+/// Arc-length split (days) for the Part 4.2A coverage rows: every tool × class
+/// renders a short-arc row (`arc_days < COVERAGE_ARC_SPLIT_DAYS`) and a long-arc
+/// row, so rust's known short-arc over-confidence no longer pools with its
+/// over-conservative long-arc fits. 30 d is an exact [`ARC_BIN_EDGES_DAYS`] edge,
+/// so no fine arc bin straddles the split. One shared constant; the report names
+/// it as the number in the key.
+pub const COVERAGE_ARC_SPLIT_DAYS: f64 = 30.0;
+
 /// One cell of the per-(class, tool, arm) predictive-power surface.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
@@ -636,6 +676,173 @@ pub struct SurfaceCell {
     /// Empirical 2σ coverage (target 0.8647).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cov_2s: Option<f64>,
+    // --- Coverage family (added for the per-direction realism headline) -----
+    //
+    // Every fraction below is the equal-weight-per-object mean over this cell's
+    // objects of that object's per-NIGHT inside-ellipse rate, keeping the
+    // night-joint convention of `med_d2_norm` / `cov_1s` / `cov_2s` exactly: a
+    // night is counted once (the orbit error is common-mode within a night).
+    // All are `default`-able so the pre-existing (August) aggregate still loads.
+    /// Empirical joint 3σ coverage \\( d^2 \le 9 \\) (target 0.9889 for 2 dof).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cov_3s: Option<f64>,
+    /// Along-track directional coverage \\( |z_{AT}| \le 1, 2, 3 \\) (normal-law
+    /// targets 0.6827 / 0.9545 / 0.9973).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cov_1s_at: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cov_2s_at: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cov_3s_at: Option<f64>,
+    /// Cross-track directional coverage \\( |z_{CT}| \le 1, 2, 3 \\).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cov_1s_ct: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cov_2s_ct: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cov_3s_ct: Option<f64>,
+    /// Law-aware expected joint coverage at \\( d^2 \le 1, 4, 9 \\) (the scored
+    /// law's own CDF; the normal-law \\( \chi^2_2 \\) constants when
+    /// [`coverage_law_aware`](Self::coverage_law_aware) is false).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exp_cov_1s: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exp_cov_2s: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exp_cov_3s: Option<f64>,
+    /// Law-aware expected along-track coverage at \\( |z| \le 1, 2, 3 \\).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exp_cov_1s_at: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exp_cov_2s_at: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exp_cov_3s_at: Option<f64>,
+    /// Law-aware expected cross-track coverage at \\( |z| \le 1, 2, 3 \\).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exp_cov_1s_ct: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exp_cov_2s_ct: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exp_cov_3s_ct: Option<f64>,
+    /// Nights behind the coverage fractions (summed over the cell's objects) —
+    /// the honest count behind each inside-ellipse rate.
+    #[serde(default)]
+    pub n_nights: u32,
+    /// Per-direction normalized realism: equal-weight-per-object
+    /// \\( \mathrm{median}(z^2)/\mathrm{(\chi^2_1\ median)} \\), 1 = calibrated
+    /// (the \\( \chi^2_1 \\) median is \\( \approx 0.4549 \\)). Along-track.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub med_z2_at_norm: Option<f64>,
+    /// Cross-track per-direction normalized realism.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub med_z2_ct_norm: Option<f64>,
+    /// Nights behind `med_z2_at_norm` / `med_z2_ct_norm` (a direction needs a
+    /// shared PA, so these can be below `n_nights`).
+    #[serde(default)]
+    pub n_z_at: u32,
+    #[serde(default)]
+    pub n_z_ct: u32,
+    /// Whether the expected coverage fractions are law-aware (true when every
+    /// contributing row was scored under its own recorded law) or the stated
+    /// normal-law constants (false). D-005 defers the Student-t run, so a
+    /// normal-law run leaves this true.
+    #[serde(default)]
+    pub coverage_law_aware: bool,
+
+    // --- Row-level coverage (trust-gated subset, Part 4.2 v2) ---------------
+    //
+    // The companions of `cov_*` above computed PER ROW, not per night: each
+    // held-out observation's own inside-ellipse flag, equal-weight-per-object.
+    // The night-joint `cov_*` divides the night's measurement noise by the
+    // night's target count; the per-row figure does not, so the two differ
+    // whenever a night carried several rows. Same subset as `cov_*`
+    // (out-of-sample, unflagged, Σ_pred-dominated). All `default`-able so the
+    // August aggregate still loads.
+    /// Per-row joint coverage \\( d^2 \le 1, 4, 9 \\), equal-weight-per-object.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cov_1s_row: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cov_2s_row: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cov_3s_row: Option<f64>,
+    /// Per-row along-track coverage \\( |z_{AT}| \le 1, 2, 3 \\).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cov_1s_at_row: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cov_2s_at_row: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cov_3s_at_row: Option<f64>,
+    /// Per-row cross-track coverage \\( |z_{CT}| \le 1, 2, 3 \\).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cov_1s_ct_row: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cov_2s_ct_row: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cov_3s_ct_row: Option<f64>,
+
+    // --- Trust-UNCONDITIONED coverage (Part 4.2 v2) -------------------------
+    //
+    // The night-joint and per-row coverage with the covariance-trust gate OFF:
+    // every converged window's published covariance counts, only in-sample and
+    // the geometric/invalid gates excluded (a row whose ONLY flag is the trust
+    // verdict re-enters; any other flag still excludes). This is the honest
+    // predictive-power figure for a tool that self-flags — rust flags the
+    // covariances it least trusts, so the trust-gated `cov_*` is computed on a
+    // self-selected subset. The night-joint cell value of 4.2A reads these.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cov_1s_unc: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cov_2s_unc: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cov_3s_unc: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cov_1s_at_unc: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cov_2s_at_unc: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cov_3s_at_unc: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cov_1s_ct_unc: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cov_2s_ct_unc: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cov_3s_ct_unc: Option<f64>,
+    /// Per-row 2σ coverage with the trust gate OFF (joint, along, cross) — the
+    /// per-row companion of `cov_2s_unc` for the 4.2A hover.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cov_2s_row_unc: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cov_2s_at_row_unc: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cov_2s_ct_row_unc: Option<f64>,
+
+    /// Out-of-sample TRUST-GATED (clean) rows in this cell, and the
+    /// Σ_pred-dominated share of them (`n_rows_pd / n_rows`): the fraction of
+    /// clean predictions whose prediction term dominates the measurement term.
+    /// This gated share accompanies the gated 4.2B realism value. The 4.2A
+    /// coverage cell reads the trust-UNCONDITIONED rate, so it uses the
+    /// unconditioned pair below — the share and the number it gates then
+    /// describe one row population. A share below 10 % is too obs-dominated.
+    #[serde(default)]
+    pub n_rows: u32,
+    #[serde(default)]
+    pub n_rows_pd: u32,
+    /// The same counts over the trust-UNCONDITIONED row population (a row whose
+    /// only flag is the covariance-trust verdict re-enters, matching
+    /// `cov_*_unc`), so the 4.2A Σ_pred-dominated share and its < 10 % hatch
+    /// gate read exactly the rows the unconditioned cell value is computed over,
+    /// never the trust-gated subset.
+    #[serde(default)]
+    pub n_rows_unc: u32,
+    #[serde(default)]
+    pub n_rows_pd_unc: u32,
+    /// Distinct objects behind the coverage: `n_objects_all` under the trust
+    /// gate OFF, `n_objects_trusted` under it ON. Their difference is the count
+    /// of objects a tool kept only by self-flagging its own covariance.
+    #[serde(default)]
+    pub n_objects_all: u32,
+    #[serde(default)]
+    pub n_objects_trusted: u32,
 }
 
 /// The aggregate artifact the report embeds (`*_predict_agg.json`): surface
@@ -647,6 +854,18 @@ pub struct PredictAggregates {
     /// Manifest snapshot id these aggregates were computed against.
     pub snapshot_id: String,
     pub cells: Vec<SurfaceCell>,
+    /// The Part 4.2A coverage rows: the same [`SurfaceCell`] coverage fields,
+    /// but pooled equal-weight-per-object over all fine arc bins on one side of
+    /// [`COVERAGE_ARC_SPLIT_DAYS`] — two rows per (class, tool, arm): short-arc
+    /// (`arc_hi_days == COVERAGE_ARC_SPLIT_DAYS`) and long-arc. The pool is a
+    /// true per-object pool across arc bins (a night counted once, an object
+    /// weighted once), never a median of the fine cells, so the matrix cell
+    /// reflects every object's own nights. `n_objects_all` / `n_objects_trusted`
+    /// are the distinct object counts of the pooled row. `default`-able so an
+    /// aggregate written before this field renders the 4.2A empty state rather
+    /// than a fabricated grid.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub coverage_cells: Vec<SurfaceCell>,
     pub per_object: Vec<ObjectWalkSummary>,
     /// Fixed-bin d² histograms per series — the report's
     /// distribution-vs-\( \chi^2_2 \) panel and reliability curve render
@@ -686,6 +905,21 @@ pub struct PredictAggregates {
     /// valid for the normal law only.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub calibration_note: Option<String>,
+    /// The manifest profile these aggregates were scored under (`full`, `ci`,
+    /// `ladder`, …), derived by `score-predictions` from the windows it
+    /// attempted (the most specific profile common to every attempted window).
+    /// `default`-able to `"unstated"` so an aggregate file written before this
+    /// field renders a marked "profile unstated" state in the report rather
+    /// than a fabricated label.
+    #[serde(default = "default_profile")]
+    pub profile: String,
+}
+
+/// The default profile label for older aggregate files that predate the
+/// [`PredictAggregates::profile`] field: `"unstated"`, which the report renders
+/// as a marked-absent provenance state, never a guessed profile name.
+pub fn default_profile() -> String {
+    "unstated".into()
 }
 
 /// Strata a [`CalibrationCell`] can summarize.
@@ -799,6 +1033,44 @@ pub struct CalibrationCell {
     pub cov_exp_9: Option<f64>,
     /// Rows entering the coverage fractions (those carrying a \\( d^2 \\)).
     pub n_cov: u32,
+    // --- Per-direction coverage (1-dof z², thresholds z² ≤ 1, 4, 9) ---------
+    //
+    // The per-row companion of the joint `cov_obs_*` / `cov_exp_*` above, over
+    // the rows carrying a shared-PA directional residual. `default`-able so the
+    // August aggregate (no directional coverage) still loads.
+    /// Observed along-track coverage \\( |z_{AT}| \le 1, 2, 3 \\).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cov_obs_1_at: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cov_obs_4_at: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cov_obs_9_at: Option<f64>,
+    /// Observed cross-track coverage \\( |z_{CT}| \le 1, 2, 3 \\).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cov_obs_1_ct: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cov_obs_4_ct: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cov_obs_9_ct: Option<f64>,
+    /// Law-aware expected per-direction coverage at \\( z^2 \le 1, 4, 9 \\)
+    /// (the \\( \chi^2_1 \\) CDF under a normal scoring law).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cov_exp_1_dir: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cov_exp_4_dir: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cov_exp_9_dir: Option<f64>,
+    /// Per-direction normalized realism over the rows
+    /// (\\( \mathrm{median}(z^2)/\mathrm{(\chi^2_1\ median)} \\), 1 = calibrated).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub med_z2_at_norm: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub med_z2_ct_norm: Option<f64>,
+    /// Rows entering the along / cross directional coverage.
+    #[serde(default)]
+    pub n_cov_at: u32,
+    #[serde(default)]
+    pub n_cov_ct: u32,
 }
 
 /// One object's walk under one (tool, config arm), in window order — the
@@ -994,6 +1266,40 @@ pub struct ObjectWalkSummary {
     /// Median separation over this object's predictions, arcsec.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub med_sep_arcsec: Option<f64>,
+    // --- Coverage family (per object, night-joint; see [`SurfaceCell`]) ------
+    /// This object's per-night inside-ellipse rates: joint \\( d^2 \le 1,4,9 \\)
+    /// and directional \\( |z_{AT}|,|z_{CT}| \le 1,2,3 \\). `default`-able.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cov_1s: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cov_2s: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cov_3s: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cov_1s_at: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cov_2s_at: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cov_3s_at: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cov_1s_ct: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cov_2s_ct: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cov_3s_ct: Option<f64>,
+    /// Nights behind this object's coverage fractions.
+    #[serde(default)]
+    pub n_nights: u32,
+    /// Per-direction normalized realism for this object
+    /// (\\( \mathrm{median}(z^2)/\mathrm{(\chi^2_1\ median)} \\), 1 = calibrated).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub med_z2_at_norm: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub med_z2_ct_norm: Option<f64>,
+    #[serde(default)]
+    pub n_z_at: u32,
+    #[serde(default)]
+    pub n_z_ct: u32,
 }
 
 #[cfg(test)]

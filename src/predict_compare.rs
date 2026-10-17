@@ -30,9 +30,10 @@ use std::path::{Path, PathBuf};
 
 use crate::predict_law::{LawKind, LawQuad};
 use crate::predict_schema::{
-    AssumedErrorModel, CalibrationCell, ObjectWalkSummary, ObjectWindows, ObsEntry,
-    PredictAggregates, PredictedObservation, ScoredPrediction, SurfaceCell, WalkWindowRecord,
-    WindowManifest, WindowSpec, calibration_strata, uncertainty_forms,
+    AssumedErrorModel, COVERAGE_ARC_SPLIT_DAYS, CalibrationCell, ObjectWalkSummary, ObjectWindows,
+    ObsEntry, PredictAggregates, PredictedObservation, ScoredPrediction, SurfaceCell,
+    WalkWindowRecord, WindowManifest, WindowSpec, calibration_strata, default_profile,
+    uncertainty_forms,
 };
 
 /// Arc-length bin edges (days) for the predictive-power surface, log-spaced.
@@ -272,6 +273,28 @@ fn quad_inv2(m: &Mat2, r: [f64; 2]) -> Option<f64> {
 
 fn quad_form2(m: &Mat2, e: [f64; 2]) -> f64 {
     e[0] * e[0] * m[0][0] + 2.0 * e[0] * e[1] * m[0][1] + e[1] * e[1] * m[1][1]
+}
+
+/// The 1-dof normalized residual along a unit direction `e`: the residual
+/// projected on `e` over \\( \sqrt{e^\top C e} \\), where `combined` is the
+/// combined covariance \\( C = \Sigma_{obs} + \Sigma_{pred} \\). `None` when the
+/// projected variance is not positive. One definition for every 1-dof z
+/// (along-track, cross-track, dominant) — never a sibling per direction.
+fn one_dof_z(r: [f64; 2], combined: &Mat2, e: [f64; 2]) -> Option<f64> {
+    let var = quad_form2(combined, e);
+    (var > 0.0).then(|| (r[0] * e[0] + r[1] * e[1]) / var.sqrt())
+}
+
+/// Inside-ellipse flags of a squared statistic against the three coverage
+/// thresholds \\( \le 1, 4, 9 \\) — the joint 1σ/2σ/3σ ellipses for a
+/// \\( d^2 \\) (2 dof) and the \\( |z| \le 1, 2, 3 \\) bands for a \\( z^2 \\)
+/// (1 dof). One definition so the joint and directional flags cannot drift.
+fn inside_flags(stat_squared: f64) -> [bool; 3] {
+    [
+        stat_squared <= crate::predict_law::COVERAGE_THRESHOLDS[0],
+        stat_squared <= crate::predict_law::COVERAGE_THRESHOLDS[1],
+        stat_squared <= crate::predict_law::COVERAGE_THRESHOLDS[2],
+    ]
 }
 
 /// Unit eigenvector of the larger eigenvalue of a symmetric 2×2.
@@ -740,11 +763,7 @@ fn score_all(
                 }
                 d2_pred_only = quad_inv2(sp, r);
                 p_chi2 = d2_combined.map(|d2| hyperjet::statistics::chi2_sf(d2, 2));
-                let e = dominant_eigenvector2(sp);
-                let var = quad_form2(&combined, e);
-                if var > 0.0 {
-                    z1 = Some((r[0] * e[0] + r[1] * e[1]) / var.sqrt());
-                }
+                z1 = one_dof_z(r, &combined, dominant_eigenvector2(sp));
             } else if p.uncertainty_form == uncertainty_forms::SIGMA1D_PA {
                 match (p.sigma1_arcsec, p.sigma1_pa_deg) {
                     (Some(s1), Some(pa)) if s1 > 0.0 => {
@@ -778,15 +797,15 @@ fn score_all(
             (None, None) => None,
         };
         let (mut resid_at, mut resid_ct) = (None, None);
+        let mut z_at = None;
         if let Some(pa) = pa {
             let (e_at, e_ct) = at_ct_basis(pa);
             resid_at = Some(r[0] * e_at[0] + r[1] * e_at[1]);
             resid_ct = Some(r[0] * e_ct[0] + r[1] * e_ct[1]);
             if sep_valid && let Some(sp) = &sp {
-                let var_ct = quad_form2(&add2(&so, sp), e_ct);
-                if var_ct > 0.0 {
-                    z_ct = Some(resid_ct.unwrap() / var_ct.sqrt());
-                }
+                let combined = add2(&so, sp);
+                z_at = one_dof_z(r, &combined, e_at);
+                z_ct = one_dof_z(r, &combined, e_ct);
             }
         }
 
@@ -816,7 +835,7 @@ fn score_all(
             p.window_index,
         )) && t != "trusted"
         {
-            flags.push("covariance_trust_flagged".into());
+            flags.push(TRUST_FLAG.into());
         }
 
         // Law-aware scoring: resolve the law, then the log score, PIT, and
@@ -856,6 +875,10 @@ fn score_all(
         let mut log_score = None;
         let mut pit = None;
         let mut pred_obs_trace_ratio = None;
+        // The joint inside-ellipse expected fractions are law-aware when the
+        // scored law's own CDF was formed for this row (an `exp_cov` entry); a
+        // row with no d² falls back to the normal-law constants in the report.
+        let mut coverage_law_aware = false;
         if let Some(spm) = &sp {
             pred_obs_trace_ratio = Some((spm[0][0] + spm[1][1]) / (so[0][0] + so[1][1]));
             if d2_combined.is_some() {
@@ -863,6 +886,7 @@ fn score_all(
                     Ok(rs) => {
                         log_score = Some(rs.log_score);
                         pit = Some(rs.pit);
+                        coverage_law_aware = true;
                         exp_cov.insert(
                             (
                                 p.tool.clone(),
@@ -881,6 +905,13 @@ fn score_all(
                 }
             }
         }
+
+        // Per-prediction inside-ellipse flags: joint d² ≤ 1,4,9 and the 1-dof
+        // directional z² ≤ 1,4,9 (|z| ≤ 1,2,3). The aggregate re-derives
+        // coverage per night; these ride on the row for transparency and tests.
+        let inside_joint = d2_combined.map(inside_flags);
+        let inside_at = z_at.map(|z| inside_flags(z * z));
+        let inside_ct = z_ct.map(|z| inside_flags(z * z));
 
         scored.push(ScoredPrediction {
             object: p.object.clone(),
@@ -907,6 +938,12 @@ fn score_all(
             p_chi2,
             z1_dominant: z1,
             z_ct,
+            z_at,
+            pa_shared_deg: pa,
+            inside_joint,
+            inside_at,
+            inside_ct,
+            coverage_law_aware,
             obs_noise_dominated,
             flags,
             reference_law,
@@ -968,6 +1005,136 @@ struct NightStat {
     arc_days: f64,
     horizon_days: f64,
     d2: f64,
+    /// Night-joint 1-dof along/cross z through the night's shared PA: the
+    /// night-mean residual projected on \\( \hat e_{AT} \\) / \\( \hat e_{CT}
+    /// \\) over \\( \sqrt{\hat e^\top \Sigma_{night} \hat e} \\). `None` when the
+    /// night carried no shared PA.
+    z_at: Option<f64>,
+    z_ct: Option<f64>,
+    /// Whether this night's rows were all scored under the normal law, so the
+    /// night-joint \\( d^2\sim\chi^2_2 \\) / \\( z\sim\mathcal N(0,1) \\)
+    /// expected coverages are exact (the one stated fallback otherwise).
+    law_aware: bool,
+}
+
+/// The one covariance-trust flag string: a row carries it when the fitting
+/// tool's own `covariance_trust` verdict was not `trusted`.
+const TRUST_FLAG: &str = "covariance_trust_flagged";
+
+/// Which rows a coverage statistic admits — the one axis that separates the
+/// headline from its trust-unconditioned companion. In-sample, the
+/// geometric/invalid gates (which withhold `d2_combined`) and Σ_obs-dominance
+/// are excluded under both modes; this chooses only whether a row the tool
+/// flagged as low-trust still counts.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum TrustMode {
+    /// Headline: only fully-clean rows (no flag of any kind).
+    Gated,
+    /// Trust-unconditioned: clean rows, plus rows whose ONLY flag is the trust
+    /// verdict. The difference from [`TrustMode::Gated`] is exactly the gate.
+    Unconditioned,
+}
+
+impl TrustMode {
+    /// Whether a row's flag set is admitted under this mode.
+    fn admits(self, flags: &[String]) -> bool {
+        match self {
+            TrustMode::Gated => flags.is_empty(),
+            TrustMode::Unconditioned => flags.iter().all(|f| f == TRUST_FLAG),
+        }
+    }
+}
+
+/// Equal-weight-per-object inside-ellipse counts at the 1σ/2σ/3σ thresholds of
+/// a squared statistic. The thresholds are 1, 4, 9 for both the joint d² and a
+/// directional z² (|z| ≤ 1,2,3 ⇔ z² ≤ 1,4,9), so one counter serves every
+/// direction. Counts, not values — pooling across arc bins is a per-object
+/// sum, and no median is taken off the unconditioned or per-row families.
+#[derive(Clone, Copy, Default)]
+struct Cov3 {
+    n: u32,
+    inside: [u32; 3],
+}
+
+impl Cov3 {
+    const THRESH: [f64; 3] = [1.0, 4.0, 9.0];
+    /// Count one squared statistic (`d2`, or `z*z` for a direction).
+    fn push_sq(&mut self, sq: f64) {
+        self.n += 1;
+        for k in 0..3 {
+            if sq <= Self::THRESH[k] {
+                self.inside[k] += 1;
+            }
+        }
+    }
+    fn merge(&mut self, o: &Cov3) {
+        self.n += o.n;
+        for k in 0..3 {
+            self.inside[k] += o.inside[k];
+        }
+    }
+    /// This object's inside-ellipse fraction at σ-index `k`; `None` with no
+    /// contributing statistic.
+    fn frac(&self, k: usize) -> Option<f64> {
+        (self.n > 0).then(|| f64::from(self.inside[k]) / f64::from(self.n))
+    }
+}
+
+/// Per-object per-row inside-ellipse counts in the three directions.
+#[derive(Clone, Copy, Default)]
+struct RowCov {
+    j: Cov3,
+    at: Cov3,
+    ct: Cov3,
+}
+
+impl RowCov {
+    fn merge(&mut self, o: &RowCov) {
+        self.j.merge(&o.j);
+        self.at.merge(&o.at);
+        self.ct.merge(&o.ct);
+    }
+}
+
+/// Accumulate one scored row's inside-ellipse flags into a per-object counter.
+fn push_row(rc: &mut RowCov, s: &ScoredPrediction) {
+    for (flags, c) in [
+        (s.inside_joint, &mut rc.j),
+        (s.inside_at, &mut rc.at),
+        (s.inside_ct, &mut rc.ct),
+    ] {
+        if let Some(ins) = flags {
+            c.n += 1;
+            for (k, &hit) in ins.iter().enumerate() {
+                if hit {
+                    c.inside[k] += 1;
+                }
+            }
+        }
+    }
+}
+
+/// The one coverage routine: equal-weight-per-object mean of each object's
+/// inside-ellipse fraction at σ-index `k` (§3.2 — the object is the
+/// independent unit). Every coverage family (gated / unconditioned / per-row;
+/// joint / along / cross) reads it; the subset is chosen by what was pushed
+/// into the per-object counters, never by a parallel routine.
+fn eqw_cov(per_object: &HashMap<String, Cov3>, k: usize) -> Option<f64> {
+    let fr: Vec<f64> = per_object.values().filter_map(|c| c.frac(k)).collect();
+    (!fr.is_empty()).then(|| fr.iter().sum::<f64>() / fr.len() as f64)
+}
+
+/// [`eqw_cov`] over one direction of a per-object [`RowCov`] map.
+fn eqw_row(
+    per_object: &HashMap<String, RowCov>,
+    pick: impl Fn(&RowCov) -> &Cov3,
+    k: usize,
+) -> Option<f64> {
+    let fr: Vec<f64> = per_object
+        .values()
+        .filter_map(|rc| pick(rc).frac(k))
+        .collect();
+    (!fr.is_empty()).then(|| fr.iter().sum::<f64>() / fr.len() as f64)
 }
 
 fn night_stats(
@@ -975,17 +1142,18 @@ fn night_stats(
     scored: &[ScoredPrediction],
     sp_matrices: &HashMap<RowKey, Mat2>,
 ) -> HashMap<(String, String, String), Vec<NightStat>> {
-    night_stats_with(manifest, scored, sp_matrices, false)
+    night_stats_with(manifest, scored, sp_matrices, TrustMode::Gated)
 }
 
-/// `include_flagged = true` keeps trust-flagged rows — only the
-/// flag-inclusive per-object fields read this; every headline statistic
-/// stays on the trust-gated call.
+/// `mode` chooses the trust subset: [`TrustMode::Gated`] is the headline
+/// (every statistic stays here); [`TrustMode::Unconditioned`] re-admits rows
+/// whose only flag is the trust verdict — the trust-unconditioned coverage and
+/// the flag-inclusive per-object fields read it.
 fn night_stats_with(
     manifest: &WindowManifest,
     scored: &[ScoredPrediction],
     sp_matrices: &HashMap<RowKey, Mat2>,
-    include_flagged: bool,
+    mode: TrustMode,
 ) -> HashMap<(String, String, String), Vec<NightStat>> {
     let idx = index_manifest(manifest);
     // (tool, arm, object) → (window, night) → rows
@@ -993,10 +1161,7 @@ fn night_stats_with(
         HashMap<(String, String, String), HashMap<(u32, i64), Vec<&'a ScoredPrediction>>>;
     let mut groups: NightGroups = HashMap::new();
     for s in scored {
-        if s.in_sample
-            || (!include_flagged && !s.flags.is_empty())
-            || s.d2_combined.is_none()
-            || s.obs_noise_dominated
+        if s.in_sample || !mode.admits(&s.flags) || s.d2_combined.is_none() || s.obs_noise_dominated
         {
             continue;
         }
@@ -1068,6 +1233,28 @@ fn night_stats_with(
             let Some(d2) = quad_inv2(&sigma_night, r) else {
                 continue;
             };
+            // Night-joint directional z through the night's shared PA (the
+            // circular mean of the rows' shared PAs — within a night the sky
+            // motion direction is constant, so this is any row's PA; it is
+            // wrap-safe and uses every row that carried one).
+            let (mut cs, mut sn) = (0.0, 0.0);
+            for s in &rows {
+                if let Some(pa) = s.pa_shared_deg {
+                    let th = pa.to_radians();
+                    cs += th.cos();
+                    sn += th.sin();
+                }
+            }
+            let (mut z_at, mut z_ct) = (None, None);
+            if cs != 0.0 || sn != 0.0 {
+                let pa_night = sn.atan2(cs).to_degrees();
+                let (e_at, e_ct) = at_ct_basis(pa_night);
+                z_at = one_dof_z(r, &sigma_night, e_at);
+                z_ct = one_dof_z(r, &sigma_night, e_ct);
+            }
+            let law_aware = rows
+                .iter()
+                .all(|s| s.scoring_law == crate::predict_law::scoring_law_tag(LawKind::Normal));
             horizons.sort_by(|a, b| a.partial_cmp(b).unwrap());
             let w = &oi.windows[&window_index];
             stats.push(NightStat {
@@ -1076,6 +1263,9 @@ fn night_stats_with(
                 arc_days: w.arc_days,
                 horizon_days: horizons[horizons.len() / 2],
                 d2,
+                z_at,
+                z_ct,
+                law_aware,
             });
         }
         out.insert((tool, arm, object), stats);
@@ -1092,6 +1282,7 @@ fn aggregate(
     opts: &ScoreOptions,
 ) -> PredictAggregates {
     let nights = night_stats(manifest, scored, sp_matrices);
+    let nights_unc = night_stats_with(manifest, scored, sp_matrices, TrustMode::Unconditioned);
     let idx = index_manifest(manifest);
 
     // ---- Surface cells ----------------------------------------------------
@@ -1099,6 +1290,28 @@ fn aggregate(
     struct CellAcc {
         per_object_sep: HashMap<String, Vec<f64>>,
         per_object_d2: HashMap<String, Vec<f64>>,
+        /// Per-object night-joint directional z (signed), for the directional
+        /// coverage and median-realism statistics.
+        per_object_z_at: HashMap<String, Vec<f64>>,
+        per_object_z_ct: HashMap<String, Vec<f64>>,
+        /// Trust-unconditioned night-joint counters (joint d², along z², cross
+        /// z²), per object — the trust-gate-off companion of `per_object_d2`.
+        per_object_d2_unc: HashMap<String, Cov3>,
+        per_object_zat_unc: HashMap<String, Cov3>,
+        per_object_zct_unc: HashMap<String, Cov3>,
+        /// Per-row inside-ellipse counters, trust-gated and unconditioned, per
+        /// object — the per-row companion of the night-joint maps.
+        per_object_row: HashMap<String, RowCov>,
+        per_object_row_unc: HashMap<String, RowCov>,
+        /// Out-of-sample rows and their Σ_pred-dominated share, carried under
+        /// BOTH trust modes: the gated pair (`n_rows`/`n_rows_pd`) for the gated
+        /// 4.2B realism value, the unconditioned pair for the trust-off 4.2A cell.
+        n_rows: u32,
+        n_rows_pd: u32,
+        n_rows_unc: u32,
+        n_rows_pd_unc: u32,
+        /// Whether every contributing row was scored under its own recorded law.
+        law_aware: bool,
         windows: BTreeSet<(String, u32)>,
         n_predictions: u32,
         expected: u32,
@@ -1109,6 +1322,18 @@ fn aggregate(
         cells.entry(key).or_insert_with(|| CellAcc {
             per_object_sep: HashMap::new(),
             per_object_d2: HashMap::new(),
+            per_object_z_at: HashMap::new(),
+            per_object_z_ct: HashMap::new(),
+            per_object_d2_unc: HashMap::new(),
+            per_object_zat_unc: HashMap::new(),
+            per_object_zct_unc: HashMap::new(),
+            per_object_row: HashMap::new(),
+            per_object_row_unc: HashMap::new(),
+            n_rows: 0,
+            n_rows_pd: 0,
+            n_rows_unc: 0,
+            n_rows_pd_unc: 0,
+            law_aware: true,
             windows: BTreeSet::new(),
             n_predictions: 0,
             expected: 0,
@@ -1193,6 +1418,74 @@ fn aggregate(
                 .or_default()
                 .push(s.sep_arcsec);
         }
+        // Per-row coverage + Σ_pred-dominated share, on the coverage subset
+        // (Σ_pred-dominated with a formed d²). The share is counted under BOTH
+        // trust modes so each panel reads the population of the value it gates:
+        // the GATED pair accompanies the gated 4.2B realism value, the
+        // UNCONDITIONED pair the trust-off 4.2A cell. The mode predicate is the
+        // one row-eligibility gate, shared with the per-row push below — a row
+        // whose only flag is the trust verdict re-enters the unconditioned pair.
+        let pd = !s.obs_noise_dominated && s.inside_joint.is_some();
+        if TrustMode::Gated.admits(&s.flags) {
+            acc.n_rows += 1;
+            if pd {
+                acc.n_rows_pd += 1;
+            }
+        }
+        if TrustMode::Unconditioned.admits(&s.flags) {
+            acc.n_rows_unc += 1;
+            if pd {
+                acc.n_rows_pd_unc += 1;
+            }
+        }
+        if pd {
+            if TrustMode::Gated.admits(&s.flags) {
+                push_row(acc.per_object_row.entry(s.object.clone()).or_default(), s);
+            }
+            if TrustMode::Unconditioned.admits(&s.flags) {
+                push_row(
+                    acc.per_object_row_unc.entry(s.object.clone()).or_default(),
+                    s,
+                );
+            }
+        }
+    }
+    // Trust-unconditioned night-joint counters, fed the same way as the gated
+    // nights above — the one night routine parameterised by the trust mode.
+    for ((tool, arm, object), stats) in &nights_unc {
+        for st in stats {
+            let (Some(ai), Some(di)) = (
+                bin_index(&ARC_BIN_EDGES_DAYS, st.arc_days),
+                bin_index(&DT_BIN_EDGES_DAYS, st.horizon_days),
+            ) else {
+                continue;
+            };
+            let key = (
+                st.class.clone(),
+                tool.clone(),
+                arm.clone(),
+                sigma_table.clone(),
+                ai,
+                di,
+            );
+            let acc = cell(&mut cells, key);
+            acc.per_object_d2_unc
+                .entry(object.clone())
+                .or_default()
+                .push_sq(st.d2);
+            if let Some(z) = st.z_at {
+                acc.per_object_zat_unc
+                    .entry(object.clone())
+                    .or_default()
+                    .push_sq(z * z);
+            }
+            if let Some(z) = st.z_ct {
+                acc.per_object_zct_unc
+                    .entry(object.clone())
+                    .or_default()
+                    .push_sq(z * z);
+            }
+        }
     }
     for ((tool, arm, object), stats) in &nights {
         for st in stats {
@@ -1211,15 +1504,204 @@ fn aggregate(
                 ai,
                 di,
             );
-            cell(&mut cells, key)
-                .per_object_d2
+            let acc = cell(&mut cells, key);
+            acc.per_object_d2
                 .entry(object.clone())
                 .or_default()
                 .push(st.d2);
+            if let Some(z) = st.z_at {
+                acc.per_object_z_at
+                    .entry(object.clone())
+                    .or_default()
+                    .push(z);
+            }
+            if let Some(z) = st.z_ct {
+                acc.per_object_z_ct
+                    .entry(object.clone())
+                    .or_default()
+                    .push(z);
+            }
+            acc.law_aware &= st.law_aware;
         }
     }
 
-    const LN2X2: f64 = 2.0 * std::f64::consts::LN_2;
+    const LN2X2: f64 = crate::predict_law::CHI2_2_MEDIAN;
+    const CHI2_1_MED: f64 = crate::predict_law::CHI2_1_MEDIAN;
+
+    // ---- Part 4.2A coverage rows -----------------------------------------
+    // Pool the fine cells' coverage counts across the arc axis into two rows
+    // per (class, tool, arm): short-arc (arc < COVERAGE_ARC_SPLIT_DAYS) and
+    // long-arc. A TRUE per-object pool — every object's nights across its arc
+    // bins are gathered before the equal-weight-per-object mean — so the cell
+    // is not a median of the fine arc cells. 30 d is an exact arc edge, so no
+    // fine bin straddles the split.
+    #[derive(Default)]
+    struct PoolAcc {
+        night: HashMap<String, Cov3>,
+        night_at: HashMap<String, Cov3>,
+        night_ct: HashMap<String, Cov3>,
+        night_unc: HashMap<String, Cov3>,
+        night_at_unc: HashMap<String, Cov3>,
+        night_ct_unc: HashMap<String, Cov3>,
+        row: HashMap<String, RowCov>,
+        row_unc: HashMap<String, RowCov>,
+        n_rows: u32,
+        n_rows_pd: u32,
+        n_rows_unc: u32,
+        n_rows_pd_unc: u32,
+        law_aware: bool,
+    }
+    // (class, tool, arm, σ-table, arc_short, dt bin)
+    type PoolKey = (String, String, String, String, bool, usize);
+    let mut pools: BTreeMap<PoolKey, PoolAcc> = BTreeMap::new();
+    for ((class, tool, arm, sigma, ai, di), acc) in &cells {
+        let arc_short = ARC_BIN_EDGES_DAYS[ai + 1] <= COVERAGE_ARC_SPLIT_DAYS;
+        let p = pools
+            .entry((
+                class.clone(),
+                tool.clone(),
+                arm.clone(),
+                sigma.clone(),
+                arc_short,
+                *di,
+            ))
+            .or_insert_with(|| PoolAcc {
+                law_aware: true,
+                ..Default::default()
+            });
+        for (obj, v) in &acc.per_object_d2 {
+            let e = p.night.entry(obj.clone()).or_default();
+            for &d2 in v {
+                e.push_sq(d2);
+            }
+        }
+        for (obj, v) in &acc.per_object_z_at {
+            let e = p.night_at.entry(obj.clone()).or_default();
+            for &z in v {
+                e.push_sq(z * z);
+            }
+        }
+        for (obj, v) in &acc.per_object_z_ct {
+            let e = p.night_ct.entry(obj.clone()).or_default();
+            for &z in v {
+                e.push_sq(z * z);
+            }
+        }
+        for (obj, c) in &acc.per_object_d2_unc {
+            p.night_unc.entry(obj.clone()).or_default().merge(c);
+        }
+        for (obj, c) in &acc.per_object_zat_unc {
+            p.night_at_unc.entry(obj.clone()).or_default().merge(c);
+        }
+        for (obj, c) in &acc.per_object_zct_unc {
+            p.night_ct_unc.entry(obj.clone()).or_default().merge(c);
+        }
+        for (obj, rc) in &acc.per_object_row {
+            p.row.entry(obj.clone()).or_default().merge(rc);
+        }
+        for (obj, rc) in &acc.per_object_row_unc {
+            p.row_unc.entry(obj.clone()).or_default().merge(rc);
+        }
+        p.n_rows += acc.n_rows;
+        p.n_rows_pd += acc.n_rows_pd;
+        p.n_rows_unc += acc.n_rows_unc;
+        p.n_rows_pd_unc += acc.n_rows_pd_unc;
+        p.law_aware &= acc.law_aware;
+    }
+    let coverage_cells: Vec<SurfaceCell> = pools
+        .into_iter()
+        .map(
+            |((class, tool, config_arm, sigma_table, arc_short, di), p)| {
+                let (arc_lo_days, arc_hi_days) = if arc_short {
+                    (ARC_BIN_EDGES_DAYS[0], COVERAGE_ARC_SPLIT_DAYS)
+                } else {
+                    (
+                        COVERAGE_ARC_SPLIT_DAYS,
+                        ARC_BIN_EDGES_DAYS[ARC_BIN_EDGES_DAYS.len() - 1],
+                    )
+                };
+                let n_nights: u32 = p.night_unc.values().map(|c| c.n).sum();
+                // Expected = the normal-law χ² CDFs, present where the cell's
+                // own unconditioned fraction (per direction) is present.
+                let cov_1s_unc = eqw_cov(&p.night_unc, 0);
+                let cov_1s_at_unc = eqw_cov(&p.night_at_unc, 0);
+                let cov_1s_ct_unc = eqw_cov(&p.night_ct_unc, 0);
+                let exp_j = |thr: f64| cov_1s_unc.map(|_| crate::predict_law::chi2_2_cdf(thr));
+                let exp_at = |thr: f64| cov_1s_at_unc.map(|_| crate::predict_law::chi2_1_cdf(thr));
+                let exp_ct = |thr: f64| cov_1s_ct_unc.map(|_| crate::predict_law::chi2_1_cdf(thr));
+                SurfaceCell {
+                    class,
+                    tool,
+                    config_arm,
+                    sigma_table,
+                    arc_lo_days,
+                    arc_hi_days,
+                    dt_lo_days: DT_BIN_EDGES_DAYS[di],
+                    dt_hi_days: DT_BIN_EDGES_DAYS[di + 1],
+                    n_objects: p.night_unc.len() as u32,
+                    n_windows: 0,
+                    n_predictions: 0,
+                    delivered_fraction: 0.0,
+                    med_sep_arcsec: None,
+                    med_d2_norm: None,
+                    // The existing cov_* carry the GATED night-joint (the 4.2A
+                    // hover "trust-gated"); the cell value reads cov_*_unc.
+                    cov_1s: eqw_cov(&p.night, 0),
+                    cov_2s: eqw_cov(&p.night, 1),
+                    cov_3s: eqw_cov(&p.night, 2),
+                    cov_1s_at: eqw_cov(&p.night_at, 0),
+                    cov_2s_at: eqw_cov(&p.night_at, 1),
+                    cov_3s_at: eqw_cov(&p.night_at, 2),
+                    cov_1s_ct: eqw_cov(&p.night_ct, 0),
+                    cov_2s_ct: eqw_cov(&p.night_ct, 1),
+                    cov_3s_ct: eqw_cov(&p.night_ct, 2),
+                    exp_cov_1s: exp_j(1.0),
+                    exp_cov_2s: exp_j(4.0),
+                    exp_cov_3s: exp_j(9.0),
+                    exp_cov_1s_at: exp_at(1.0),
+                    exp_cov_2s_at: exp_at(4.0),
+                    exp_cov_3s_at: exp_at(9.0),
+                    exp_cov_1s_ct: exp_ct(1.0),
+                    exp_cov_2s_ct: exp_ct(4.0),
+                    exp_cov_3s_ct: exp_ct(9.0),
+                    n_nights,
+                    med_z2_at_norm: None,
+                    med_z2_ct_norm: None,
+                    n_z_at: 0,
+                    n_z_ct: 0,
+                    coverage_law_aware: p.law_aware,
+                    cov_1s_row: eqw_row(&p.row, |rc| &rc.j, 0),
+                    cov_2s_row: eqw_row(&p.row, |rc| &rc.j, 1),
+                    cov_3s_row: eqw_row(&p.row, |rc| &rc.j, 2),
+                    cov_1s_at_row: eqw_row(&p.row, |rc| &rc.at, 0),
+                    cov_2s_at_row: eqw_row(&p.row, |rc| &rc.at, 1),
+                    cov_3s_at_row: eqw_row(&p.row, |rc| &rc.at, 2),
+                    cov_1s_ct_row: eqw_row(&p.row, |rc| &rc.ct, 0),
+                    cov_2s_ct_row: eqw_row(&p.row, |rc| &rc.ct, 1),
+                    cov_3s_ct_row: eqw_row(&p.row, |rc| &rc.ct, 2),
+                    cov_1s_unc,
+                    cov_2s_unc: eqw_cov(&p.night_unc, 1),
+                    cov_3s_unc: eqw_cov(&p.night_unc, 2),
+                    cov_1s_at_unc,
+                    cov_2s_at_unc: eqw_cov(&p.night_at_unc, 1),
+                    cov_3s_at_unc: eqw_cov(&p.night_at_unc, 2),
+                    cov_1s_ct_unc,
+                    cov_2s_ct_unc: eqw_cov(&p.night_ct_unc, 1),
+                    cov_3s_ct_unc: eqw_cov(&p.night_ct_unc, 2),
+                    cov_2s_row_unc: eqw_row(&p.row_unc, |rc| &rc.j, 1),
+                    cov_2s_at_row_unc: eqw_row(&p.row_unc, |rc| &rc.at, 1),
+                    cov_2s_ct_row_unc: eqw_row(&p.row_unc, |rc| &rc.ct, 1),
+                    n_rows: p.n_rows,
+                    n_rows_pd: p.n_rows_pd,
+                    n_rows_unc: p.n_rows_unc,
+                    n_rows_pd_unc: p.n_rows_pd_unc,
+                    n_objects_all: p.night_unc.len() as u32,
+                    n_objects_trusted: p.night.len() as u32,
+                }
+            },
+        )
+        .collect();
+
     let cells: Vec<SurfaceCell> = cells
         .into_iter()
         .map(|((class, tool, config_arm, sigma_table, ai, di), acc)| {
@@ -1233,14 +1715,38 @@ fn aggregate(
                 .values()
                 .filter_map(|v| median(&mut v.clone()))
                 .collect();
-            let cov = |thr: f64| -> Option<f64> {
-                let per_obj: Vec<f64> = acc
-                    .per_object_d2
+            // Equal-weight-per-object inside-ellipse rate: per object the
+            // fraction of its nights with the statistic within the threshold,
+            // then the mean over objects. One form for the joint d² (|·| is a
+            // no-op since d² ≥ 0) and the signed directional z.
+            let cov_of = |m: &HashMap<String, Vec<f64>>, thr: f64| -> Option<f64> {
+                let per_obj: Vec<f64> = m
                     .values()
-                    .map(|v| v.iter().filter(|d| **d <= thr).count() as f64 / v.len() as f64)
+                    .map(|v| v.iter().filter(|x| x.abs() <= thr).count() as f64 / v.len() as f64)
                     .collect();
                 (!per_obj.is_empty()).then(|| per_obj.iter().sum::<f64>() / per_obj.len() as f64)
             };
+            // Equal-weight-per-object median of z² over χ²₁ median, with its n.
+            let med_z2 = |m: &HashMap<String, Vec<f64>>| -> (Option<f64>, u32) {
+                let mut meds: Vec<f64> = m
+                    .values()
+                    .filter_map(|v| median(&mut v.iter().map(|z| z * z).collect::<Vec<_>>()))
+                    .collect();
+                let n: u32 = m.values().map(|v| v.len() as u32).sum();
+                (median(&mut meds).map(|x| x / CHI2_1_MED), n)
+            };
+            let cov_1s = cov_of(&acc.per_object_d2, 1.0);
+            let cov_1s_at = cov_of(&acc.per_object_z_at, 1.0);
+            let cov_1s_ct = cov_of(&acc.per_object_z_ct, 1.0);
+            // Expected inside-ellipse fractions: the normal-law χ² CDFs, which
+            // are the night-joint reference exactly when the scoring law is
+            // normal (coverage_law_aware); otherwise the one stated fallback.
+            let exp_j = |thr: f64| cov_1s.map(|_| crate::predict_law::chi2_2_cdf(thr));
+            let exp_at = |thr: f64| cov_1s_at.map(|_| crate::predict_law::chi2_1_cdf(thr));
+            let exp_ct = |thr: f64| cov_1s_ct.map(|_| crate::predict_law::chi2_1_cdf(thr));
+            let (med_z2_at_norm, n_z_at) = med_z2(&acc.per_object_z_at);
+            let (med_z2_ct_norm, n_z_ct) = med_z2(&acc.per_object_z_ct);
+            let n_nights: u32 = acc.per_object_d2.values().map(|v| v.len() as u32).sum();
             let n_objects = acc
                 .per_object_sep
                 .keys()
@@ -1266,8 +1772,57 @@ fn aggregate(
                 },
                 med_sep_arcsec: median(&mut sep_meds),
                 med_d2_norm: median(&mut d2_meds).map(|m| m / LN2X2),
-                cov_1s: cov(1.0),
-                cov_2s: cov(4.0),
+                cov_1s,
+                cov_2s: cov_of(&acc.per_object_d2, 4.0),
+                cov_3s: cov_of(&acc.per_object_d2, 9.0),
+                cov_1s_at,
+                cov_2s_at: cov_of(&acc.per_object_z_at, 2.0),
+                cov_3s_at: cov_of(&acc.per_object_z_at, 3.0),
+                cov_1s_ct,
+                cov_2s_ct: cov_of(&acc.per_object_z_ct, 2.0),
+                cov_3s_ct: cov_of(&acc.per_object_z_ct, 3.0),
+                exp_cov_1s: exp_j(1.0),
+                exp_cov_2s: exp_j(4.0),
+                exp_cov_3s: exp_j(9.0),
+                exp_cov_1s_at: exp_at(1.0),
+                exp_cov_2s_at: exp_at(4.0),
+                exp_cov_3s_at: exp_at(9.0),
+                exp_cov_1s_ct: exp_ct(1.0),
+                exp_cov_2s_ct: exp_ct(4.0),
+                exp_cov_3s_ct: exp_ct(9.0),
+                n_nights,
+                med_z2_at_norm,
+                med_z2_ct_norm,
+                n_z_at,
+                n_z_ct,
+                coverage_law_aware: acc.law_aware,
+                cov_1s_row: eqw_row(&acc.per_object_row, |rc| &rc.j, 0),
+                cov_2s_row: eqw_row(&acc.per_object_row, |rc| &rc.j, 1),
+                cov_3s_row: eqw_row(&acc.per_object_row, |rc| &rc.j, 2),
+                cov_1s_at_row: eqw_row(&acc.per_object_row, |rc| &rc.at, 0),
+                cov_2s_at_row: eqw_row(&acc.per_object_row, |rc| &rc.at, 1),
+                cov_3s_at_row: eqw_row(&acc.per_object_row, |rc| &rc.at, 2),
+                cov_1s_ct_row: eqw_row(&acc.per_object_row, |rc| &rc.ct, 0),
+                cov_2s_ct_row: eqw_row(&acc.per_object_row, |rc| &rc.ct, 1),
+                cov_3s_ct_row: eqw_row(&acc.per_object_row, |rc| &rc.ct, 2),
+                cov_1s_unc: eqw_cov(&acc.per_object_d2_unc, 0),
+                cov_2s_unc: eqw_cov(&acc.per_object_d2_unc, 1),
+                cov_3s_unc: eqw_cov(&acc.per_object_d2_unc, 2),
+                cov_1s_at_unc: eqw_cov(&acc.per_object_zat_unc, 0),
+                cov_2s_at_unc: eqw_cov(&acc.per_object_zat_unc, 1),
+                cov_3s_at_unc: eqw_cov(&acc.per_object_zat_unc, 2),
+                cov_1s_ct_unc: eqw_cov(&acc.per_object_zct_unc, 0),
+                cov_2s_ct_unc: eqw_cov(&acc.per_object_zct_unc, 1),
+                cov_3s_ct_unc: eqw_cov(&acc.per_object_zct_unc, 2),
+                cov_2s_row_unc: eqw_row(&acc.per_object_row_unc, |rc| &rc.j, 1),
+                cov_2s_at_row_unc: eqw_row(&acc.per_object_row_unc, |rc| &rc.at, 1),
+                cov_2s_ct_row_unc: eqw_row(&acc.per_object_row_unc, |rc| &rc.ct, 1),
+                n_rows: acc.n_rows,
+                n_rows_pd: acc.n_rows_pd,
+                n_rows_unc: acc.n_rows_unc,
+                n_rows_pd_unc: acc.n_rows_pd_unc,
+                n_objects_all: acc.per_object_d2_unc.len() as u32,
+                n_objects_trusted: acc.per_object_d2.len() as u32,
             }
         })
         .collect();
@@ -1296,6 +1851,20 @@ fn aggregate(
                 flag_counts: Default::default(),
                 trust_reasons: Default::default(),
                 med_sep_arcsec: None,
+                cov_1s: None,
+                cov_2s: None,
+                cov_3s: None,
+                cov_1s_at: None,
+                cov_2s_at: None,
+                cov_3s_at: None,
+                cov_1s_ct: None,
+                cov_2s_ct: None,
+                cov_3s_ct: None,
+                n_nights: 0,
+                med_z2_at_norm: None,
+                med_z2_ct_norm: None,
+                n_z_at: 0,
+                n_z_ct: 0,
             });
         s.n_windows_expected += 1;
         if w.converged {
@@ -1329,7 +1898,7 @@ fn aggregate(
             }
         }
     }
-    let nights_incl = night_stats_with(manifest, scored, sp_matrices, true);
+    let nights_incl = &nights_unc;
     let mut per_obj_sep: HashMap<(String, String, String), Vec<f64>> = HashMap::new();
     for s in scored {
         if !s.in_sample && s.flags.is_empty() {
@@ -1350,6 +1919,33 @@ fn aggregate(
         if let Some(stats) = nights.get(&(key.1.clone(), key.2.clone(), key.0.clone())) {
             let mut d2s: Vec<f64> = stats.iter().map(|st| st.d2).collect();
             sum.med_d2_norm = median(&mut d2s).map(|m| m / LN2X2);
+            // Per-object night-joint coverage and directional realism — the
+            // object's own inside-ellipse rate over its nights.
+            let frac = |thr: f64, xs: &[f64]| {
+                xs.iter().filter(|x| x.abs() <= thr).count() as f64 / xs.len() as f64
+            };
+            sum.n_nights = d2s.len() as u32;
+            sum.cov_1s = Some(frac(1.0, &d2s));
+            sum.cov_2s = Some(frac(4.0, &d2s));
+            sum.cov_3s = Some(frac(9.0, &d2s));
+            let zat: Vec<f64> = stats.iter().filter_map(|st| st.z_at).collect();
+            let zct: Vec<f64> = stats.iter().filter_map(|st| st.z_ct).collect();
+            if !zat.is_empty() {
+                sum.cov_1s_at = Some(frac(1.0, &zat));
+                sum.cov_2s_at = Some(frac(2.0, &zat));
+                sum.cov_3s_at = Some(frac(3.0, &zat));
+                sum.n_z_at = zat.len() as u32;
+                sum.med_z2_at_norm = median(&mut zat.iter().map(|z| z * z).collect::<Vec<_>>())
+                    .map(|m| m / CHI2_1_MED);
+            }
+            if !zct.is_empty() {
+                sum.cov_1s_ct = Some(frac(1.0, &zct));
+                sum.cov_2s_ct = Some(frac(2.0, &zct));
+                sum.cov_3s_ct = Some(frac(3.0, &zct));
+                sum.n_z_ct = zct.len() as u32;
+                sum.med_z2_ct_norm = median(&mut zct.iter().map(|z| z * z).collect::<Vec<_>>())
+                    .map(|m| m / CHI2_1_MED);
+            }
         }
     }
 
@@ -1638,7 +2234,9 @@ fn aggregate(
 
     PredictAggregates {
         snapshot_id: manifest.snapshot_id.clone(),
+        profile: derive_profile(manifest, windows),
         cells,
+        coverage_cells,
         per_object: summaries.into_values().collect(),
         d2_histograms,
         per_window,
@@ -1646,6 +2244,51 @@ fn aggregate(
         per_window_note,
         calibration,
         calibration_note,
+    }
+}
+
+/// The profile a walk was scored under, derived from the window manifest and
+/// the windows the tool actually attempted: the most specific profile
+/// (`ladder` > `ci` > `full`) that every attempted window is a member of. A
+/// `full` run attempts windows outside the `ci` / `ladder` subsets, so their
+/// shared membership collapses to `full`; a `ci` run attempts only `ci` members
+/// and so on. Returns `"unstated"` when no window was attempted or the attempted
+/// set shares no common profile — the honest marked state, never a guess.
+fn derive_profile(manifest: &WindowManifest, windows: &[WalkWindowRecord]) -> String {
+    use crate::predict_schema::profiles;
+    let mut spec_profiles: HashMap<(&str, u32), &[String]> = HashMap::new();
+    for o in &manifest.objects {
+        for w in &o.windows {
+            spec_profiles.insert((o.object.as_str(), w.index), w.profiles.as_slice());
+        }
+    }
+    // Intersect the profile memberships over every attempted (object, window).
+    let mut common: Option<BTreeSet<&str>> = None;
+    for rec in windows {
+        let Some(profs) = spec_profiles.get(&(rec.object.as_str(), rec.window_index)) else {
+            continue;
+        };
+        let set: BTreeSet<&str> = profs.iter().map(String::as_str).collect();
+        common = Some(match common {
+            None => set,
+            Some(acc) => acc.intersection(&set).copied().collect(),
+        });
+    }
+    match common {
+        Some(set) if !set.is_empty() => {
+            for name in [profiles::LADDER, profiles::CI, profiles::FULL] {
+                if set.contains(name) {
+                    return name.to_string();
+                }
+            }
+            // A common profile exists but is none of the known names: name it
+            // rather than guess (the first alphabetically, deterministically).
+            set.iter()
+                .next()
+                .map(|s| s.to_string())
+                .unwrap_or_else(default_profile)
+        }
+        _ => default_profile(),
     }
 }
 
@@ -1764,6 +2407,10 @@ struct CalRow {
     pit: f64,
     d2: f64,
     expected_coverage: [f64; 3],
+    /// Directional squared z (along, cross) through the shared PA — `None` when
+    /// the row carried no shared-PA directional residual.
+    z_at2: Option<f64>,
+    z_ct2: Option<f64>,
 }
 
 /// The stratum a [`CalibrationCell`] summarizes.
@@ -1836,6 +2483,8 @@ fn calibration_cells(
             pit,
             d2,
             expected_coverage: ecov,
+            z_at2: s.z_at.map(|z| z * z),
+            z_ct2: s.z_ct.map(|z| z * z),
         });
     }
 
@@ -1984,6 +2633,25 @@ fn calibration_cells(
         let obs = |c: f64| rr.iter().filter(|r| r.d2 <= c).count() as f64 / n_cov as f64;
         let exp = |k: usize| rr.iter().map(|r| r.expected_coverage[k]).sum::<f64>() / n_cov as f64;
 
+        // Per-direction coverage over the rows carrying a shared-PA residual:
+        // observed z² ≤ 1, 4, 9 and the normal-law χ²₁ expected, plus the
+        // per-direction normalized realism median(z²)/χ²₁-median.
+        let dir_rows = |pick: fn(&&CalRow) -> Option<f64>| -> Vec<f64> {
+            rr.iter().filter_map(pick).collect()
+        };
+        let z_at2: Vec<f64> = dir_rows(|r| r.z_at2);
+        let z_ct2: Vec<f64> = dir_rows(|r| r.z_ct2);
+        let dir_obs = |xs: &[f64], c: f64| -> Option<f64> {
+            (!xs.is_empty())
+                .then(|| xs.iter().filter(|x| **x <= c).count() as f64 / xs.len() as f64)
+        };
+        let dir_med = |xs: &[f64]| -> Option<f64> {
+            median(&mut xs.to_vec()).map(|m| m / crate::predict_law::CHI2_1_MEDIAN)
+        };
+        let dir_exp = |xs: &[f64], c: f64| -> Option<f64> {
+            (!xs.is_empty()).then(|| crate::predict_law::chi2_1_cdf(c))
+        };
+
         let (arc_lo_days, arc_hi_days, dt_lo_days, dt_hi_days, trace_band, stratum_tag) =
             match stratum {
                 Stratum::Overall => (None, None, None, None, None, calibration_strata::OVERALL),
@@ -2039,6 +2707,19 @@ fn calibration_cells(
             cov_exp_4: Some(exp(1)),
             cov_exp_9: Some(exp(2)),
             n_cov,
+            cov_obs_1_at: dir_obs(&z_at2, COV_C[0]),
+            cov_obs_4_at: dir_obs(&z_at2, COV_C[1]),
+            cov_obs_9_at: dir_obs(&z_at2, COV_C[2]),
+            cov_obs_1_ct: dir_obs(&z_ct2, COV_C[0]),
+            cov_obs_4_ct: dir_obs(&z_ct2, COV_C[1]),
+            cov_obs_9_ct: dir_obs(&z_ct2, COV_C[2]),
+            cov_exp_1_dir: dir_exp(&z_at2, COV_C[0]).or_else(|| dir_exp(&z_ct2, COV_C[0])),
+            cov_exp_4_dir: dir_exp(&z_at2, COV_C[1]).or_else(|| dir_exp(&z_ct2, COV_C[1])),
+            cov_exp_9_dir: dir_exp(&z_at2, COV_C[2]).or_else(|| dir_exp(&z_ct2, COV_C[2])),
+            med_z2_at_norm: dir_med(&z_at2),
+            med_z2_ct_norm: dir_med(&z_ct2),
+            n_cov_at: z_at2.len() as u32,
+            n_cov_ct: z_ct2.len() as u32,
         });
     }
     out
@@ -2255,6 +2936,268 @@ mod tests {
             captured: None,
             covariance_provenance: None,
         }
+    }
+
+    // ── Part 4.2A coverage v2: arc split, trust-unconditioned, per-row ──────
+
+    /// One NEA object with the given windows, each `(window_index, arc_days,
+    /// target_nights)`; every target is held out at a 5-day horizon (one dt
+    /// bin), one observation per (window, night).
+    fn cov_manifest(windows: &[(u32, f64, &[i64])]) -> WindowManifest {
+        let (ra0, dec0) = (100.0_f64, 20.0_f64);
+        let mut observations: Vec<ObsEntry> = Vec::new();
+        let mut specs: Vec<WindowSpec> = Vec::new();
+        let mut obs_idx = 0u32;
+        for &(wi, arc_days, nights) in windows {
+            let mut targets = Vec::new();
+            for &night in nights {
+                // A faint RA jitter keeps every observation's key_hash distinct
+                // while they share a night when needed.
+                observations.push(obs(ra0 + f64::from(obs_idx) * 1e-6, dec0, night, 0.1));
+                targets.push(TargetSpec {
+                    obs_idx,
+                    rung: "next".into(),
+                    horizon_days: 5.0,
+                });
+                obs_idx += 1;
+            }
+            specs.push(WindowSpec {
+                index: wi,
+                cut_night: 59050 + i64::from(wi),
+                cut_utc: "2020-08-19T00:00:00Z".into(),
+                cut_mjd_tt: 59050.0008,
+                cut_mjd_tdb: 59050.0008,
+                intra_night: false,
+                profiles: vec!["full".into()],
+                n_obs_fit: 10,
+                last_fit_obs_idx: 0,
+                arc_days,
+                targets,
+                in_sample: vec![],
+                seed: None,
+            });
+        }
+        let n = observations.len() as u32;
+        WindowManifest {
+            schema_version: crate::predict_schema::MANIFEST_SCHEMA_VERSION,
+            snapshot_id: "test-snap".into(),
+            bundle_nights: 1,
+            generated_by: "test".into(),
+            ladder_days: vec![7.0],
+            ladder_tolerance: 0.5,
+            min_horizon_days: 0.3,
+            max_obs_per_night: 12,
+            objects: vec![ObjectWindows {
+                object: "TestObj".into(),
+                mpc_designation: "T1".into(),
+                population: "NEO".into(),
+                class: classes::NEA.into(),
+                eligible: true,
+                ineligible_reason: None,
+                first_night: 59000,
+                apparition_end_night: 59300,
+                n_obs_total: n,
+                n_excluded_space_based: 0,
+                observations,
+                windows: specs,
+            }],
+        }
+    }
+
+    /// A prediction placed `resid_e` arcsec West of its observation (so the
+    /// gnomonic residual is `resid_e` arcsec East), with predicted covariance
+    /// `sp` (arcsec²).
+    fn cov_pred(
+        m: &WindowManifest,
+        obs_idx: u32,
+        window_index: u32,
+        resid_e: f64,
+        sp: Mat2,
+    ) -> PredictedObservation {
+        let e = &m.objects[0].observations[obs_idx as usize];
+        let cosd = e.dec_deg.to_radians().cos();
+        PredictedObservation {
+            object: "TestObj".into(),
+            tool: "rust".into(),
+            config_arm: "default".into(),
+            window_index,
+            obs_idx,
+            key_hash: e.key_hash,
+            in_sample: false,
+            ra_deg: e.ra_deg - resid_e * ARCSEC2DEG / cosd,
+            dec_deg: e.dec_deg,
+            epoch_scale_used: "tdb".into(),
+            uncertainty_form: uncertainty_forms::RADEC_2X2.into(),
+            cov_radec: Some(sp),
+            cov_units: Some("arcsec2".into()),
+            cov_basis: Some("great_circle".into()),
+            sigma1_arcsec: None,
+            sigma1_pa_deg: None,
+            pa_motion_deg: Some(90.0),
+            sky_rate_deg_day: Some(0.5),
+        }
+    }
+
+    fn cov_window(window_index: u32, trust: Option<&str>) -> WalkWindowRecord {
+        let mut w = window_record("rust", "default", Some(1.0));
+        w.window_index = window_index;
+        w.covariance_trust = trust.map(Into::into);
+        w
+    }
+
+    /// (i) A window the engine flagged as low-trust stays in the headline
+    /// (trust-unconditioned) coverage, with its object counted in
+    /// `n_objects_all`, but drops out of the trust-gated figure and
+    /// `n_objects_trusted`. The difference is exactly the trust gate.
+    #[test]
+    fn trust_gate_drops_a_window_from_the_gated_figure_but_not_the_headline() {
+        let m = cov_manifest(&[(0, 5.0, &[59060, 59067])]);
+        let sp: Mat2 = [[4.0, 0.0], [0.0, 4.0]]; // Σ_pred ≫ Σ_obs: prediction-dominated
+        let preds: Vec<PredictedObservation> = (0..2)
+            .map(|i| cov_pred(&m, i, 0, 1.0, sp)) // 1″ residual: inside 2σ
+            .collect();
+        let windows = vec![cov_window(
+            0,
+            Some("WeaklyDeterminedHighN { solved_width: 9 }"),
+        )];
+        let (scored, spm, ec) = score_all(&m, &preds, &windows, &opts()).unwrap();
+        let agg = aggregate(&m, &scored, &windows, &spm, &ec, &opts());
+        // The fine cell for the short-arc window (arc 5 d → [3,10), dt 5 d → [3,10)).
+        let c = agg
+            .cells
+            .iter()
+            .find(|c| c.arc_lo_days == 3.0 && c.dt_lo_days == 3.0)
+            .expect("the flagged window's cell");
+        assert!(
+            c.cov_2s.is_none(),
+            "a fully trust-flagged cell has no gated coverage"
+        );
+        assert_eq!(
+            c.cov_2s_unc,
+            Some(1.0),
+            "the trust-unconditioned headline keeps the flagged window"
+        );
+        assert_eq!(c.n_objects_trusted, 0);
+        assert_eq!(c.n_objects_all, 1);
+        // The pooled 4.2A short-arc row carries the same split.
+        let p = agg
+            .coverage_cells
+            .iter()
+            .find(|c| c.arc_hi_days == COVERAGE_ARC_SPLIT_DAYS && c.dt_lo_days == 3.0)
+            .expect("the pooled short-arc coverage row");
+        assert!(p.cov_2s.is_none());
+        assert_eq!(p.cov_2s_unc, Some(1.0));
+        assert_eq!(p.n_objects_all, 1);
+        assert_eq!(p.n_objects_trusted, 0);
+        // The Σ_pred-dominated share the 4.2A matrix hatches on must read the
+        // SAME (unconditioned) rows as the cell value it gates. Both nights are
+        // Σ_pred-dominated and carry only the trust verdict, so the gated pair
+        // is empty (a self-flagged cell read 0 % share under the gated count and
+        // hatched despite a real cov_2s_unc) while the unconditioned pair holds
+        // both rows — the share now matches the number shown.
+        assert_eq!(
+            (p.n_rows, p.n_rows_pd),
+            (0, 0),
+            "the gated share excludes the fully trust-flagged rows"
+        );
+        assert_eq!(
+            (p.n_rows_unc, p.n_rows_pd_unc),
+            (2, 2),
+            "the unconditioned share keeps them, matching cov_2s_unc"
+        );
+    }
+
+    /// (ii)+(iii) Two short-arc windows and one long-arc window of one object
+    /// land in the right coverage rows; the pooled short-arc rate is a true
+    /// per-object pool across the two arc bins (2 inside of 6 nights = 1/3),
+    /// not the median of the two fine-cell rates (1.0 and 0.0).
+    #[test]
+    fn coverage_rows_split_by_arc_and_pool_per_object_not_by_median() {
+        let sp: Mat2 = [[4.0, 0.0], [0.0, 4.0]];
+        // W0 short arc 5 d: 2 nights, 1″ residual (inside 2σ).
+        // W1 short arc 15 d: 4 nights, 5″ residual (outside 2σ, inside 3σ).
+        // W2 long arc 100 d: 2 nights, 1″ residual (inside).
+        let m = cov_manifest(&[
+            (0, 5.0, &[59060, 59067]),
+            (1, 15.0, &[59074, 59081, 59088, 59095]),
+            (2, 100.0, &[59200, 59207]),
+        ]);
+        let mut preds: Vec<PredictedObservation> = Vec::new();
+        for i in 0..2 {
+            preds.push(cov_pred(&m, i, 0, 1.0, sp));
+        }
+        for i in 2..6 {
+            preds.push(cov_pred(&m, i, 1, 5.0, sp));
+        }
+        for i in 6..8 {
+            preds.push(cov_pred(&m, i, 2, 1.0, sp));
+        }
+        let windows = vec![
+            cov_window(0, None),
+            cov_window(1, None),
+            cov_window(2, None),
+        ];
+        let (scored, spm, ec) = score_all(&m, &preds, &windows, &opts()).unwrap();
+        let agg = aggregate(&m, &scored, &windows, &spm, &ec, &opts());
+        // Fine cells: W0 [3,10) = 1.0, W1 [10,30) = 0.0 — both short-arc.
+        let fine = |alo: f64| {
+            agg.cells
+                .iter()
+                .find(|c| c.arc_lo_days == alo && c.dt_lo_days == 3.0)
+                .and_then(|c| c.cov_2s_unc)
+        };
+        assert_eq!(fine(3.0), Some(1.0));
+        assert_eq!(fine(10.0), Some(0.0));
+        // (ii) the object shows up in a short-arc AND a long-arc pooled row.
+        let short = agg
+            .coverage_cells
+            .iter()
+            .find(|c| c.arc_hi_days == COVERAGE_ARC_SPLIT_DAYS && c.dt_lo_days == 3.0)
+            .expect("short-arc row");
+        let long = agg
+            .coverage_cells
+            .iter()
+            .find(|c| c.arc_lo_days == COVERAGE_ARC_SPLIT_DAYS && c.dt_lo_days == 3.0)
+            .expect("long-arc row");
+        assert_eq!(short.n_objects_all, 1);
+        assert_eq!(long.n_objects_all, 1);
+        assert_eq!(long.cov_2s_unc, Some(1.0), "the long-arc window is inside");
+        // (iii) pooled = 2 inside of 6 nights = 1/3, not median([1.0, 0.0]).
+        let pooled = short.cov_2s_unc.expect("pooled short-arc rate");
+        assert!(
+            (pooled - 1.0 / 3.0).abs() < 1e-9,
+            "pooled per-object rate was {pooled}, expected 1/3"
+        );
+        assert!(pooled != 1.0 && pooled != 0.0 && (pooled - 0.5).abs() > 1e-9);
+    }
+
+    /// (iv) On a night carrying several held-out rows the per-row and
+    /// night-joint 2σ coverage differ: the night-joint divides the night's
+    /// measurement noise by the row count, tightening its ellipse, so a
+    /// residual inside every row's 2σ can fall outside the night-joint 2σ.
+    #[test]
+    fn row_level_and_night_joint_coverage_differ_when_a_night_has_several_rows() {
+        let entries: Vec<ObsEntry> = (0..6)
+            .map(|i| obs(100.0 + f64::from(i) * 1e-6, 20.0, 59060, 1.0))
+            .collect();
+        let m = manifest(entries);
+        let sp: Mat2 = [[1.2, 0.0], [0.0, 1.2]]; // tr Σ_pred 2.4 > tr Σ_obs 2.0
+        let preds: Vec<PredictedObservation> =
+            (0..6).map(|i| cov_pred(&m, i, 0, 2.6, sp)).collect();
+        let windows = vec![cov_window(0, None)];
+        let (scored, spm, ec) = score_all(&m, &preds, &windows, &opts()).unwrap();
+        let agg = aggregate(&m, &scored, &windows, &spm, &ec, &opts());
+        // arc 50 d → [30,100); dt 5 d → [3,10).
+        let c = agg
+            .cells
+            .iter()
+            .find(|c| c.arc_lo_days == 30.0 && c.dt_lo_days == 3.0)
+            .expect("the cell");
+        // Per-row d² ≈ 3.07 (inside 2σ for all six); night-joint d² ≈ 4.95
+        // (outside), so the one night is outside while every row is inside.
+        assert_eq!(c.cov_2s_row, Some(1.0), "every row is inside 2σ");
+        assert_eq!(c.cov_2s, Some(0.0), "the one night is outside 2σ");
+        assert!(c.cov_2s != c.cov_2s_row);
     }
 
     /// `own` reads the fit's recorded law; a normal fit resolves to the χ²₂
@@ -2846,6 +3789,103 @@ mod tests {
         assert!((s.resid_ct_arcsec.unwrap() - 2.0).abs() < 1e-5);
     }
 
+    /// z_at and z_ct are the residual on the along/cross unit vector over the
+    /// square root of the combined covariance projected on it, through the one
+    /// shared PA. With a diagonal Σ and PA = 90° (along-track = East), z_at is
+    /// the East residual over σ_east and z_ct the North over σ_north; rotating
+    /// the PA by 90° swaps the two directions.
+    #[test]
+    fn z_at_and_z_ct_through_shared_pa_swap_under_rotation() {
+        // The ≤ boundary is pinned directly on the helper (no gnomonic epsilon).
+        assert_eq!(inside_flags(1.0), [true, true, true]);
+        assert_eq!(inside_flags(4.0), [false, true, true]);
+        assert_eq!(inside_flags(9.0 + 1e-9), [false, false, false]);
+
+        let cosd = 20.0_f64.to_radians().cos();
+        // r = (1″ E, 1″ N); Σ_obs = 0.09″² isotropic; Σ_pred = diag(0.07, 3.91)
+        // ⇒ C = diag(0.16, 4.0). z_at = 1/√0.16 = 2.5, z_ct = 1/√4 = 0.5.
+        let entries = vec![obs(
+            100.0 + ARCSEC2DEG / cosd,
+            20.0 + ARCSEC2DEG,
+            59_060,
+            0.3,
+        )];
+        let m = manifest(entries);
+        let p = prediction(&m, 0, 100.0, 20.0, Some([[0.07, 0.0], [0.0, 3.91]]));
+        let (scored, _, _) = score_all(&m, std::slice::from_ref(&p), &[], &opts()).unwrap();
+        let s = &scored[0];
+        assert!((s.pa_shared_deg.unwrap() - 90.0).abs() < 1e-9);
+        assert!((s.z_at.unwrap() - 2.5).abs() < 1e-4, "z_at {:?}", s.z_at);
+        assert!((s.z_ct.unwrap() - 0.5).abs() < 1e-4, "z_ct {:?}", s.z_ct);
+        // Flags: z_at² = 6.25 ⇒ inside_at = [F, F, T]; z_ct² = 0.25 ⇒ [T, T, T];
+        // d² = 1/0.16 + 1/4 = 6.5 ⇒ inside_joint = [F, F, T].
+        assert_eq!(s.inside_at.unwrap(), [false, false, true]);
+        assert_eq!(s.inside_ct.unwrap(), [true, true, true]);
+        assert_eq!(s.inside_joint.unwrap(), [false, false, true]);
+        assert!(s.coverage_law_aware);
+
+        // Rotate the shared PA to 180°: along-track becomes −North, cross-track
+        // +East, so the magnitudes swap (|z_at| 2.5→0.5, |z_ct| 0.5→2.5).
+        let mut p2 = prediction(&m, 0, 100.0, 20.0, Some([[0.07, 0.0], [0.0, 3.91]]));
+        p2.pa_motion_deg = Some(180.0);
+        let (scored2, _, _) = score_all(&m, &[p2], &[], &opts()).unwrap();
+        let s2 = &scored2[0];
+        assert!(
+            (s2.z_at.unwrap().abs() - 0.5).abs() < 1e-4,
+            "z_at {:?}",
+            s2.z_at
+        );
+        assert!(
+            (s2.z_ct.unwrap().abs() - 2.5).abs() < 1e-4,
+            "z_ct {:?}",
+            s2.z_ct
+        );
+    }
+
+    /// A residual within the 1σ ellipse (d² = 0.81) flags inside_1s and
+    /// inside_2s true; the per-row expected fractions are the law-aware normal
+    /// constants.
+    #[test]
+    fn inside_ellipse_flags_within_the_one_sigma_ellipse() {
+        let cosd = 20.0_f64.to_radians().cos();
+        // r = (0.45″ E, 0); Σ_obs = 0.09″², Σ_pred = 0.16″² ⇒ C = 0.25″² isotropic
+        // ⇒ d² = 0.2025/0.25 = 0.81 (within the 1σ ellipse). z_at = 0.9, z_ct = 0.
+        let entries = vec![obs(100.0 + 0.45 * ARCSEC2DEG / cosd, 20.0, 59_060, 0.3)];
+        let m = manifest(entries);
+        let p = prediction(&m, 0, 100.0, 20.0, Some([[0.16, 0.0], [0.0, 0.16]]));
+        let (scored, _, exp_cov) = score_all(&m, std::slice::from_ref(&p), &[], &opts()).unwrap();
+        let s = &scored[0];
+        assert!((s.d2_combined.unwrap() - 0.81).abs() < 1e-4);
+        let [in1, in2, in3] = s.inside_joint.unwrap();
+        assert!(
+            in1 && in2 && in3,
+            "within the 1σ ellipse is inside 1σ/2σ/3σ"
+        );
+        assert_eq!(s.inside_at.unwrap(), [true, true, true]);
+        // The flags' expected values are the law-aware (normal) constants: the
+        // joint χ²₂ CDF for the ellipse, the χ²₁ CDF for the directions.
+        let key = (
+            "rust".to_string(),
+            "default".to_string(),
+            "TestObj".to_string(),
+            0u32,
+            0u32,
+        );
+        let e = exp_cov[&key];
+        for (got, want) in e.iter().zip([0.393469, 0.864665, 0.988891]) {
+            assert!((got - want).abs() < 1e-6, "joint exp {got} vs {want}");
+        }
+        assert_eq!(
+            [
+                crate::predict_law::chi2_1_cdf(1.0),
+                crate::predict_law::chi2_1_cdf(4.0),
+                crate::predict_law::chi2_1_cdf(9.0),
+            ]
+            .map(|v| (v * 1e4).round()),
+            [6827.0, 9545.0, 9973.0]
+        );
+    }
+
     #[test]
     fn non_psd_covariance_flags() {
         let entries = vec![obs(100.0, 20.0, 59060, 0.3)];
@@ -2909,6 +3949,77 @@ mod tests {
             (d2 - 1.0 / 1.5).abs() < 1e-6,
             "night d² = {d2}, want 0.6667"
         );
+    }
+
+    /// The coverage family on a hand-computed scored set: four nights (one obs
+    /// each, so night-joint = per-obs), PA 90 (along-track = East), isotropic
+    /// C = diag(0.25, 0.25). East residuals [0.25, 0.45, 0.75, 1.25]″ give
+    /// z_at = 2·east = [0.5, 0.9, 1.5, 2.5], z_ct = 0, and d² = z_at² =
+    /// [0.25, 0.81, 2.25, 6.25]. The surface cell and per-object summary carry
+    /// equal-weight-per-object inside-ellipse rates and median(z²)/χ²₁-median.
+    #[test]
+    fn aggregate_coverage_family_hand_computed() {
+        let cosd = 20.0_f64.to_radians().cos();
+        let easts = [0.25_f64, 0.45, 0.75, 1.25];
+        let entries: Vec<_> = easts
+            .iter()
+            .enumerate()
+            .map(|(i, &e)| obs(100.0 + e * ARCSEC2DEG / cosd, 20.0, 59_060 + i as i64, 0.3))
+            .collect();
+        let m = manifest(entries);
+        let preds: Vec<_> = (0..4)
+            .map(|i| prediction(&m, i, 100.0, 20.0, Some([[0.16, 0.0], [0.0, 0.16]])))
+            .collect();
+        let windows = vec![window_record("rust", "default", None)];
+        let (scored, sp, exp_cov) = score_all(&m, &preds, &windows, &opts()).unwrap();
+        let agg = aggregate(&m, &scored, &windows, &sp, &exp_cov, &opts());
+
+        let cell = agg
+            .cells
+            .iter()
+            .find(|c| c.tool == "rust" && c.config_arm == "default")
+            .expect("one surface cell");
+        let close = |a: Option<f64>, b: f64| (a.unwrap() - b).abs() < 1e-6;
+        assert_eq!(cell.n_nights, 4);
+        // Joint d² ≤ 1, 4, 9: 2/4, 3/4, 4/4.
+        assert!(close(cell.cov_1s, 0.5) && close(cell.cov_2s, 0.75) && close(cell.cov_3s, 1.0));
+        // Along-track |z| ≤ 1, 2, 3: 2/4, 3/4, 4/4.
+        assert!(
+            close(cell.cov_1s_at, 0.5) && close(cell.cov_2s_at, 0.75) && close(cell.cov_3s_at, 1.0)
+        );
+        // Cross-track z is identically zero ⇒ every band covered.
+        assert!(
+            close(cell.cov_1s_ct, 1.0) && close(cell.cov_2s_ct, 1.0) && close(cell.cov_3s_ct, 1.0)
+        );
+        assert_eq!((cell.n_z_at, cell.n_z_ct), (4, 4));
+        // Median z² is the upper-middle (median() takes values[len/2]) = 2.25.
+        assert!(close(
+            cell.med_z2_at_norm,
+            2.25 / crate::predict_law::CHI2_1_MEDIAN
+        ));
+        // Cross-track residual is zero up to gnomonic second order ⇒ ≈ 0.
+        assert!(cell.med_z2_ct_norm.unwrap().abs() < 1e-6);
+        assert!(close(
+            cell.med_d2_norm,
+            2.25 / crate::predict_law::CHI2_2_MEDIAN
+        ));
+        // Law-aware expected fractions: the normal χ² constants.
+        assert!(cell.coverage_law_aware);
+        assert!(close(cell.exp_cov_1s, 0.393469) && close(cell.exp_cov_2s, 0.864665));
+        assert!(close(cell.exp_cov_2s_at, 0.954500) && close(cell.exp_cov_3s_ct, 0.997300));
+
+        // The per-object summary carries the same per-object family.
+        let po = agg
+            .per_object
+            .iter()
+            .find(|p| p.object == "TestObj")
+            .expect("one object summary");
+        assert_eq!(po.n_nights, 4);
+        assert!(close(po.cov_1s, 0.5) && close(po.cov_2s, 0.75));
+        assert!(close(
+            po.med_z2_at_norm,
+            2.25 / crate::predict_law::CHI2_1_MEDIAN
+        ));
     }
 
     #[test]
