@@ -301,6 +301,15 @@ struct ReportArgs {
     /// Use `ci-check` to gate a CI workflow on the contents.
     #[arg(long)]
     summary: Option<PathBuf>,
+    /// Walk-forward predictive-power aggregate(s) (`score-predictions
+    /// --out-agg`), for Part 4.2. Repeat the flag or comma-separate.
+    ///
+    /// Multiple files are treated as disjoint shards of ONE walk and are merged
+    /// by concatenating their families; shards whose `snapshot_id` differ are
+    /// refused rather than pooled. Aggregates only — the per-prediction JSONL
+    /// stays off the page; only the per-object timeline travels, as a sidecar.
+    #[arg(long, value_delimiter = ',')]
+    predict_agg: Vec<PathBuf>,
 }
 
 #[derive(Parser, Debug)]
@@ -1854,11 +1863,35 @@ fn report(args: ReportArgs) -> Result<(), Box<dyn std::error::Error>> {
                 .into(),
         );
     }
+    // Load and merge the walk-forward predictive-power aggregates (Part 4.2).
+    let mut aggregates: Vec<empyrean_validation::predict_schema::PredictAggregates> = Vec::new();
+    for path in &args.predict_agg {
+        let raw =
+            std::fs::read_to_string(path).map_err(|e| format!("read {}: {e}", path.display()))?;
+        let agg: empyrean_validation::predict_schema::PredictAggregates =
+            serde_json::from_str(&raw).map_err(|e| format!("parse {}: {e}", path.display()))?;
+        eprintln!(
+            "Loaded {} surface cells, {} per-object summaries, {} walk timelines, {} reduced-χ² \
+             histograms and {} calibration cells from {} (snapshot {}, profile {})",
+            agg.cells.len(),
+            agg.per_object.len(),
+            agg.per_window.len(),
+            agg.reduced_chi2.len(),
+            agg.calibration.len(),
+            path.display(),
+            agg.snapshot_id,
+            agg.profile,
+        );
+        aggregates.push(agg);
+    }
+    let predict_agg = empyrean_validation::report::merge_predict_aggregates(aggregates)?;
+
     generate_report(
         &all,
         &orbit_comparisons,
         &args.output,
         args.summary.as_deref(),
+        predict_agg.as_ref(),
     )
     .map_err(|e| format!("report: {e}"))?;
     eprintln!("Wrote report to {}", args.output.display());
@@ -2716,6 +2749,7 @@ mod tests {
             results: vec![results],
             output: dir.path().join("report.html"),
             summary: None,
+            predict_agg: vec![],
         })
         .expect_err("absent sidecar must fail");
         let msg = err.to_string();
@@ -2737,6 +2771,7 @@ mod tests {
             results: vec![results],
             output: dir.path().join("report.html"),
             summary: None,
+            predict_agg: vec![],
         })
         .expect("staged sidecar");
     }
@@ -2755,6 +2790,7 @@ mod tests {
             results: vec![results],
             output: dir.path().join("report.html"),
             summary: None,
+            predict_agg: vec![],
         })
         .expect("prop-only run needs no sidecar");
     }

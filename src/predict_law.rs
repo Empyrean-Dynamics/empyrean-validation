@@ -90,8 +90,23 @@ use hyperjet::statistics::ln_gamma;
 pub type Mat2 = [[f64; 2]; 2];
 
 /// The three squared-Mahalanobis thresholds coverage is reported at
-/// (\\( d^2 \le 1, 4, 9 \\) — the 1σ, 2σ, 3σ ellipse radii).
+/// (\\( d^2 \le 1, 4, 9 \\) — the 1σ, 2σ, 3σ ellipse radii). The same three
+/// thresholds serve the 1-dof directional coverage as \\( z^2 \le 1, 4, 9 \\)
+/// (\\( |z| \le 1, 2, 3 \\)).
 pub const COVERAGE_THRESHOLDS: [f64; 3] = [1.0, 4.0, 9.0];
+
+/// The \\( \chi^2_2 \\) median \\( 2\ln 2 \\): the joint-\\( d^2 \\)
+/// normalized-realism denominator, so `median(d²)/CHI2_2_MEDIAN == 1` is
+/// calibrated. One definition shared by the surface, per-object and
+/// per-window realism statistics.
+pub const CHI2_2_MEDIAN: f64 = 2.0 * std::f64::consts::LN_2;
+
+/// The \\( \chi^2_1 \\) median \\( \approx 0.4549 \\): the per-direction
+/// (1-dof \\( z^2 \\)) normalized-realism denominator, so
+/// `median(z²)/CHI2_1_MEDIAN == 1` is calibrated. It is
+/// \\( (\Phi^{-1}(3/4))^2 \\) — the square of the standard-normal upper
+/// quartile.
+pub const CHI2_1_MEDIAN: f64 = 0.454_936_423_119_572_4;
 
 /// Trapezoidal nodes of the log-\\( w \\) \\( w \\)-rule (built once per
 /// \\( \nu \\)). 512 nodes over the quantile bracket hold both the
@@ -525,12 +540,30 @@ fn log_sum_exp(xs: &[f64]) -> f64 {
     m + s.ln()
 }
 
-/// \\( \chi^2_2 \\) CDF, \\( F(c) = 1 - e^{-c/2} \\).
-fn chi2_2_cdf(c: f64) -> f64 {
+/// \\( \chi^2_2 \\) CDF, \\( F(c) = 1 - e^{-c/2} \\) — the reference law for the
+/// joint 2-dof \\( d^2 \\). Public so the coverage aggregation and tests read
+/// the expected joint fractions from one definition (e.g.
+/// `chi2_2_cdf(4) = 0.8647` is the 2σ-ellipse expected coverage).
+pub fn chi2_2_cdf(c: f64) -> f64 {
     if c <= 0.0 {
         0.0
     } else {
         1.0 - (-c / 2.0).exp()
+    }
+}
+
+/// \\( \chi^2_1 \\) CDF, \\( F(c) = P(1/2, c/2) = \operatorname{erf}
+/// (\sqrt{c/2}) \\) — the reference law for a 1-dof \\( z^2 \\) (the
+/// along-track and cross-track directional statistics). Public so the
+/// directional coverage aggregation and tests read the expected per-direction
+/// fractions from one definition (e.g. `chi2_1_cdf(4) = 0.9545` is the
+/// \\( |z| \le 2 \\) expected coverage).
+pub fn chi2_1_cdf(c: f64) -> f64 {
+    use hyperjet::statistics::upper_inc_gamma_reg;
+    if c <= 0.0 {
+        0.0
+    } else {
+        1.0 - upper_inc_gamma_reg(0.5, c / 2.0)
     }
 }
 
@@ -821,6 +854,25 @@ mod tests {
     }
 
     // -- (a) the four limiting cases -------------------------------------
+
+    #[test]
+    fn chi2_cdfs_and_medians_pin_the_coverage_constants() {
+        // Joint 2-dof expected coverage at d² ≤ 1, 4, 9 (the 1σ/2σ/3σ ellipses).
+        let joint = [chi2_2_cdf(1.0), chi2_2_cdf(4.0), chi2_2_cdf(9.0)];
+        for (got, want) in joint.iter().zip([0.393469, 0.864665, 0.988891]) {
+            assert!((got - want).abs() < 1e-6, "joint {got} vs {want}");
+        }
+        // Per-direction 1-dof expected coverage at |z| ≤ 1, 2, 3.
+        let one = [chi2_1_cdf(1.0), chi2_1_cdf(4.0), chi2_1_cdf(9.0)];
+        for (got, want) in one.iter().zip([0.682689, 0.954500, 0.997300]) {
+            assert!((got - want).abs() < 1e-6, "1-dof {got} vs {want}");
+        }
+        assert_eq!(chi2_1_cdf(0.0), 0.0);
+        assert_eq!(chi2_2_cdf(-1.0), 0.0);
+        // Medians: χ²₂ median = 2 ln 2; χ²₁ median = (Φ⁻¹(3/4))² (its CDF is 1/2).
+        assert!((CHI2_2_MEDIAN - 1.386_294_361).abs() < 1e-6);
+        assert!((chi2_1_cdf(CHI2_1_MEDIAN) - 0.5).abs() < 1e-6, "χ²₁ median");
+    }
 
     #[test]
     fn limit_sigma_pred_to_zero_matches_closed_form() {

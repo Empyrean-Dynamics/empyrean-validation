@@ -10,6 +10,9 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::Path;
 
 use crate::catalog::population_color;
+use crate::predict_schema::{
+    COVERAGE_ARC_SPLIT_DAYS, CalibrationCell, ObjectWalkSummary, PredictAggregates, SurfaceCell,
+};
 use crate::schema::{ValidationResult, test_types};
 
 /// Numerical-fidelity threshold: any metric whose absolute difference
@@ -141,6 +144,16 @@ fn fmt_arcsec(v: f64) -> String {
 /// `include_str!` rather than a duplicated literal, so the values and their
 /// provenance note live in exactly one place in this tree.
 const BRAND_TOKENS_CSS: &str = include_str!("../assets/empyrean-tokens.css");
+
+/// The Empyrean Dynamics orbital mark, inlined as a data URI so the branded
+/// chart export (the one download button on every Plotly toolbar) carries the
+/// logo with no network fetch. This is the transparent-background mark (the
+/// orbit and bodies, no filled tile), derived from the 1024×1024 masthead icon
+/// by keying out the near-black tile fill and resampling to 256×256. The tile
+/// fill equalled the dark theme surface, so the filled icon was invisible on
+/// dark and a dark box on light; the mark reads on both surfaces and is used,
+/// unchanged, in either theme.
+const LOGO_BYTES: &[u8] = include_bytes!("../docs/empyrean-dynamics-icon-mark.png");
 
 /// Test types rolled up per channel — in the summary JSON, the §10 matrix,
 /// and the fidelity descriptor chips.
@@ -744,6 +757,9 @@ enum GridAxis {
     EphMas,
     /// Wall-clock, milliseconds (G1..G3 per-object timing grids).
     TimingMs,
+    /// Sky separation, arcseconds — the predictive-power accuracy surface
+    /// (Part 4.2A). Same one decade ladder, physical decade edges fixed below.
+    SepArcsec,
 }
 
 impl GridAxis {
@@ -759,6 +775,8 @@ impl GridAxis {
             GridAxis::EphMas => [1e-3, 1e-2, 1e-1, 1.0, 1e1, 1e2],
             // ms:  100 µs, 1 ms, 10 ms, 100 ms, 1 s, 10 s
             GridAxis::TimingMs => [0.1, 1.0, 10.0, 100.0, 1e3, 1e4],
+            // arcsec: 10 mas, 100 mas, 1″, 10″, 100″, 1000″
+            GridAxis::SepArcsec => [1e-2, 1e-1, 1.0, 1e1, 1e2, 1e3],
         };
         let mut b = 1u8;
         for &e in &edges {
@@ -792,6 +810,7 @@ fn grid_fmt(axis: GridAxis, v: f64) -> String {
         GridAxis::PropKm => fmt_error(Some(v)),
         GridAxis::EphMas => fmt_mas(v),
         GridAxis::TimingMs => fmt_ms(v),
+        GridAxis::SepArcsec => fmt_arcsec(v),
     }
 }
 
@@ -1006,6 +1025,26 @@ fn grid_compact(axis: GridAxis, v: f64) -> String {
                 format!("{:.1}s", a / 1e3)
             }
         }
+        GridAxis::SepArcsec => {
+            // The decade colour already carries the magnitude; this is a terse
+            // ≤6-char refinement, mas below 1″ and arcsec above.
+            if a < 1.0 {
+                let m = a * 1e3;
+                if m >= 10.0 {
+                    format!("{m:.0}ma")
+                } else {
+                    format!("{m:.1}ma")
+                }
+            } else if a < 1e3 {
+                if a >= 10.0 {
+                    format!("{a:.0}\"")
+                } else {
+                    format!("{a:.1}\"")
+                }
+            } else {
+                format!("{a:.0e}")
+            }
+        }
     }
 }
 
@@ -1024,7 +1063,7 @@ fn grid_cell(
             // agreement grids' is a not-compared pair. Same hatch, axis-true hover.
             let reason = match axis {
                 GridAxis::TimingMs => HATCH_NOT_TIMED,
-                GridAxis::PropKm | GridAxis::EphMas => HATCH_NOT_COMPARED,
+                GridAxis::PropKm | GridAxis::EphMas | GridAxis::SepArcsec => HATCH_NOT_COMPARED,
             };
             format!("<td class=\"gc hatch{t0}\" title=\"{reason}\"></td>")
         }
@@ -1575,6 +1614,15 @@ fn grid_key_html(axis: GridAxis) -> String {
             "1–10 s",
             "&gt;10 s",
         ],
+        GridAxis::SepArcsec => [
+            "&lt;10 mas",
+            "10–100 mas",
+            "100 mas–1″",
+            "1–10″",
+            "10–100″",
+            "100–1000″",
+            "&gt;1000″",
+        ],
     };
     // Only the two end labels are shown; every swatch carries its own bin label
     // and physical anchor as a hover title (text-diet rule 2c).
@@ -1582,6 +1630,10 @@ fn grid_key_html(axis: GridAxis) -> String {
         GridAxis::PropKm => ("&lt;1 m", "&gt;1e6 km"),
         GridAxis::EphMas => ("&lt;1 µas", "&gt;100 mas"),
         GridAxis::TimingMs => ("&lt;100 µs", "&gt;10 s"),
+        // 4.2A's accuracy ladder is swatch-only: every decade label rides in its
+        // swatch hover, so the legend spends no visible words against the page
+        // budget while the cells carry the compact value in view.
+        GridAxis::SepArcsec => ("&lt;10 mas", "&gt;1000″"),
     };
     let mut s = String::from("<div class=\"grid-key\">");
     for (i, b) in bins.iter().enumerate() {
@@ -1610,6 +1662,11 @@ fn grid_key_html(axis: GridAxis) -> String {
             s.push_str("<span class=\"gk\"><span class=\"gk-sw rw\" title=\"off-scale: above the top decade\"></span>runaway</span>");
             s.push_str(&format!("<span class=\"gk\"><span class=\"gk-sw hatch\" title=\"tool has no rows for this pair\"></span>{HATCH_NOT_COMPARED}</span>"));
         }
+        GridAxis::SepArcsec => {
+            // Swatch-only (labels on hover), matching the swatch-only decade ramp.
+            s.push_str("<span class=\"gk\"><span class=\"gk-sw rw\" title=\"off-scale: above the top decade (runaway)\"></span></span>");
+            s.push_str("<span class=\"gk\"><span class=\"gk-sw hatch\" title=\"fewer than three objects in this cell (thin)\"></span></span>");
+        }
     }
     s.push_str("</div>");
     s
@@ -1619,6 +1676,34 @@ fn grid_key_html(axis: GridAxis) -> String {
 /// the rust channel's first-order (Jet1) arm. Defined once so the agreement
 /// values, their row order and the cost wall-clock all read the same rows.
 const EMP_SECTION1_ARM: &str = "first_order_detection_on";
+
+/// Owner vocabulary rule (lang/design/validation-report-redesign.md, 2026-10-17):
+/// the page names a derivative order the way a user thinks of it, never the way
+/// the engine implements it. This one function owns the arm-id → method-label
+/// mapping; every header, hover, key chip, disclosure and section title that
+/// names a derivative order routes its wording through here, so "Jet1", "Jet2",
+/// "6×6", "9×9", "STM" and "hyperdual" never reach the page as a label. Widths
+/// are spelled "(N=6)" / "(N=9)" and only where two widths sit side by side.
+/// Crate and type names stay in the Configurations appendix, where a tool's
+/// version is stated.
+fn method_label(arm: &str) -> &str {
+    if arm.starts_with("second_order") {
+        "second order"
+    } else if arm.starts_with("first_order") {
+        "first order"
+    } else if arm.starts_with("f64") {
+        "state only"
+    } else if arm.starts_with("auto") {
+        "auto cascade"
+    } else if arm.starts_with("sigma_point") {
+        "sigma-point"
+    } else if arm.starts_with("monte_carlo") {
+        "Monte Carlo"
+    } else {
+        // An unmapped arm id renders verbatim — visible, never a silent blank.
+        arm
+    }
+}
 
 /// Whether `r` is an empyrean propagation row Section 1 keys on. Both the
 /// propagation agreement values and the propagation cost heatmap select cells
@@ -2837,10 +2922,20 @@ fn build_channel_fidelity_grid(results: &[ValidationResult]) -> String {
     h.push_str(
         "<div class=\"panel-title\" title=\"Complete per-object grid — every channel × test type\">Complete per-object grid</div>",
     );
-    h.push_str("<div class=\"grid-scroll\"><table class=\"agrid fidgrid\"><thead><tr><th class=\"gobj\">object</th>");
+    // Two-level grouped header: the channel spans its test-type columns once
+    // (no repeated channel word), the test type sits under it. In-table, so no
+    // visible-word budget cost.
+    h.push_str("<div class=\"grid-scroll\"><table class=\"agrid fidgrid\"><thead><tr><th class=\"gobj\" rowspan=\"2\">object</th>");
     for &ch in &present_ch {
+        h.push_str(&format!(
+            "<th class=\"fo-h fo-grp\" colspan=\"{}\">{ch}</th>",
+            test_types.len()
+        ));
+    }
+    h.push_str("</tr><tr>");
+    for _ in &present_ch {
         for (_, disp, _, _, _) in &test_types {
-            h.push_str(&format!("<th class=\"fo-h\">{ch}<br/>{disp}</th>"));
+            h.push_str(&format!("<th class=\"fo-h\">{disp}</th>"));
         }
     }
     h.push_str("</tr></thead><tbody>");
@@ -3353,6 +3448,11 @@ fn build_tool_ranking_html(
             .partial_cmp(&block_worst(&a.1))
             .unwrap_or(std::cmp::Ordering::Equal)
     });
+    // The two per-object tables (50 rows each) sit behind one toggle; the
+    // per-population rows above are the default view. The summary is the toggle;
+    // its body is hidden by default, so the two panel-titles cost no visible
+    // words until the reader opens it. Nothing is dropped — only folded.
+    h.push_str("<details class=\"more-tables\"><summary class=\"more-sum\">per object</summary>");
     h.push_str("<div class=\"panel-title\">By tool and object</div>");
     h.push_str("<div class=\"grid-scroll\"><table class=\"agrid r3grid\"><thead><tr title=\"Each cell: that tool's median km difference from JPL Horizons across the seventeen horizons; smaller closer; one decade ladder; hatched where the tool has no rows; dagger = an object ASSIST cannot model.\"><th class=\"gobj\">object</th><th>empyrean</th><th>ASSIST</th><th>find_orb</th></tr></thead><tbody>");
     for (pop, objs) in &blocks {
@@ -3456,6 +3556,7 @@ fn build_tool_ranking_html(
         }
         h.push_str("</tbody></table></div>");
     }
+    h.push_str("</details>");
     h
 }
 
@@ -4548,34 +4649,36 @@ fn build_part2_timing_t1(results: &[ValidationResult]) -> String {
         None,
         assist("assist_asteroid_institute_variational_off"),
     ));
-    for (lbl, arm) in [
+    for (cfg, arm) in [
         (
-            "empyrean barebones, ASSIST-default-like (f64)",
+            "ASSIST-default-like",
             "f64_detection_off_assist_default_like",
         ),
         (
-            "empyrean barebones, asteroid-institute-like (f64)",
+            "asteroid-institute-like",
             "f64_detection_off_assist_asteroid_institute_like",
         ),
         (
-            "empyrean Jet1 barebones, ASSIST-default-like",
+            "ASSIST-default-like",
             "first_order_detection_off_assist_default_like",
         ),
     ] {
+        let lbl = format!("empyrean · {} · {cfg}", method_label(arm));
         let (s, core) = emp("propagation", Some(arm));
-        h.push_str(&row(lbl, if core { Some(CORE_NOTE) } else { None }, s));
+        h.push_str(&row(&lbl, if core { Some(CORE_NOTE) } else { None }, s));
     }
     h.push_str(&group("propagation · whole call", BOUND_B));
-    for (lbl, arm) in [
-        ("empyrean f64", "f64_detection_on"),
-        ("empyrean first-order + 6×6", "first_order_detection_on"),
-        ("empyrean auto cascade", "auto_detection_on"),
-        ("empyrean second-order (Jet2)", "second_order_detection_on"),
-        ("empyrean sigma-point", "sigma_point_detection_on"),
-        ("empyrean Monte Carlo", "monte_carlo_100_detection_on"),
+    for arm in [
+        "f64_detection_on",
+        "first_order_detection_on",
+        "auto_detection_on",
+        "second_order_detection_on",
+        "sigma_point_detection_on",
+        "monte_carlo_100_detection_on",
     ] {
+        let lbl = format!("empyrean · {}", method_label(arm));
         let (s, core) = emp("propagation", Some(arm));
-        h.push_str(&row(lbl, if core { Some(CORE_NOTE) } else { None }, s));
+        h.push_str(&row(&lbl, if core { Some(CORE_NOTE) } else { None }, s));
     }
     h.push_str(&row("kete", None, ext("propagation", &|r| r.kete_time_ms)));
     h.push_str(&row(
@@ -4826,8 +4929,12 @@ fn build_timing_grids(
     let (eph_ch, eph_fallback) = emp_eph;
     let (od_ch, od_fallback) = emp_od;
     let g1: Vec<TimingCol> = vec![
-        TimingCol::timed("emp f64", rust_arm("f64_detection_on"), BOUND_B),
-        TimingCol::timed("emp Jet1", rust_arm("first_order_detection_on"), BOUND_B),
+        TimingCol::timed("emp state only", rust_arm("f64_detection_on"), BOUND_B),
+        TimingCol::timed(
+            "emp first order",
+            rust_arm("first_order_detection_on"),
+            BOUND_B,
+        ),
         TimingCol::timed("ASSIST", assist_prop_getter(), BOUND_A),
         TimingCol::timed(
             "kete",
@@ -4968,16 +5075,1759 @@ fn tool_color_tokens_css() -> String {
     format!("{dark}{light}")
 }
 
+/// Merge several walk-forward aggregate files (`score-predictions --out-agg`)
+/// into one, or `None` when the list is empty.
+///
+/// Multiple `--predict-agg` files are treated as disjoint shards of ONE walk
+/// and are concatenated family by family. Aggregates whose `snapshot_id`
+/// disagree describe different observations and are refused rather than pooled.
+/// A `profile` that disagrees across shards collapses to the `"unstated"` marked
+/// state — a merged family whose shards ran different schedules has no single
+/// profile to claim — and a budget / calibration note from any shard is carried
+/// forward verbatim, since the reduction it records cannot be undone here.
+pub fn merge_predict_aggregates(
+    aggregates: Vec<crate::predict_schema::PredictAggregates>,
+) -> Result<Option<crate::predict_schema::PredictAggregates>, String> {
+    let mut it = aggregates.into_iter();
+    let Some(mut merged) = it.next() else {
+        return Ok(None);
+    };
+    for next in it {
+        if next.snapshot_id != merged.snapshot_id {
+            return Err(format!(
+                "--predict-agg files disagree on snapshot_id: {:?} vs {:?}. Aggregates from \
+                 different fixture snapshots describe different observations and cannot be \
+                 pooled — regenerate every walk against one snapshot, or pass them to \
+                 separate reports.",
+                merged.snapshot_id, next.snapshot_id
+            ));
+        }
+        if next.profile != merged.profile {
+            merged.profile = crate::predict_schema::default_profile();
+        }
+        merged.cells.extend(next.cells);
+        merged.coverage_cells.extend(next.coverage_cells);
+        merged.per_object.extend(next.per_object);
+        merged.d2_histograms.extend(next.d2_histograms);
+        merged.per_window.extend(next.per_window);
+        merged.reduced_chi2.extend(next.reduced_chi2);
+        merged.calibration.extend(next.calibration);
+        // A budget note from any input describes the merged family too — the
+        // reduction already happened upstream and cannot be undone here.
+        for (src, dst) in [
+            (next.per_window_note, &mut merged.per_window_note),
+            (next.calibration_note, &mut merged.calibration_note),
+        ] {
+            if let Some(note) = src {
+                match dst.as_mut() {
+                    Some(existing) if !existing.contains(&note) => {
+                        existing.push_str("  ");
+                        existing.push_str(&note);
+                    }
+                    Some(_) => {}
+                    None => *dst = Some(note),
+                }
+            }
+        }
+    }
+    Ok(Some(merged))
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// Part 4.2 — Predictive power (walk-forward covariance realism)
+//
+// The small static families (surfaces, marginals, arm grid, per-object walk,
+// calibration) render server-side here into numbers-only matrices on the one
+// decade ladder; only the large per-object timeline family travels to the
+// client, as a second verified sidecar. Every cell carries a number or a mark —
+// a thin cell (< 3 objects) is hatched with its reason and n, never pooled.
+// ═══════════════════════════════════════════════════════════════════
+
+/// Thin-cell hatch reason: a cell with fewer than three contributing objects is
+/// out of statistics and is shown hatched, never pooled into a neighbour.
+const HATCH_THIN: &str = "fewer than three objects — out of statistics";
+/// A surface cell no window reached: distinct from a thin cell (which has 1–2
+/// objects) and from an all-failed object (4.2D), so the reader can tell an
+/// unsampled corner of the (arc × dt) plane from a sampled-but-thin one.
+const HATCH_NO_WINDOW: &str = "no window reached this cell";
+/// A 4.2A coverage cell whose Σ_pred-dominated share of rows is below
+/// [`COVERAGE_MIN_PD_SHARE`]: too observation-dominated for the inside-ellipse
+/// rate to read as a test of the tool's covariance rather than the pinned σ
+/// table, so it is hatched with the share on hover, never coloured.
+const HATCH_SHARE: &str = "share below 10% — too obs-dominated to read";
+/// A 4.2A coverage cell with objects and share but no inside-ellipse rate.
+const HATCH_NO_RATE: &str = "no inside-ellipse rate in this cell";
+/// Minimum Σ_pred-dominated share of a 4.2A coverage cell's rows for the
+/// inside-ellipse rate to be read (below it the cell is hatched).
+const COVERAGE_MIN_PD_SHARE: f64 = 0.10;
+/// The marked-absent state for the D-003 log-score / law-aware calibration
+/// family: it has no data until a Student-t arm runs (D-005), so it is marked,
+/// never fabricated.
+const AWAITING_STUDENT_T: &str = "awaiting Student-t chain";
+/// χ²₂ 99% point — the tail threshold the arm grid reports the exceedance of.
+const CHI2_2_P99: f64 = 9.210_340_371_976_184;
+
+/// The realism diverging scale CSS (Part 4.2A), the one exception (D-004) to the
+/// decade ladder. Built entirely from theme tokens via `color-mix` — blue mixes
+/// `--ed-accent`, red mixes `--ed-error`, both over `--ed-bg`, and the calibrated
+/// centre is `--ed-surface` — so it carries no hard-coded colour and re-themes
+/// with the page. Classes `rvb1..rvb3` (over-conservative), `rv0` (calibrated),
+/// `rvr1..rvr3` (over-confident), used on both the grid cells and the key.
+fn realism_css() -> String {
+    let mut s = String::new();
+    s.push_str("  .rv0 { background: var(--ed-surface); }\n");
+    // Blue (over-conservative) and red (over-confident) share the 22/48 steps, but
+    // the deepest blue caps at 60%, not 78% like the red end: the brand accent blue
+    // (#5b9bd5) is far lighter than the error red (#d05040), so at 78% the deepest
+    // blue cell fails the 4.5:1 light-text contrast in the dark (default) theme
+    // (measured 3.58:1). 60% darkens it to ~5.1:1, matching the red end's ~5.0:1 —
+    // the two extremes then read as equally prominent (perceptually symmetric), and
+    // the lighter light-theme ground only gains contrast (4.80 → 6.68). One
+    // generator, both themes, still no hard-coded colour; the WCAG test below holds
+    // every step ≥ 4.5:1 so a percentage or token regression fails the gate.
+    for (cls, pct) in [("rvb1", 22), ("rvb2", 48), ("rvb3", 60)] {
+        s.push_str(&format!(
+            "  .{cls} {{ background: color-mix(in srgb, var(--ed-accent) {pct}%, var(--ed-bg)); }}\n"
+        ));
+    }
+    for (cls, pct) in [("rvr1", 22), ("rvr2", 48), ("rvr3", 78)] {
+        s.push_str(&format!(
+            "  .{cls} {{ background: color-mix(in srgb, var(--ed-error) {pct}%, var(--ed-bg)); }}\n"
+        ));
+    }
+    s.push_str("  td.gc.rv0 .cn, td.gc.rvb1 .cn, td.gc.rvb2 .cn, td.gc.rvb3 .cn, td.gc.rvr1 .cn, td.gc.rvr2 .cn, td.gc.rvr3 .cn { color: var(--ed-text-primary); }\n");
+    s
+}
+
+/// Diverging realism bin for a normalized realism value `m = median(d²)/(2 ln 2)`
+/// (1 is calibrated): its CSS class and the plain-words direction for the hover.
+/// `x = log₂ m`; |x| < 0.5 is calibrated, x < 0 over-conservative (blue), x > 0
+/// over-confident (red), in three magnitude steps each side.
+fn realism_bin(m: f64) -> (&'static str, &'static str) {
+    if !(m.is_finite() && m > 0.0) {
+        return ("rv0", "calibrated");
+    }
+    let x = m.log2();
+    let a = x.abs();
+    if a < 0.5 {
+        ("rv0", "calibrated")
+    } else if x < 0.0 {
+        if a < 1.5 {
+            ("rvb1", "over-conservative")
+        } else if a < 3.0 {
+            ("rvb2", "over-conservative")
+        } else {
+            ("rvb3", "over-conservative")
+        }
+    } else if a < 1.5 {
+        ("rvr1", "over-confident")
+    } else if a < 3.0 {
+        ("rvr2", "over-confident")
+    } else {
+        ("rvr3", "over-confident")
+    }
+}
+
+/// The realism key (Part 4.2A): the one diverging-scale legend, stating the D-004
+/// exception. Kept to ≤ 8 visible words (the H5 key cap); the full reading of
+/// each swatch rides in its hover title.
+fn realism_key_html() -> String {
+    // The container hover states the one diverging-scale exception (D-004) so the
+    // key carries the exception without spending visible words on it.
+    let mut s = String::from(
+        "<div class=\"grid-key\" title=\"The one diverging log₂ scale, the single exception to the decade ladder. 0 (grey) is calibrated, blue over-conservative, red over-confident.\">",
+    );
+    for (cls, title) in [
+        (
+            "rvb3",
+            "over-conservative: realism ≪ 1 (covariance too wide)",
+        ),
+        ("rvb1", "mildly over-conservative"),
+        ("rv0", "calibrated: median d² = χ²₂ median, realism = 1"),
+        ("rvr1", "mildly over-confident"),
+        ("rvr3", "over-confident: realism ≫ 1 (covariance too tight)"),
+    ] {
+        let vis = match cls {
+            "rvb3" => "over-conservative",
+            "rv0" => "calibrated",
+            "rvr3" => "over-confident",
+            _ => "",
+        };
+        s.push_str(&format!(
+            "<span class=\"gk\"><span class=\"gk-sw {cls}\" title=\"{}\"></span>{vis}</span>",
+            attr_escape(title)
+        ));
+    }
+    // The thin-cell mark (swatch only, reason on hover) and, stated visibly in the
+    // key per the binding ruling, the one diverging-log₂ exception (D-004).
+    s.push_str("<span class=\"gk\"><span class=\"gk-sw hatch\" title=\"fewer than three objects in this cell (thin)\"></span></span>");
+    s.push_str("<span class=\"gk\">log₂ · diverging</span></div>");
+    s
+}
+
+/// Equal-weight-per-object median of a `Option<f64>` statistic over a set of
+/// objects — the one estimator every 4.2 matrix uses, so none can drift.
+fn pw_median(vals: impl Iterator<Item = f64>) -> Option<f64> {
+    grid_median(vals.filter(|v| v.is_finite()).collect::<Vec<_>>())
+}
+
+/// Sorted, ascending axis of distinct `(lo, hi)` bin edges over the cells, keyed
+/// by `lo`'s bit pattern (monotone for positive f64), so the grid shape is
+/// data-driven and byte-stable.
+fn pw_axis(edges: impl Iterator<Item = (f64, f64)>) -> Vec<(f64, f64)> {
+    let mut m: BTreeMap<u64, (f64, f64)> = BTreeMap::new();
+    for (lo, hi) in edges {
+        if lo.is_finite() {
+            m.insert(lo.to_bits(), (lo, hi));
+        }
+    }
+    m.into_values().collect()
+}
+
+/// Split an arm slug into its factor tokens on the real factor delimiters
+/// (`.`, `+`, `_`): `efcc.adap.nonight+mc` → `[efcc, adap, nonight, mc]`. One
+/// definition so the arm-grid main-effects sweep and the per-arm decode hover
+/// tokenize identically — splitting on `_` alone (the arms are dot/plus-delimited)
+/// made every slug a single token and emptied the sub-matrix.
+fn pw_arm_tokens(arm: &str) -> impl Iterator<Item = &str> {
+    arm.split(['.', '+', '_']).filter(|t| !t.is_empty())
+}
+
+/// The four configuration factors of an arm slug, as `[debias, rejection,
+/// nightly, transport]` levels. One arm carries one level of each; transport
+/// defaults to `linear` when neither `mc` nor `sp` is present. Owner, 2026-10-17:
+/// the 4.2C arm tables show these factor columns instead of the raw slug, main
+/// effects first and the full grid behind a toggle.
+fn pw_arm_factors(arm: &str) -> [&'static str; 4] {
+    let mut f: [&'static str; 4] = ["—", "—", "—", "linear"];
+    for t in pw_arm_tokens(arm) {
+        match t {
+            "efcc" => f[0] = "efcc",
+            "nodeb" => f[0] = "nodeb",
+            "adap" => f[1] = "adap",
+            "cmc" => f[1] = "cmc",
+            "norej" => f[1] = "norej",
+            "nonight" => f[2] = "nonight",
+            "vfc" => f[2] = "vfc",
+            "mc" => f[3] = "mc",
+            "sp" => f[3] = "sp",
+            _ => {}
+        }
+    }
+    f
+}
+
+/// The factor a single arm token belongs to (for the main-effects factor column).
+fn pw_token_factor(tok: &str) -> &'static str {
+    match tok {
+        "efcc" | "nodeb" => "debias",
+        "adap" | "cmc" | "norej" => "rejection",
+        "nonight" | "vfc" => "nightly",
+        "mc" | "sp" => "transport",
+        _ => "",
+    }
+}
+
+/// The in-table calibration ruler for a 4.2C realism column: states the neutral
+/// point of the diverging realism scale. Wrapped in a no-transform span so the
+/// header-uppercase rule leaves it alone (and H7 skips it).
+const RV_RULER: &str = "<div class=\"rvruler\"><span class=\"r1sub\">1 = calibrated</span></div>";
+
+/// Every configuration arm present in the aggregate's surface cells (across all
+/// tools), stable order. One definition so the surfaces' arm count, the arm grid
+/// and the calibration coverage span the same set and no arm is silently dropped;
+/// an arm no rust walk produced renders as an explicit hatched row.
+fn pw_all_arms(agg: &PredictAggregates) -> Vec<&str> {
+    let mut v: BTreeSet<&str> = BTreeSet::new();
+    for c in &agg.cells {
+        v.insert(c.config_arm.as_str());
+    }
+    v.into_iter().collect()
+}
+
+/// The most-populated `(tool, arm)` pair over `items`, rust preferred. Iteration
+/// is over a sorted map, so ties resolve to the first (alphabetically-smallest)
+/// arm, keeping the choice byte-stable.
+fn pw_best_series<'a>(
+    items: impl Iterator<Item = (&'a str, &'a str)>,
+) -> Option<(&'a str, &'a str)> {
+    let mut counts: BTreeMap<(&'a str, &'a str), usize> = BTreeMap::new();
+    for k in items {
+        *counts.entry(k).or_default() += 1;
+    }
+    // Track the winning pair and its (rust-first, count) score separately rather
+    // than as one nested tuple (clippy's type-complexity cap).
+    let mut best_pair: Option<(&'a str, &'a str)> = None;
+    let mut best_score = (false, 0usize);
+    for (k, n) in counts {
+        let score = (k.0 == "rust", n);
+        if best_pair.is_none() || score > best_score {
+            best_pair = Some(k);
+            best_score = score;
+        }
+    }
+    best_pair
+}
+
+/// The configuration the distribution ships by default: EFCC catalogue
+/// debias, adaptive rejection, VFC2017 nightly weighting, linear transport.
+const PRODUCTION_ARM: (&str, &str) = ("rust", "efcc.adap.vfc");
+
+/// The `(tool, arm)` series the single-arm 4.2 views key on — 4.2A's default
+/// surface, 4.2B's horizon marginals, 4.2D's per-object walk and 4.2F's timeline.
+/// It is the pair that actually co-occurs in the data and carries the most
+/// per-object statistics, rust preferred, falling back to raw per-object presence
+/// then to the cell arms. One definition so no panel independently selects a
+/// `(tool, arm)` that never ran together — the rust `default` arm, which no rust
+/// walk produced, is what emptied the default surface, the marginals and the
+/// per-object matrix.
+fn pw_primary_series(agg: &PredictAggregates) -> (&str, &str) {
+    // The shipped configuration is featured whenever the run carries it; the
+    // most-populated pair is only the fallback, so a control arm never
+    // headlines by a tie-break.
+    if agg.per_object.iter().any(|p| {
+        p.tool == PRODUCTION_ARM.0 && p.config_arm == PRODUCTION_ARM.1 && p.med_d2_norm.is_some()
+    }) {
+        return PRODUCTION_ARM;
+    }
+    pw_best_series(
+        agg.per_object
+            .iter()
+            .filter(|p| p.med_d2_norm.is_some())
+            .map(|p| (p.tool.as_str(), p.config_arm.as_str())),
+    )
+    .or_else(|| {
+        pw_best_series(
+            agg.per_object
+                .iter()
+                .map(|p| (p.tool.as_str(), p.config_arm.as_str())),
+        )
+    })
+    .or_else(|| {
+        pw_best_series(
+            agg.cells
+                .iter()
+                .map(|c| (c.tool.as_str(), c.config_arm.as_str())),
+        )
+    })
+    .unwrap_or(("", ""))
+}
+
+/// Compact day-bin column label: `0.3–1 d`, `1–3`, `100–400`, …
+fn pw_day_label(lo: f64, hi: f64) -> String {
+    let f = |v: f64| {
+        if v >= 1.0 {
+            format!("{v:.0}")
+        } else {
+            format!("{v}")
+        }
+    };
+    format!("{}–{}", f(lo), f(hi))
+}
+
+/// One accuracy surface cell: median separation on the SepArcsec decade ladder,
+/// hatched (reason + n on hover) when thin, missing, or without a value. `c` is
+/// the cell for this (arc × dt) corner, or `None` when no window reached it.
+fn pw_accuracy_cell(c: Option<&SurfaceCell>) -> String {
+    match c {
+        None => format!("<td class=\"gc hatch\" title=\"{HATCH_NO_WINDOW}\"></td>"),
+        Some(c) if c.n_objects < 3 => format!(
+            "<td class=\"gc hatch\" title=\"n={} · {}\"></td>",
+            c.n_objects, HATCH_THIN
+        ),
+        Some(c) => match c.med_sep_arcsec {
+            Some(v) if v.is_finite() => {
+                let bin = GridAxis::SepArcsec.bin(v);
+                let rw = if bin == 7 { " rw" } else { "" };
+                let hover = attr_escape(&format!(
+                    "{} · n {} · {} windows · delivered {:.0}%",
+                    grid_fmt(GridAxis::SepArcsec, v),
+                    c.n_objects,
+                    c.n_windows,
+                    c.delivered_fraction * 100.0
+                ));
+                format!(
+                    "<td class=\"gc gb{bin}{rw}\" title=\"{hover}\"><span class=\"cn\">{}</span></td>",
+                    grid_compact(GridAxis::SepArcsec, v)
+                )
+            }
+            _ => format!(
+                "<td class=\"gc hatch\" title=\"n={} · no held-out separation in this cell\"></td>",
+                c.n_objects
+            ),
+        },
+    }
+}
+
+/// One realism surface cell: normalized realism on the diverging log₂ scale
+/// (D-004), hatched (reason + n on hover) when thin, missing, or without a value.
+fn pw_realism_cell(c: Option<&SurfaceCell>) -> String {
+    match c {
+        None => format!("<td class=\"gc hatch\" title=\"{HATCH_NO_WINDOW}\"></td>"),
+        Some(c) if c.n_objects < 3 => format!(
+            "<td class=\"gc hatch\" title=\"n={} · {}\"></td>",
+            c.n_objects, HATCH_THIN
+        ),
+        Some(c) => match c.med_d2_norm {
+            Some(v) if v.is_finite() && v > 0.0 => {
+                let (cls, dir) = realism_bin(v);
+                let dir_txt =
+                    |r: Option<f64>| r.map(|x| format!("{x:.2}")).unwrap_or_else(|| "—".into());
+                // 4.2B realism is the trust-GATED median, so its Σ_pred share
+                // reads the gated pair (4.2A, trust-off, reads the unc pair).
+                let share = if c.n_rows > 0 {
+                    format!(
+                        "{:.0}%",
+                        f64::from(c.n_rows_pd) / f64::from(c.n_rows) * 100.0
+                    )
+                } else {
+                    "—".into()
+                };
+                let hover = attr_escape(&format!(
+                    "realism {v:.2} ({dir}) · along {} · cross {} · n {} · {} windows · σ_pred-dominated {share} of rows",
+                    dir_txt(c.med_z2_at_norm),
+                    dir_txt(c.med_z2_ct_norm),
+                    c.n_objects,
+                    c.n_windows
+                ));
+                format!(
+                    "<td class=\"gc {cls}\" title=\"{hover}\"><span class=\"cn\">{v:.2}</span></td>"
+                )
+            }
+            _ => format!(
+                "<td class=\"gc hatch\" title=\"n={} · no σ-dominated d² in this cell\"></td>",
+                c.n_objects
+            ),
+        },
+    }
+}
+
+/// Surface cells of one (class, tool, arm) group, keyed within the group by
+/// the `(arc_lo bits, dt_lo bits)` corner of the (arc × dt) plane.
+type PwCellMap<'a> = HashMap<(u64, u64), &'a SurfaceCell>;
+/// Surface cells grouped by (class, tool, arm), each group a [`PwCellMap`].
+type PwGroups<'a> = BTreeMap<(&'a str, &'a str, &'a str), PwCellMap<'a>>;
+
+/// Render one (arc × dt) grid for a (class, tool, arm) group — accuracy
+/// (`realism == false`) or realism (`realism == true`). Rows are arc bins
+/// descending (long arcs on top), columns dt bins ascending; every corner
+/// carries a number or a mark.
+fn pw_surface_grid(
+    cells: &PwCellMap,
+    arc_bins: &[(f64, f64)],
+    dt_bins: &[(f64, f64)],
+    realism: bool,
+) -> String {
+    // The accuracy / realism label rides in the corner header cell, which is
+    // table content (exempt from the visible-word budget) rather than a caption.
+    let label = if realism { "realism" } else { "accuracy" };
+    let mut h = String::from(
+        "<div class=\"grid-scroll\"><table class=\"agrid pw-grid\"><thead><tr><th class=\"gobj\">",
+    );
+    h.push_str(&uhdr(&format!("{label} · arc ╲ dt")));
+    h.push_str("</th>");
+    for &(lo, hi) in dt_bins {
+        h.push_str(&format!(
+            "<th class=\"dt\" title=\"horizon {lo}–{hi} d\">{}</th>",
+            pw_day_label(lo, hi)
+        ));
+    }
+    h.push_str("</tr></thead><tbody>");
+    for &(alo, ahi) in arc_bins.iter().rev() {
+        h.push_str(&format!(
+            "<tr><td class=\"gtool\" title=\"fit arc {alo}–{ahi} d\">{}</td>",
+            pw_day_label(alo, ahi)
+        ));
+        for &(dlo, _dhi) in dt_bins {
+            let c = cells.get(&(alo.to_bits(), dlo.to_bits())).copied();
+            h.push_str(&if realism {
+                pw_realism_cell(c)
+            } else {
+                pw_accuracy_cell(c)
+            });
+        }
+        h.push_str("</tr>");
+    }
+    h.push_str("</tbody></table></div>");
+    h
+}
+
+/// The one diverging bin for a coverage cell: observed minus expected in units
+/// of the binomial standard error \\( \sqrt{p(1-p)/n} \\) on the D-004 scale.
+/// Fewer inside than expected (observed < expected) is over-confident (red);
+/// more is over-conservative (blue); within one standard error is calibrated.
+/// `n` is the independent-unit count (objects). One decision, one definition.
+fn coverage_bin(obs: f64, exp: f64, n: u32) -> (&'static str, &'static str) {
+    if n == 0 || !(exp > 0.0 && exp < 1.0) || !obs.is_finite() {
+        return ("rv0", "calibrated");
+    }
+    let se = (exp * (1.0 - exp) / n as f64).sqrt();
+    if se <= 0.0 || se.is_nan() {
+        return ("rv0", "calibrated");
+    }
+    let z = (obs - exp) / se;
+    let a = z.abs();
+    if a < 1.0 {
+        ("rv0", "calibrated")
+    } else if z < 0.0 {
+        // Fewer inside the ellipse than expected — the covariance is too tight.
+        if a < 2.0 {
+            ("rvr1", "over-confident")
+        } else if a < 4.0 {
+            ("rvr2", "over-confident")
+        } else {
+            ("rvr3", "over-confident")
+        }
+    } else if a < 2.0 {
+        ("rvb1", "over-conservative")
+    } else if a < 4.0 {
+        ("rvb2", "over-conservative")
+    } else {
+        ("rvb3", "over-conservative")
+    }
+}
+
+/// The three coverage directions of Part 4.2A — the joint 2-dof ellipse and the
+/// two 1-dof sky directions through the shared position angle. Each resolves a
+/// surface cell's observed and law-aware expected inside-ellipse fractions at
+/// 1σ/2σ/3σ, so one matrix renderer serves all three.
+#[derive(Clone, Copy)]
+enum CovDir {
+    Joint,
+    Along,
+    Cross,
+}
+
+impl CovDir {
+    /// Trust-UNCONDITIONED inside-ellipse fractions at 1σ/2σ/3σ — the matrix
+    /// cell value (2σ) and the 1σ/3σ shown on hover. Every converged window's
+    /// published covariance counts, so a tool cannot flatter its rate by
+    /// self-flagging the covariances it least trusts.
+    fn obs_unc(self, c: &SurfaceCell) -> [Option<f64>; 3] {
+        match self {
+            CovDir::Joint => [c.cov_1s_unc, c.cov_2s_unc, c.cov_3s_unc],
+            CovDir::Along => [c.cov_1s_at_unc, c.cov_2s_at_unc, c.cov_3s_at_unc],
+            CovDir::Cross => [c.cov_1s_ct_unc, c.cov_2s_ct_unc, c.cov_3s_ct_unc],
+        }
+    }
+    /// Trust-GATED 2σ fraction — the hover's self-flagged figure, the one the
+    /// tool itself would report.
+    fn cond_2s(self, c: &SurfaceCell) -> Option<f64> {
+        match self {
+            CovDir::Joint => c.cov_2s,
+            CovDir::Along => c.cov_2s_at,
+            CovDir::Cross => c.cov_2s_ct,
+        }
+    }
+    /// Per-row (not night-joint) 2σ fraction on the same unconditioned subset.
+    /// The night-joint divides a night's measurement noise by its target count;
+    /// the per-row figure does not, so it does not inherit the under-coverage
+    /// of correlated per-night noise.
+    fn row_2s(self, c: &SurfaceCell) -> Option<f64> {
+        match self {
+            CovDir::Joint => c.cov_2s_row_unc,
+            CovDir::Along => c.cov_2s_at_row_unc,
+            CovDir::Cross => c.cov_2s_ct_row_unc,
+        }
+    }
+    /// Law-aware expected inside-ellipse fractions at 1σ/2σ/3σ.
+    fn exp(self, c: &SurfaceCell) -> [Option<f64>; 3] {
+        match self {
+            CovDir::Joint => [c.exp_cov_1s, c.exp_cov_2s, c.exp_cov_3s],
+            CovDir::Along => [c.exp_cov_1s_at, c.exp_cov_2s_at, c.exp_cov_3s_at],
+            CovDir::Cross => [c.exp_cov_1s_ct, c.exp_cov_2s_ct, c.exp_cov_3s_ct],
+        }
+    }
+    /// The matrix's reading-line direction label (rides in the corner header).
+    fn label(self) -> &'static str {
+        match self {
+            CovDir::Joint => "joint · 2 dof",
+            CovDir::Along => "along-track · 1 dof",
+            CovDir::Cross => "cross-track · 1 dof",
+        }
+    }
+}
+
+/// The arm the coverage matrices key on for `tool`: rust resolves to the shared
+/// [`pw_primary_series`] arm; an external tool resolves to the arm carrying the
+/// most coverage (its Monte-Carlo sky covariance), since find_orb's analytic
+/// `default` arm delivers no 2×2 and so no inside-ellipse rate — only its
+/// `+mc` arm does. Falls back to the most-populated arm when no arm has coverage,
+/// so the tool still renders (hatched). Ties break on the smaller arm name.
+fn pw_coverage_arm_for<'a>(agg: &'a PredictAggregates, tool: &str) -> Option<&'a str> {
+    if tool == pw_primary_series(agg).0 {
+        return Some(pw_primary_series(agg).1);
+    }
+    let mut by_arm: BTreeMap<&str, u64> = BTreeMap::new();
+    for c in agg.cells.iter().filter(|c| c.tool == tool) {
+        if c.cov_2s.is_some() {
+            *by_arm.entry(c.config_arm.as_str()).or_default() += u64::from(c.n_nights);
+        }
+    }
+    // Most coverage nights wins; iterate a sorted map so ties take the smaller
+    // arm name deterministically.
+    let best = by_arm
+        .into_iter()
+        .fold(None::<(&str, u64)>, |acc, (a, n)| match acc {
+            Some((_, bn)) if bn >= n => acc,
+            _ => Some((a, n)),
+        });
+    best.map(|(a, _)| a).or_else(|| {
+        pw_best_series(
+            agg.cells
+                .iter()
+                .filter(|c| c.tool == tool)
+                .map(|c| (c.tool.as_str(), c.config_arm.as_str())),
+        )
+        .map(|(_, a)| a)
+    })
+}
+
+/// A pooled coverage row is short-arc when its upper edge is the split value.
+fn cov_arc_short(c: &SurfaceCell) -> bool {
+    c.arc_hi_days.to_bits() == COVERAGE_ARC_SPLIT_DAYS.to_bits()
+}
+
+/// One coverage matrix (a [`CovDir`]): rows = tool (at its primary arm) grouped
+/// over object class, two rows per class — short-arc and long-arc about the
+/// [`COVERAGE_ARC_SPLIT_DAYS`] split — and columns = the dt bins. Each cell is
+/// the trust-UNCONDITIONED 2σ inside-ellipse rate, pooled equal-weight-per-object
+/// over all arc bins of the row (never a median of arc cells), on the diverging
+/// observed-minus-expected scale; the trust-gated and per-row figures, 1σ/3σ,
+/// expected, the object counts (all / trusted) and the Σ_pred-dominated share
+/// ride the hover. A tool with no coverage is one hatched group; a cell with
+/// fewer than three objects, or a Σ_pred share below the floor, is hatched.
+fn pw_coverage_matrix(agg: &PredictAggregates, dir: CovDir, dt_bins: &[(f64, f64)]) -> String {
+    // Classes and tools from the surface cells, so the row groups reconcile with
+    // the 4.2B tool selector; a tool with no pooled coverage renders its group
+    // all-hatched (never a dropped tool).
+    let classes: Vec<&str> = {
+        let mut v: BTreeSet<&str> = BTreeSet::new();
+        for c in &agg.cells {
+            v.insert(c.class.as_str());
+        }
+        v.into_iter().collect()
+    };
+    // Tools in a fixed order; the reference-PA tool (rust) first, then externals.
+    let mut tools: Vec<&str> = {
+        let mut v: BTreeSet<&str> = BTreeSet::new();
+        for c in &agg.cells {
+            v.insert(c.tool.as_str());
+        }
+        v.into_iter().collect()
+    };
+    tools.sort_by_key(|t| (*t != "rust", *t));
+    // (tool, arm, class, arc_short, dt_lo bits) → the pooled coverage row.
+    let by_key: HashMap<(&str, &str, &str, bool, u64), &SurfaceCell> = agg
+        .coverage_cells
+        .iter()
+        .map(|c| {
+            (
+                (
+                    c.tool.as_str(),
+                    c.config_arm.as_str(),
+                    c.class.as_str(),
+                    cov_arc_short(c),
+                    c.dt_lo_days.to_bits(),
+                ),
+                c,
+            )
+        })
+        .collect();
+    let split = format!("{:.0}", COVERAGE_ARC_SPLIT_DAYS);
+
+    // De-crowding (owner, 2026-10-17): per tool, every (class, arc-side) row with
+    // no numeric cell in this direction — whether no tool reached it anywhere or
+    // only this tool missed it — is folded into one "no predictive windows" line
+    // per tool, the folded class labels and the distinct hatch reasons on that
+    // line's chip hover. Marked and counted, never dropped; the screens of empty
+    // hatch are reclaimed. The fold decision is made per row below (has_numeric).
+    let mut h = String::from(
+        "<div class=\"grid-scroll\"><table class=\"agrid pw-grid\"><thead><tr><th class=\"gobj\">",
+    );
+    // The whole matrix reading rides in the corner header (table content, exempt
+    // from the word budget): the direction and its dof, that the cell is the
+    // trust-off observed 2σ inside-ellipse percent computed on Σ_pred-dominated
+    // rows only, the tool ╲ dt layout, and the horizon unit. The scope (σ_pred
+    // nights only) is the one load-bearing caveat, so it rides the always-visible
+    // header beside trust-off, not only the hover and the collapsed method body.
+    h.push_str(&uhdr(&format!(
+        "{} · trust-off · σ_pred-only 2σ% · tool ╲ dt · days",
+        dir.label()
+    )));
+    h.push_str("</th>");
+    for &(lo, hi) in dt_bins {
+        h.push_str(&format!(
+            "<th class=\"dt\" title=\"horizon {lo}–{hi} d · observed inside 2σ, percent\">{}</th>",
+            pw_day_label(lo, hi)
+        ));
+    }
+    h.push_str("</tr></thead><tbody>");
+
+    let pct = |v: Option<f64>| {
+        v.map(|x| format!("{:.0}%", x * 100.0))
+            .unwrap_or_else(|| "—".into())
+    };
+    let pct1 = |v: Option<f64>| {
+        v.map(|x| format!("{:.1}%", x * 100.0))
+            .unwrap_or_else(|| "—".into())
+    };
+
+    for tool in &tools {
+        let arm = pw_coverage_arm_for(agg, tool);
+        let Some(arm) = arm else {
+            h.push_str(&format!(
+                "<tr class=\"gpophdr\"><td class=\"gpopname\" colspan=\"{}\" title=\"no walk ran for {}\">{} — {HATCH_NOT_IN_RUN}</td></tr>",
+                dt_bins.len() + 1,
+                attr_escape(tool),
+                attr_escape(tool),
+            ));
+            continue;
+        };
+        // Tool group header naming the tool AND the covariance arm it is scored on
+        // (its Monte-Carlo sky covariance for an external tool). The arm is the
+        // provenance of the whole row group, so it rides visibly beside the tool.
+        h.push_str(&format!(
+            "<tr class=\"gpophdr\"><td class=\"gpopname\" colspan=\"{}\" title=\"covariance arm {}\">{} <span class=\"pwarm\">{}</span></td></tr>",
+            dt_bins.len() + 1,
+            attr_escape(arm),
+            attr_escape(tool),
+            attr_escape(arm),
+        ));
+        // Rows with no numeric cell for this (tool, direction) fold into one
+        // "no predictive windows" line per tool; a row with at least one numeric
+        // cell is shown in full. The folded class labels and the distinct hatch
+        // reasons ride the fold line's chip hover — marked and counted, never
+        // dropped.
+        let mut folded_labels: Vec<String> = Vec::new();
+        let mut folded_reasons: BTreeSet<&'static str> = BTreeSet::new();
+        for cl in &classes {
+            // Two rows per class: short-arc then long-arc, about the split. The
+            // split keeps rust's short-arc over-confidence from pooling with its
+            // over-conservative long-arc fits (and the same for every tool).
+            for arc_short in [true, false] {
+                let label = if arc_short {
+                    format!("{cl} · short-arc <{split} d")
+                } else {
+                    format!("{cl} · long-arc \u{2265}{split} d")
+                };
+                let mut cells = String::new();
+                let mut has_numeric = false;
+                let mut row_reasons: BTreeSet<&'static str> = BTreeSet::new();
+                for &(dlo, _dhi) in dt_bins {
+                    let Some(c) = by_key
+                        .get(&(tool, arm, cl, arc_short, dlo.to_bits()))
+                        .copied()
+                    else {
+                        cells.push_str(&format!(
+                            "<td class=\"gc hatch\" title=\"n=0 · {HATCH_NO_WINDOW}\"></td>"
+                        ));
+                        row_reasons.insert(HATCH_NO_WINDOW);
+                        continue;
+                    };
+                    let n_all = c.n_objects_all;
+                    // The Σ_pred-dominated share and its <10% hatch gate read the
+                    // UNCONDITIONED row population — the same rows the cell value
+                    // (cov_*_unc) is computed over — so the number shown and the
+                    // decision to show it describe one population, never the
+                    // trust-gated subset (4.2B realism reads the gated pair).
+                    let share = if c.n_rows_unc > 0 {
+                        f64::from(c.n_rows_pd_unc) / f64::from(c.n_rows_unc)
+                    } else {
+                        0.0
+                    };
+                    if n_all < 3 {
+                        cells.push_str(&format!(
+                            "<td class=\"gc hatch\" title=\"n={n_all} · {HATCH_THIN}\"></td>"
+                        ));
+                        row_reasons.insert(HATCH_THIN);
+                        continue;
+                    }
+                    if share < COVERAGE_MIN_PD_SHARE {
+                        cells.push_str(&format!(
+                            "<td class=\"gc hatch\" title=\"n={n_all} · σ_pred-dominated {:.0}% of rows · {HATCH_SHARE}\"></td>",
+                            share * 100.0
+                        ));
+                        row_reasons.insert(HATCH_SHARE);
+                        continue;
+                    }
+                    let obs = dir.obs_unc(c);
+                    match (obs[1], dir.exp(c)[1]) {
+                        (Some(o2), Some(e2)) => {
+                            let (ccls, dir_word) = coverage_bin(o2, e2, n_all);
+                            let exp = dir.exp(c);
+                            let hover = attr_escape(&format!(
+                                "trust off: inside 2σ {} vs expected {} ({dir_word}) · trust-gated {} · per-row {} · 1σ {} 3σ {} · expected 1σ {} 3σ {} · n {n_all} objects ({} trusted) · {} nights · computed on the {:.0}% of rows where σ_pred dominates",
+                                pct(obs[1]),
+                                pct1(exp[1]),
+                                pct(dir.cond_2s(c)),
+                                pct(dir.row_2s(c)),
+                                pct(obs[0]),
+                                pct(obs[2]),
+                                pct1(exp[0]),
+                                pct1(exp[2]),
+                                c.n_objects_trusted,
+                                c.n_nights,
+                                share * 100.0,
+                            ));
+                            cells.push_str(&format!(
+                                "<td class=\"gc {ccls}\" title=\"{hover}\"><span class=\"cn\">{}</span></td>",
+                                pct(Some(o2))
+                            ));
+                            has_numeric = true;
+                        }
+                        _ => {
+                            cells.push_str(&format!(
+                                "<td class=\"gc hatch\" title=\"n={n_all} · {HATCH_NO_RATE}\"></td>"
+                            ));
+                            row_reasons.insert(HATCH_NO_RATE);
+                        }
+                    }
+                }
+                if has_numeric {
+                    h.push_str(&format!(
+                        "<tr><td class=\"gtool\">{}</td>{cells}</tr>",
+                        attr_escape(&label)
+                    ));
+                } else {
+                    folded_labels.push(label);
+                    folded_reasons.extend(row_reasons);
+                }
+            }
+        }
+        // One consolidated "no predictive windows" line per tool, the folded
+        // class × arc labels and the distinct hatch reasons on its chip hover.
+        if !folded_labels.is_empty() {
+            let reasons: Vec<&str> = folded_reasons.iter().copied().collect();
+            let hover = attr_escape(&format!(
+                "no numeric coverage for {}: {} · reasons: {}",
+                tool,
+                folded_labels.join(", "),
+                reasons.join("; "),
+            ));
+            h.push_str(&format!(
+                "<tr class=\"pwnowin\"><td class=\"gtool\" title=\"{hover}\">no predictive windows</td>"
+            ));
+            for _ in dt_bins {
+                h.push_str(&format!(
+                    "<td class=\"gc hatch\" title=\"{HATCH_NO_WINDOW}\"></td>"
+                ));
+            }
+            h.push_str("</tr>");
+        }
+    }
+    h.push_str("</tbody></table></div>");
+    h
+}
+
+/// The one coverage key for Part 4.2A: the diverging swatches (over-confident
+/// red / calibrated / over-conservative blue) and the expected 1σ/2σ/3σ
+/// inside-ellipse percentages, for the joint and the 1-dof directions, read
+/// from the aggregate. Kept to ≤ 8 visible words; the joint-vs-1-dof reading of
+/// the two number triples rides in the container hover.
+fn pw_coverage_key(agg: &PredictAggregates) -> String {
+    let triple = |dir: CovDir| -> String {
+        agg.cells
+            .iter()
+            .find_map(|c| {
+                let e = dir.exp(c);
+                e.iter().all(|x| x.is_some()).then(|| {
+                    format!(
+                        "{:.0}/{:.0}/{:.1}",
+                        e[0].unwrap() * 100.0,
+                        e[1].unwrap() * 100.0,
+                        e[2].unwrap() * 100.0
+                    )
+                })
+            })
+            .unwrap_or_else(|| "—".into())
+    };
+    format!(
+        "<div class=\"grid-key\" title=\"The one diverging scale: observed minus expected inside-ellipse rate in binomial standard errors. Fewer inside than expected is over-confident (red), more over-conservative (blue). The cell is the trust-unconditioned 2σ rate, pooled equal-weight-per-object over the row's arc bins; rows split at a 30 d fit arc. A cell with a Σ_pred-dominated share below 10% is hatched. The triples are expected 1σ/2σ/3σ percentages.\"><span class=\"gk\"><span class=\"gk-sw rvr3\"></span>over-confident</span><span class=\"gk\"><span class=\"gk-sw rv0\"></span>calibrated</span><span class=\"gk\"><span class=\"gk-sw rvb3\"></span>over-conservative</span><span class=\"gk\" title=\"expected joint 1σ/2σ/3σ · the cells show the 2σ value\">joint {}</span><span class=\"gk\" title=\"expected 1-dof along/cross 1σ/2σ/3σ · the cells show the 2σ value\">axis {}</span></div>",
+        triple(CovDir::Joint),
+        triple(CovDir::Along),
+    )
+}
+
+/// 4.2A — Coverage: the headline product. One matrix per direction (joint 2-dof,
+/// along-track, cross-track); each cell the observed 2σ inside-ellipse rate per
+/// tool × class × horizon, coloured by observed minus expected on the one
+/// diverging scale. This is the predictive-power answer: how often the next
+/// observations land inside the state ellipse, and whether that rate is honest.
+fn pw_coverage_html(agg: &PredictAggregates) -> String {
+    let dt_bins = pw_axis(agg.cells.iter().map(|c| (c.dt_lo_days, c.dt_hi_days)));
+    let mut h = String::new();
+    h.push_str("<div class=\"panel-title\" title=\"How often the next observations land inside the predicted state ellipse, per tool, class and horizon, against the expected rate. One matrix per direction (joint, along-track, cross-track); the cell is the trust-unconditioned 2σ inside-ellipse rate, pooled equal-weight-per-object over the row's arc bins, with the trust-gated and per-row figures on hover.\">Coverage</div>");
+    // The diverging key and the expected anchors lead, directly under the title and
+    // above the first matrix, so a reader meets the red/blue scale and the expected
+    // percentages before the grids they colour, never after.
+    h.push_str(&pw_coverage_key(agg));
+    // Direction toggle (owner, 2026-10-17): one matrix visible at a time, joint
+    // the default, instead of three stacked. The <select> is skip-counted, so the
+    // toggle costs no visible words; all three matrices stay in the DOM (two
+    // hidden), so every direction is one click away.
+    h.push_str("<div class=\"pw-select\"><label class=\"pw-sel-label\"><select id=\"pw-cov-dir\" aria-label=\"coverage direction\" title=\"coverage direction\"><option value=\"joint\" selected>joint</option><option value=\"along\">along-track</option><option value=\"cross\">cross-track</option></select></label></div>");
+    for (dir, key, shown) in [
+        (CovDir::Joint, "joint", true),
+        (CovDir::Along, "along", false),
+        (CovDir::Cross, "cross", false),
+    ] {
+        h.push_str(&format!(
+            "<div class=\"pw-cov-mat\" data-dir=\"{key}\"{}>",
+            if shown { "" } else { " hidden" }
+        ));
+        h.push_str(&pw_coverage_matrix(agg, dir, &dt_bins));
+        h.push_str("</div>");
+    }
+    h.push_str("<div class=\"disclosures\"><details><summary>");
+    h.push_str(DISCLOSURE_SUMMARY);
+    h.push_str("</summary><div class=\"disc-body\">Coverage is how often the next night's observation lands inside the predicted ellipse. Only Σ_pred-dominated nights count, where the prediction term exceeds the measurement term, so the rate tests the tool's covariance rather than the pinned σ table; a night counts once, its orbit error being common-mode. The cell is unconditioned on the engine's trust flag, so no tool flatters its rate by dropping the covariances it least trusts; the trust-gated and per-row rates ride the hover. Rows split at a 30 d fit arc. The joint matrix uses the 2×2 d²; along and cross use the 1-dof z.</div></details></div>");
+    h
+}
+
+/// 4.2B — the accuracy + realism surface pairs, one per (class, tool, arm) group
+/// present in the data, with a Class · Tool · Arm selector (a sibling of the
+/// Part-1 pair-panel show/hide). The reference arm for the common support is
+/// fixed at `default`. `profile` is the server-derived provenance label baked
+/// into the one reading line, so the page states which arms/profile the data
+/// came from without trusting the fetch.
+fn pw_surfaces_html(agg: &PredictAggregates, profile: &str) -> String {
+    let arc_bins = pw_axis(agg.cells.iter().map(|c| (c.arc_lo_days, c.arc_hi_days)));
+    let dt_bins = pw_axis(agg.cells.iter().map(|c| (c.dt_lo_days, c.dt_hi_days)));
+
+    // Distinct selector dimensions, stable order.
+    let classes: Vec<&str> = {
+        let mut v: BTreeSet<&str> = BTreeSet::new();
+        for c in &agg.cells {
+            v.insert(c.class.as_str());
+        }
+        v.into_iter().collect()
+    };
+    let tools: Vec<&str> = {
+        let mut v: BTreeSet<&str> = BTreeSet::new();
+        for c in &agg.cells {
+            v.insert(c.tool.as_str());
+        }
+        v.into_iter().collect()
+    };
+    let arms: Vec<&str> = {
+        let mut v: BTreeSet<&str> = BTreeSet::new();
+        for c in &agg.cells {
+            v.insert(c.config_arm.as_str());
+        }
+        v.into_iter().collect()
+    };
+
+    // Group the cells.
+    let mut groups: PwGroups = BTreeMap::new();
+    for c in &agg.cells {
+        groups
+            .entry((c.class.as_str(), c.tool.as_str(), c.config_arm.as_str()))
+            .or_default()
+            .insert((c.arc_lo_days.to_bits(), c.dt_lo_days.to_bits()), c);
+    }
+
+    // Default selection: the primary (tool, arm) series — the pair that actually
+    // co-occurs in the data — and the class with the most populated cells for
+    // it, so the headline panel shows real surfaces on load and never the "not in
+    // this run" fallback (the rust `default` arm has no rust walk, so defaulting to
+    // it emptied the headline). The selector still lists every class/tool/arm, so a
+    // reader can still choose an empty combination and see it marked absent.
+    let (def_tool, def_arm) = pw_primary_series(agg);
+    let populated = |cl: &str| {
+        groups
+            .get(&(cl, def_tool, def_arm))
+            .map_or(0, |g| g.values().filter(|c| c.n_objects >= 3).count())
+    };
+    let def_class = classes
+        .iter()
+        .copied()
+        .filter(|cl| populated(cl) > 0)
+        .max_by_key(|cl| populated(cl))
+        .or_else(|| classes.first().copied())
+        .unwrap_or("");
+
+    let mut h = String::new();
+    h.push_str(&format!(
+        "<div class=\"panel-title\" title=\"Walk-forward accuracy (separation, decade ladder) and realism (normalized d², diverging log₂ scale), per (class, tool, arm) over the arc × dt plane. {na} arms, {nc} classes, {profile}, snapshot {snap}.\">Surfaces</div>",
+        na = arms.len(),
+        nc = classes.len(),
+        profile = attr_escape(profile),
+        snap = attr_escape(&agg.snapshot_id),
+    ));
+    // Selector bar (a sibling of the Part-1 pair-panel selector).
+    h.push_str("<div class=\"pw-select\">");
+    for (id, label, opts, def) in [
+        ("pw-class", "class", &classes, def_class),
+        ("pw-tool", "tool", &tools, def_tool),
+        ("pw-arm", "arm", &arms, def_arm),
+    ] {
+        // The label text rides in the select's accessible name and hover rather
+        // than as a visible word (the page's visible-word budget keeps 4.2's prose
+        // on hover); the option values name the dimension on sight.
+        h.push_str(&format!(
+            "<label class=\"pw-sel-label\"><select id=\"{id}\" aria-label=\"{label}\" title=\"{label}\">"
+        ));
+        for o in opts.iter() {
+            let sel = if *o == def { " selected" } else { "" };
+            h.push_str(&format!(
+                "<option value=\"{v}\"{sel}>{v}</option>",
+                v = attr_escape(o)
+            ));
+        }
+        h.push_str("</select></label>");
+    }
+    h.push_str("</div>");
+
+    // Keys: accuracy ladder (shared) + realism diverging (the one exception).
+    h.push_str(&grid_key_html(GridAxis::SepArcsec));
+    h.push_str(&realism_key_html());
+
+    // The surfaces provenance (arms, classes, profile, snapshot) is folded into
+    // the panel-title hover above, so no separate reading line is spent here.
+
+    // The panels, one per present (class, tool, arm) group; all hidden but the
+    // default selection, toggled by the selector.
+    h.push_str("<div class=\"pw-pairs\">");
+    for ((cl, tool, arm), cells) in &groups {
+        let shown = *cl == def_class && *tool == def_tool && *arm == def_arm;
+        let hidden = if shown { "" } else { " hidden" };
+        h.push_str(&format!(
+            "<div class=\"pw-pair\" data-class=\"{}\" data-tool=\"{}\" data-arm=\"{}\"{hidden}>",
+            attr_escape(cl),
+            attr_escape(tool),
+            attr_escape(arm)
+        ));
+        h.push_str("<div class=\"pw-grid-pair\">");
+        h.push_str("<div class=\"pw-grid-one\">");
+        h.push_str(&pw_surface_grid(cells, &arc_bins, &dt_bins, false));
+        h.push_str("</div><div class=\"pw-grid-one\">");
+        h.push_str(&pw_surface_grid(cells, &arc_bins, &dt_bins, true));
+        h.push_str("</div></div></div>");
+    }
+    // The not-available line for a selected combination that carries no cells.
+    h.push_str(&format!(
+        "<div class=\"pw-pair-na\" hidden><span class=\"gk-sw hatch\" title=\"no walk ran for this class, tool and arm\"></span> {HATCH_NOT_IN_RUN}</div>"
+    ));
+    h.push_str("</div>");
+
+    // Method.
+    h.push_str("<div class=\"disclosures\"><details><summary>");
+    h.push_str(DISCLOSURE_SUMMARY);
+    h.push_str("</summary><div class=\"disc-body\">Walk-forward: fit a growing per-night window, predict each held-out sky position with its 2×2, score d². Accuracy is the equal-weight-per-object median separation on the one decade ladder; realism is the equal-weight-per-object median(d²)/(2 ln 2) on the one diverging log₂ scale — 1 is calibrated, &lt;1 over-conservative (blue), &gt;1 over-confident (red). Support is triangular: a long horizon exists only from early arc cuts. The scoring σ is pinned and identical across arms, so a difference between arms is the fitted covariance, not the scoring table. A cell with fewer than three objects is hatched, never pooled.</div></details></div>");
+    h
+}
+
+/// 4.2C — class × dt-bin marginal of the surfaces (equal-weight-per-object median
+/// separation and realism), for the rust `default` arm, every dt bin at once.
+fn pw_marginals_html(agg: &PredictAggregates) -> String {
+    let dt_bins = pw_axis(agg.cells.iter().map(|c| (c.dt_lo_days, c.dt_hi_days)));
+    let classes: Vec<&str> = {
+        let mut v: BTreeSet<&str> = BTreeSet::new();
+        for c in &agg.cells {
+            v.insert(c.class.as_str());
+        }
+        v.into_iter().collect()
+    };
+    // The single (tool, arm) this marginal is taken over: the primary series the
+    // other single-arm views share, so it is never an empty (tool, arm) slice.
+    let (tool, arm) = pw_primary_series(agg);
+
+    let mut h = String::new();
+    h.push_str("<div class=\"panel-title\" title=\"Horizon marginals per class for the primary (tool, arm): each cell an equal-weight-per-object marginal of the surfaces over the arc axis within one horizon bin — never a pooled one-dimensional statistic. The metric selector chooses what each cell shows (accuracy or realism joint / along-track / cross-track) on the surfaces' ladder; the other three ride the cell hover.\">Horizon marginals</div>");
+    // Metric toggle (owner, 2026-10-17): one number per cell instead of four
+    // stacked, chosen here — accuracy on the decade ladder, realism joint (the
+    // default) / along-track / cross-track on the diverging scale. The <select>
+    // is skip-counted, so the toggle costs no visible words; the surfaces' two
+    // keys above carry the ladder legend for the chosen metric.
+    h.push_str("<div class=\"pw-select\"><label class=\"pw-sel-label\"><select id=\"pw-marg-metric\" aria-label=\"metric\" title=\"metric\"><option value=\"acc\">accuracy</option><option value=\"rj\" selected>realism joint</option><option value=\"at\">realism along-track</option><option value=\"ct\">realism cross-track</option></select></label></div>");
+    h.push_str("<div class=\"grid-scroll\"><table class=\"agrid pw-grid\"><thead><tr><th class=\"gobj\">class</th>");
+    for &(lo, hi) in &dt_bins {
+        // Plain-text title: an `uhdr` span (it carries a double-quote) interpolated
+        // into a `title="…"` attribute closed the attribute early and leaked a
+        // `">` into the visible header. The day unit and the cell layout ride in
+        // the (now attribute-safe) hover.
+        h.push_str(&format!(
+            "<th class=\"dt\" title=\"horizon {lo}–{hi} d · sep then realism joint / along / cross\">{}</th>",
+            pw_day_label(lo, hi)
+        ));
+    }
+    h.push_str("</tr></thead><tbody>");
+    for cl in &classes {
+        h.push_str(&format!("<tr><td class=\"gtool\">{}</td>", attr_escape(cl)));
+        for &(dlo, _dhi) in &dt_bins {
+            let bin_cells: Vec<&SurfaceCell> = agg
+                .cells
+                .iter()
+                .filter(|c| {
+                    c.class == *cl
+                        && c.tool == tool
+                        && c.config_arm == arm
+                        && c.dt_lo_days.to_bits() == dlo.to_bits()
+                        && c.n_objects >= 3
+                })
+                .collect();
+            if bin_cells.is_empty() {
+                let n: u32 = agg
+                    .cells
+                    .iter()
+                    .filter(|c| {
+                        c.class == *cl
+                            && c.tool == tool
+                            && c.config_arm == arm
+                            && c.dt_lo_days.to_bits() == dlo.to_bits()
+                    })
+                    .map(|c| c.n_objects)
+                    .max()
+                    .unwrap_or(0);
+                h.push_str(&format!(
+                    "<td class=\"gc hatch\" title=\"n={n} · {HATCH_THIN}\"></td>"
+                ));
+                continue;
+            }
+            let sep = pw_median(bin_cells.iter().filter_map(|c| c.med_sep_arcsec));
+            let real = pw_median(bin_cells.iter().filter_map(|c| c.med_d2_norm));
+            let n_obj: u32 = bin_cells.iter().map(|c| c.n_objects).max().unwrap_or(0);
+            let sep_txt = sep
+                .map(|v| grid_compact(GridAxis::SepArcsec, v))
+                .unwrap_or_else(|| "—".into());
+            let real_at = pw_median(bin_cells.iter().filter_map(|c| c.med_z2_at_norm));
+            let real_ct = pw_median(bin_cells.iter().filter_map(|c| c.med_z2_ct_norm));
+            let chip = |r: Option<f64>| match r {
+                Some(v) => (realism_bin(v).0, format!("{v:.2}")),
+                None => ("rv0", "—".to_string()),
+            };
+            let (real_cls, real_txt) = chip(real);
+            let (at_cls, at_txt) = chip(real_at);
+            let (ct_cls, ct_txt) = chip(real_ct);
+            let bin = sep.map(|v| GridAxis::SepArcsec.bin(v)).unwrap_or(1);
+            let hover = attr_escape(&format!(
+                "sep {} · realism joint {} along {} cross {} · n {n_obj}",
+                sep.map(|v| grid_fmt(GridAxis::SepArcsec, v))
+                    .unwrap_or_else(|| "—".into()),
+                real.map(|v| format!("{v:.3}"))
+                    .unwrap_or_else(|| "—".into()),
+                real_at
+                    .map(|v| format!("{v:.3}"))
+                    .unwrap_or_else(|| "—".into()),
+                real_ct
+                    .map(|v| format!("{v:.3}"))
+                    .unwrap_or_else(|| "—".into()),
+            ));
+            // One number per cell — the metric selector swaps the shown value and
+            // its colour class; all four ride data-* and the full set is on hover.
+            // Default is realism joint (rj). Hatch cells carry no data-* and the
+            // selector skips them.
+            h.push_str(&format!(
+                "<td class=\"gc pw-mcell {real_cls}\" data-acc=\"{}\" data-acc-cls=\"gb{bin}\" data-rj=\"{real_txt}\" data-rj-cls=\"{real_cls}\" data-at=\"{at_txt}\" data-at-cls=\"{at_cls}\" data-ct=\"{ct_txt}\" data-ct-cls=\"{ct_cls}\" title=\"{hover}\"><span class=\"cn\">{real_txt}</span></td>",
+                attr_escape(&sep_txt)
+            ));
+        }
+        h.push_str("</tr>");
+    }
+    h.push_str("</tbody></table></div>");
+    h.push_str("<div class=\"disclosures\"><details><summary>");
+    h.push_str(DISCLOSURE_SUMMARY);
+    h.push_str("</summary><div class=\"disc-body\">Each cell is an equal-weight-per-object marginal of the surfaces over the arc axis within one horizon bin — never a pooled one-dimensional statistic. The metric selector above chooses what each cell shows: accuracy (median separation, decade ladder) or realism — joint, along-track or cross-track — on the diverging scale (median z² over the χ²₁ median, 1 calibrated); the other three ride the cell hover. Thin bins (fewer than three objects) are hatched with n.</div></details></div>");
+    h
+}
+
+/// 4.2D — the configuration arms: arm × {median realism (joint, along, cross),
+/// χ²₂-99% tail, median reduced-χ²}, plus a main-effects sub-matrix. Every arm
+/// at once, numbers only, no ranking word.
+fn pw_arms_html(agg: &PredictAggregates) -> String {
+    // Every arm present in the aggregate (the shared full arm axis), so the count
+    // reconciles with 4.2A and no arm is silently dropped. Per-arm statistics below
+    // come from the rust per-object summaries (the true per-object statistic); an
+    // arm no rust walk produced renders as an explicit hatched row.
+    let arms = pw_all_arms(agg);
+    // Tail fraction P(d² > χ²₂ 99%) per arm from the pooled (class = all)
+    // d² histogram, when one exists.
+    let tail_of = |arm: &str| -> Option<(f64, u32)> {
+        let hist = agg
+            .d2_histograms
+            .iter()
+            .find(|h| h.tool == "rust" && h.config_arm == arm && h.class == "all")?;
+        if hist.n == 0 {
+            return None;
+        }
+        // Count rows at or above CHI2_2_P99 using the linear bins + overflow.
+        let width = hist.domain_max / hist.counts.len().max(1) as f64;
+        let mut above = hist.overflow;
+        for (i, &c) in hist.counts.iter().enumerate() {
+            let edge = (i + 1) as f64 * width;
+            if edge > CHI2_2_P99 {
+                above += c;
+            }
+        }
+        Some((above as f64 / hist.n as f64, hist.n))
+    };
+    let rchi2_of = |arm: &str| -> Option<(f64, Vec<u32>)> {
+        let hist = agg
+            .reduced_chi2
+            .iter()
+            .find(|h| h.tool == "rust" && h.config_arm == arm)?;
+        if hist.n_with == 0 {
+            return None;
+        }
+        // Median bin of the log10 histogram.
+        let total: u32 = hist.counts.iter().sum();
+        if total == 0 {
+            return None;
+        }
+        let half = total / 2;
+        let mut acc = 0u32;
+        let n_bins = hist.counts.len().max(1);
+        let step = (hist.log10_hi - hist.log10_lo) / n_bins as f64;
+        let mut med = hist.log10_lo;
+        for (i, &c) in hist.counts.iter().enumerate() {
+            acc += c;
+            if acc >= half {
+                med = hist.log10_lo + (i as f64 + 0.5) * step;
+                break;
+            }
+        }
+        let dof: Vec<u32> = hist.dof.iter().map(|d| d.ndof).collect();
+        Some((10f64.powf(med), dof))
+    };
+
+    let mut h = String::new();
+    h.push_str("<div class=\"panel-title\" title=\"The full factorial of configuration arms over debias, outlier rejection, nightly bundling and covariance transport: median realism, χ²₂ 99% tail exceedance, and median reduced-χ² per arm; an arm no rust walk produced is hatched, never dropped. The reader compares the numbers; nothing is ranked.\">Configuration arms</div>");
+    // Main effects first (owner, 2026-10-17); the full factor grid sits behind a
+    // toggle. Swept over the rust factorial only — the other tools' single arms
+    // carry no factor structure, so they are not part of a swept level.
+    let rust_arms: Vec<&str> = arms
+        .iter()
+        .copied()
+        .filter(|a| {
+            agg.per_object
+                .iter()
+                .any(|p| p.tool == "rust" && p.config_arm == *a)
+        })
+        .collect();
+    h.push_str(&pw_main_effects_html(agg, &rust_arms));
+    h.push_str("<details class=\"more-tables\"><summary>full factor grid</summary>");
+    h.push_str(&format!(
+        "<div class=\"grid-scroll\"><table class=\"agrid pw-grid\"><thead><tr><th class=\"gobj\">debias</th><th>rejection</th><th>nightly</th><th>transport</th><th title=\"joint median realism\">{}{RV_RULER}</th><th title=\"along-track median realism\">{}{RV_RULER}</th><th title=\"cross-track median realism\">{}{RV_RULER}</th><th>{}</th><th>{}</th><th>objects</th></tr></thead><tbody>",
+        uhdr("median realism"),
+        uhdr("along"),
+        uhdr("cross"),
+        uhdr("χ²₂ 99% tail"),
+        uhdr("median χ²ᵣ"),
+    ));
+    for arm in &arms {
+        // An arm present in the cells but with no rust walk (another tool's single
+        // arm): an explicit hatched row with its reason, so the 38 vs 36 arm counts
+        // reconcile and nothing vanishes silently.
+        let has_rust = agg
+            .per_object
+            .iter()
+            .any(|p| p.tool == "rust" && p.config_arm == *arm);
+        if !has_rust {
+            let fac = pw_arm_factors(arm);
+            h.push_str(&format!(
+                "<tr><td class=\"gtool\" title=\"{}\">{}</td><td>{}</td><td>{}</td><td>{}</td><td class=\"gc hatch\" title=\"no rust walk for this arm\"></td><td class=\"gc hatch\" title=\"no rust walk for this arm\"></td><td class=\"gc hatch\" title=\"no rust walk for this arm\"></td><td class=\"gc hatch\" title=\"no rust walk for this arm\"></td><td class=\"gc hatch\" title=\"no rust walk for this arm\"></td><td class=\"r1c\"><span class=\"cn-n\">0</span></td></tr>",
+                attr_escape(arm),
+                fac[0], fac[1], fac[2], fac[3],
+            ));
+            continue;
+        }
+        let med_over = |pick: fn(&ObjectWalkSummary) -> Option<f64>| {
+            pw_median(
+                agg.per_object
+                    .iter()
+                    .filter(|p| p.tool == "rust" && p.config_arm == *arm)
+                    .filter_map(pick),
+            )
+        };
+        let real = med_over(|p| p.med_d2_norm);
+        let real_at = med_over(|p| p.med_z2_at_norm);
+        let real_ct = med_over(|p| p.med_z2_ct_norm);
+        let n_obj = agg
+            .per_object
+            .iter()
+            .filter(|p| p.tool == "rust" && p.config_arm == *arm && p.med_d2_norm.is_some())
+            .count();
+        let rcell = |r: Option<f64>| match r {
+            Some(v) => format!(
+                "<td class=\"gc {}\"><span class=\"cn\">{v:.2}</span></td>",
+                realism_bin(v).0
+            ),
+            None => "<td class=\"gc rv0\"><span class=\"cn\">—</span></td>".to_string(),
+        };
+        let (real_cls, real_txt) = match real {
+            Some(v) => (realism_bin(v).0, format!("{v:.2}")),
+            None => ("rv0", "—".into()),
+        };
+        let tail_txt = match tail_of(arm) {
+            Some((f, n)) => format!(
+                "<span class=\"cn\" title=\"{n} rows\">{:.1}%</span>",
+                f * 100.0
+            ),
+            None => format!(
+                "<span class=\"cn hatch-inline\" title=\"no d² histogram for this arm\">{}</span>",
+                "—"
+            ),
+        };
+        let rchi2_txt = match rchi2_of(arm) {
+            Some((m, dof)) => {
+                let dof_str = if dof.is_empty() {
+                    String::new()
+                } else {
+                    format!(
+                        " · ν {}–{}",
+                        dof.iter().min().copied().unwrap_or(0),
+                        dof.iter().max().copied().unwrap_or(0)
+                    )
+                };
+                format!(
+                    "<span class=\"cn\" title=\"median reduced-χ²{dof_str}\">{m:.2}</span>"
+                )
+            }
+            None => "<span class=\"cn hatch-inline\" title=\"no reduced-χ² histogram for this arm\">—</span>".to_string(),
+        };
+        let fac = pw_arm_factors(arm);
+        h.push_str(&format!(
+            "<tr><td class=\"gtool\" title=\"{}\">{}</td><td>{}</td><td>{}</td><td>{}</td><td class=\"gc {real_cls}\"><span class=\"cn\">{real_txt}</span></td>{}{}<td>{tail_txt}</td><td>{rchi2_txt}</td><td class=\"r1c\"><span class=\"cn-n\">{n_obj}</span></td></tr>",
+            attr_escape(arm),
+            fac[0], fac[1], fac[2], fac[3],
+            rcell(real_at),
+            rcell(real_ct),
+        ));
+    }
+    h.push_str("</tbody></table></div>");
+    h.push_str("</details>");
+
+    h.push_str("<div class=\"disclosures\"><details><summary>");
+    h.push_str(DISCLOSURE_SUMMARY);
+    h.push_str("</summary><div class=\"disc-body\">The full factorial over debias, outlier rejection, nightly bundling and covariance transport. Median realism is the surfaces realism statistic over the arm's objects, with the along-track and cross-track medians beside the joint; the χ²₂ 99% tail is the fraction of held-out d² beyond 9.21; the reduced-χ² is the in-sample fit statistic, whose expected central interval depends on ν (shown per arm). Main effects sweep one factor and marginalize the rest. An arm no rust walk produced is hatched. No arm is ranked — the reader compares the numbers.</div></details></div>");
+    h
+}
+
+/// The 4.2C main-effects sub-matrix: for each factor token that varies across the
+/// arm set, the marginal median realism at each of its levels.
+fn pw_main_effects_html(agg: &PredictAggregates, arms: &[&str]) -> String {
+    // Treat each distinct factor token (debias efcc/nodeb, rejection adap/cmc/norej,
+    // nightly nonight/vfc, transport mc/sp) as a level and group the arms that carry
+    // it. Tokens come from [`pw_arm_tokens`] (the real `.`/`+`/`_` delimiters);
+    // splitting on `_` alone left each slug one token and emptied the sub-matrix.
+    // A token carried by only one arm is not a swept level and is skipped below.
+    let mut tokens: BTreeSet<&str> = BTreeSet::new();
+    for a in arms {
+        for t in pw_arm_tokens(a) {
+            tokens.insert(t);
+        }
+    }
+    if tokens.is_empty() {
+        return String::new();
+    }
+    // The sub-matrix label rides in the header cell (table content, exempt from
+    // the visible-word budget) rather than a separate counted panel-title.
+    let mut h = String::from("<div class=\"grid-scroll\"><table class=\"agrid pw-grid\"><thead>");
+    h.push_str(&format!(
+        "<tr><th class=\"gobj\">factor</th><th>level</th><th>{}{RV_RULER}</th><th>arms</th></tr></thead><tbody>",
+        uhdr("marginal realism"),
+    ));
+    for tok in &tokens {
+        let matching: Vec<&str> = arms
+            .iter()
+            .copied()
+            .filter(|a| pw_arm_tokens(a).any(|t| t == *tok))
+            .collect();
+        if matching.len() < 2 {
+            continue; // a token carried by one arm is not a swept level
+        }
+        let real = pw_median(
+            agg.per_object
+                .iter()
+                .filter(|p| p.tool == "rust" && matching.iter().any(|a| *a == p.config_arm))
+                .filter_map(|p| p.med_d2_norm),
+        );
+        let (cls, txt) = match real {
+            Some(v) => (realism_bin(v).0, format!("{v:.2}")),
+            None => ("rv0", "—".into()),
+        };
+        h.push_str(&format!(
+            "<tr><td class=\"gtool\">{}</td><td>{}</td><td class=\"gc {cls}\"><span class=\"cn\">{txt}</span></td><td class=\"r1c\"><span class=\"cn-n\">{}</span></td></tr>",
+            pw_token_factor(tok),
+            attr_escape(tok),
+            matching.len(),
+        ));
+    }
+    h.push_str("</tbody></table></div>");
+    h
+}
+
+/// 4.2E — the per-object walk: object × the `default` arm → windows
+/// converged/expected, realism, median separation. Non-convergence is a row,
+/// never a drop; an object no window converged on is the hatched state.
+fn pw_objects_html(agg: &PredictAggregates) -> String {
+    // The single (tool, arm) walked per object: the shared primary series, so the
+    // matrix is never an empty (tool, arm) slice reading "0 objects".
+    let (tool, arm) = pw_primary_series(agg);
+    let mut rows: Vec<&ObjectWalkSummary> = agg
+        .per_object
+        .iter()
+        .filter(|p| p.tool == tool && p.config_arm == arm)
+        .collect();
+    rows.sort_by(|a, b| a.class.cmp(&b.class).then(a.object.cmp(&b.object)));
+
+    let mut h = String::new();
+    h.push_str(&format!(
+        "<div class=\"panel-title\" title=\"Per-object walk for the primary (tool, arm) over {} objects: windows converged of expected, realism (joint, along, cross), median separation. A partially-failed walk shows its fraction; an object no window converged on is hatched, never dropped.\">Per-object walk</div>",
+        rows.len()
+    ));
+    h.push_str("<div class=\"grid-key\"><span class=\"gk\"><span class=\"gk-sw hatch\" title=\"no window converged for this object\"></span>none converged</span></div>");
+    h.push_str(&format!(
+        "<div class=\"grid-scroll\"><table class=\"agrid pw-grid\"><thead><tr><th class=\"gobj\">object</th><th>class</th><th>windows</th><th title=\"joint realism\">{}</th><th title=\"along-track realism\">{}</th><th title=\"cross-track realism\">{}</th><th>{}</th></tr></thead><tbody>",
+        uhdr("realism"),
+        uhdr("along"),
+        uhdr("cross"),
+        uhdr("median sep"),
+    ));
+    for p in &rows {
+        let conv = format!("{}/{}", p.n_windows_converged, p.n_windows_expected);
+        if p.n_windows_converged == 0 {
+            h.push_str(&format!(
+                "<tr><td class=\"gtool\">{}</td><td>{}</td><td class=\"gc hatch\" title=\"no window converged — {} expected\">{conv}</td><td class=\"gc hatch\"></td><td class=\"gc hatch\"></td><td class=\"gc hatch\"></td><td class=\"gc hatch\"></td></tr>",
+                attr_escape(&p.object),
+                attr_escape(&p.class),
+                p.n_windows_expected,
+            ));
+            continue;
+        }
+        let (real_cls, real_txt, real_hover) = match p.med_d2_norm {
+            Some(v) => (
+                realism_bin(v).0,
+                format!("{v:.2}"),
+                format!("realism {v:.3}"),
+            ),
+            None => ("rv0", "—".into(), "no σ-dominated d²".into()),
+        };
+        let rcell = |r: Option<f64>, lbl: &str| match r {
+            Some(v) => format!(
+                "<td class=\"gc {}\" title=\"{lbl} realism {v:.3}\"><span class=\"cn\">{v:.2}</span></td>",
+                realism_bin(v).0
+            ),
+            None => format!(
+                "<td class=\"gc rv0\" title=\"{lbl}: no σ-dominated z\"><span class=\"cn\">—</span></td>"
+            ),
+        };
+        let at_cell = rcell(p.med_z2_at_norm, "along-track");
+        let ct_cell = rcell(p.med_z2_ct_norm, "cross-track");
+        let sep_txt = p
+            .med_sep_arcsec
+            .map(|v| grid_compact(GridAxis::SepArcsec, v))
+            .unwrap_or_else(|| "—".into());
+        let sep_bin = p
+            .med_sep_arcsec
+            .map(|v| GridAxis::SepArcsec.bin(v))
+            .unwrap_or(1);
+        let trust = if p.trust_reasons.is_empty() {
+            String::new()
+        } else {
+            let t: Vec<String> = p
+                .trust_reasons
+                .iter()
+                .map(|(k, v)| format!("{k}:{v}"))
+                .collect();
+            format!(" · trust {}", t.join(" "))
+        };
+        h.push_str(&format!(
+            "<tr><td class=\"gtool\">{}</td><td>{}</td><td class=\"gc\" title=\"{} predictions{trust}\"><span class=\"cn\">{conv}</span></td><td class=\"gc {real_cls}\" title=\"{}\"><span class=\"cn\">{real_txt}</span></td>{at_cell}{ct_cell}<td class=\"gc gb{sep_bin}\" title=\"{}\"><span class=\"cn\">{sep_txt}</span></td></tr>",
+            attr_escape(&p.object),
+            attr_escape(&p.class),
+            p.n_predictions,
+            attr_escape(&real_hover),
+            attr_escape(
+                &p.med_sep_arcsec
+                    .map(|v| grid_fmt(GridAxis::SepArcsec, v))
+                    .unwrap_or_else(|| "—".into())
+            ),
+        ));
+    }
+    h.push_str("</tbody></table></div>");
+    h.push_str("<div class=\"disclosures\"><details><summary>");
+    h.push_str(DISCLOSURE_SUMMARY);
+    h.push_str("</summary><div class=\"disc-body\">Converged of expected windows per object for the primary (tool, arm). A partially-failed walk shows its fraction; an object no window converged on is the hatched state, counted, never dropped. Realism — joint, then along-track and cross-track — rides the diverging scale; separation the decade ladder. The engine's covariance-trust verdicts ride in each row's hover.</div></details></div>");
+    h
+}
+
+/// 4.2F — calibration: observed 1σ/2σ coverage per arm (from the surface cells,
+/// against the normal-law χ²₂ expectation), plus the D-003 log-score ranking,
+/// PIT / CvM and law-aware coverage, which are marked absent until a Student-t
+/// arm runs (D-005) — never fabricated.
+fn pw_calibration_html(agg: &PredictAggregates) -> String {
+    // The shared full arm axis, so the row count reconciles with 4.2A / 4.2C; an
+    // arm no rust walk produced renders as an explicit hatched row.
+    let arms = pw_all_arms(agg);
+    let mut h = String::new();
+    h.push_str("<div class=\"panel-title\" title=\"Calibration: observed 1σ/2σ coverage against the normal-law χ²₂ expectation. The law-aware log-score ranking has no data until a Student-t arm runs.\">Calibration</div>");
+    h.push_str("<div class=\"grid-summary reading\" title=\"observed 1σ/2σ coverage against the normal-law χ²₂ expectation 0.3935 / 0.8647; the law-aware log-score ranking has no data until a Student-t arm runs\">log-score absent</div>");
+    let cov_cell = |v: Option<f64>| match v {
+        Some(x) => format!("<td class=\"gc\"><span class=\"cn\">{x:.3}</span></td>"),
+        None => "<td class=\"gc hatch\" title=\"no covered cell for this arm\"></td>".to_string(),
+    };
+    let rust_arms: Vec<&str> = arms
+        .iter()
+        .copied()
+        .filter(|a| {
+            agg.cells
+                .iter()
+                .any(|c| c.tool == "rust" && c.config_arm == *a)
+        })
+        .collect();
+
+    // Main-effects summary first (owner, 2026-10-17): one factor swept, the rest
+    // marginalized over the rust factorial — the marginal 1σ/2σ coverage at each
+    // factor level, the same factor-column shape as Configuration arms.
+    h.push_str(&format!(
+        "<div class=\"grid-scroll\"><table class=\"agrid pw-grid\"><thead><tr><th class=\"gobj\">factor</th><th>level</th><th title=\"median over the level's cells (rust, n ≥ 3) · normal-law χ²₂ expectation 0.3935\">{}</th><th title=\"median over the level's cells (rust, n ≥ 3) · normal-law χ²₂ expectation 0.8647\">{}</th><th>arms</th></tr></thead><tbody>",
+        uhdr("1σ obs"),
+        uhdr("2σ obs"),
+    ));
+    {
+        let mut tokens: BTreeSet<&str> = BTreeSet::new();
+        for a in &rust_arms {
+            for t in pw_arm_tokens(a) {
+                tokens.insert(t);
+            }
+        }
+        for tok in &tokens {
+            let matching: Vec<&str> = rust_arms
+                .iter()
+                .copied()
+                .filter(|a| pw_arm_tokens(a).any(|t| t == *tok))
+                .collect();
+            if matching.len() < 2 {
+                continue; // a token carried by one arm is not a swept level
+            }
+            let c1 = pw_median(
+                agg.cells
+                    .iter()
+                    .filter(|c| {
+                        c.tool == "rust"
+                            && c.n_objects >= 3
+                            && matching.iter().any(|a| *a == c.config_arm)
+                    })
+                    .filter_map(|c| c.cov_1s),
+            );
+            let c2 = pw_median(
+                agg.cells
+                    .iter()
+                    .filter(|c| {
+                        c.tool == "rust"
+                            && c.n_objects >= 3
+                            && matching.iter().any(|a| *a == c.config_arm)
+                    })
+                    .filter_map(|c| c.cov_2s),
+            );
+            h.push_str(&format!(
+                "<tr><td class=\"gtool\">{}</td><td>{}</td>{}{}<td class=\"r1c\"><span class=\"cn-n\">{}</span></td></tr>",
+                pw_token_factor(tok),
+                attr_escape(tok),
+                cov_cell(c1),
+                cov_cell(c2),
+                matching.len(),
+            ));
+        }
+    }
+    h.push_str("</tbody></table></div>");
+
+    // The full per-arm list behind a toggle: the rust factorial as factor columns,
+    // the external tools' single arms as tool-named rows (no factor structure).
+    h.push_str("<details class=\"more-tables\"><summary>full arm list</summary>");
+    h.push_str(&format!(
+        "<div class=\"grid-scroll\"><table class=\"agrid pw-grid\"><thead><tr><th class=\"gobj\">debias</th><th>rejection</th><th>nightly</th><th>transport</th><th title=\"normal-law χ²₂ expectation 0.3935\">{}</th><th title=\"normal-law χ²₂ expectation 0.8647\">{}</th></tr></thead><tbody>",
+        uhdr("1σ obs"),
+        uhdr("2σ obs"),
+    ));
+    for arm in &arms {
+        let has_rust = agg
+            .cells
+            .iter()
+            .any(|c| c.tool == "rust" && c.config_arm == *arm);
+        if !has_rust {
+            // External tool's single arm: a row named by tool, no factor structure.
+            let tool = agg
+                .cells
+                .iter()
+                .find(|c| c.config_arm == *arm)
+                .map(|c| c.tool.as_str())
+                .unwrap_or("");
+            h.push_str(&format!(
+                "<tr><td class=\"gtool\" title=\"{}\">{} · {}</td><td>—</td><td>—</td><td>—</td><td class=\"gc hatch\" title=\"no rust walk for this arm\"></td><td class=\"gc hatch\" title=\"no rust walk for this arm\"></td></tr>",
+                attr_escape(arm),
+                attr_escape(tool),
+                attr_escape(arm),
+            ));
+            continue;
+        }
+        let fac = pw_arm_factors(arm);
+        let c1 = pw_median(
+            agg.cells
+                .iter()
+                .filter(|c| c.tool == "rust" && c.config_arm == *arm && c.n_objects >= 3)
+                .filter_map(|c| c.cov_1s),
+        );
+        let c2 = pw_median(
+            agg.cells
+                .iter()
+                .filter(|c| c.tool == "rust" && c.config_arm == *arm && c.n_objects >= 3)
+                .filter_map(|c| c.cov_2s),
+        );
+        h.push_str(&format!(
+            "<tr><td class=\"gtool\" title=\"{}\">{}</td><td>{}</td><td>{}</td><td>{}</td>{}{}</tr>",
+            attr_escape(arm),
+            fac[0], fac[1], fac[2], fac[3],
+            cov_cell(c1),
+            cov_cell(c2),
+        ));
+    }
+    h.push_str("</tbody></table></div>");
+    h.push_str("</details>");
+
+    // D-003 log-score ranking: marked absent until the Student-t chain runs
+    // (D-005). The cross-law ranking is only meaningful once a Student-t arm
+    // exists, so a normal-law-only run keeps the marked-absent state even though
+    // its calibration cells carry normal-law log scores. The sub-matrix label
+    // rides in its header cell (table content, exempt).
+    if agg
+        .calibration
+        .iter()
+        .any(|c| c.scoring_law == "student-t" && c.mean_log_score.is_some())
+    {
+        h.push_str(&pw_log_score_table(agg));
+    } else {
+        h.push_str(&format!(
+            "<div class=\"grid-scroll\"><table class=\"agrid pw-grid\"><thead><tr><th class=\"gobj\">log-score ranking — arm</th><th>{}</th><th>{}</th><th>nights</th></tr></thead><tbody><tr><td class=\"gc hatch\" title=\"{AWAITING_STUDENT_T}\" colspan=\"4\">{AWAITING_STUDENT_T}</td></tr></tbody></table></div>",
+            uhdr("mean log-score"),
+            uhdr("SE"),
+        ));
+    }
+    h.push_str("<div class=\"disclosures\"><details><summary>");
+    h.push_str(DISCLOSURE_SUMMARY);
+    h.push_str("</summary><div class=\"disc-body\">Observed coverage is the equal-weight-per-object median over the surface cells of the fraction of held-out d² within 1σ and 2σ, paired here with the normal-law χ²₂ expectation (0.3935, 0.8647). The main-effects rows take that same median over all the cells of the arms at a factor level (rust, n ≥ 3) — not a mean of per-arm values — so they reconcile with the full-arm-list rows; the linear transport baseline carries no main-effect row, being the absence of the mc/sp token. The proper scoring rule — mean log predictive density, resampled by night for a cluster-robust standard error — and the law-aware coverage, PIT and Cramér–von Mises statistics are empty until a Student-t arm runs; their rows are hatched \"awaiting Student-t chain\", never filled with a fabricated number.</div></details></div>");
+    h
+}
+
+/// The populated log-score ranking table, drawn only when a calibration cell
+/// carries a `mean_log_score` (i.e. a Student-t arm has run). A stated number
+/// with its SE — never a winner word.
+fn pw_log_score_table(agg: &PredictAggregates) -> String {
+    let mut rows: Vec<&CalibrationCell> = agg
+        .calibration
+        .iter()
+        .filter(|c| {
+            c.stratum == "overall"
+                && c.class == "all"
+                && c.scoring_law == "student-t"
+                && c.mean_log_score.is_some()
+        })
+        .collect();
+    rows.sort_by(|a, b| {
+        b.mean_log_score
+            .partial_cmp(&a.mean_log_score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    let mut h = String::from(
+        "<div class=\"grid-scroll\"><table class=\"agrid pw-grid\"><thead><tr><th class=\"gobj\">log-score ranking — arm</th><th>",
+    );
+    h.push_str(&uhdr("mean log-score"));
+    h.push_str("</th><th>");
+    h.push_str(&uhdr("SE"));
+    h.push_str("</th><th>nights</th></tr></thead><tbody>");
+    for c in &rows {
+        h.push_str(&format!(
+            "<tr><td class=\"gtool\" title=\"{}\">{}</td><td class=\"gc\"><span class=\"cn\">{}</span></td><td class=\"gc\"><span class=\"cn\">{}</span></td><td class=\"r1c\"><span class=\"cn-n\">{}</span></td></tr>",
+            attr_escape(&c.scoring_law),
+            attr_escape(&c.config_arm),
+            c.mean_log_score.map(|v| format!("{v:.3}")).unwrap_or_else(|| "—".into()),
+            c.mean_log_score_se.map(|v| format!("{v:.3}")).unwrap_or_else(|| "—".into()),
+            c.n_nights,
+        ));
+    }
+    h.push_str("</tbody></table></div>");
+    h
+}
+
+/// 4.2G — the per-object walk timeline shell: an object `<select>` and a mount
+/// the client draws into from the verified predict sidecar. The one interactive
+/// element; it shows nothing until the sidecar verifies.
+fn pw_timeline_shell(agg: &PredictAggregates) -> String {
+    // Objects available in the per-window family (the sidecar), stable order.
+    let mut objs: Vec<(&str, &str)> = agg
+        .per_window
+        .iter()
+        .map(|w| (w.object.as_str(), w.class.as_str()))
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect();
+    objs.sort();
+    let mut h = String::new();
+    h.push_str("<div class=\"panel-title\" title=\"One object's walk: normalized d² and separation versus window as the fit arc grows. The arc × dt surfaces marginalise exactly this per-window view.\">Walk timeline</div>");
+    h.push_str("<div class=\"pw-select\"><label class=\"pw-sel-label\"><select id=\"pw-timeline-object\" aria-label=\"object\" title=\"object\">");
+    for (o, cl) in &objs {
+        h.push_str(&format!(
+            "<option value=\"{v}\" title=\"{cl}\">{v}</option>",
+            v = attr_escape(o),
+            cl = attr_escape(cl)
+        ));
+    }
+    h.push_str("</select></label></div>");
+    h.push_str("<div id=\"pw-timeline-chart\" style=\"height:360px;\"></div>");
+    h.push_str("<div class=\"disclosures\"><details><summary>");
+    h.push_str(DISCLOSURE_SUMMARY);
+    h.push_str("</summary><div class=\"disc-body\">One point per fit window as the arc grows: normalized d² against the χ²₂ 50% / 95% bands, and median separation. Breaks are failed or empty windows; the curve is cut across apparition gaps. This chart reads the verified per-object sidecar fetched beside the dataset; it shows nothing until that file's byte length and hash match.</div></details></div>");
+    h
+}
+
+/// Build Part 4.2 "Predictive power" — the `s15` section body. `None` (no walk
+/// loaded) renders the empty state; the section shell always renders.
+fn build_predictive_power_html(agg: Option<&PredictAggregates>) -> String {
+    let Some(agg) = agg else {
+        return "<div class=\"grid-summary\" title=\"No walk-forward aggregate was supplied (report --predict-agg). Run score-predictions and pass its aggregate to populate this section.\">No walk-forward data in this report.</div>".to_string();
+    };
+    // Provenance label (arms/classes/snapshot) is baked into 4.2A's one reading
+    // line, server-side, so it is stated without a second reading line and
+    // without trusting the client fetch.
+    let profile = if agg.profile == "unstated" {
+        "profile unstated".to_string()
+    } else {
+        format!("profile {}", agg.profile)
+    };
+    let mut h = String::new();
+    // 4.2A Coverage leads — the predictive-power headline.
+    h.push_str(&pw_coverage_html(agg));
+    // 4.2B surfaces, 4.2C marginals, 4.2D arms, 4.2E per-object, 4.2F
+    // calibration, 4.2G timeline.
+    h.push_str(&pw_surfaces_html(agg, &profile));
+    h.push_str(&pw_marginals_html(agg));
+    h.push_str(&pw_arms_html(agg));
+    h.push_str(&pw_objects_html(agg));
+    h.push_str(&pw_calibration_html(agg));
+    h.push_str(&pw_timeline_shell(agg));
+    h
+}
+
 /// Generate the interactive HTML validation report.
 ///
 /// `orbit_comparisons` is the optional sidecar from `validate od`'s
 /// `_compare.jsonl` output — empty slice when no orbit-comparison data is
 /// available (e.g., CI runs that skip the SBDB / find_orb queries).
+///
+/// `predict_agg` is the walk-forward predictive-power aggregate
+/// (`score-predictions --out-agg`, merged by [`merge_predict_aggregates`]) —
+/// `None` when no walk was loaded, which renders Part 4.2's empty state. The
+/// small static families render server-side into the page; only the large
+/// per-object timeline family travels to the client, as a second verified
+/// sidecar beside the dataset.
 pub fn generate_report(
     results: &[ValidationResult],
     orbit_comparisons: &[crate::schema::OrbitComparison],
     output: &Path,
     summary: Option<&Path>,
+    predict_agg: Option<&crate::predict_schema::PredictAggregates>,
 ) -> Result<(), String> {
     let core_results: Vec<&ValidationResult> =
         results.iter().filter(|r| r.channel == "core").collect();
@@ -5143,6 +6993,15 @@ pub fn generate_report(
     } else {
         report_run_iso
     };
+    // The empyrean distribution version the component table reports, defined once
+    // here and reused by the branded-export attribution so the two cannot drift.
+    let empyrean_version = "0.10.0";
+    // The branded-export attribution, built once server-side. It is emitted only
+    // into the client script (never as visible page text); the download handler
+    // appends each chart's own section, title and selected pair at click time.
+    let export_attribution = format!(
+        "EMPYREAN DYNAMICS · validation report · {report_run_date} · empyrean {empyrean_version}"
+    );
     let test_epoch = prop_results.first().map(|r| r.epoch_mjd_tdb).unwrap_or(0.0);
 
     // Test-epoch as a calendar date label (MJD → UTC date, no fractional).
@@ -5215,6 +7074,9 @@ pub fn generate_report(
     let h4_fidelity_grid_html = build_channel_fidelity_grid(results);
     let tool_ranking_html = build_tool_ranking_html(results, orbit_comparisons);
     let covariance_realism_html = build_covariance_realism_html(results, orbit_comparisons);
+    // Part 4.2: the walk-forward predictive-power section. Server-rendered static
+    // families; the per-object timeline travels to the client as a sidecar.
+    let predictive_power_html = build_predictive_power_html(predict_agg);
     // Timing (empyrean-52esa pass 6): the selected pair's per-object / per-population
     // wall clock in Section 1 (one per axis, 1.1C/1.2C/1.3C), all cross-tool
     // wall-clock matrices in Part 2 (§2.2). One place resolves the empyrean
@@ -5324,7 +7186,7 @@ pub fn generate_report(
       <tr><td>Asteroid perturber set</td><td>SB441-N16: <code>1, 2, 3, 4, 7, 10, 15, 16, 31, 52, 65, 87, 88, 107, 511, 704</code></td></tr>
       <tr><td>Force model (standard)</td><td>Point-mass Sun + 8 planets + Moon + Pluto + 16 SB441-N16 asteroids; 1PN GR Einstein-Infeld-Hoffmann for Sun; non-gravitational A1 (radial) / A2 (transverse) / A3 (normal) accelerations with Marsden's <code>g(r)</code>. For asteroids, A2 ≠ 0 is the standard parameterisation of the <b>Yarkovsky effect</b> (Marsden, Sekanina &amp; Yeomans 1973 / Vokrouhlický et al. 2015).</td></tr>
       <tr><td>Integrator</td><td>GR15 (15-stage Gauss-Radau, adaptive step; derived solely from Everhart 1985)</td></tr>
-      <tr><td>Autodiff (Jet1 STM)</td><td>forward-mode, N = 6 (or 9 with non-grav)</td></tr>
+      <tr><td>Autodiff</td><td>forward-mode partials, N = 6 (or 9 with non-grav)</td></tr>
       <tr><td>External OD references</td><td>JPL SBDB (reported normalized rms → reduced χ² + n_obs) &middot; layup (Holman, Smithsonian/CfA) &middot; find_orb (Project Pluto, B. Gray) &middot; GRSS (Makadia et al. &mdash; the second radar-capable reference)</td></tr>
       <tr><td>External propagation references</td><td>ASSIST 1.2.3 (Holman et al. 2023) on REBOUND 4.6.0 IAS15, run under three configurations (see the six-arm section &mdash; settings read back after <code>assist.Extras</code> attach): <b>default</b> (mode 1 &ldquo;global&rdquo;, &epsilon; 1e-9, min_dt 0, initial dt 0.001 d), <b>layup</b> (mode 2, else identical), <b>asteroid_institute</b> (mode 1, &epsilon; 1e-6, min_dt 1e-9 d, initial dt 1e-6 d). ASSIST models no Marsden <b>DT</b> (non-gravitational time delay) term, so the five objects whose plan IC carries one &mdash; 67P (&Delta;T +45.69 d), 103P/Hartley 2 (+12.23 d), 46P/Wirtanen (&minus;14.15 d), 2I/Borisov (&minus;65.13 d), 3I/ATLAS (+9.48 d) &mdash; diverge from Horizons under every configuration; empyrean applies &Delta;T and matches Horizons to metres, so those rows are excluded from the ASSIST position medians and marked, never dropped. &middot; OpenOrb (Granvik et al.)</td></tr>
       <tr><td>Observation source</td><td>Minor Planet Center API; fetched at runtime</td></tr>
@@ -5522,7 +7384,7 @@ pub fn generate_report(
   #part1 {{ order: 10; }} #part1-bar {{ order: 11; }} #s02 {{ order: 12; }} #s03 {{ order: 13; }} #s-t1-prop {{ order: 14; }} #s06 {{ order: 15; }} #s06b {{ order: 16; }} #s-t2-eph {{ order: 17; }} #s07 {{ order: 18; }} #s08b {{ order: 19; }} #s-t3-od {{ order: 20; }}
   #part2 {{ order: 21; }} #s-ranking {{ order: 22; }} #s-timing {{ order: 23; }}
   #part3 {{ order: 30; }} #s10 {{ order: 31; }} #s05 {{ order: 32; }} #s09b {{ order: 33; }}
-  #part4 {{ order: 40; }} #s12 {{ order: 41; }}
+  #part4 {{ order: 40; }} #s12 {{ order: 41; }} #s15 {{ order: 42; }}
   #appendix {{ order: 49; }} #s01 {{ order: 50; }} #s01b {{ order: 51; }} #s05c {{ order: 52; }} #s13 {{ order: 53; }}
   @media (max-width: 1100px) {{ .rail {{ display: none; }} .masthead {{ padding: 32px 20px 18px; }} }}
 
@@ -5569,6 +7431,13 @@ pub fn generate_report(
 
   .section-q {{ font-family: var(--ed-font-body); font-size: 14px; color: var(--ed-text-secondary); line-height: 1.6; max-width: 900px; margin-bottom: 14px; }}
   .disclosures {{ margin-top: 12px; font-family: var(--ed-font-mono); font-size: 11px; }}
+  .more-tables {{ margin-top: 10px; }}
+  .more-tables > summary {{ cursor: pointer; display: inline-block; font-family: var(--ed-font-mono); font-size: 11px; color: var(--ed-text-secondary); border: 1px solid var(--ed-input-border); border-radius: var(--ed-radius-sm); padding: 3px 10px; list-style: none; }}
+  .more-tables > summary::-webkit-details-marker {{ display: none; }}
+  .more-tables > summary::before {{ content: "▸ "; color: var(--ed-text-muted); }}
+  .more-tables[open] > summary::before {{ content: "▾ "; }}
+  .more-tables > summary:hover {{ color: var(--ed-accent); border-color: var(--ed-accent); }}
+  .more-tables[open] > summary {{ margin-bottom: 8px; }}
   .disclosures summary {{ color: var(--ed-accent); cursor: pointer; }}
   .disclosures .disc-body {{ color: var(--ed-text-secondary); line-height: 1.7; max-width: 900px; margin-top: 8px; }}
   .refs {{ color: var(--ed-text-secondary); line-height: 1.6; max-width: 900px; }}
@@ -5636,6 +7505,8 @@ pub fn generate_report(
      wrapper, not below the bar — the offset is inert there. */
   table.agrid th {{ padding: 5px 4px; color: var(--ed-text-secondary); font-weight: 400; letter-spacing: 0.3px; font-size: 11px; border-bottom: 1px solid var(--ed-border); position: sticky; top: var(--sticky-offset, 0px); background: var(--ed-bg); z-index: 2; }}
   table.agrid th.gdt {{ text-align: center; min-width: 40px; }}
+  table.agrid th.fo-grp {{ text-align: center; border-left: 1px solid var(--ed-border); font-weight: 700; color: var(--ed-text-primary); }}
+  .rvruler {{ font-size: 9px; color: var(--ed-text-muted); font-weight: 400; margin-top: 1px; }}
   table.agrid th.gt0h {{ color: var(--ed-text-muted); border-left: 3px solid var(--ed-border); }}
   table.agrid th.gobj {{ text-align: left; position: sticky; left: 0; z-index: 3; background: var(--ed-bg); }}
   table.agrid th.gworst {{ position: sticky; right: 0; background: var(--ed-bg); z-index: 3; text-align: left; min-width: 76px; }}
@@ -5644,6 +7515,10 @@ pub fn generate_report(
   .agrid tr.gsummary td.gtool {{ color: var(--ed-text-primary); }}
   /* Per-population median header row (H1/H2). */
   .agrid tr.gpophdr td.gpopname {{ font-family: var(--ed-font-display); font-weight: 700; font-size: 12px; color: var(--ed-text-primary); text-transform: uppercase; letter-spacing: 0.5px; padding: 6px 10px 6px 8px; position: sticky; left: 0; background: var(--ed-bg); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }}
+  /* The covariance-arm provenance beside a 4.2A tool group name: a quieter mono
+     slug that keeps its own case (text-transform: none) so efcc.adap.nonight is
+     not uppercased. */
+  .agrid tr.gpophdr td.gpopname .pwarm {{ font-family: var(--ed-font-mono); font-weight: 400; font-size: 11px; letter-spacing: 0; text-transform: none; color: var(--ed-text-muted); }}
   .agrid tr.gpophdr td {{ border-top: 2px solid var(--ed-border); }}
   .agrid tr.gobjr td.gobjname2 {{ text-align: left; color: var(--ed-text-primary); font-size: 12px; padding: 3px 10px 3px 16px; position: sticky; left: 0; background: var(--ed-bg); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }}
   /* G1..G3 timing grids still use the block/tool row shape. */
@@ -5764,6 +7639,20 @@ pub fn generate_report(
      both themes are generated from the LADDER_DARK / LADDER_LIGHT single source
      so the flip lives in one place and every bin clears AA in both themes. */
 {ladder_css}
+  /* The one exception to the decade ladder: the realism diverging log₂
+     scale, built from theme tokens via color-mix so it carries no hard-coded
+     colour and re-themes with the page. */
+{realism_css}
+  /* Part 4.2 layout: the surface selector bar, the side-by-side accuracy/realism
+     grid pair, the realism inline chip in the marginals matrix. */
+  .pw-select {{ display: flex; gap: 14px; flex-wrap: wrap; align-items: center; margin: 8px 0; font-family: var(--ed-font-mono); font-size: 11px; }}
+  .pw-sel-label {{ color: var(--ed-text-muted); }}
+  .pw-select select {{ background: var(--ed-input-bg); color: var(--ed-text-primary); border: 1px solid var(--ed-input-border); border-radius: var(--ed-radius-sm); padding: 2px 6px; font-family: var(--ed-font-mono); font-size: 11px; }}
+  .pw-grid-pair {{ display: flex; gap: 18px; flex-wrap: wrap; }}
+  .pw-grid-one {{ flex: 1 1 320px; min-width: 0; }}
+  .pw-grid-cap {{ font-family: var(--ed-font-mono); font-size: 10px; color: var(--ed-text-muted); text-transform: uppercase; letter-spacing: 1px; margin: 4px 0; }}
+  .rv-chip {{ padding: 0 3px; border-radius: 2px; }}
+  .panel-title.sub {{ font-size: 11px; opacity: 0.85; margin-top: 10px; }}
   .grid-key .gk-sw.rw {{ background: #22405a; position: relative; }}
   .grid-key .gk-sw.rw::after {{ content: ""; position: absolute; top: 0; right: 0; border-width: 0 5px 5px 0; border-style: solid; border-color: transparent var(--ed-text-primary) transparent transparent; }}
 
@@ -5829,10 +7718,11 @@ pub fn generate_report(
   <a data-target="s-timing" href="#s-timing">2.2 Wall clock</a>
   <div class="rail-part">{part3_name}</div>
   <a data-target="s10" href="#s10">3.1 Channel fidelity</a>
-  <a data-target="s05" href="#s05">3.2 Derivatives (STM)</a>
+  <a data-target="s05" href="#s05">3.2 Derivatives</a>
   <a data-target="s09b" href="#s09b">3.3 Non-grav recovery</a>
   <div class="rail-part">{part4_name}</div>
-  <a data-target="s12" href="#s12">4.1 Covariance realism</a>
+  <a data-target="s12" href="#s12">4.1 Consistency with JPL at epoch</a>
+  <a data-target="s15" href="#s15">4.2 Predictive power</a>
   <div class="rail-part">{appendix_name}</div>
   <a data-target="s01" href="#s01">Run summary</a>
   <a data-target="s01b" href="#s01b">External tools</a>
@@ -5859,9 +7749,9 @@ pub fn generate_report(
   <table class="od-table" style="max-width:720px; margin-bottom:6px;">
     <thead><tr><th style="text-align:left">Component</th><th style="text-align:left">Purpose</th><th>Version</th></tr></thead>
     <tbody>
-      <tr><td style="text-align:left">hyperjet</td><td style="text-align:left">Automatic differentiation &mdash; STMs / STTs</td><td>1.13.0</td></tr>
+      <tr><td style="text-align:left">hyperjet</td><td style="text-align:left">Automatic differentiation &mdash; forward-mode partials</td><td>1.13.0</td></tr>
       <tr><td style="text-align:left">empyrean-core</td><td style="text-align:left">Reference channel (<code>validate-core</code>)</td><td>0.10.2</td></tr>
-      <tr><td style="text-align:left">empyrean</td><td style="text-align:left">Distribution under test &mdash; Rust wrapper, C ABI, Python wheel, CLI</td><td>0.10.0</td></tr>
+      <tr><td style="text-align:left">empyrean</td><td style="text-align:left">Distribution under test &mdash; Rust wrapper, C ABI, Python wheel, CLI</td><td>{empyrean_version}</td></tr>
       <tr><td style="text-align:left">empyrean-py</td><td style="text-align:left">Python wheel</td><td>0.10.0</td></tr>
       <tr><td style="text-align:left">empyrean-cli</td><td style="text-align:left">Command-line interface</td><td>0.10.0</td></tr>
       <tr><td style="text-align:left">C ABI</td><td style="text-align:left"><code>EMPYREAN_ABI_VERSION</code> &mdash; equality-checked at load</td><td>1000</td></tr>
@@ -5891,7 +7781,7 @@ pub fn generate_report(
         <td><code>plan</code> step &mdash; queried, not a runner (SBDB + Horizons disk cache)</td>
       </tr>
       <tr>
-        <td><b title="Used for: N-body propagation; first-order STM via 6 variational particles (first order only).">ASSIST</b></td>
+        <td><b title="Used for: N-body propagation; first-order partials via 6 variational particles (first order only).">ASSIST</b></td>
         <td>Holman et al. 2023 · REBOUND IAS15 · DE440</td>
         <td><a href="https://github.com/Empyrean-Dynamics/empyrean-validation/blob/main/runners/assist/run_assist.py" target="_blank" rel="noopener"><code>runners/assist/run_assist.py</code></a></td>
       </tr>
@@ -6030,12 +7920,12 @@ pub fn generate_report(
 
 <div class="section" id="s05" data-page="empyrean">
   <div class="section-num">3.2A</div>
-  <div class="section-title" title="Derivatives — first-order STM cross-validation">Derivatives</div>
-  <div class="panel-title">First-order STM cross-validation</div>
+  <div class="section-title" title="Derivatives — first-order cross-validation">Derivatives</div>
+  <div class="panel-title">First-order cross-validation</div>
   <div class="chart-container">
     <div id="stm-agree-chart" style="height:{chart_h}px;"></div>
   </div>
-  <div class="disclosures"><details><summary>{disc_summary}</summary><div class="disc-body">Relative Frobenius difference vs |dt| (log-y): empyrean's Jet1 STM against the corrected ASSIST variational STM over all first-order rows (median solid, 95th-percentile dashed), and against an ASSIST single-particle finite difference on a representative subset (measured step-size floor 1e-8, dotted). The two analytic methods agree to machine precision on the bulk; the tail is the self-perturber rows and deep encounters; the finite difference anchors both to truth at its own floor.</div></details></div>
+  <div class="disclosures"><details><summary>{disc_summary}</summary><div class="disc-body">Relative Frobenius difference vs |dt| (log-y): empyrean's first-order partials against the corrected ASSIST variational partials over all first-order rows (median solid, 95th-percentile dashed), and against an ASSIST single-particle finite difference on a representative subset (measured step-size floor 1e-8, dotted). The two analytic methods agree to machine precision on the bulk; the tail is the self-perturber rows and deep encounters; the finite difference anchors both to truth at its own floor.</div></details></div>
 </div>
 
 <div class="section" id="s09b">
@@ -6059,7 +7949,7 @@ pub fn generate_report(
       </table>
     </div>
   </div>
-  <div class="disclosures"><details><summary>{disc_summary}</summary><div class="disc-body">Objects with a non-zero JPL non-grav signal (Apophis, Bennu, the comets) are re-fit with <code>solve_for = StateAndNonGrav</code>; the fitted Marsden A1/A2/A3 and their 1σ (9×9 covariance diagonal) are compared to JPL. <b>PASS</b> when <code>|z| = |od_a − ic_a| / σ ≤ 3</code> on every coefficient. A <code>None</code> is a loud <b>FAIL</b>, not a blank — the 9×9 covariance was absent (silent fall-back to a state-only fit), the regression this section catches. All four channels (rust/c/cli/python) run side by side, so an FFI drop of the block shows immediately.</div></details></div>
+  <div class="disclosures"><details><summary>{disc_summary}</summary><div class="disc-body">Objects with a non-zero JPL non-grav signal (Apophis, Bennu, the comets) are re-fit with <code>solve_for = StateAndNonGrav</code>; the fitted Marsden A1/A2/A3 and their 1σ (the (N=9) covariance diagonal) are compared to JPL. <b>PASS</b> when <code>|z| = |od_a − ic_a| / σ ≤ 3</code> on every coefficient. A <code>None</code> is a loud <b>FAIL</b>, not a blank — the (N=9) covariance was absent (silent fall-back to a state-only fit), the regression this section catches. All four channels (rust/c/cli/python) run side by side, so an FFI drop of the block shows immediately.</div></details></div>
 </div>
 
 <div class="part-head" id="part4">{part4_name}</div>
@@ -6075,20 +7965,25 @@ pub fn generate_report(
 
 </div>
 
+<div class="section" id="s15">
+  <div class="section-num" title="Walk-forward predictive power: forward accuracy and covariance realism as the fit arc grows.">4.2</div>
+  {predictive_power_html}
+</div>
+
 <div class="section" id="s05c" data-page="empyrean">
   <div class="section-num">A.3</div>
   <div class="section-title" title="ASSIST configurations — six arms">ASSIST configurations</div>
   <div class="panel-title" title="Resolved integrator settings, read back after attach">Resolved integrator settings</div>
   <div class="heatmap-container"><div id="assist-arms-settings"></div></div>
-  <div class="disclosures"><details><summary>{disc_summary}</summary><div class="disc-body">The same objects and epochs under three ASSIST integrator configurations, each with the six first-order variational particles off (single-particle f64) and on (6&times;6 STM). <code>assist_default</code> = what <code>assist.Extras</code> attach leaves (IAS15 adaptive mode 1, 1e-9, min_dt 0, initial dt 0.001 d); <code>assist_layup</code> sets adaptive mode 2 (PRS controller) after attach, as Smithsonian/layup does; <code>assist_asteroid_institute</code> = adam-assist defaults (1e-6, min_dt 1e-9 d, mode 1, initial dt 1e-6 d), the config every earlier ASSIST number used. Each arm has a per-row wall clock cap; a row whose adaptive step collapses before the target epoch is a loud FAIL, counted below, never substituted.</div></details></div>
+  <div class="disclosures"><details><summary>{disc_summary}</summary><div class="disc-body">The same objects and epochs under three ASSIST integrator configurations, each with the six variational particles off (state only) and on (first-order partials, N=6). <code>assist_default</code> = what <code>assist.Extras</code> attach leaves (IAS15 adaptive mode 1, 1e-9, min_dt 0, initial dt 0.001 d); <code>assist_layup</code> sets adaptive mode 2 (PRS controller) after attach, as Smithsonian/layup does; <code>assist_asteroid_institute</code> = adam-assist defaults (1e-6, min_dt 1e-9 d, mode 1, initial dt 1e-6 d), the config every earlier ASSIST number used. Each arm has a per-row wall clock cap; a row whose adaptive step collapses before the target epoch is a loud FAIL, counted below, never substituted.</div></details></div>
   <div class="panel-title" title="Per-horizon median timing — integrate call only (ms)">Per-horizon median timing</div>
   <div class="heatmap-container"><div id="assist-arms-timing"></div></div>
   <div class="panel-title" title="Position agreement vs empyrean at 3 and 15 years, per configuration">Position agreement vs empyrean</div>
   <div class="heatmap-container"><div id="assist-arms-pos"></div></div>
   <div class="disclosures"><details><summary>{disc_summary}</summary><div class="disc-body">Median |empyrean &minus; ASSIST| in km at |dt| = 3 yr and 15 yr; the propagated position is independent of the variational particles, so this is per configuration. empyrean is its own <code>f64_detection_on</code> reference. Marsden &Delta;T objects are excluded from each median and counted separately (see &Delta;T exclusion); the all-rows median is in parentheses.</div></details></div>
-  <div class="panel-title" title="STM agreement vs empyrean, per variational arm">STM agreement vs empyrean</div>
+  <div class="panel-title" title="First-order agreement vs empyrean, per variational arm">First-order agreement vs empyrean</div>
   <div class="heatmap-container"><div id="assist-arms-stm"></div></div>
-  <div class="disclosures"><details><summary>{disc_summary}</summary><div class="disc-body">Median relative Frobenius difference |emp &minus; ast|/|emp| between empyrean's Jet1 STM and each configuration's ASSIST variational STM, over all horizons.</div></details></div>
+  <div class="disclosures"><details><summary>{disc_summary}</summary><div class="disc-body">Median relative Frobenius difference |emp &minus; ast|/|emp| between empyrean's first-order partials and each configuration's ASSIST variational partials, over all horizons.</div></details></div>
   <div class="panel-title">empyrean barebones arms &mdash; ASSIST-matched settings</div>
   <div class="heatmap-container">
   <table class="od-table" style="font-size:11px;">
@@ -6113,6 +8008,16 @@ pub fn generate_report(
 // the fetched bytes against (file name, byte length, row count, FNV-1a-32 hash).
 let results = null;
 const DATASET = DATASET_DESCRIPTOR_JSON;
+// The Part 4.2 per-object timeline sidecar descriptor (file, bytes, rows, hash),
+// or null when no walk aggregate was supplied. Verified exactly like DATASET
+// before any 4.2F chart draws; the server-rendered 4.2 tables render regardless.
+const PREDICT_DESCRIPTOR = PREDICT_DESCRIPTOR_JSON;
+// The (tool, arm) series the whole of Part 4.2 keys on, computed server-side, so
+// the one-object timeline draws the same primary series the surfaces and matrices
+// do rather than whichever walk happens to sit first in the sidecar. `null` when
+// no walk aggregate was supplied.
+const PW_PRIMARY = PW_PRIMARY_JSON;
+let predictWindows = null;   // installed only after the sidecar verifies
 const popColors = POP_COLORS_JSON;
 const channelColors = CHANNEL_COLORS_JSON;
 const AU_KM = 149597870.700;
@@ -6645,6 +8550,10 @@ const baseLayout = {{
     get paper_bgcolor() {{ return themeVar('--ed-bg'); }},
     get plot_bgcolor() {{ return themeVar('--ed-bg'); }},
     get font() {{ return {{ family: 'JetBrains Mono', size: 10, color: themeVar('--ed-text-muted') }}; }},
+    // The always-on toolbar reads the page's muted text colour so it is legible in
+    // either theme; rethemeCharts re-colours it on a flip. Every call site spreads
+    // baseLayout, so this one definition colours every chart's toolbar.
+    get modebar() {{ return {{ orientation: 'h', color: themeVar('--ed-text-muted'), activecolor: themeVar('--ed-text-secondary'), bgcolor: 'rgba(0,0,0,0)' }}; }},
     legend: {{ font: {{ size: 9 }}, bgcolor: 'rgba(0,0,0,0)' }},
     margin: {{ l: 60, r: 20, t: 50, b: 50 }},
     hovermode: 'closest',
@@ -6670,7 +8579,7 @@ function ax(title, type) {{
 function rethemeCharts() {{
     if (!window.Plotly) return;
     document.querySelectorAll('.js-plotly-plot').forEach(gd => {{
-        const upd = {{ paper_bgcolor: themeVar('--ed-bg'), plot_bgcolor: themeVar('--ed-bg'), 'font.color': themeVar('--ed-text-muted'), 'title.font.color': themeVar('--ed-text-secondary') }};
+        const upd = {{ paper_bgcolor: themeVar('--ed-bg'), plot_bgcolor: themeVar('--ed-bg'), 'font.color': themeVar('--ed-text-muted'), 'title.font.color': themeVar('--ed-text-secondary'), 'modebar.color': themeVar('--ed-text-muted'), 'modebar.activecolor': themeVar('--ed-text-secondary') }};
         for (const k of Object.keys(gd.layout || {{}})) {{
             if (!/^[xy]axis\d*$/.test(k)) continue;
             upd[k + '.color'] = themeVar('--ed-text-muted');
@@ -6680,6 +8589,124 @@ function rethemeCharts() {{
         try {{ Plotly.relayout(gd, upd); }} catch (e) {{ console.error('retheme failed for', gd.id, e); }}
     }});
 }}
+
+// ─────────── one shared Plotly config + branded PNG export ───────────
+// Every Plotly.react / Plotly.newPlot call on the page passes this one config
+// object, so the toolbar and its behaviour cannot drift between call sites. The
+// toolbar is always visible (not hover-gated); its buttons are our branded PNG
+// download, zoom, pan and reset-axes only — Plotly's own camera, box/lasso
+// select, incremental zoom, autoscale, spike-lines, hover-mode toggles and logo
+// are all removed. The toolbar colour comes from baseLayout.modebar (theme-aware).
+// The logo data URI, the attribution and the run date are built server-side and
+// emitted here; nothing of the stamp appears as visible page text.
+const EMP_LOGO_URI = EMPYREAN_LOGO_URI_B64;
+const EMP_ATTRIBUTION = EMPYREAN_EXPORT_ATTRIBUTION;
+const EMP_REPORT_DATE = EMPYREAN_EXPORT_DATE;
+function empSlug(s) {{
+    return (s || '').toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '') || 'chart';
+}}
+// A heading's text with the pair-chip selector echo removed: the chip names the
+// live comparison pair and is appended to the caption on its own, so its words
+// are not part of the title (without this the Part 1 titles read "Error
+// growthempyrean vs JPL").
+function empTitleText(el) {{
+    if (!el) return '';
+    let s = '';
+    el.childNodes.forEach(n => {{
+        if (n.nodeType === 1 && n.classList && n.classList.contains('pair-chip')) return;
+        s += n.textContent || '';
+    }});
+    return s.trim();
+}}
+// The chart's identity, read at click time; drives the caption and filename.
+// Number: the section number. Title: the chart's own Plotly title when it set
+// one (the covariance panels do) — read from `layout`, never `_fullLayout`,
+// which Plotly fills with its "Click to enter…" placeholder — else the nearest
+// heading above the chart in document order (a panel title if one precedes it,
+// else the section title), pair chip stripped. Pair: appended only for a pair
+// chart, detected by a pair chip in the chart's section — `#part1` is a sibling
+// part-head, never an ancestor, so ancestry cannot detect a Part 1 chart.
+function empChartIdentity(gd) {{
+    const sec = gd.closest ? gd.closest('.section') : null;
+    let num = '';
+    if (sec) {{ const ns = sec.querySelector('.section-num'); if (ns) num = ns.textContent.trim(); }}
+    let title = '';
+    const lay = gd.layout || {{}};
+    const gt = (lay.title && lay.title.text) ? String(lay.title.text).trim() : '';
+    if (gt) {{
+        title = gt;
+    }} else if (sec) {{
+        const heads = sec.querySelectorAll('.panel-title, .section-title');
+        let chosen = null;
+        heads.forEach(h => {{ if (h.compareDocumentPosition(gd) & Node.DOCUMENT_POSITION_FOLLOWING) chosen = h; }});
+        title = empTitleText(chosen);
+    }}
+    let pair = '';
+    if (sec && sec.querySelector('.pair-chip')) {{
+        try {{ pair = toolLabel(TOOL1) + ' vs ' + toolLabel(TOOL2); }} catch (e) {{ pair = ''; }}
+    }} else if (gd && gd.id === 'pw-timeline-chart') {{
+        // The 4.2F walk timeline is per-object, not per-pair: its variant is the
+        // selected object, so the stamp and filename name which object the PNG is
+        // (otherwise every object exported as the same '…_none_' file).
+        const os = document.getElementById('pw-timeline-object');
+        if (os && os.value) pair = os.value;
+    }}
+    const caption = [num, title, pair].filter(Boolean).join(' · ');
+    const filename = 'empyrean-validation_' + empSlug([num, title].filter(Boolean).join('-')) + '_'
+        + (pair ? empSlug(pair) : 'none') + '_' + EMP_REPORT_DATE;
+    return {{ caption: caption, filename: filename }};
+}}
+// The branded PNG export, wired as the toolbar's one download button. It grows
+// the canvas by a footer band and lays the attribution (left) and the logo mark
+// (right, square) across that band, below the x-axis title — which keeps its
+// standoff just under the ticks — so the stamp never crosses the axis title.
+// Colours come from the theme tokens read at click time. The figure's layout is
+// restored exactly in a finally block (keys that were absent are cleared, not
+// left as empty arrays), so the page itself never shows the stamp.
+function empExportPng(gd) {{
+    const id = empChartIdentity(gd);
+    const layout = gd.layout || {{}};
+    const hadImages = 'images' in layout;
+    const hadAnnotations = 'annotations' in layout;
+    const prevMargin = Object.assign({{}}, layout.margin || {{}});
+    const prevImages = (layout.images || []).slice();
+    const prevAnnotations = (layout.annotations || []).slice();
+    const fl = gd._fullLayout || {{}};
+    const flM = fl.margin || {{}};
+    const W = fl.width || gd.clientWidth || 700;
+    const H = fl.height || gd.clientHeight || 420;
+    const baseB = prevMargin.b != null ? prevMargin.b : (flM.b != null ? flM.b : 50);
+    const topM = prevMargin.t != null ? prevMargin.t : (flM.t != null ? flM.t : 50);
+    const leftM = prevMargin.l != null ? prevMargin.l : (flM.l != null ? flM.l : 60);
+    const rightM = prevMargin.r != null ? prevMargin.r : (flM.r != null ? flM.r : 20);
+    const band = 58;                       // footer height added below the plot (px)
+    const newB = baseB + band;
+    const exportH = H + band;              // grow the canvas; the plot area stays put
+    const plotH = Math.max(exportH - topM - newB, 1);
+    const plotW = Math.max(W - leftM - rightM, 1);
+    const footShift = -(newB - 16);        // footer line ~16px above the figure bottom
+    const logoPx = Math.min(band - 20, 34);
+    const logo = {{ source: EMP_LOGO_URI, xref: 'paper', yref: 'paper', x: 1, y: footShift / plotH,
+        xanchor: 'right', yanchor: 'middle', sizex: logoPx / plotW, sizey: logoPx / plotH,
+        opacity: 0.9, layer: 'above' }};
+    const caption = {{ text: EMP_ATTRIBUTION + (id.caption ? ' · ' + id.caption : ''),
+        xref: 'paper', yref: 'paper', x: 0, y: 0, xanchor: 'left', yanchor: 'middle',
+        yshift: footShift, showarrow: false,
+        font: {{ family: 'JetBrains Mono', size: 9, color: themeVar('--ed-text-muted') }} }};
+    const restore = {{ margin: prevMargin, images: hadImages ? prevImages : null, annotations: hadAnnotations ? prevAnnotations : null }};
+    return Promise.resolve()
+        .then(() => Plotly.relayout(gd, {{ images: prevImages.concat([logo]), annotations: prevAnnotations.concat([caption]), 'margin.b': newB }}))
+        .then(() => Plotly.downloadImage(gd, {{ format: 'png', scale: 2, width: W, height: exportH, filename: id.filename }}))
+        .catch(e => {{ console.error('branded export failed', e); }})
+        .finally(() => Plotly.relayout(gd, restore));
+}}
+const PLOTLY_CONFIG = {{
+    responsive: true,
+    displayModeBar: true,
+    displaylogo: false,
+    modeBarButtonsToRemove: ['toImage', 'select2d', 'lasso2d', 'zoomIn2d', 'zoomOut2d', 'autoScale2d', 'toggleSpikelines', 'hoverClosestCartesian', 'hoverCompareCartesian'],
+    modeBarButtonsToAdd: [{{ name: 'downloadPng', title: 'Download PNG', icon: Plotly.Icons.camera, click: empExportPng }}],
+}};
 
 // ─────────── boot: everything that reads the fetched dataset ───────────
 // Runs ONLY after loadDataset() has fetched, byte-length-verified, FNV-verified,
@@ -6759,7 +8786,7 @@ function drawGrowthChart(elId, opts) {{
             ...baseLayout,
             xaxis: {{ visible: false }}, yaxis: {{ visible: false }},
             annotations: [{{ text: `<b>${{toolLabel(TOOL1)}} vs ${{toolLabel(TOOL2)}}</b> has no ${{opts.noun}} comparison stored for this pair.`, showarrow: false, font: {{ color: themeVar('--ed-text-muted'), size: 12 }}, x: 0.5, y: 0.5, xref: 'paper', yref: 'paper' }}],
-        }}, {{ responsive: true }});
+        }}, PLOTLY_CONFIG);
         return;
     }}
     const val = opts.valFn;
@@ -6809,7 +8836,7 @@ function drawGrowthChart(elId, opts) {{
         yaxis: ax(`|${{toolLabel(TOOL1)}} − ${{toolLabel(TOOL2)}}| ${{opts.quantity}} (${{opts.unit}})`, 'log'),
         showlegend: true,
         legend: {{ ...baseLayout.legend, ...LEGEND_H }},
-    }}, {{ responsive: true, displayModeBar: 'hover', modeBarButtonsToRemove: ['select2d', 'lasso2d', 'autoScale2d', 'toggleSpikelines'] }});
+    }}, PLOTLY_CONFIG);
 }}
 // Propagation error growth (#growth-chart) through the shared drawer. Its extra
 // series is the ASSIST model gap — the objects ASSIST cannot model, drawn only
@@ -6930,7 +8957,7 @@ if (assistResults.length > 0) {{
         }}
         if (!traces.length) {{
             Plotly.react(el, [], {{ ...baseLayout, xaxis: {{ visible: false }}, yaxis: {{ visible: false }},
-                annotations: [{{ text: 'No STM cross-validation rows.', showarrow: false, font: {{ color: '#8b9198', size: 12 }}, x: 0.5, y: 0.5, xref: 'paper', yref: 'paper' }}] }}, {{ responsive: true }});
+                annotations: [{{ text: 'No first-order cross-validation rows.', showarrow: false, font: {{ color: '#8b9198', size: 12 }}, x: 0.5, y: 0.5, xref: 'paper', yref: 'paper' }}] }}, PLOTLY_CONFIG);
             return;
         }}
         const dtsAll = Array.from(allDts).sort((a, b) => a - b);
@@ -6942,7 +8969,7 @@ if (assistResults.length > 0) {{
             yaxis: ax('rel. Frobenius difference (log)', 'log'),
             showlegend: true,
             legend: {{ ...baseLayout.legend, ...LEGEND_H }},
-        }}, {{ responsive: true, displayModeBar: 'hover', modeBarButtonsToRemove: ['select2d', 'lasso2d', 'autoScale2d', 'toggleSpikelines'] }});
+        }}, PLOTLY_CONFIG);
     }})();
 }}
 
@@ -7112,7 +9139,7 @@ function drawEphChannels() {{
         xaxis: ax('dt (days from epoch)'),
         yaxis: ax('Angular separation (mas)', 'log'),
         showlegend: true, legend: {{ ...baseLayout.legend, ...LEGEND_H }},
-    }}, {{ responsive: true, displayModeBar: 'hover', modeBarButtonsToRemove: ['select2d', 'lasso2d', 'autoScale2d', 'toggleSpikelines'] }});
+    }}, PLOTLY_CONFIG);
 }}
 // Ephemeris error growth (#eph-sep-chart). The per-population pair view goes
 // through the SAME shared drawer as the propagation chart; the "empyrean
@@ -7337,7 +9364,7 @@ function buildCovariancePanels() {{
     objs1.forEach((o, i) => {{ t1.push({{ x: [i, i], y: [empChi[o], jplChi[o]], mode: 'lines', line: {{ color: '#3a4453', width: 1 }}, hoverinfo: 'skip', showlegend: false }}); }});
     t1.push({{ x: objs1.map((o, i) => i), y: objs1.map(o => empChi[o]), mode: 'markers', marker: {{ color: '#5b9bd5', size: 6 }}, name: 'empyrean', text: objs1, hovertemplate: '%{{text}}<br>empyrean χ²ᵣ %{{y:.3f}}<extra></extra>' }});
     t1.push({{ x: objs1.map((o, i) => i), y: objs1.map(o => jplChi[o]), mode: 'markers', marker: {{ color: '#d05080', size: 6, symbol: 'diamond' }}, name: 'JPL', text: objs1, hovertemplate: '%{{text}}<br>JPL χ²ᵣ %{{y:.3f}}<extra></extra>' }});
-    Plotly.react('cov-chi2-panel', t1, {{ ...baseLayout, title: covTitle('1 · reduced χ² — empyrean paired to JPL'), margin: {{ l: 46, r: 8, t: 28, b: 58 }}, xaxis: {{ ...ax('object (sorted by empyrean)'), showticklabels: false }}, yaxis: ax('χ²ᵣ', 'log'), shapes: [{{ type: 'line', x0: -0.5, x1: Math.max(objs1.length - 0.5, 0.5), y0: 1, y1: 1, line: {{ color: '#8b9198', dash: 'dash', width: 1 }} }}], legend: COV_LEGEND }}, {{ responsive: true, displayModeBar: false }});
+    Plotly.react('cov-chi2-panel', t1, {{ ...baseLayout, title: covTitle('1 · reduced χ² — empyrean paired to JPL'), margin: {{ l: 46, r: 8, t: 28, b: 58 }}, xaxis: {{ ...ax('object (sorted by empyrean)'), showticklabels: false }}, yaxis: ax('χ²ᵣ', 'log'), shapes: [{{ type: 'line', x0: -0.5, x1: Math.max(objs1.length - 0.5, 0.5), y0: 1, y1: 1, line: {{ color: '#8b9198', dash: 'dash', width: 1 }} }}], legend: COV_LEGEND }}, PLOTLY_CONFIG);
     // Panel 2 — σ ratio vs observed arc, coloured by population.
     const byPop = {{}};
     for (const c of recs) {{ if (radarExcluded.has(c.object)) continue; const rr = c.sigma_fit[0] / c.sigma_ref[0]; const a = arc[c.object]; if (!isFinite(rr) || a == null) continue; const p = popOf[c.object] || '?'; (byPop[p] = byPop[p] || []).push([a, rr, c.object]); }}
@@ -7345,7 +9372,7 @@ function buildCovariancePanels() {{
     for (const p in byPop) {{ const pts = byPop[p]; t2.push({{ x: pts.map(q => q[0]), y: pts.map(q => q[1]), mode: 'markers', marker: {{ color: popColors[p] || '#888', size: 7 }}, name: p, text: pts.map(q => q[2]), hovertemplate: '%{{text}} (' + p + ')<br>arc %{{x}} d<br>σ ratio %{{y:.2f}}<extra></extra>' }}); }}
     const allArc = recs.map(c => arc[c.object]).filter(a => a != null);
     const amin = allArc.length ? Math.min(...allArc) : 1, amax = allArc.length ? Math.max(...allArc) : 1e5;
-    Plotly.react('cov-ratio-panel', t2, {{ ...baseLayout, title: covTitle('2 · σ_emp(a) / σ_JPL(a) vs observed arc'), margin: {{ l: 46, r: 8, t: 28, b: 36 }}, xaxis: ax('observed arc (days)', 'log'), yaxis: ax('σ ratio (a element)', 'log'), shapes: [{{ type: 'line', x0: amin, x1: amax, y0: 1, y1: 1, line: {{ color: '#8b9198', dash: 'dash', width: 1 }} }}], showlegend: false }}, {{ responsive: true, displayModeBar: false }});
+    Plotly.react('cov-ratio-panel', t2, {{ ...baseLayout, title: covTitle('2 · σ_emp(a) / σ_JPL(a) vs observed arc'), margin: {{ l: 46, r: 8, t: 28, b: 36 }}, xaxis: ax('observed arc (days)', 'log'), yaxis: ax('σ ratio (a element)', 'log'), shapes: [{{ type: 'line', x0: amin, x1: amax, y0: 1, y1: 1, line: {{ color: '#8b9198', dash: 'dash', width: 1 }} }}], showlegend: false }}, PLOTLY_CONFIG);
     // Panel 3 — σ_eq empirical CDF vs χ(6)/√6 expected.
     const sig = recs.filter(c => !radarExcluded.has(c.object)).map(c => c.sigma_equiv_combined).filter(v => v != null && isFinite(v)).sort((a, b) => a - b);
     const n = sig.length;
@@ -7355,7 +9382,7 @@ function buildCovariancePanels() {{
     Plotly.react('cov-cdf-panel', [
         {{ x: ex, y: ey, mode: 'lines', line: {{ color: '#8b9198', width: 2 }}, name: 'expected χ(6)/√6' }},
         {{ x: sig, y: obsY, mode: 'lines', line: {{ color: '#5b9bd5', width: 2 }}, name: `observed (n=${{n}})` }},
-    ], {{ ...baseLayout, title: covTitle('3 · σ_eq empirical CDF vs expected'), margin: {{ l: 46, r: 8, t: 28, b: 64 }}, xaxis: ax('σ_eq', 'log'), yaxis: ax('cumulative fraction'), legend: COV_LEGEND }}, {{ responsive: true, displayModeBar: false }});
+    ], {{ ...baseLayout, title: covTitle('3 · σ_eq empirical CDF vs expected'), margin: {{ l: 46, r: 8, t: 28, b: 64 }}, xaxis: ax('σ_eq', 'log'), yaxis: ax('cumulative fraction'), legend: COV_LEGEND }}, PLOTLY_CONFIG);
 }}
 try {{ buildCovariancePanels(); }} catch (e) {{ console.error('buildCovariancePanels failed', e); }}
 // Charts follow whatever pair is selected at boot time, and every later change.
@@ -7402,12 +9429,15 @@ function fmtDataBytes(n) {{
     if (n >= 1024) return (n / 1024).toFixed(1) + ' KB';
     return n + ' B';
 }}
-function datasetBanner(html, kind) {{
-    let b = document.getElementById('dataset-banner');
+// One banner definition, shared by the dataset load and the Part 4.2 timeline so
+// neither re-declares the sticky error chrome. Each owns its own element id, so a
+// dataset-load success hiding its banner never hides the timeline's, and vice-versa.
+function banner(id, zpri, html, kind) {{
+    let b = document.getElementById(id);
     if (!b) {{
         b = document.createElement('div');
-        b.id = 'dataset-banner';
-        b.style.cssText = 'position:sticky;top:0;z-index:9999;padding:10px 16px;font-size:13px;font-family:JetBrains Mono,monospace;line-height:1.4;';
+        b.id = id;
+        b.style.cssText = `position:sticky;top:0;z-index:${{zpri}};padding:10px 16px;font-size:13px;font-family:JetBrains Mono,monospace;line-height:1.4;`;
         document.body.insertBefore(b, document.body.firstChild);
     }}
     b.style.background = kind === 'error' ? '#4a1418' : '#12303a';
@@ -7417,6 +9447,7 @@ function datasetBanner(html, kind) {{
     b.hidden = false;
     return b;
 }}
+function datasetBanner(html, kind) {{ return banner('dataset-banner', 9999, html, kind); }}
 // FNV-1a 32-bit over a Uint8Array, 8 lowercase hex digits (Math.imul keeps the
 // multiply in 32 bits). Matches the Rust hash printed in the descriptor.
 function fnv1a32(bytes) {{
@@ -7477,6 +9508,153 @@ async function loadDataset() {{
     catch (e) {{ console.error('boot failed', e); datasetFail(`The dataset verified but the charts failed to render (${{e}}).`); }}
 }}
 
+// ─────────── Part 4.2 predictive-power: surface selector + timeline sidecar ──
+// The surface selector (4.2A) needs no fetched data — it toggles pre-rendered
+// server panels. Only the per-object timeline (4.2F) reads the second sidecar,
+// verified byte-length + FNV exactly like the dataset before anything draws; the
+// server-rendered 4.2 tables stay visible in every load state.
+// 4.2 Horizon marginals metric toggle: one number per cell; the selector
+// (accuracy | realism joint | along-track | cross-track) swaps the shown value
+// and its colour class, the other three stay on the cell hover. Hatch cells
+// carry no data-* and are skipped.
+function wireMarginalMetric() {{
+    const sel = document.getElementById('pw-marg-metric');
+    if (!sel) return;
+    const cells = Array.from(document.querySelectorAll('td.pw-mcell'));
+    function apply() {{
+        const m = sel.value;
+        cells.forEach(td => {{
+            const v = td.dataset[m];
+            const cls = td.dataset[m + 'Cls'];
+            if (v === undefined) return;
+            td.className = 'gc pw-mcell ' + cls;
+            const span = td.querySelector('.cn');
+            if (span) span.textContent = v;
+        }});
+    }}
+    sel.addEventListener('change', apply);
+    apply();
+}}
+// 4.2A coverage direction toggle: one matrix (joint | along-track | cross-track)
+// visible at a time, joint the default. Pure show/hide of pre-rendered server
+// tables, no fetched data.
+function wireCoverageDirection() {{
+    const sel = document.getElementById('pw-cov-dir');
+    if (!sel) return;
+    const mats = Array.from(document.querySelectorAll('.pw-cov-mat'));
+    function apply() {{
+        mats.forEach(m => {{ m.hidden = m.dataset.dir !== sel.value; }});
+    }}
+    sel.addEventListener('change', apply);
+    apply();
+}}
+function wirePredictiveSurfaces() {{
+    const cls = document.getElementById('pw-class');
+    const tool = document.getElementById('pw-tool');
+    const arm = document.getElementById('pw-arm');
+    if (!cls || !tool || !arm) return;
+    const na = document.querySelector('.pw-pair-na');
+    // Arms present per tool, from the server-rendered pair panels. find_orb/layup
+    // carry only their Monte-Carlo arms; the 36 rust arms are rust-only. Scoping
+    // the arm selector to the chosen tool means every offered arm yields a surface,
+    // never an all-hatched grid a reader would misread as a broken tool.
+    const armsByTool = {{}};
+    document.querySelectorAll('.pw-pair').forEach(p => {{
+        (armsByTool[p.dataset.tool] = armsByTool[p.dataset.tool] || new Set()).add(p.dataset.arm);
+    }});
+    function repopulateArms() {{
+        const avail = Array.from(armsByTool[tool.value] || []).sort();
+        const cur = arm.value;
+        arm.innerHTML = '';
+        avail.forEach(a => {{ const o = document.createElement('option'); o.value = a; o.textContent = a; arm.appendChild(o); }});
+        arm.value = avail.indexOf(cur) >= 0 ? cur : (avail[0] || '');
+    }}
+    function apply() {{
+        let shown = false;
+        document.querySelectorAll('.pw-pair').forEach(p => {{
+            const m = p.dataset.class === cls.value && p.dataset.tool === tool.value && p.dataset.arm === arm.value;
+            p.hidden = !m;
+            if (m) shown = true;
+        }});
+        if (na) na.hidden = shown;
+    }}
+    cls.addEventListener('change', apply);
+    tool.addEventListener('change', () => {{ repopulateArms(); apply(); }});
+    arm.addEventListener('change', apply);
+    repopulateArms();
+    apply();
+}}
+function predictFail(msg) {{
+    // A distinct class (not `dataset-pending`) so boot()'s pending-placeholder sweep
+    // never removes this message, and its own banner (not the shared dataset banner)
+    // so a later dataset-load success never hides this failure. The 4.2 tables are
+    // server-rendered, so they stay complete whatever the timeline sidecar does.
+    const el = document.getElementById('pw-timeline-chart');
+    if (el) el.innerHTML = `<div class="predict-pending" style="${{DATASET_PENDING_STYLE}}">walk timeline not loaded — ${{msg}}</div>`;
+    banner('predict-banner', 9998, '<b>Walk timeline not loaded.</b> ' + msg + ' The Part 4.2 tables above are server-rendered and complete.', 'error');
+}}
+async function loadPredict() {{
+    // No walk aggregate in this report: 4.2F simply has nothing to draw, and the
+    // server-rendered 4.2 tables carry the section on their own.
+    if (!PREDICT_DESCRIPTOR) return;
+    const d = PREDICT_DESCRIPTOR;
+    let buf;
+    try {{
+        const resp = await fetch(d.file);
+        if (!resp.ok) {{ predictFail(`HTTP ${{resp.status}} ${{resp.statusText || ''}} fetching ${{d.file}}.`); return; }}
+        buf = await resp.arrayBuffer();
+    }} catch (e) {{
+        predictFail(`serve the folder over HTTP — a browser will not fetch ${{d.file}} from disk (file://). (${{e}})`);
+        return;
+    }}
+    const bytes = new Uint8Array(buf);
+    if (bytes.length !== d.bytes) {{ predictFail(`byte-length mismatch: expected ${{d.bytes}}, got ${{bytes.length}} — the sidecar belongs to a different run.`); return; }}
+    if (fnv1a32(bytes) !== d.hash) {{ predictFail(`hash mismatch — the sidecar belongs to a different run.`); return; }}
+    let parsed;
+    try {{ parsed = JSON.parse(new TextDecoder('utf-8').decode(bytes)); }}
+    catch (e) {{ predictFail(`the sidecar is not valid JSON (${{e}}).`); return; }}
+    if (!parsed || !Array.isArray(parsed.per_window)) {{ predictFail(`the sidecar carries no per_window array.`); return; }}
+    predictWindows = parsed.per_window;
+    try {{ initWalkTimeline(); }}
+    catch (e) {{ console.error('walk timeline failed', e); predictFail(`the sidecar verified but the timeline failed to render (${{e}}).`); }}
+}}
+function initWalkTimeline() {{
+    const sel = document.getElementById('pw-timeline-object');
+    if (!sel) return;
+    sel.addEventListener('change', () => drawWalkTimeline(sel.value));
+    if (sel.value) drawWalkTimeline(sel.value);
+}}
+// χ²₂ median and 95% point, normalized by 2 ln 2 so they sit on the same
+// realism scale the surfaces use (1 = calibrated).
+const PW_BAND_50 = 1.0, PW_BAND_95 = 5.991464547107979 / (2 * Math.LN2);
+function drawWalkTimeline(object) {{
+    const el = document.getElementById('pw-timeline-chart');
+    if (!el || !window.Plotly || !predictWindows) return;
+    const tl = (PW_PRIMARY && predictWindows.find(w => w.object === object && w.tool === PW_PRIMARY.tool && w.config_arm === PW_PRIMARY.arm))
+            || predictWindows.find(w => w.object === object);
+    if (!tl) {{
+        Plotly.react(el, [], {{ ...baseLayout, xaxis: {{ visible: false }}, yaxis: {{ visible: false }},
+            annotations: [{{ text: 'no walk for this object', showarrow: false, x: 0.5, y: 0.5, xref: 'paper', yref: 'paper', font: {{ color: themeVar('--ed-text-muted'), size: 12 }} }}] }}, PLOTLY_CONFIG);
+        return;
+    }}
+    const x = tl.arc_days;
+    const traces = [
+        {{ x, y: tl.med_d2_norm, name: 'realism d²n', mode: 'lines+markers', marker: {{ size: MARKER }}, line: {{ color: themeVar('--ed-accent') }}, connectgaps: false, yaxis: 'y' }},
+        {{ x, y: tl.med_sep_arcsec, name: 'sep (arcsec)', mode: 'lines+markers', marker: {{ size: MARKER }}, line: {{ color: themeVar('--ed-text-secondary') }}, connectgaps: false, yaxis: 'y2' }},
+    ];
+    const layout = {{ ...baseLayout,
+        xaxis: ax('fit arc (days)', 'log'),
+        yaxis: {{ ...ax('realism d²n', 'log') }},
+        yaxis2: {{ ...ax('sep (arcsec)', 'log'), overlaying: 'y', side: 'right' }},
+        legend: LEGEND_H,
+        shapes: [
+            {{ type: 'line', xref: 'paper', x0: 0, x1: 1, yref: 'y', y0: PW_BAND_50, y1: PW_BAND_50, line: {{ color: themeVar('--ed-border'), dash: 'dot' }} }},
+            {{ type: 'line', xref: 'paper', x0: 0, x1: 1, yref: 'y', y0: PW_BAND_95, y1: PW_BAND_95, line: {{ color: themeVar('--ed-border'), dash: 'dot' }} }},
+        ],
+    }};
+    Plotly.react(el, traces, layout, PLOTLY_CONFIG);
+}}
+
 // ─────────── tool-pair selector + page switch: wire + initial state ───────────
 // Runs first, after every server-rendered panel is in the DOM. Each is isolated so
 // a single wiring failure can't leave the report in a broken half-initialized state
@@ -7486,12 +9664,17 @@ try {{ wireToolSelector(); }} catch (e) {{ console.error('wireToolSelector faile
 try {{ wirePageNav(); }} catch (e) {{ console.error('wirePageNav failed', e); }}
 try {{ wireCompareBar(); }} catch (e) {{ console.error('wireCompareBar failed', e); }}
 try {{ wireHeatmapCrosshair(); }} catch (e) {{ console.error('wireHeatmapCrosshair failed', e); }}
+try {{ wirePredictiveSurfaces(); }} catch (e) {{ console.error('wirePredictiveSurfaces failed', e); }}
+try {{ wireCoverageDirection(); }} catch (e) {{ console.error('wireCoverageDirection failed', e); }}
+try {{ wireMarginalMetric(); }} catch (e) {{ console.error('wireMarginalMetric failed', e); }}
 loadDataset();
+loadPredict();
 </script>
 </body>
 </html>"##,
         brand_tokens_css = BRAND_TOKENS_CSS,
         ladder_css = ladder_css(),
+        realism_css = realism_css(),
         tool_tokens_css = tool_color_tokens_css(),
         disc_summary = DISCLOSURE_SUMMARY,
         coeff_defs = NG_COEFF_DEFS,
@@ -7519,11 +9702,13 @@ loadDataset();
         h4_fidelity_grid_html = h4_fidelity_grid_html,
         tool_ranking_html = tool_ranking_html,
         covariance_realism_html = covariance_realism_html,
+        predictive_power_html = predictive_power_html,
         t1_prop_timing_html = t1_prop_timing_html,
         t2_eph_timing_html = t2_eph_timing_html,
         t3_od_timing_html = t3_od_timing_html,
         part2_timing_html = part2_timing_html,
         provenance_footer_html = provenance_footer_html,
+        empyrean_version = empyrean_version,
     );
 
     // Write the dataset (and fail loudly) BEFORE the HTML, and hand the page a
@@ -7544,7 +9729,71 @@ loadDataset();
     });
     let dataset_descriptor_json = serde_json::to_string(&dataset_descriptor).unwrap_or_default();
 
+    // The Part 4.2 per-object timeline sidecar: the one large walk family, written
+    // beside the dataset as `<stem>.predict.json` and verified by the page (byte
+    // length + FNV) exactly like the dataset. Only `per_window` travels; the small
+    // static families already rendered server-side. `null` descriptor when no walk
+    // aggregate was supplied, so 4.2F simply has nothing to fetch.
+    let predict_descriptor_json = match predict_agg {
+        Some(agg) => {
+            let predict_path = predict_path_for(output);
+            let predict_file_name = predict_path
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .ok_or_else(|| {
+                    format!(
+                        "predict sidecar path has no file name: {}",
+                        predict_path.display()
+                    )
+                })?;
+            let sidecar = serde_json::json!({
+                "snapshot_id": agg.snapshot_id,
+                "profile": agg.profile,
+                "per_window": agg.per_window,
+            });
+            let sidecar_json = serde_json::to_string(&sidecar)
+                .map_err(|e| format!("serialize predict sidecar: {e}"))?;
+            std::fs::write(&predict_path, sidecar_json.as_bytes()).map_err(|e| {
+                format!(
+                    "Failed to write predict sidecar {}: {e}",
+                    predict_path.display()
+                )
+            })?;
+            let descriptor = serde_json::json!({
+                "file": predict_file_name,
+                "bytes": sidecar_json.len(),
+                "rows": agg.per_window.len(),
+                "hash": fnv1a32_hex(sidecar_json.as_bytes()),
+            });
+            serde_json::to_string(&descriptor).unwrap_or_else(|_| "null".to_string())
+        }
+        None => "null".to_string(),
+    };
+
+    // The primary (tool, arm) series the whole of Part 4.2 keys on, computed
+    // server-side so the client timeline draws the same series as the surfaces and
+    // matrices. `null` when no walk aggregate was supplied.
+    let pw_primary_json = match predict_agg {
+        Some(agg) => {
+            let (tool, arm) = pw_primary_series(agg);
+            serde_json::json!({ "tool": tool, "arm": arm }).to_string()
+        }
+        None => "null".to_string(),
+    };
+
+    // The branded-export inputs the client script carries: the inlined logo data
+    // URI, the server-built attribution, and the run date (for the export filename).
+    // JSON-encoded so each lands as a correctly-quoted, escaped JS string literal.
+    let logo_data_uri = format!("data:image/png;base64,{}", base64_encode(LOGO_BYTES));
+    let logo_uri_json = serde_json::to_string(&logo_data_uri).unwrap_or_default();
+    let export_attribution_json = serde_json::to_string(&export_attribution).unwrap_or_default();
+    let report_date_json = serde_json::to_string(report_run_date).unwrap_or_default();
+    let html = html.replace("EMPYREAN_LOGO_URI_B64", &logo_uri_json);
+    let html = html.replace("EMPYREAN_EXPORT_ATTRIBUTION", &export_attribution_json);
+    let html = html.replace("EMPYREAN_EXPORT_DATE", &report_date_json);
     let html = html.replace("DATASET_DESCRIPTOR_JSON", &dataset_descriptor_json);
+    let html = html.replace("PREDICT_DESCRIPTOR_JSON", &predict_descriptor_json);
+    let html = html.replace("PW_PRIMARY_JSON", &pw_primary_json);
     let html = html.replace("TOOLS_PRESENT_JSON", &tools_present_json);
     let html = html.replace("POP_COLORS_JSON", &pop_colors_json);
     let html = html.replace("CHANNEL_COLORS_JSON", &channel_colors_json);
@@ -7552,6 +9801,19 @@ loadDataset();
     let html = html.replace("RADAR_EXCLUDED_JSON", &radar_excluded_json);
 
     std::fs::write(output, html).map_err(|e| format!("Failed to write report: {e}"))
+}
+
+/// The Part 4.2 timeline sidecar path for a report output: the output with its
+/// extension replaced by `.predict.json`
+/// (`validation_report.html` -> `validation_report.predict.json`). Mirrors
+/// [`dataset_path_for`] so the two sidecars sit together beside the page.
+fn predict_path_for(output: &Path) -> std::path::PathBuf {
+    let mut name = output
+        .file_stem()
+        .map(|s| s.to_os_string())
+        .unwrap_or_default();
+    name.push(".predict.json");
+    output.with_file_name(name)
 }
 
 /// The dataset path for a report output: the output with its extension replaced
@@ -7563,6 +9825,35 @@ fn dataset_path_for(output: &Path) -> std::path::PathBuf {
         .unwrap_or_default();
     name.push(".data.json");
     output.with_file_name(name)
+}
+
+/// Standard-alphabet base64 (RFC 4648, with padding). Used once, to inline the
+/// masthead icon as a data URI for the branded chart export; a twenty-line
+/// encoder is cheaper to own than a dependency pulled in for a single call.
+/// Matches the published reference vectors ("" -> "", "f" -> "Zg==",
+/// "foobar" -> "Zm9vYmFy").
+fn base64_encode(bytes: &[u8]) -> String {
+    const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
+    for chunk in bytes.chunks(3) {
+        let b0 = chunk[0] as u32;
+        let b1 = *chunk.get(1).unwrap_or(&0) as u32;
+        let b2 = *chunk.get(2).unwrap_or(&0) as u32;
+        let n = (b0 << 16) | (b1 << 8) | b2;
+        out.push(TABLE[((n >> 18) & 0x3f) as usize] as char);
+        out.push(TABLE[((n >> 12) & 0x3f) as usize] as char);
+        out.push(if chunk.len() > 1 {
+            TABLE[((n >> 6) & 0x3f) as usize] as char
+        } else {
+            '='
+        });
+        out.push(if chunk.len() > 2 {
+            TABLE[(n & 0x3f) as usize] as char
+        } else {
+            '='
+        });
+    }
+    out
 }
 
 /// FNV-1a 32-bit hash of `bytes` as 8 lowercase hex digits. Matches the published
@@ -7673,7 +9964,7 @@ mod tests {
         let rows = vec![synthetic_rust_prop_row("Apophis", 0.0)];
         let dir = tempfile::tempdir().unwrap();
         let out = dir.path().join("report.html");
-        generate_report(&rows, &[], &out, None).unwrap();
+        generate_report(&rows, &[], &out, None, None).unwrap();
         let html = std::fs::read_to_string(&out).unwrap();
 
         // The light page ground the finding measured against.
@@ -7769,7 +10060,7 @@ mod tests {
         let (rows, cmps) = radar_scenario();
         let dir = tempfile::tempdir().unwrap();
         let out = dir.path().join("report.html");
-        generate_report(&rows, &cmps, &out, None).unwrap();
+        generate_report(&rows, &cmps, &out, None, None).unwrap();
         let raw = std::fs::read_to_string(&out).unwrap();
         // Excise <script>/<style> so `<th>` literals in the client JS source
         // (headers the browser builds at runtime) are not scanned as markup.
@@ -7828,7 +10119,7 @@ mod tests {
         ];
         let dir = tempfile::tempdir().unwrap();
         let out = dir.path().join("report.html");
-        let result = generate_report(&rows, &[], &out, None);
+        let result = generate_report(&rows, &[], &out, None, None);
         assert!(result.is_ok(), "generate_report failed: {result:?}");
         let html = std::fs::read_to_string(&out).unwrap();
         assert!(html.contains("EMPYREAN"), "missing brand title");
@@ -7844,7 +10135,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let html = dir.path().join("report.html");
         let summary = dir.path().join("summary.json");
-        let result = generate_report(&rows, &[], &html, Some(&summary));
+        let result = generate_report(&rows, &[], &html, Some(&summary), None);
         assert!(result.is_ok());
         let summary_json = std::fs::read_to_string(&summary).unwrap();
         let v: serde_json::Value = serde_json::from_str(&summary_json).unwrap();
@@ -7882,7 +10173,7 @@ mod tests {
         }];
         let dir = tempfile::tempdir().unwrap();
         let out = dir.path().join("report.html");
-        generate_report(&rows, &comps, &out, None).unwrap();
+        generate_report(&rows, &comps, &out, None, None).unwrap();
         let html = std::fs::read_to_string(&out).unwrap();
         assert!(
             html.contains("Covariance realism"),
@@ -7986,8 +10277,169 @@ mod tests {
         ];
         let dir = tempfile::tempdir().unwrap();
         let out = dir.path().join("report.html");
-        generate_report(&rows, &[], &out, None).unwrap();
+        generate_report(&rows, &[], &out, None, None).unwrap();
         std::fs::read_to_string(&out).unwrap()
+    }
+
+    /// Owner vocabulary rule (lang/design/validation-report-redesign.md,
+    /// 2026-10-17): the page names derivative orders as "state only / first
+    /// order / second order", never "Jet1", "Jet2", "6×6", "9×9", "STM" or
+    /// "hyperdual" as a label. Crate and type names may remain only in the
+    /// Configurations appendix (s01/s01b/s05c/s13), where a tool's version is
+    /// stated; `<script>` / `<style>` are not reader-facing prose.
+    #[test]
+    fn vocabulary_no_banned_derivative_tokens_outside_appendix() {
+        fn strip_tag(src: &str, tag: &str) -> String {
+            let (open, close) = (format!("<{tag}"), format!("</{tag}>"));
+            let mut out = String::new();
+            let mut rest = src;
+            while let Some(a) = rest.find(&open) {
+                out.push_str(&rest[..a]);
+                match rest[a..].find(&close) {
+                    Some(rel) => rest = &rest[a + rel + close.len()..],
+                    None => {
+                        rest = "";
+                        break;
+                    }
+                }
+            }
+            out.push_str(rest);
+            out
+        }
+        // The enclosing section id of a byte offset (last section-start before
+        // it), robust to the covariance block nesting s05c / s13 under s12.
+        fn section_of(html: &str, pos: usize) -> &str {
+            const MARK: &str = "<div class=\"section\"";
+            let mut cur = "(pre)";
+            let mut i = 0;
+            while let Some(rel) = html[i..].find(MARK) {
+                let s = i + rel;
+                if s > pos {
+                    break;
+                }
+                if let Some(idrel) = html[s..].find("id=\"") {
+                    let idstart = s + idrel + 4;
+                    if let Some(idend) = html[idstart..].find('"') {
+                        cur = &html[idstart..idstart + idend];
+                    }
+                }
+                i = s + MARK.len();
+            }
+            cur
+        }
+        const APPENDIX: [&str; 4] = ["s01", "s01b", "s05c", "s13"];
+        const BANNED: [&str; 11] = [
+            "Jet1",
+            "Jet2",
+            "hyperdual",
+            "6×6",
+            "9×9",
+            "6&times;6",
+            "9&times;9",
+            "6x6",
+            "9x9",
+            "STM",
+            "STT",
+        ];
+        fn scan(html: &str) -> Option<(String, String, String)> {
+            for tok in BANNED {
+                let mut i = 0;
+                while let Some(rel) = html[i..].find(tok) {
+                    let pos = i + rel;
+                    let sid = section_of(html, pos);
+                    if !APPENDIX.contains(&sid) {
+                        let a = pos.saturating_sub(40);
+                        let b = (pos + tok.len() + 20).min(html.len());
+                        let ctx = html.get(a..b).unwrap_or(tok).to_string();
+                        return Some((tok.to_string(), sid.to_string(), ctx));
+                    }
+                    i = pos + tok.len();
+                }
+            }
+            None
+        }
+        // Proof the scan can fail: a planted token outside the appendix is caught,
+        // and the appendix exemption lets the same token through inside it.
+        assert!(
+            scan("<div class=\"section\" id=\"s15\"><div class=\"panel-title\">Jet1</div></div>")
+                .is_some(),
+            "the scanner must catch a planted banned token outside the appendix"
+        );
+        assert!(
+            scan("<div class=\"section\" id=\"s05c\"><div>Jet1</div></div>").is_none(),
+            "a banned token inside the Configurations appendix must be exempt"
+        );
+        // Render the exact sites that leaked: the 4.2 configuration-arm and
+        // calibration tables (need the predict aggregate) and every 2.2
+        // timing/propagation arm id that reaches method_label, plus the ASSIST
+        // arms — so a banned token at any of them would be scanned, not skipped.
+        let mut rows = vec![
+            synthetic_rust_prop_row("Apophis", 0.0),
+            synthetic_rust_prop_row("Apophis", 30.0),
+            synthetic_rust_prop_row("Bennu", 0.0),
+            synthetic_rust_prop_row("Bennu", 365.0),
+        ];
+        for a in [
+            "f64_detection_on",
+            "first_order_detection_on",
+            "auto_detection_on",
+            "second_order_detection_on",
+            "sigma_point_detection_on",
+            "monte_carlo_100_detection_on",
+            "f64_detection_off_assist_default_like",
+            "f64_detection_off_assist_asteroid_institute_like",
+            "first_order_detection_off_assist_default_like",
+        ] {
+            let mut r = synthetic_rust_prop_row("Apophis", 30.0);
+            r.propagation_uncertainty = Some(a.to_string());
+            r.emp_time_ms = Some(3.0);
+            rows.push(r);
+        }
+        for a in [
+            "assist_default_variational_off",
+            "assist_default_variational_on",
+            "assist_layup_variational_off",
+            "assist_asteroid_institute_variational_off",
+        ] {
+            let mut r = synthetic_rust_prop_row("Apophis", 30.0);
+            r.channel = "assist".to_string();
+            r.propagation_uncertainty = Some(a.to_string());
+            rows.push(r);
+        }
+        let agg = synthetic_predict_aggregates("snap");
+        let dir = tempfile::tempdir().unwrap();
+        let out = dir.path().join("report.html");
+        generate_report(&rows, &[], &out, None, Some(&agg)).unwrap();
+        let raw = std::fs::read_to_string(&out).unwrap();
+        let html = strip_tag(&strip_tag(&raw, "script"), "style");
+        if let Some((tok, sid, ctx)) = scan(&html) {
+            panic!(
+                "banned derivative token {tok:?} in section {sid} (outside the appendix): …{ctx}…"
+            );
+        }
+        // Fail-proof at a real rendered site: a banned token spliced into the 2.2
+        // timing-arm label must be caught. The replacement must change the page,
+        // or the site never rendered and the fail-proof is vacuous.
+        let leaked_raw = raw.replacen("empyrean · first order", "empyrean · Jet1", 1);
+        assert_ne!(
+            leaked_raw, raw,
+            "the timing-arm label site must render, or the fail-proof is vacuous"
+        );
+        let leaked = strip_tag(&strip_tag(&leaked_raw, "script"), "style");
+        assert!(
+            scan(&leaked).is_some(),
+            "the scan must catch a banned token injected at a real timing-arm label site"
+        );
+    }
+
+    #[test]
+    fn method_label_maps_orders_and_passes_unknown_through() {
+        assert_eq!(method_label("f64_detection_on"), "state only");
+        assert_eq!(method_label("first_order_detection_on"), "first order");
+        assert_eq!(method_label("second_order_detection_on"), "second order");
+        // An unmapped arm id renders verbatim, never a silent blank.
+        assert_eq!(method_label("totally_unknown_arm"), "totally_unknown_arm");
+        assert!(!method_label("totally_unknown_arm").is_empty());
     }
 
     #[test]
@@ -8169,7 +10621,7 @@ mod tests {
         ];
         let dir = tempfile::tempdir().unwrap();
         let out = dir.path().join("report.html");
-        generate_report(&rows, &[], &out, None).unwrap();
+        generate_report(&rows, &[], &out, None, None).unwrap();
         let html = std::fs::read_to_string(&out).unwrap();
 
         // (1) the sibling dataset holds the verbatim serialization.
@@ -8268,6 +10720,19 @@ mod tests {
     }
 
     #[test]
+    fn base64_encode_matches_reference_vectors() {
+        // RFC 4648 §10 test vectors: a wrong alphabet, shift or padding here would
+        // corrupt the inlined logo so the branded export shows a broken image.
+        assert_eq!(base64_encode(b""), "");
+        assert_eq!(base64_encode(b"f"), "Zg==");
+        assert_eq!(base64_encode(b"fo"), "Zm8=");
+        assert_eq!(base64_encode(b"foo"), "Zm9v");
+        assert_eq!(base64_encode(b"foob"), "Zm9vYg==");
+        assert_eq!(base64_encode(b"fooba"), "Zm9vYmE=");
+        assert_eq!(base64_encode(b"foobar"), "Zm9vYmFy");
+    }
+
+    #[test]
     fn dataset_name_derives_from_output_stem() {
         // Two reports in one directory must not collide on their dataset file.
         assert_eq!(
@@ -8278,8 +10743,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let a = dir.path().join("report_a.html");
         let b = dir.path().join("report_b.html");
-        generate_report(&rows, &[], &a, None).unwrap();
-        generate_report(&rows, &[], &b, None).unwrap();
+        generate_report(&rows, &[], &a, None, None).unwrap();
+        generate_report(&rows, &[], &b, None, None).unwrap();
         assert!(dir.path().join("report_a.data.json").exists());
         assert!(dir.path().join("report_b.data.json").exists());
         assert!(
@@ -8311,8 +10776,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let out1 = dir.path().join("r1.html");
         let out2 = dir.path().join("r2.html");
-        generate_report(&rows, &[], &out1, None).unwrap();
-        generate_report(&rows, &[], &out2, None).unwrap();
+        generate_report(&rows, &[], &out1, None, None).unwrap();
+        generate_report(&rows, &[], &out2, None, None).unwrap();
         // The ONLY intended difference is the dataset file name each page cites.
         let s1 = std::fs::read_to_string(&out1)
             .unwrap()
@@ -8367,7 +10832,7 @@ mod tests {
         }
         let dir = tempfile::tempdir().unwrap();
         let out = dir.path().join("report.html");
-        generate_report(&rows, &[], &out, None).unwrap();
+        generate_report(&rows, &[], &out, None, None).unwrap();
         let html = std::fs::read_to_string(&out).unwrap();
 
         // Exactly one hatch definition, everywhere on the page.
@@ -9038,7 +11503,7 @@ mod tests {
         let rows = timing_fixture();
         let dir = tempfile::tempdir().unwrap();
         let out = dir.path().join("report.html");
-        generate_report(&rows, &[], &out, None).unwrap();
+        generate_report(&rows, &[], &out, None, None).unwrap();
         let html = std::fs::read_to_string(&out).unwrap();
 
         let all = ["empyrean", "assist", "findorb", "jpl", "kete", "jorbit"];
@@ -9291,7 +11756,7 @@ mod tests {
     fn run_summary_is_ordered_into_the_appendix_and_the_page_opens_on_part_one() {
         let dir = tempfile::tempdir().unwrap();
         let out = dir.path().join("report.html");
-        generate_report(&timing_fixture(), &[], &out, None).unwrap();
+        generate_report(&timing_fixture(), &[], &out, None, None).unwrap();
         let html = std::fs::read_to_string(&out).unwrap();
         let order = |id: &str| -> u32 {
             let rule = format!("#{id} {{ order: ");
@@ -9317,7 +11782,7 @@ mod tests {
     fn part_two_hatched_cells_carry_their_reason_on_hover_only() {
         let dir = tempfile::tempdir().unwrap();
         let out = dir.path().join("report.html");
-        generate_report(&timing_fixture(), &[], &out, None).unwrap();
+        generate_report(&timing_fixture(), &[], &out, None, None).unwrap();
         let html = std::fs::read_to_string(&out).unwrap();
         let start = html.find("id=\"s-ranking\"").expect("Part 2 section");
         let end = html[start..].find("id=\"s-timing\"").unwrap() + start;
@@ -9394,7 +11859,7 @@ mod tests {
 
         let dir = tempfile::tempdir().unwrap();
         let out = dir.path().join("report.html");
-        generate_report(&timing_fixture(), &[], &out, None).unwrap();
+        generate_report(&timing_fixture(), &[], &out, None, None).unwrap();
         let html = std::fs::read_to_string(&out).unwrap();
         let rail = html
             .find("data-target=\"s-ranking\"")
@@ -9501,7 +11966,7 @@ mod tests {
         // console stays clean on the owner's local server.
         let dir = tempfile::tempdir().unwrap();
         let out = dir.path().join("report.html");
-        generate_report(&timing_fixture(), &[], &out, None).unwrap();
+        generate_report(&timing_fixture(), &[], &out, None, None).unwrap();
         let html = std::fs::read_to_string(&out).unwrap();
         let head = &html[..html.find("</head>").expect("head present")];
         assert!(
@@ -9515,7 +11980,7 @@ mod tests {
         let rows = timing_fixture();
         let dir = tempfile::tempdir().unwrap();
         let out = dir.path().join("report.html");
-        generate_report(&rows, &[], &out, None).unwrap();
+        generate_report(&rows, &[], &out, None, None).unwrap();
         let html = std::fs::read_to_string(&out).unwrap();
 
         let p2 = html.find("id=\"part2\"").expect("part2 anchor");
@@ -9562,7 +12027,7 @@ mod tests {
         assert_eq!(emp_eph_channel(&rows), ("core", true));
         let dir = tempfile::tempdir().unwrap();
         let out = dir.path().join("report.html");
-        generate_report(&rows, &[], &out, None).unwrap();
+        generate_report(&rows, &[], &out, None, None).unwrap();
         let html = std::fs::read_to_string(&out).unwrap();
         assert!(
             html.contains("core channel</span>"),
@@ -9591,7 +12056,7 @@ mod tests {
         assert_eq!(picked, vec![5.0], "the rust ephemeris value must be used");
         let dir2 = tempfile::tempdir().unwrap();
         let out2 = dir2.path().join("report.html");
-        generate_report(&rows2, &[], &out2, None).unwrap();
+        generate_report(&rows2, &[], &out2, None, None).unwrap();
         let html2 = std::fs::read_to_string(&out2).unwrap();
         assert!(
             !html2.contains("core channel</span>"),
@@ -9638,7 +12103,7 @@ mod tests {
             rows.push(r);
         }
         let cols = vec![TimingCol::timed(
-            "emp Jet1",
+            "emp first order",
             rust_arm("first_order_detection_on"),
             BOUND_B,
         )];
@@ -9677,7 +12142,14 @@ mod tests {
     fn timing_grids_opt_into_the_sticky_overflow_rule() {
         let dir = tempfile::tempdir().unwrap();
         let out = dir.path().join("report.html");
-        generate_report(&[synthetic_rust_prop_row("Apophis", 0.0)], &[], &out, None).unwrap();
+        generate_report(
+            &[synthetic_rust_prop_row("Apophis", 0.0)],
+            &[],
+            &out,
+            None,
+            None,
+        )
+        .unwrap();
         let html = std::fs::read_to_string(&out).unwrap();
 
         // Wrapper side: the T1 wall-clock and a per-object G* grid carry the marker.
@@ -9696,7 +12168,7 @@ mod tests {
         // Precision: the wide per-object fidelity grid shares the fidgrid class but
         // must keep the plain wrapper (it scrolls horizontally, never pins).
         assert!(
-            html.contains("grid-scroll\"><table class=\"agrid fidgrid\"><thead><tr><th class=\"gobj\">object</th>"),
+            html.contains("grid-scroll\"><table class=\"agrid fidgrid\"><thead><tr><th class=\"gobj\" rowspan=\"2\">object</th>"),
             "wide fidelity grid must keep the plain grid-scroll wrapper"
         );
         // Rule side: the ≥1360px overflow-drop rule must target the marker, or the
@@ -9881,7 +12353,7 @@ mod tests {
     fn render_rows(rows: &[ValidationResult]) -> String {
         let dir = tempfile::tempdir().unwrap();
         let out = dir.path().join("report.html");
-        generate_report(rows, &[], &out, None).unwrap();
+        generate_report(rows, &[], &out, None, None).unwrap();
         std::fs::read_to_string(&out).unwrap()
     }
 
@@ -10361,7 +12833,7 @@ mod tests {
         // directly under the 1.2 heatmap and before the ephemeris cost.
         let dir = tempfile::tempdir().unwrap();
         let out = dir.path().join("report.html");
-        generate_report(&timing_fixture(), &[], &out, None).unwrap();
+        generate_report(&timing_fixture(), &[], &out, None, None).unwrap();
         let html = std::fs::read_to_string(&out).unwrap();
 
         // The eph-sep-chart lives inside the new s06b section, not the s06
@@ -10420,7 +12892,7 @@ mod tests {
         // grid directly at B.
         let dir = tempfile::tempdir().unwrap();
         let out = dir.path().join("report.html");
-        generate_report(&timing_fixture(), &[], &out, None).unwrap();
+        generate_report(&timing_fixture(), &[], &out, None, None).unwrap();
         let html = std::fs::read_to_string(&out).unwrap();
         let num = |sid: &str| -> String {
             let at = html
@@ -10452,7 +12924,7 @@ mod tests {
         // per-chart drawers and the divergent gMed estimator are gone.
         let dir = tempfile::tempdir().unwrap();
         let out = dir.path().join("report.html");
-        generate_report(&timing_fixture(), &[], &out, None).unwrap();
+        generate_report(&timing_fixture(), &[], &out, None, None).unwrap();
         let html = std::fs::read_to_string(&out).unwrap();
         assert_eq!(
             html.matches("function drawGrowthChart(").count(),
@@ -10499,7 +12971,7 @@ mod tests {
         // ephemeris canonical, 520px). The card class is defined exactly once.
         let dir = tempfile::tempdir().unwrap();
         let out = dir.path().join("report.html");
-        generate_report(&timing_fixture(), &[], &out, None).unwrap();
+        generate_report(&timing_fixture(), &[], &out, None, None).unwrap();
         let html = std::fs::read_to_string(&out).unwrap();
         assert_eq!(
             html.matches(".chart-container {").count(),
@@ -10530,7 +13002,7 @@ mod tests {
         // token, re-theme on a flip, and keep the legend clear of the title band.
         let dir = tempfile::tempdir().unwrap();
         let out = dir.path().join("report.html");
-        generate_report(&timing_fixture(), &[], &out, None).unwrap();
+        generate_report(&timing_fixture(), &[], &out, None, None).unwrap();
         let html = std::fs::read_to_string(&out).unwrap();
 
         // The invisible ghost-grey literal is gone everywhere.
@@ -10573,6 +13045,270 @@ mod tests {
             html.matches("legend: COV_LEGEND").count(),
             2,
             "the two legended covariance panels share the bottom-placed legend"
+        );
+    }
+
+    // ── Signature download button + branded export ──────────────────────────
+
+    #[test]
+    fn every_plotly_call_passes_the_one_shared_config() {
+        let html = render_rows(&pair_test_rows());
+        // Exactly one displayModeBar literal — it lives only in the shared config.
+        assert_eq!(
+            html.matches("displayModeBar").count(),
+            1,
+            "displayModeBar must appear exactly once, inside the shared PLOTLY_CONFIG"
+        );
+        // The shared config object is defined exactly once.
+        assert_eq!(
+            html.matches("const PLOTLY_CONFIG =").count(),
+            1,
+            "one shared Plotly config object for every call site"
+        );
+        // Every Plotly.react(/newPlot( call passes PLOTLY_CONFIG as its config: the
+        // number of calls must equal the number that end in `, PLOTLY_CONFIG)`.
+        let calls = html.matches("Plotly.react(").count() + html.matches("Plotly.newPlot(").count();
+        assert!(
+            calls >= 10,
+            "expected the full set of chart call sites, found {calls}"
+        );
+        assert_eq!(
+            html.matches(", PLOTLY_CONFIG)").count(),
+            calls,
+            "every Plotly.react/newPlot call must pass the shared config ({calls} calls)"
+        );
+        // The config keeps the toolbar always on, drops Plotly's logo, and adds our
+        // one branded download button in place of the stock camera.
+        assert!(
+            html.contains("displayModeBar: true"),
+            "the toolbar must always be visible"
+        );
+        assert!(
+            html.contains("displaylogo: false"),
+            "the Plotly logo must be off"
+        );
+        assert!(
+            html.contains("click: empExportPng"),
+            "the one download button must call the branded exporter"
+        );
+    }
+
+    #[test]
+    fn export_attribution_carries_run_date_and_component_version() {
+        let html = render_rows(&pair_test_rows());
+        // The run date shown in the provenance table.
+        let rd_anchor = "Report generated</td><td>";
+        let rd_at = html.find(rd_anchor).expect("provenance run date") + rd_anchor.len();
+        let run_date = &html[rd_at..rd_at + html[rd_at..].find('<').unwrap()];
+        assert_eq!(
+            run_date.len(),
+            10,
+            "run date should be YYYY-MM-DD: {run_date}"
+        );
+        // The empyrean version shown in the component table (the distribution-under-
+        // test row), read from the page rather than hardcoded in the test.
+        let hdr = html.find("<th>Version</th>").expect("component table");
+        let row_at = hdr + html[hdr..].find(">empyrean</td>").expect("empyrean row");
+        let row = &html[row_at..row_at + html[row_at..].find("</tr>").unwrap()];
+        let vtd = row.rfind("<td>").unwrap() + "<td>".len();
+        let version = &row[vtd..vtd + row[vtd..].find("</td>").unwrap()];
+        // The server-built attribution const carries both.
+        let anchor = "const EMP_ATTRIBUTION = ";
+        let at = html.find(anchor).expect("attribution const") + anchor.len();
+        let rest = &html[at..];
+        assert!(
+            rest.starts_with('"'),
+            "attribution must be a JS string literal: {}",
+            &rest[..40.min(rest.len())]
+        );
+        let close = rest[1..].find('"').unwrap() + 1;
+        let attr = &rest[1..close];
+        assert!(
+            attr.contains(run_date),
+            "attribution must carry the run date {run_date}: {attr}"
+        );
+        assert!(
+            attr.contains(version),
+            "attribution must carry the component version {version}: {attr}"
+        );
+        assert!(
+            attr.starts_with("EMPYREAN DYNAMICS · validation report ·"),
+            "attribution must lead with the brand and report type: {attr}"
+        );
+    }
+
+    #[test]
+    fn logo_is_inlined_once_as_a_png_data_uri() {
+        let html = render_rows(&pair_test_rows());
+        // The data URI appears exactly once (one shared logo const).
+        let needle = "data:image/png;base64,";
+        assert_eq!(
+            html.matches(needle).count(),
+            1,
+            "the logo data URI must be emitted exactly once"
+        );
+        // The embedded bytes are a PNG (magic number), and the base64 payload begins
+        // with that magic, so the export renders a real image.
+        assert_eq!(
+            &LOGO_BYTES[..8],
+            &[0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A],
+            "the embedded logo must be a PNG"
+        );
+        let at = html.find(needle).unwrap() + needle.len();
+        assert!(
+            html[at..].starts_with("iVBORw0KGgo"),
+            "the base64 payload must decode to the PNG magic header"
+        );
+    }
+
+    #[test]
+    fn exported_logo_is_the_resampled_transparent_mark_not_the_filled_tile() {
+        // The filled 1024×1024 tile's background equalled the dark theme surface,
+        // so it was invisible on dark and a dark box on light. The inlined asset
+        // must be the resampled, truecolour+alpha mark (orbit + bodies, no tile),
+        // which reads on both themes. Read the IHDR directly (no decode): bytes
+        // 12..16 name the chunk, 16..20 the width, 20..24 the height, 25 the
+        // colour type.
+        assert_eq!(&LOGO_BYTES[12..16], b"IHDR", "IHDR must be the first chunk");
+        let w = u32::from_be_bytes([
+            LOGO_BYTES[16],
+            LOGO_BYTES[17],
+            LOGO_BYTES[18],
+            LOGO_BYTES[19],
+        ]);
+        let h = u32::from_be_bytes([
+            LOGO_BYTES[20],
+            LOGO_BYTES[21],
+            LOGO_BYTES[22],
+            LOGO_BYTES[23],
+        ]);
+        let colour_type = LOGO_BYTES[25];
+        assert_eq!(
+            w, h,
+            "the mark is square (export sizing keeps it pixel-square)"
+        );
+        assert!(
+            w <= 512,
+            "the inlined logo must be the resampled mark, not the 1024px masthead tile: {w}px"
+        );
+        assert_eq!(
+            colour_type, 6,
+            "the mark must be truecolour+alpha (PNG colour type 6) so its background is transparent"
+        );
+    }
+
+    #[test]
+    fn export_identity_keys_off_the_pair_chip_not_part1_ancestry() {
+        let html = render_rows(&pair_test_rows());
+        // The old identity gated the pair on DOM ancestry (gd.closest('#part1')),
+        // but #part1 is a sibling part-head, never an ancestor of a chart, so the
+        // pair was never appended and the filename pair slot was always 'none'.
+        assert!(
+            !html.contains("closest('#part1')"),
+            "the export identity must not gate the pair on #part1 ancestry"
+        );
+        assert!(
+            html.contains("<div class=\"part-head\" id=\"part1\">"),
+            "#part1 is a sibling part-head label, not a wrapper, which is why ancestry failed"
+        );
+        // The pair is now gated on a pair chip inside the chart's own section.
+        assert!(
+            html.contains("sec.querySelector('.pair-chip')"),
+            "the pair must be detected by a pair chip in the chart's section"
+        );
+        // Each Part 1 client chart sits in the SAME section as a pair chip, so the
+        // gate fires for exactly those charts.
+        for id in ["growth-chart", "eph-sep-chart"] {
+            let at = html
+                .find(&format!("id=\"{id}\""))
+                .unwrap_or_else(|| panic!("#{id} must be present"));
+            let sec_open = html[..at]
+                .rfind("<div class=\"section\"")
+                .expect("the chart's section open tag");
+            assert!(
+                html[sec_open..at].contains("pair-chip"),
+                "#{id}'s section must carry a pair chip so the export pair gate fires"
+            );
+        }
+        // The title text strips the pair chip, so Part 1 titles are not glued (no
+        // "Error growthempyrean vs JPL").
+        assert!(
+            html.contains("function empTitleText(")
+                && html.contains("classList.contains('pair-chip')"),
+            "empTitleText must remove the pair chip from a heading's text"
+        );
+    }
+
+    #[test]
+    fn export_identity_titles_from_layout_and_the_nearest_heading() {
+        let html = render_rows(&pair_test_rows());
+        // The title comes from the chart's own Plotly title via `layout`, not
+        // `_fullLayout` — Plotly fills `_fullLayout.title.text` with a "Click to
+        // enter…" placeholder for a title-less chart, which would caption every
+        // growth/ephemeris/STM/walk chart with the placeholder.
+        assert!(
+            html.contains("const lay = gd.layout") && html.contains("lay.title && lay.title.text"),
+            "the title must be read from layout.title (never the _fullLayout placeholder)"
+        );
+        assert!(
+            !html.contains("_fullLayout.title"),
+            "the identity must not read the _fullLayout title placeholder"
+        );
+        // Charts with no Plotly title fall back to the nearest heading above them
+        // in document order (panel title, else section title).
+        assert!(
+            html.contains("DOCUMENT_POSITION_FOLLOWING"),
+            "the title falls back to the nearest preceding heading in the section"
+        );
+        // Caption and filename join the parts with an explicit separator (no glued
+        // words like the old join(' ')).
+        assert!(
+            html.contains("[num, title, pair].filter(Boolean).join(' · ')"),
+            "the caption must join number, title and pair with an explicit separator"
+        );
+    }
+
+    #[test]
+    fn export_stamp_grows_a_footer_band_and_restores_the_layout_exactly() {
+        let html = render_rows(&pair_test_rows());
+        // The caption used to be anchored into a 34px bottom margin on top of the
+        // x-axis title, which it overprinted. It now grows the canvas by a footer
+        // band and lays the stamp across that band, below the axis title.
+        assert!(
+            !html.contains("const pad = 34") && !html.contains("yshift: -(pad - 10)"),
+            "the old top-anchored caption placement must be gone"
+        );
+        assert!(
+            html.contains("const band = 58")
+                && html.contains("const exportH = H + band")
+                && html.contains("height: exportH"),
+            "the export must grow the canvas by a footer band for the stamp"
+        );
+        // The finally block restores the layout exactly: keys that were absent are
+        // cleared (null), not left as empty arrays.
+        assert!(
+            html.contains("const hadImages = 'images' in layout")
+                && html.contains("hadImages ? prevImages : null")
+                && html.contains("hadAnnotations ? prevAnnotations : null"),
+            "the restore must clear images/annotations that were absent, not leave empty arrays"
+        );
+    }
+
+    #[test]
+    fn export_attribution_lives_only_in_script() {
+        let html = render_rows(&pair_test_rows());
+        // Pull the attribution string from its script const.
+        let anchor = "const EMP_ATTRIBUTION = ";
+        let at = html.find(anchor).expect("attribution const") + anchor.len();
+        let rest = &html[at..];
+        let close = rest[1..].find('"').unwrap() + 1;
+        let attr = rest[1..close].to_string();
+        // It must never appear as text a reader sees (scripts/styles stripped, then
+        // tags dropped so only text nodes remain).
+        let visible = text_only(&strip_tag_spans(&strip_tag_spans(&html, "script"), "style"));
+        assert!(
+            !visible.contains(&attr),
+            "the attribution string must live only in the client script, not visible text: {attr}"
         );
     }
 
@@ -10789,5 +13525,1082 @@ mod tests {
         assert!(
             html.contains("smaller closer; one decade ladder; hatched where the tool has no rows")
         );
+    }
+
+    // ── Part 4.2 predictive power ────────────────────────────────────────
+
+    fn pw_surface_cell(
+        key: (&str, &str, &str),
+        arc: (f64, f64),
+        dt: (f64, f64),
+        n_objects: u32,
+        stats: (Option<f64>, Option<f64>),
+    ) -> SurfaceCell {
+        let (class, tool, arm) = key;
+        let (sep, d2) = stats;
+        SurfaceCell {
+            class: class.into(),
+            tool: tool.into(),
+            config_arm: arm.into(),
+            sigma_table: "pinned".into(),
+            arc_lo_days: arc.0,
+            arc_hi_days: arc.1,
+            dt_lo_days: dt.0,
+            dt_hi_days: dt.1,
+            n_objects,
+            n_windows: n_objects * 4,
+            n_predictions: n_objects * 16,
+            delivered_fraction: 0.9,
+            med_sep_arcsec: sep,
+            med_d2_norm: d2,
+            cov_1s: Some(0.39),
+            cov_2s: Some(0.86),
+            cov_3s: Some(0.98),
+            cov_1s_at: Some(0.66),
+            cov_2s_at: Some(0.94),
+            cov_3s_at: Some(0.99),
+            cov_1s_ct: Some(0.71),
+            cov_2s_ct: Some(0.96),
+            cov_3s_ct: Some(0.995),
+            exp_cov_1s: Some(0.3935),
+            exp_cov_2s: Some(0.8647),
+            exp_cov_3s: Some(0.9889),
+            exp_cov_1s_at: Some(0.6827),
+            exp_cov_2s_at: Some(0.9545),
+            exp_cov_3s_at: Some(0.9973),
+            exp_cov_1s_ct: Some(0.6827),
+            exp_cov_2s_ct: Some(0.9545),
+            exp_cov_3s_ct: Some(0.9973),
+            n_nights: n_objects * 2,
+            med_z2_at_norm: d2,
+            med_z2_ct_norm: d2.map(|v| v * 0.8),
+            n_z_at: n_objects * 2,
+            n_z_ct: n_objects * 2,
+            coverage_law_aware: true,
+            cov_1s_row: Some(0.40),
+            cov_2s_row: Some(0.85),
+            cov_3s_row: Some(0.97),
+            cov_1s_at_row: Some(0.67),
+            cov_2s_at_row: Some(0.93),
+            cov_3s_at_row: Some(0.99),
+            cov_1s_ct_row: Some(0.70),
+            cov_2s_ct_row: Some(0.95),
+            cov_3s_ct_row: Some(0.99),
+            cov_1s_unc: Some(0.37),
+            cov_2s_unc: Some(0.82),
+            cov_3s_unc: Some(0.96),
+            cov_1s_at_unc: Some(0.64),
+            cov_2s_at_unc: Some(0.92),
+            cov_3s_at_unc: Some(0.98),
+            cov_1s_ct_unc: Some(0.69),
+            cov_2s_ct_unc: Some(0.94),
+            cov_3s_ct_unc: Some(0.99),
+            cov_2s_row_unc: Some(0.80),
+            cov_2s_at_row_unc: Some(0.91),
+            cov_2s_ct_row_unc: Some(0.93),
+            // Gated share 12/16 = 75 % (the 4.2B realism hover reads this pair);
+            // the unc pair is deliberately distinct (5/20 = 25 %) so a 4.2B read
+            // of the wrong pair would fail the 75 % assertion.
+            n_rows: n_objects * 16,
+            n_rows_pd: n_objects * 12,
+            n_rows_unc: n_objects * 20,
+            n_rows_pd_unc: n_objects * 5,
+            n_objects_all: n_objects,
+            n_objects_trusted: n_objects,
+        }
+    }
+
+    /// A pooled 4.2A coverage row (one arc side × dt bin). `obs2` is the
+    /// trust-unconditioned joint 2σ rate the matrix cell shows; `share` is the
+    /// Σ_pred-dominated fraction of rows (below 0.10 hatches the cell).
+    fn pw_coverage_cell(
+        key: (&str, &str, &str),
+        arc_short: bool,
+        dt: (f64, f64),
+        counts: (u32, u32),
+        obs2: Option<f64>,
+        cond2: Option<f64>,
+        share: f64,
+    ) -> SurfaceCell {
+        let (class, tool, arm) = key;
+        let (n_all, n_trusted) = counts;
+        let (arc_lo_days, arc_hi_days) = if arc_short {
+            (1.0, COVERAGE_ARC_SPLIT_DAYS)
+        } else {
+            (COVERAGE_ARC_SPLIT_DAYS, 30000.0)
+        };
+        // 4.2A reads the UNCONDITIONED share, so `share` drives the unc pair; the
+        // gated pair is deliberately empty (0 % share) so a cell that wrongly
+        // read it would hatch and fail the numeric assertions.
+        let n_rows_unc = 40u32;
+        let n_rows_pd_unc = (f64::from(n_rows_unc) * share).round() as u32;
+        let n_rows = 40u32;
+        let n_rows_pd = 0u32;
+        // Expected present only where the observed value is (the cell gates on it).
+        let exp = |v: f64| obs2.map(|_| v);
+        SurfaceCell {
+            class: class.into(),
+            tool: tool.into(),
+            config_arm: arm.into(),
+            sigma_table: "pinned".into(),
+            arc_lo_days,
+            arc_hi_days,
+            dt_lo_days: dt.0,
+            dt_hi_days: dt.1,
+            n_objects: n_all,
+            n_windows: 0,
+            n_predictions: 0,
+            delivered_fraction: 0.0,
+            med_sep_arcsec: None,
+            med_d2_norm: None,
+            cov_1s: cond2.map(|v| v - 0.4),
+            cov_2s: cond2,
+            cov_3s: cond2.map(|v| (v + 0.1).min(1.0)),
+            cov_1s_at: cond2.map(|v| v - 0.2),
+            cov_2s_at: cond2,
+            cov_3s_at: cond2.map(|v| (v + 0.05).min(1.0)),
+            cov_1s_ct: cond2.map(|v| v - 0.2),
+            cov_2s_ct: cond2,
+            cov_3s_ct: cond2.map(|v| (v + 0.05).min(1.0)),
+            exp_cov_1s: exp(0.3935),
+            exp_cov_2s: exp(0.8647),
+            exp_cov_3s: exp(0.9889),
+            exp_cov_1s_at: exp(0.6827),
+            exp_cov_2s_at: exp(0.9545),
+            exp_cov_3s_at: exp(0.9973),
+            exp_cov_1s_ct: exp(0.6827),
+            exp_cov_2s_ct: exp(0.9545),
+            exp_cov_3s_ct: exp(0.9973),
+            n_nights: n_all * 3,
+            med_z2_at_norm: None,
+            med_z2_ct_norm: None,
+            n_z_at: 0,
+            n_z_ct: 0,
+            coverage_law_aware: true,
+            cov_1s_row: None,
+            cov_2s_row: None,
+            cov_3s_row: None,
+            cov_1s_at_row: None,
+            cov_2s_at_row: None,
+            cov_3s_at_row: None,
+            cov_1s_ct_row: None,
+            cov_2s_ct_row: None,
+            cov_3s_ct_row: None,
+            cov_1s_unc: obs2.map(|v| (v - 0.4).max(0.0)),
+            cov_2s_unc: obs2,
+            cov_3s_unc: obs2.map(|v| (v + 0.1).min(1.0)),
+            cov_1s_at_unc: obs2.map(|v| (v - 0.2).max(0.0)),
+            cov_2s_at_unc: obs2,
+            cov_3s_at_unc: obs2.map(|v| (v + 0.05).min(1.0)),
+            cov_1s_ct_unc: obs2.map(|v| (v - 0.2).max(0.0)),
+            cov_2s_ct_unc: obs2,
+            cov_3s_ct_unc: obs2.map(|v| (v + 0.05).min(1.0)),
+            cov_2s_row_unc: obs2.map(|v| (v + 0.03).min(1.0)),
+            cov_2s_at_row_unc: obs2,
+            cov_2s_ct_row_unc: obs2,
+            n_rows,
+            n_rows_pd,
+            n_rows_unc,
+            n_rows_pd_unc,
+            n_objects_all: n_all,
+            n_objects_trusted: n_trusted,
+        }
+    }
+
+    /// A synthetic walk aggregate exercising every 4.2 sub-panel: a well-sampled
+    /// cell, a thin (n < 3) cell, two arms, a per-object walk (one all-failed),
+    /// an empty calibration family, and a one-object timeline.
+    fn synthetic_predict_aggregates(snapshot: &str) -> PredictAggregates {
+        // Mirrors production arm naming: rust arms are dot/plus-delimited (never
+        // "default"), and the single "default" arm belongs to another tool — so
+        // (rust, "default") does not co-occur, exactly the shape that emptied the
+        // default surface, the marginals and the per-object matrix before the
+        // primary-series fix. The full arm axis (4) also exceeds the rust arm count
+        // (3), exercising the 4.2C/4.2E reconciliation, and the '.'/'+' slugs
+        // exercise the main-effects tokeniser.
+        PredictAggregates {
+            snapshot_id: snapshot.into(),
+            profile: "ci".into(),
+            cells: vec![
+                // Primary rust arm, two dt bins, both n >= 3 (4.2B populates).
+                pw_surface_cell(
+                    ("NEA", "rust", "efcc.adap.nonight"),
+                    (1.0, 3.0),
+                    (0.3, 1.0),
+                    5,
+                    (Some(0.8), Some(1.0)),
+                ),
+                pw_surface_cell(
+                    ("NEA", "rust", "efcc.adap.nonight"),
+                    (3.0, 10.0),
+                    (1.0, 3.0),
+                    5,
+                    (Some(8.0), Some(12.0)),
+                ),
+                // Below the three-object floor: must hatch, never pool.
+                pw_surface_cell(
+                    ("NEA", "rust", "efcc.adap.nonight"),
+                    (1.0, 3.0),
+                    (1.0, 3.0),
+                    2,
+                    (Some(0.5), Some(0.3)),
+                ),
+                // Two more rust arms (a '.'-only and a '+'-transport slug) so the
+                // main-effects tokeniser has factor tokens shared across '.' and '+'.
+                pw_surface_cell(
+                    ("NEA", "rust", "nodeb.adap.nonight+mc"),
+                    (1.0, 3.0),
+                    (0.3, 1.0),
+                    4,
+                    (Some(1.2), Some(2.0)),
+                ),
+                pw_surface_cell(
+                    ("NEA", "rust", "efcc.adap.vfc+mc"),
+                    (1.0, 3.0),
+                    (0.3, 1.0),
+                    4,
+                    (Some(1.5), Some(0.6)),
+                ),
+                // Another tool's single "default" arm: present in the cells, so the
+                // full arm axis (4) exceeds the rust arm count (3); 4.2C/4.2E render
+                // it as an explicit hatched row, never dropped.
+                pw_surface_cell(
+                    ("NEA", "findorb", "default"),
+                    (1.0, 3.0),
+                    (0.3, 1.0),
+                    5,
+                    (Some(2.0), Some(1.5)),
+                ),
+            ],
+            coverage_cells: vec![
+                // rust at its primary arm: a short-arc and a long-arc row with
+                // numeric cells (short-arc the more over-confident), a Σ_pred-share
+                // hatch (dt 1–3 d short-arc), and a thin hatch (dt 1–3 d long-arc).
+                pw_coverage_cell(
+                    ("NEA", "rust", "efcc.adap.nonight"),
+                    true,
+                    (0.3, 1.0),
+                    (5, 3),
+                    Some(0.78),
+                    Some(0.90),
+                    0.60,
+                ),
+                pw_coverage_cell(
+                    ("NEA", "rust", "efcc.adap.nonight"),
+                    false,
+                    (0.3, 1.0),
+                    (4, 4),
+                    Some(0.40),
+                    Some(0.42),
+                    0.50,
+                ),
+                pw_coverage_cell(
+                    ("NEA", "rust", "efcc.adap.nonight"),
+                    true,
+                    (1.0, 3.0),
+                    (5, 3),
+                    Some(0.80),
+                    Some(0.88),
+                    0.05,
+                ),
+                pw_coverage_cell(
+                    ("NEA", "rust", "efcc.adap.nonight"),
+                    false,
+                    (1.0, 3.0),
+                    (2, 2),
+                    Some(0.70),
+                    Some(0.72),
+                    0.50,
+                ),
+                // find_orb at its default arm.
+                pw_coverage_cell(
+                    ("NEA", "findorb", "default"),
+                    true,
+                    (0.3, 1.0),
+                    (4, 4),
+                    Some(0.70),
+                    Some(0.70),
+                    0.30,
+                ),
+                pw_coverage_cell(
+                    ("NEA", "findorb", "default"),
+                    false,
+                    (0.3, 1.0),
+                    (3, 3),
+                    Some(0.99),
+                    Some(0.99),
+                    0.40,
+                ),
+            ],
+            per_object: vec![
+                ObjectWalkSummary {
+                    object: "Apophis".into(),
+                    class: "NEA".into(),
+                    tool: "rust".into(),
+                    config_arm: "efcc.adap.nonight".into(),
+                    n_windows_expected: 4,
+                    n_windows_converged: 3,
+                    n_windows_failed: 1,
+                    n_predictions: 16,
+                    med_d2_norm: Some(1.1),
+                    n_predictions_incl_flagged: 0,
+                    med_d2_norm_incl_flagged: None,
+                    flag_counts: Default::default(),
+                    trust_reasons: Default::default(),
+                    med_sep_arcsec: Some(0.9),
+                    cov_1s: Some(0.40),
+                    cov_2s: Some(0.85),
+                    cov_3s: Some(0.97),
+                    cov_1s_at: Some(0.64),
+                    cov_2s_at: Some(0.93),
+                    cov_3s_at: Some(0.99),
+                    cov_1s_ct: Some(0.70),
+                    cov_2s_ct: Some(0.95),
+                    cov_3s_ct: Some(0.99),
+                    n_nights: 8,
+                    med_z2_at_norm: Some(1.2),
+                    med_z2_ct_norm: Some(0.9),
+                    n_z_at: 8,
+                    n_z_ct: 8,
+                },
+                // An object no window converged on: the hatched row.
+                ObjectWalkSummary {
+                    object: "Bennu".into(),
+                    class: "NEA".into(),
+                    tool: "rust".into(),
+                    config_arm: "efcc.adap.nonight".into(),
+                    n_windows_expected: 4,
+                    n_windows_converged: 0,
+                    n_windows_failed: 4,
+                    n_predictions: 0,
+                    med_d2_norm: None,
+                    n_predictions_incl_flagged: 0,
+                    med_d2_norm_incl_flagged: None,
+                    flag_counts: Default::default(),
+                    trust_reasons: Default::default(),
+                    med_sep_arcsec: None,
+                    cov_1s: None,
+                    cov_2s: None,
+                    cov_3s: None,
+                    cov_1s_at: None,
+                    cov_2s_at: None,
+                    cov_3s_at: None,
+                    cov_1s_ct: None,
+                    cov_2s_ct: None,
+                    cov_3s_ct: None,
+                    n_nights: 0,
+                    med_z2_at_norm: None,
+                    med_z2_ct_norm: None,
+                    n_z_at: 0,
+                    n_z_ct: 0,
+                },
+                // The other rust arms carry a per-object realism so the main-effects
+                // sweep marginalizes real numbers across shared factor tokens.
+                ObjectWalkSummary {
+                    object: "Apophis".into(),
+                    class: "NEA".into(),
+                    tool: "rust".into(),
+                    config_arm: "nodeb.adap.nonight+mc".into(),
+                    n_windows_expected: 4,
+                    n_windows_converged: 4,
+                    n_windows_failed: 0,
+                    n_predictions: 16,
+                    med_d2_norm: Some(1.3),
+                    n_predictions_incl_flagged: 0,
+                    med_d2_norm_incl_flagged: None,
+                    flag_counts: Default::default(),
+                    trust_reasons: Default::default(),
+                    med_sep_arcsec: Some(1.0),
+                    cov_1s: Some(0.41),
+                    cov_2s: Some(0.87),
+                    cov_3s: Some(0.98),
+                    cov_1s_at: Some(0.67),
+                    cov_2s_at: Some(0.95),
+                    cov_3s_at: Some(0.99),
+                    cov_1s_ct: Some(0.69),
+                    cov_2s_ct: Some(0.95),
+                    cov_3s_ct: Some(0.99),
+                    n_nights: 8,
+                    med_z2_at_norm: Some(1.4),
+                    med_z2_ct_norm: Some(1.0),
+                    n_z_at: 8,
+                    n_z_ct: 8,
+                },
+                ObjectWalkSummary {
+                    object: "Apophis".into(),
+                    class: "NEA".into(),
+                    tool: "rust".into(),
+                    config_arm: "efcc.adap.vfc+mc".into(),
+                    n_windows_expected: 4,
+                    n_windows_converged: 4,
+                    n_windows_failed: 0,
+                    n_predictions: 16,
+                    med_d2_norm: Some(0.7),
+                    n_predictions_incl_flagged: 0,
+                    med_d2_norm_incl_flagged: None,
+                    flag_counts: Default::default(),
+                    trust_reasons: Default::default(),
+                    med_sep_arcsec: Some(0.8),
+                    cov_1s: Some(0.38),
+                    cov_2s: Some(0.84),
+                    cov_3s: Some(0.97),
+                    cov_1s_at: Some(0.63),
+                    cov_2s_at: Some(0.92),
+                    cov_3s_at: Some(0.98),
+                    cov_1s_ct: Some(0.72),
+                    cov_2s_ct: Some(0.96),
+                    cov_3s_ct: Some(0.995),
+                    n_nights: 8,
+                    med_z2_at_norm: Some(0.8),
+                    med_z2_ct_norm: Some(0.6),
+                    n_z_at: 8,
+                    n_z_ct: 8,
+                },
+                // The non-rust "default" arm's walk: present, but 4.2C/4.2E key on
+                // rust, so this arm renders hatched there, not from this row.
+                ObjectWalkSummary {
+                    object: "Apophis".into(),
+                    class: "NEA".into(),
+                    tool: "findorb".into(),
+                    config_arm: "default".into(),
+                    n_windows_expected: 4,
+                    n_windows_converged: 4,
+                    n_windows_failed: 0,
+                    n_predictions: 16,
+                    med_d2_norm: Some(1.8),
+                    n_predictions_incl_flagged: 0,
+                    med_d2_norm_incl_flagged: None,
+                    flag_counts: Default::default(),
+                    trust_reasons: Default::default(),
+                    med_sep_arcsec: Some(2.0),
+                    cov_1s: Some(0.35),
+                    cov_2s: Some(0.80),
+                    cov_3s: Some(0.95),
+                    cov_1s_at: Some(0.60),
+                    cov_2s_at: Some(0.90),
+                    cov_3s_at: Some(0.98),
+                    cov_1s_ct: Some(0.66),
+                    cov_2s_ct: Some(0.93),
+                    cov_3s_ct: Some(0.99),
+                    n_nights: 8,
+                    med_z2_at_norm: Some(1.9),
+                    med_z2_ct_norm: Some(1.3),
+                    n_z_at: 8,
+                    n_z_ct: 8,
+                },
+            ],
+            d2_histograms: Vec::new(),
+            per_window: vec![crate::predict_schema::WalkTimeline {
+                tool: "rust".into(),
+                config_arm: "efcc.adap.nonight".into(),
+                object: "Apophis".into(),
+                class: "NEA".into(),
+                window_index: vec![0, 1, 2],
+                arc_days: vec![1.0, 3.0, 10.0],
+                converged: vec![true, true, false],
+                med_d2_norm: vec![Some(1.0), Some(1.2), None],
+                med_sep_arcsec: vec![Some(0.8), Some(0.9), None],
+                n_preds: vec![4, 5, 0],
+            }],
+            reduced_chi2: Vec::new(),
+            per_window_note: None,
+            // Empty: the D-003 family has no data until a Student-t arm runs.
+            calibration: Vec::new(),
+            calibration_note: None,
+        }
+    }
+
+    /// True when the page carries a "D-00<digit>" ruling id anywhere.
+    fn contains_ruling_id(html: &str) -> bool {
+        html.match_indices("D-00").any(|(i, _)| {
+            html[i + 4..]
+                .chars()
+                .next()
+                .is_some_and(|c| c.is_ascii_digit())
+        })
+    }
+
+    #[test]
+    fn predict_aggregates_profile_defaults_to_unstated() {
+        // An aggregate file written before the profile field parses with the
+        // marked-absent label, never a guessed profile.
+        let json = r#"{"snapshot_id":"snap","cells":[],"per_object":[]}"#;
+        let agg: PredictAggregates = serde_json::from_str(json).unwrap();
+        assert_eq!(agg.profile, "unstated");
+    }
+
+    #[test]
+    fn realism_bin_is_diverging_about_one() {
+        assert_eq!(realism_bin(1.0).0, "rv0", "calibrated is the centre");
+        assert_eq!(realism_bin(0.1).1, "over-conservative", "m<1 is blue");
+        assert_eq!(realism_bin(10.0).1, "over-confident", "m>1 is red");
+        assert_eq!(realism_bin(0.01).0, "rvb3", "far below is the deepest blue");
+        assert_eq!(realism_bin(100.0).0, "rvr3", "far above is the deepest red");
+    }
+
+    #[test]
+    fn report_renders_predictive_power_with_a_walk() {
+        let rows = vec![synthetic_rust_prop_row("Apophis", 0.0)];
+        let agg = synthetic_predict_aggregates("2026-07-29-snap");
+        let dir = tempfile::tempdir().unwrap();
+        let out = dir.path().join("report.html");
+        generate_report(&rows, &[], &out, None, Some(&agg)).unwrap();
+        let html = std::fs::read_to_string(&out).unwrap();
+        assert!(html.contains("id=\"s15\""), "missing 4.2 anchor");
+        assert!(html.contains("class=\"agrid pw-grid\""), "no 4.2 grids");
+        assert!(html.contains("class=\"gc rv"), "no diverging realism cells");
+        assert!(
+            html.contains("class=\"gc gb"),
+            "no decade-ladder accuracy cells"
+        );
+        assert!(
+            html.contains("log₂ · diverging"),
+            "the realism key must state the exception"
+        );
+        assert!(
+            !contains_ruling_id(&html),
+            "a ruling id shipped in the page"
+        );
+        assert!(
+            html.contains("id=\"pw-timeline-object\""),
+            "4.2F must carry its object select"
+        );
+        // Provenance (profile) is baked into the server-rendered reading line.
+        assert!(html.contains("profile ci"), "profile must be stated");
+    }
+
+    #[test]
+    fn predictive_power_matrices_populate_on_production_like_arms() {
+        // With production-like rust arms (dot/plus-delimited, never "default"), the
+        // single-arm views (4.2B marginals, 4.2D per-object) and the main-effects
+        // sub-matrix must each render real numbers. Before the primary-series fix
+        // they selected the never-co-occurring (rust, "default") slice and rendered
+        // all-hatched; before the token-split fix the sub-matrix was empty — both
+        // while the gate stayed green. Each assertion fails on the broken render.
+        let rows = vec![synthetic_rust_prop_row("Apophis", 0.0)];
+        let agg = synthetic_predict_aggregates("snap");
+        let dir = tempfile::tempdir().unwrap();
+        let out = dir.path().join("report.html");
+        generate_report(&rows, &[], &out, None, Some(&agg)).unwrap();
+        let html = std::fs::read_to_string(&out).unwrap();
+
+        // Count the numeric value spans (`<span class="cn">…`) inside one panel's
+        // slice of the page; an all-hatched matrix carries none.
+        let numeric_cells = |start: &str, end: &str| -> usize {
+            let s = html
+                .find(start)
+                .unwrap_or_else(|| panic!("missing section marker: {start}"));
+            let e = html[s..].find(end).map(|i| s + i).unwrap_or(html.len());
+            html[s..e].matches("<span class=\"cn\">").count()
+        };
+        // 4.2A coverage leads and renders real inside-ellipse rates.
+        assert!(
+            numeric_cells("Coverage</div>", "Surfaces</div>") > 0,
+            "4.2A coverage must render numeric inside-ellipse rates, not an all-hatched matrix"
+        );
+        assert!(
+            numeric_cells("Horizon marginals</div>", "Configuration arms</div>") > 0,
+            "4.2C marginals must render numeric cells, not an all-hatched matrix"
+        );
+        assert!(
+            numeric_cells("Configuration arms</div>", "Per-object walk</div>") > 0,
+            "4.2C main-effects sub-matrix (now leading the arm section) must render at least one numeric row"
+        );
+        assert!(
+            numeric_cells("Per-object walk</div>", "Calibration</div>") > 0,
+            "4.2E per-object matrix must render at least one numeric row"
+        );
+        // The full arm axis (4) exceeds the rust arm count (3); the surfaces
+        // provenance (folded into the panel-title hover) states 4 arms, and the
+        // non-rust arm is hatched with its reason in the arm grid, never dropped.
+        assert!(
+            html.contains("4 arms, 1 classes, profile ci"),
+            "the surfaces provenance must count the full arm axis (4)"
+        );
+        assert!(
+            html.contains("no rust walk for this arm"),
+            "an arm no rust walk produced must render hatched with its reason"
+        );
+    }
+
+    #[test]
+    fn coverage_headline_anchors_render_on_the_face() {
+        // 4.2A is the owner's answer-bearing panel: it must state, without a hover,
+        // the diverging scale and expected anchors (ABOVE the matrices, not below),
+        // that the cell is the observed 2σ inside-ellipse percent, the dof of each
+        // direction, the horizon unit, and the covariance arm each tool row is
+        // scored on. All but the two key labels ride table-exempt header text, so
+        // this adds no visible-word-budget cost beyond the two labels.
+        let rows = vec![synthetic_rust_prop_row("Apophis", 0.0)];
+        let agg = synthetic_predict_aggregates("snap");
+        let dir = tempfile::tempdir().unwrap();
+        let out = dir.path().join("report.html");
+        generate_report(&rows, &[], &out, None, Some(&agg)).unwrap();
+        let html = std::fs::read_to_string(&out).unwrap();
+
+        let cs = html.find(">Coverage</div>").expect("4.2A Coverage panel");
+        let ce = html[cs..]
+            .find("Surfaces</div>")
+            .map(|i| cs + i)
+            .expect("end of 4.2A block");
+        let cov = &html[cs..ce];
+
+        // Finding 3: the key (scale + expected anchors) leads, above the first matrix.
+        let key_at = cov
+            .find("class=\"grid-key\"")
+            .expect("coverage key present");
+        let grid_at = cov
+            .find("<table class=\"agrid pw-grid\">")
+            .expect("coverage matrix present");
+        assert!(
+            key_at < grid_at,
+            "the coverage key must precede the first matrix, not sit below all three"
+        );
+
+        // Finding 4: each direction's dof is on its (exempt) corner title, and the
+        // expected triples carry a visible joint / axis label (not hover-only).
+        assert!(
+            cov.contains("joint · 2 dof"),
+            "joint matrix must state 2 dof"
+        );
+        assert!(
+            cov.contains("along-track · 1 dof"),
+            "along-track matrix must state 1 dof"
+        );
+        assert!(
+            cov.contains("cross-track · 1 dof"),
+            "cross-track matrix must state 1 dof"
+        );
+        assert!(
+            cov.contains(">joint 39/86/98.9<"),
+            "the joint expected triple must carry a visible label"
+        );
+        assert!(
+            cov.contains(">axis 68/95/99.7<"),
+            "the 1-dof expected triple must carry a visible label"
+        );
+
+        // Finding 5 / v2-#6: the corner states the cell is the trust-off observed
+        // 2σ percent, computed on Σ_pred-dominated rows only (the one load-bearing
+        // scope caveat, now on the always-visible header beside trust-off, not
+        // only the hover and the collapsed method body), and the horizon in days.
+        assert!(
+            cov.contains("trust-off · σ_pred-only 2σ% · tool ╲ dt · days"),
+            "the corner must state trust-off, the σ_pred-only scope, the 2σ unit and the day horizon"
+        );
+        assert!(
+            cov.contains("σ_pred-only"),
+            "the Σ_pred-dominated scope must ride the always-visible corner header"
+        );
+
+        // Finding 6: the covariance arm rides visibly beside the tool group name.
+        assert!(
+            cov.contains("<span class=\"pwarm\">efcc.adap.nonight</span>"),
+            "the rust coverage group header must name its covariance arm on the face"
+        );
+    }
+
+    #[test]
+    fn coverage_matrix_splits_arc_and_carries_the_v2_figures() {
+        // 4.2A v2: two arc rows per class, the cell the trust-unconditioned rate,
+        // the trust-gated and per-row figures on hover, and a Σ_pred-share hatch
+        // with its reason. Each assertion fails on the pre-v2 single-row render.
+        let rows = vec![synthetic_rust_prop_row("Apophis", 0.0)];
+        let agg = synthetic_predict_aggregates("snap");
+        let dir = tempfile::tempdir().unwrap();
+        let out = dir.path().join("report.html");
+        generate_report(&rows, &[], &out, None, Some(&agg)).unwrap();
+        let html = std::fs::read_to_string(&out).unwrap();
+        let cs = html.find(">Coverage</div>").expect("4.2A Coverage panel");
+        let ce = html[cs..].find("Surfaces</div>").map(|i| cs + i).unwrap();
+        let cov = &html[cs..ce];
+
+        // Both arc rows are present for the class.
+        assert!(
+            cov.contains("short-arc"),
+            "4.2A must carry the short-arc rows"
+        );
+        assert!(
+            cov.contains("long-arc"),
+            "4.2A must carry the long-arc rows"
+        );
+        // The cell is the trust-unconditioned rate (78%); the hover carries the
+        // trust-gated and per-row figures the reader compares it against.
+        assert!(
+            cov.contains("<span class=\"cn\">78%</span>"),
+            "the cell must show the trust-unconditioned 2σ rate"
+        );
+        assert!(
+            cov.contains("trust-gated 90%"),
+            "the hover must carry the trust-gated figure"
+        );
+        assert!(
+            cov.contains("per-row 81%"),
+            "the hover must carry the per-row figure"
+        );
+        // A cell below the Σ_pred-dominated share floor is hatched with its reason.
+        assert!(
+            cov.contains("share below 10%"),
+            "a cell below the Σ_pred-dominated share floor must hatch with its reason"
+        );
+        assert!(
+            cov.contains("σ_pred-dominated 5% of rows"),
+            "the share hatch must state the measured share"
+        );
+        // v2-#6: the numeric cell's hover states the Σ_pred share as a FILTER on
+        // the row population (reads as "computed on these rows only"), not as a
+        // bare descriptor. The short-arc dt 0.3–1 d cell is 60 % Σ_pred-dominated.
+        assert!(
+            cov.contains("computed on the 60% of rows where σ_pred dominates"),
+            "the numeric cell hover must read the Σ_pred share as a row filter"
+        );
+    }
+
+    #[test]
+    fn coverage_folds_always_empty_class_rows_into_one_counted_line() {
+        // v2-#8: a (class, arc-side) no tool reached in any direction is not
+        // drawn as a full hatched row under every tool; it is folded into one
+        // consolidated "no predictive windows" line per matrix, the classes
+        // named with their 0-object count on hover (marked and counted). Here
+        // MainBelt has a surface cell (so it is a class) but no coverage row, so
+        // both its arc sides fold; NEA keeps its per-tool short/long rows.
+        let rows = vec![synthetic_rust_prop_row("Apophis", 0.0)];
+        let mut agg = synthetic_predict_aggregates("snap");
+        agg.cells.push(pw_surface_cell(
+            ("MainBelt", "rust", "efcc.adap.nonight"),
+            (1.0, 3.0),
+            (0.3, 1.0),
+            5,
+            (Some(1.0), Some(1.0)),
+        ));
+        let dir = tempfile::tempdir().unwrap();
+        let out = dir.path().join("report.html");
+        generate_report(&rows, &[], &out, None, Some(&agg)).unwrap();
+        let html = std::fs::read_to_string(&out).unwrap();
+        let cs = html.find(">Coverage</div>").expect("4.2A Coverage panel");
+        let ce = html[cs..].find("Surfaces</div>").map(|i| cs + i).unwrap();
+        let cov = &html[cs..ce];
+
+        // The consolidated line is present and names the empty class on its hover.
+        assert!(
+            cov.contains("no predictive windows"),
+            "always-empty class rows must fold into one consolidated line"
+        );
+        assert!(
+            cov.contains("MainBelt · short-arc") && cov.contains("MainBelt · long-arc"),
+            "the consolidated line must name the empty class × arc combinations"
+        );
+        // MainBelt is NOT drawn as a per-tool data row (that is what folded).
+        assert!(
+            !cov.contains("<td class=\"gtool\">MainBelt"),
+            "the empty class must not keep a full hatched per-tool row"
+        );
+        // NEA keeps its per-tool short/long rows (it has coverage data).
+        assert!(
+            cov.contains("<td class=\"gtool\">NEA · short-arc"),
+            "a class with data keeps its per-tool arc rows"
+        );
+    }
+
+    #[test]
+    fn production_arm_is_featured_over_a_more_populated_control_arm() {
+        // Without the shipped arm in the data, the most-populated pair leads
+        // (the fixture's rust arms tie at one object; the alphabetical
+        // tie-break picks the nonight control).
+        let mut agg = synthetic_predict_aggregates("snap");
+        assert_eq!(pw_primary_series(&agg), ("rust", "efcc.adap.nonight"));
+
+        // A second nonight object makes the control the most-populated arm.
+        let mut didymos = agg.per_object[0].clone();
+        didymos.object = "Didymos".into();
+        agg.per_object.push(didymos);
+
+        // The shipped arm present but unscored (no converged window) does not
+        // feature: a headline needs data behind it.
+        let mut unscored = agg.per_object[1].clone();
+        unscored.config_arm = PRODUCTION_ARM.1.into();
+        agg.per_object.push(unscored);
+        assert_eq!(pw_primary_series(&agg), ("rust", "efcc.adap.nonight"));
+
+        // One scored object on the shipped arm features it over the control's
+        // two, for the headline and the per-tool coverage arm alike.
+        let mut scored = agg.per_object[0].clone();
+        scored.config_arm = PRODUCTION_ARM.1.into();
+        agg.per_object.push(scored);
+        assert_eq!(pw_primary_series(&agg), PRODUCTION_ARM);
+        assert_eq!(pw_coverage_arm_for(&agg, "rust"), Some(PRODUCTION_ARM.1));
+        assert_eq!(pw_coverage_arm_for(&agg, "findorb"), Some("default"));
+    }
+
+    #[test]
+    fn realism_surface_hover_carries_the_sigma_pred_share() {
+        // Item 3: the 4.2B realism cell hover gains the Σ_pred-dominated share of
+        // rows (n_rows_pd / n_rows); the fixture's well-sampled cells carry 75%.
+        let rows = vec![synthetic_rust_prop_row("Apophis", 0.0)];
+        let agg = synthetic_predict_aggregates("snap");
+        let dir = tempfile::tempdir().unwrap();
+        let out = dir.path().join("report.html");
+        generate_report(&rows, &[], &out, None, Some(&agg)).unwrap();
+        let html = std::fs::read_to_string(&out).unwrap();
+        assert!(
+            html.contains("σ_pred-dominated 75% of rows"),
+            "a 4.2B realism cell hover must carry the Σ_pred-dominated share"
+        );
+    }
+
+    #[test]
+    fn diverging_ramp_text_clears_wcag_aa_in_both_themes() {
+        // Every 4.2A diverging cell carries a number (shownums) inked
+        // --ed-text-primary over a color-mix of the theme accent/error on the theme
+        // bg. The deepest blue (rvb3) failed 4.5:1 in the dark theme at 78% (3.58:1)
+        // and is now 60%. This recomputes the WCAG contrast of every step in BOTH
+        // themes from the emitted percentages and the page's own tokens, so a
+        // percentage or token regression below AA fails the gate (it fails at 78%).
+        let html = render_rows(&pair_test_rows());
+        let css = realism_css();
+
+        fn hex(s: &str) -> (f64, f64, f64) {
+            let s = s.trim_start_matches('#');
+            (
+                u8::from_str_radix(&s[0..2], 16).unwrap() as f64,
+                u8::from_str_radix(&s[2..4], 16).unwrap() as f64,
+                u8::from_str_radix(&s[4..6], 16).unwrap() as f64,
+            )
+        }
+        fn tok(html: &str, from: usize, needle: &str) -> (f64, f64, f64) {
+            let i = html[from..]
+                .find(needle)
+                .map(|k| from + k)
+                .unwrap_or_else(|| panic!("token {needle} not found"))
+                + needle.len();
+            hex(&html[i..i + 7])
+        }
+        fn pct(css: &str, cls: &str) -> f64 {
+            let anchor = format!(".{cls} {{");
+            let seg = &css[css.find(&anchor).expect("ramp class in realism_css")..];
+            let p = seg.find('%').expect("percent in ramp rule");
+            let b = seg.as_bytes();
+            let mut j = p;
+            while j > 0 && b[j - 1].is_ascii_digit() {
+                j -= 1;
+            }
+            seg[j..p].parse::<f64>().unwrap()
+        }
+        fn lin(c: f64) -> f64 {
+            let c = c / 255.0;
+            if c <= 0.03928 {
+                c / 12.92
+            } else {
+                ((c + 0.055) / 1.055).powf(2.4)
+            }
+        }
+        fn lum(c: (f64, f64, f64)) -> f64 {
+            0.2126 * lin(c.0) + 0.7152 * lin(c.1) + 0.0722 * lin(c.2)
+        }
+        fn contrast(a: (f64, f64, f64), b: (f64, f64, f64)) -> f64 {
+            let (l1, l2) = (lum(a), lum(b));
+            let (hi, lo) = if l1 > l2 { (l1, l2) } else { (l2, l1) };
+            (hi + 0.05) / (lo + 0.05)
+        }
+        fn mix(x: (f64, f64, f64), bg: (f64, f64, f64), p: f64) -> (f64, f64, f64) {
+            let q = p / 100.0;
+            (
+                x.0 * q + bg.0 * (1.0 - q),
+                x.1 * q + bg.1 * (1.0 - q),
+                x.2 * q + bg.2 * (1.0 - q),
+            )
+        }
+
+        // Dark tokens are the first occurrence; light tokens come after the light
+        // --ed-bg anchor, with --ed-error inherited from dark (light does not set it).
+        let d_accent = tok(&html, 0, "--ed-accent: ");
+        let d_error = tok(&html, 0, "--ed-error: ");
+        let d_bg = tok(&html, 0, "--ed-bg: ");
+        let d_text = tok(&html, 0, "--ed-text-primary: ");
+        let l0 = html.find("--ed-bg: #f6f8fb").expect("light theme block");
+        let l_accent = tok(&html, l0, "--ed-accent: ");
+        let l_bg = tok(&html, l0, "--ed-bg: ");
+        let l_text = tok(&html, l0, "--ed-text-primary: ");
+        let l_error = d_error;
+
+        for (cls, base_d, base_l) in [
+            ("rvb1", d_accent, l_accent),
+            ("rvb2", d_accent, l_accent),
+            ("rvb3", d_accent, l_accent),
+            ("rvr1", d_error, l_error),
+            ("rvr2", d_error, l_error),
+            ("rvr3", d_error, l_error),
+        ] {
+            let p = pct(&css, cls);
+            let cd = contrast(d_text, mix(base_d, d_bg, p));
+            let cl = contrast(l_text, mix(base_l, l_bg, p));
+            assert!(cd >= 4.5, "dark {cls} at {p}% = {cd:.2}:1 (< 4.5 AA)");
+            assert!(cl >= 4.5, "light {cls} at {p}% = {cl:.2}:1 (< 4.5 AA)");
+        }
+    }
+
+    #[test]
+    fn export_identity_names_the_timeline_object_not_none() {
+        let html = render_rows(&pair_test_rows());
+        // The 4.2F walk timeline is per-object; its PNG stamp and filename must name
+        // the selected object (the variant slot), not the pair-less 'none' every
+        // object collapsed to before.
+        assert!(
+            html.contains("gd.id === 'pw-timeline-chart'"),
+            "the export identity must special-case the walk-timeline chart"
+        );
+        assert!(
+            html.contains("getElementById('pw-timeline-object')")
+                && html.contains("pair = os.value"),
+            "the timeline export must read the selected object into the variant slot"
+        );
+    }
+
+    #[test]
+    fn surfaces_arm_selector_is_scoped_to_the_tool() {
+        let html = render_rows(&pair_test_rows());
+        // The arm <select> is repopulated on tool change to the arms that exist for
+        // that tool, so a reader never picks a rust-only arm under find_orb / layup
+        // and lands on an all-hatched grid that reads as a broken tool.
+        assert!(
+            html.contains("armsByTool[p.dataset.tool]"),
+            "the surfaces wiring must index arms by tool from the pair panels"
+        );
+        assert!(
+            html.contains("function repopulateArms()"),
+            "the surfaces wiring must repopulate the arm options per tool"
+        );
+        assert!(
+            html.contains("repopulateArms(); apply();"),
+            "a tool change must repopulate the arm options before re-applying"
+        );
+    }
+
+    #[test]
+    fn report_without_a_walk_renders_the_empty_state() {
+        let rows = vec![synthetic_rust_prop_row("Apophis", 0.0)];
+        let dir = tempfile::tempdir().unwrap();
+        let out = dir.path().join("report.html");
+        generate_report(&rows, &[], &out, None, None).unwrap();
+        let html = std::fs::read_to_string(&out).unwrap();
+        assert!(html.contains("id=\"s15\""), "the 4.2 shell always renders");
+        assert!(
+            html.contains("No walk-forward data"),
+            "empty state must show its message"
+        );
+        assert!(
+            !html.contains("class=\"agrid pw-grid\""),
+            "the empty state must render no grids"
+        );
+        assert!(
+            html.contains("const PREDICT_DESCRIPTOR = null;"),
+            "no walk means a null descriptor"
+        );
+        assert!(
+            !predict_path_for(&out).exists(),
+            "no walk means no predict sidecar on disk"
+        );
+    }
+
+    #[test]
+    fn predictive_power_hatches_a_thin_cell_never_pools_it() {
+        let rows = vec![synthetic_rust_prop_row("Apophis", 0.0)];
+        let agg = synthetic_predict_aggregates("snap");
+        let dir = tempfile::tempdir().unwrap();
+        let out = dir.path().join("report.html");
+        generate_report(&rows, &[], &out, None, Some(&agg)).unwrap();
+        let html = std::fs::read_to_string(&out).unwrap();
+        // The n=2 thin cell renders hatched with its count + reason, never as a
+        // coloured value (its 0.3 realism / 0.5 sep must not appear as a cell).
+        assert!(
+            html.contains("n=2 · fewer than three objects"),
+            "a thin cell must be hatched with n and reason"
+        );
+    }
+
+    #[test]
+    fn predictive_calibration_marks_log_score_absent_when_empty() {
+        let rows = vec![synthetic_rust_prop_row("Apophis", 0.0)];
+        let agg = synthetic_predict_aggregates("snap"); // calibration is empty
+        let dir = tempfile::tempdir().unwrap();
+        let out = dir.path().join("report.html");
+        generate_report(&rows, &[], &out, None, Some(&agg)).unwrap();
+        let html = std::fs::read_to_string(&out).unwrap();
+        assert!(
+            html.contains("awaiting Student-t chain"),
+            "the empty log-score family must be marked absent"
+        );
+    }
+
+    #[test]
+    fn predict_sidecar_is_written_and_matches_its_descriptor() {
+        let rows = vec![synthetic_rust_prop_row("Apophis", 0.0)];
+        let agg = synthetic_predict_aggregates("snap");
+        let dir = tempfile::tempdir().unwrap();
+        let out = dir.path().join("report.html");
+        generate_report(&rows, &[], &out, None, Some(&agg)).unwrap();
+        let html = std::fs::read_to_string(&out).unwrap();
+        // The large per-object family must not ride inline on the page.
+        assert!(
+            !html.contains("\"per_window\""),
+            "per_window must travel as a sidecar, not inline"
+        );
+        let sidecar = predict_path_for(&out);
+        let blob = std::fs::read(&sidecar).expect("sidecar must be written");
+        let hash = fnv1a32_hex(&blob);
+        assert!(
+            html.contains(&format!("\"bytes\":{}", blob.len())),
+            "descriptor byte length must match the sidecar"
+        );
+        assert!(
+            html.contains(&format!("\"hash\":\"{hash}\"")),
+            "descriptor FNV must match the sidecar"
+        );
+        let parsed: serde_json::Value = serde_json::from_slice(&blob).unwrap();
+        assert_eq!(
+            parsed["per_window"].as_array().unwrap().len(),
+            agg.per_window.len(),
+            "sidecar must carry the per_window family"
+        );
+    }
+
+    #[test]
+    fn predictive_report_is_byte_reproducible_including_the_sidecar() {
+        let rows = vec![synthetic_rust_prop_row("Apophis", 0.0)];
+        let agg = synthetic_predict_aggregates("snap");
+        let dir = tempfile::tempdir().unwrap();
+        let a = dir.path().join("a.html");
+        let b = dir.path().join("b.html");
+        generate_report(&rows, &[], &a, None, Some(&agg)).unwrap();
+        generate_report(&rows, &[], &b, None, Some(&agg)).unwrap();
+        let sa = std::fs::read(predict_path_for(&a)).unwrap();
+        let sb = std::fs::read(predict_path_for(&b)).unwrap();
+        assert_eq!(sa, sb, "the predict sidecar must be byte-reproducible");
+    }
+
+    #[test]
+    fn merge_predict_aggregates_concatenates_and_guards_snapshot_and_profile() {
+        let a = synthetic_predict_aggregates("snap");
+        let mut b = synthetic_predict_aggregates("snap");
+        b.profile = "full".into();
+        let merged = merge_predict_aggregates(vec![a.clone(), b])
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            merged.cells.len(),
+            a.cells.len() * 2,
+            "cells must concatenate"
+        );
+        assert_eq!(
+            merged.profile, "unstated",
+            "disagreeing profiles collapse to the marked state"
+        );
+        let mut c = synthetic_predict_aggregates("other-snap");
+        c.snapshot_id = "other-snap".into();
+        assert!(
+            merge_predict_aggregates(vec![a, c]).is_err(),
+            "a snapshot mismatch must be refused"
+        );
+        assert!(merge_predict_aggregates(vec![]).unwrap().is_none());
     }
 }
