@@ -1527,6 +1527,7 @@ fn run_shard(
                     predict_time_ms: None,
                     captured,
                     covariance_provenance,
+                    engine_version: engine_version.clone(),
                 };
                 let mut rec = rec;
                 if let Some(f) = capture_failure.or(provenance_failure) {
@@ -1560,6 +1561,7 @@ fn run_shard(
                     predict_time_ms: None,
                     captured: None,
                     covariance_provenance: None,
+                    engine_version: engine_version.clone(),
                 };
                 (rec, None)
             }
@@ -2651,6 +2653,7 @@ mod tests {
             predict_time_ms: None,
             captured: None,
             covariance_provenance: None,
+            engine_version: None,
         };
         let row = thin_row(&obj, &w, &rec);
         assert_eq!(row.test_type, "covariance_realism");

@@ -481,6 +481,14 @@ pub struct WalkWindowRecord {
     /// diagnostics. `None` for a failed window or a tool that reports none.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub covariance_provenance: Option<FitCovarianceProvenance>,
+    /// The `empyrean` engine version string the runner saw when it produced
+    /// this fit (`empyrean::version_string()`) — the same source the result
+    /// rows record as `source_version`, one spelling. Additive + serde-default:
+    /// a walk written before this field (every walk before 2026-10-18) parses
+    /// with it absent, and `score-predictions` then reports the engine as "not
+    /// recorded by the walk" rather than fabricating a build.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub engine_version: Option<String>,
 }
 
 /// One predicted observation — the runner side. Runners emit predictions,
@@ -974,6 +982,28 @@ pub struct PredictAggregates {
     /// than a fabricated label.
     #[serde(default = "default_profile")]
     pub profile: String,
+    /// The distinct `empyrean` engine version strings the walk recorded on its
+    /// window rows, grouped per (tool, config arm) series — see
+    /// [`SeriesEngineVersions`]. Additive + serde-default: an aggregate scored
+    /// from a walk that recorded no [`WalkWindowRecord::engine_version`] (every
+    /// walk before 2026-10-18) carries an empty vector, which the report renders
+    /// as "engine not recorded by the walk" — never a guessed build.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub engine_versions: Vec<SeriesEngineVersions>,
+}
+
+/// The distinct engine version strings one (tool, config arm) series' window
+/// rows recorded — the per-series engine identity `score-predictions` carries
+/// from the walk into the aggregate. `versions` is sorted and deduplicated; an
+/// empty list is never emitted (a series with no recorded version contributes
+/// no entry, so the aggregate's `engine_versions` stays empty and the report
+/// marks the engine "not recorded by the walk").
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct SeriesEngineVersions {
+    pub tool: String,
+    pub config_arm: String,
+    pub versions: Vec<String>,
 }
 
 /// The default profile label for older aggregate files that predate the
@@ -1469,10 +1499,20 @@ mod tests {
             predict_time_ms: None,
             captured: None,
             covariance_provenance: None,
+            engine_version: Some("empyrean 0.10.0".into()),
         };
-        let back: WalkWindowRecord =
-            serde_json::from_str(&serde_json::to_string(&w).unwrap()).unwrap();
+        let json = serde_json::to_string(&w).unwrap();
+        assert!(
+            json.contains("\"engine_version\":\"empyrean 0.10.0\""),
+            "a recorded engine version must serialize onto the window row"
+        );
+        let back: WalkWindowRecord = serde_json::from_str(&json).unwrap();
         assert_eq!(w, back);
+        // Serde-default: a pre-2026-10-18 window row (no engine_version) parses
+        // with the field absent, not refused by deny_unknown_fields.
+        let legacy = r#"{"object":"2024 YR4","tool":"rust","config_arm":"default","window_index":3,"converged":false,"failure":"x","warm_start":false,"seed_source":"own_iod","fit_time_ms":1.0}"#;
+        let parsed: WalkWindowRecord = serde_json::from_str(legacy).unwrap();
+        assert_eq!(parsed.engine_version, None);
 
         let p = PredictedObservation {
             object: "2024 YR4".into(),
