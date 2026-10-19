@@ -587,7 +587,7 @@ fn vec_dr_km(a: &Option<[f64; 3]>, b: &Option<[f64; 3]>) -> Option<f64> {
 /// validated against `core` to confirm the FFI boundary is transparent.
 /// Every detection-off arm — f64 and first-order — is a timing probe whose
 /// transported state equals its detection-on sibling (bit-identical for
-/// `f64_detection_off`), so it carries no independent accuracy signal and is
+/// `none_detection_off`), so it carries no independent accuracy signal and is
 /// kept OUT of the fidelity rollup, the per-channel counts, and the accuracy /
 /// error-growth views — surfacing only in the dedicated timing panels.
 fn is_timing_only_uncertainty(mode: Option<&str>) -> bool {
@@ -607,9 +607,9 @@ fn rollup_channels(results: &[ValidationResult]) -> Vec<ChannelRollup> {
     };
     // Key includes `propagation_uncertainty` so that a row produced under
     // the Jet1 STM path (`first_order_detection_on`) is matched against the
-    // same-mode core baseline rather than the f64 baseline (and vice
-    // versa). Without this, the two modes silently overwrite in the
-    // hash map and ~50% of the comparable rows hit a Jet1-vs-f64 diff
+    // same-mode core baseline rather than the `none_detection_on` baseline
+    // (and vice versa). Without this, the two modes silently overwrite in
+    // the hash map and ~50% of the comparable rows hit a Jet1-vs-none diff
     // that's small but well above the 1e-10 fidelity threshold.
     // (object, dt_days, force_model, test_type, observer, uncertainty-mode).
     type RowKey = (String, i64, String, String, Option<String>, Option<String>);
@@ -851,7 +851,95 @@ fn rollup_channels(results: &[ValidationResult]) -> Vec<ChannelRollup> {
     out
 }
 
-fn write_summary(rollups: &[ChannelRollup], path: &Path) -> Result<(), String> {
+/// Per-(channel, method) summary breakdown — the same per-method columns the
+/// cross-channel matrix shows, so the CI summary carries the method axis: the
+/// detection-on rows produced, delivered and refused, and the parity against
+/// the rust reference (compared rows, bit-identical rows, worst relative
+/// position difference).
+fn method_summary_json(results: &[ValidationResult]) -> serde_json::Value {
+    use crate::schema::uncertainty_modes as um;
+    let channels = ["rust", "core", "c", "python", "cli"];
+    type Key = (String, i64, String, String, Option<String>, String);
+    let on_arm = |r: &ValidationResult| -> Option<(&'static str, String)> {
+        let tag = r.propagation_uncertainty.as_deref()?;
+        if um::arm_of(tag) != Some(um::DETECTION_ON) {
+            return None;
+        }
+        um::method_of(tag).map(|m| (m, tag.to_string()))
+    };
+    let key_of = |r: &ValidationResult, tag: &str| -> Key {
+        (
+            r.object.clone(),
+            r.dt_days as i64,
+            r.force_model.clone(),
+            r.test_type.clone(),
+            r.observer.clone(),
+            tag.to_string(),
+        )
+    };
+    let mut rust_by_key: HashMap<Key, &ValidationResult> = HashMap::new();
+    for r in results {
+        if r.channel == "rust"
+            && let Some((_, tag)) = on_arm(r)
+        {
+            rust_by_key.insert(key_of(r, &tag), r);
+        }
+    }
+    // (channel, method) -> (n_rows, n_delivered, n_refused, n_compared,
+    // n_bit_identical, max_rel).
+    type MethodAgg = (u32, u32, u32, u32, u32, f64);
+    let mut agg: BTreeMap<(String, &'static str), MethodAgg> = BTreeMap::new();
+    for r in results {
+        let Some((method, tag)) = on_arm(r) else {
+            continue;
+        };
+        if !channels.contains(&r.channel.as_str()) {
+            continue;
+        }
+        let e = agg
+            .entry((r.channel.clone(), method))
+            .or_insert((0, 0, 0, 0, 0, 0.0));
+        e.0 += 1;
+        match r.orbit_delivered {
+            Some(true) => e.1 += 1,
+            Some(false) => e.2 += 1,
+            None => {}
+        }
+        if r.channel != "rust"
+            && let Some(rr) = rust_by_key.get(&key_of(r, &tag))
+            && let (Some(a), Some(b)) = (r.emp_pos_au, rr.emp_pos_au)
+        {
+            let (rel, bit) = method_rel_pos_diff(&a, &b);
+            e.3 += 1;
+            if bit {
+                e.4 += 1;
+            }
+            e.5 = e.5.max(rel);
+        }
+    }
+    let arr: Vec<serde_json::Value> = agg
+        .into_iter()
+        .map(|((channel, method), (n, deliv, refused, cmp, bit, maxrel))| {
+            serde_json::json!({
+                "channel": channel,
+                "method": method,
+                "n_rows": n,
+                "n_delivered": deliv,
+                "n_refused": refused,
+                "n_compared_vs_rust": cmp,
+                "n_bit_identical": bit,
+                "max_rel_pos_diff_vs_rust": if cmp > 0 { serde_json::json!(maxrel) } else { serde_json::Value::Null },
+            })
+        })
+        .collect();
+    serde_json::Value::Array(arr)
+}
+
+fn write_summary(
+    rollups: &[ChannelRollup],
+    results: &[ValidationResult],
+    path: &Path,
+) -> Result<(), String> {
     let arr: Vec<serde_json::Value> = rollups
         .iter()
         .map(|r| {
@@ -903,6 +991,7 @@ fn write_summary(rollups: &[ChannelRollup], path: &Path) -> Result<(), String> {
     let summary = serde_json::json!({
         "fidelity_threshold": FIDELITY_THRESHOLD,
         "channels": arr,
+        "by_method": method_summary_json(results),
     });
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).map_err(|e| format!("create {}: {e}", parent.display()))?;
@@ -2036,7 +2125,7 @@ fn method_label(arm: &str) -> &str {
         "second order"
     } else if arm.starts_with("first_order") {
         "first order"
-    } else if arm.starts_with("f64") {
+    } else if arm.starts_with("f64") || arm.starts_with("none") {
         "state only"
     } else if arm.starts_with("auto") {
         "auto cascade"
@@ -2044,6 +2133,8 @@ fn method_label(arm: &str) -> &str {
         "sigma-point"
     } else if arm.starts_with("monte_carlo") {
         "Monte Carlo"
+    } else if arm.starts_with("gaussian_mixture") {
+        "Gaussian mixture"
     } else {
         // An unmapped arm id renders verbatim — visible, never a silent blank.
         arm
@@ -3464,6 +3555,820 @@ fn build_channel_fidelity_grid(results: &[ValidationResult]) -> String {
     h
 }
 
+// ── Per-method cross-channel matrix ─────────────────────────────────
+//
+// One block per object, one row per uncertainty method (plan order), one
+// column per engine channel. A cell is that method's same-method parity
+// against the RUST reference: the worst relative Cartesian-position
+// difference across the method's rows, `0 (bit-id)` when every paired row is
+// bit-identical, an `auto` cell keyed on the resolved rung (a channel that
+// resolved to a different rung reads as a mismatch, never a number), a
+// refusal shown by name, or `not produced` for a method a channel has not
+// produced at this pin. Nothing is blank. Keys on the `detection_on` arm
+// only (the `detection_off*` arms are timing benchmarks in the cost panels).
+
+/// Relative Cartesian-position difference between a channel state and the
+/// rust reference state, and whether the two are bit-identical.
+fn method_rel_pos_diff(a: &[f64; 3], b: &[f64; 3]) -> (f64, bool) {
+    let (dx, dy, dz) = (a[0] - b[0], a[1] - b[1], a[2] - b[2]);
+    let dnorm = (dx * dx + dy * dy + dz * dz).sqrt();
+    let bnorm = (b[0] * b[0] + b[1] * b[1] + b[2] * b[2]).sqrt();
+    let bit = dx == 0.0 && dy == 0.0 && dz == 0.0;
+    let rel = if bnorm > 0.0 { dnorm / bnorm } else { dnorm };
+    (rel, bit)
+}
+
+/// Client-side renderers (injected into the page script via the
+/// `METHOD_RENDER_JS` token) for the two by-object views fed from the fetched
+/// sidecar rows: the per-method matrix (3.1 A) and the outcome-and-tallies
+/// table (3.1 C). The cell semantics mirror the Rust data contract but run in
+/// the browser, so the full by-object grid stays in the sidecar, not the page.
+const METHOD_RENDER_JS: &str = r##"
+const METHOD_LABELS = {
+    none: 'state only', first_order: 'first order', second_order: 'second order',
+    auto: 'auto cascade', sigma_point: 'sigma-point', monte_carlo: 'Monte Carlo',
+    gaussian_mixture: 'Gaussian mixture',
+};
+function mEsc(s) { return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;'); }
+function mMethodOf(tag) {
+    if (!tag || !tag.endsWith('_detection_on')) return null;
+    const m = tag.slice(0, -'_detection_on'.length);
+    return METHOD_ORDER.includes(m) ? m : null;
+}
+function renderMethodMatrix() {
+    const body = document.getElementById('method-matrix-body');
+    if (!body) return;
+    const CHANS = ['rust', 'core', 'c', 'python', 'cli'];
+    const BAND = 1e-10;
+    const lbl = (x) => METHOD_LABELS[x] || x;
+    const ttKind = (tt) => tt === 'orbit_determination_transport' ? 'transport'
+        : (tt === 'orbit_determination' || tt === 'orbit_determination_radar') ? 'od'
+        : tt === 'ephemeris' ? 'ephemeris' : 'propagation';
+    const statusFamily = (s) => !s ? 'other'
+        : /withheld/i.test(s) ? 'withheld'
+        : /no honest implementation|refus/i.test(s) ? 'refused'
+        : /fail/i.test(s) ? 'failed' : 'other';
+    // Delivery of ONE product: a covariance product the engine delivered, one it
+    // did NOT (classified into a status family), or one with no recorded state.
+    const delivery = (r) => {
+        if (r.orbit_delivered === false) return { st: 'nd', fam: statusFamily(r.orbit_status) };
+        if (r.orbit_status != null && r.orbit_status !== 'delivered') return { st: 'nd', fam: statusFamily(r.orbit_status) };
+        if (r.orbit_delivered === true || r.orbit_status === 'delivered') return { st: 'd' };
+        return { st: 'nr' };
+    };
+    const keyOf = (r, tag) => [r.object, Math.trunc(r.dt_days), r.force_model, r.test_type, r.observer || '', tag].join('|');
+    const rustByKey = new Map();
+    for (const r of results) {
+        if (r.channel !== 'rust') continue;
+        const m = mMethodOf(r.propagation_uncertainty);
+        if (m) rustByKey.set(keyOf(r, r.propagation_uncertainty), r);
+    }
+    // Per (channel, object, method): parity over the DELIVERED paired products,
+    // the not-delivered counts by family, the per-test-type delivered/total, the
+    // auto resolved rung, and the verbatim status messages (for the hover).
+    const cellData = new Map();
+    const objPop = new Map();
+    for (const r of results) {
+        const m = mMethodOf(r.propagation_uncertainty);
+        if (!m || !CHANS.includes(r.channel)) continue;
+        const key = r.channel + '|' + r.object + '|' + m;
+        let cd = cellData.get(key);
+        if (!cd) { cd = { worstRel: 0, anyPaired: false, allBit: true, deliveredN: 0, notRecordedN: 0, fam: { refused: 0, failed: 0, withheld: 0, other: 0 }, perTT: {}, resolved: null, messages: new Set() }; cellData.set(key, cd); }
+        objPop.set(r.object, r.population);
+        const k = ttKind(r.test_type);
+        if (!cd.perTT[k]) cd.perTT[k] = { d: 0, nd: 0, nr: 0 };
+        if (m === 'auto' && r.resolved_method && cd.resolved === null) cd.resolved = mMethodOf(r.resolved_method) || r.resolved_method;
+        const d = delivery(r);
+        if (d.st === 'd') {
+            cd.deliveredN++; cd.perTT[k].d++;
+            if (r.channel !== 'rust') {
+                const rr = rustByKey.get(keyOf(r, r.propagation_uncertainty));
+                if (rr && Array.isArray(r.emp_pos_au) && Array.isArray(rr.emp_pos_au)) {
+                    const dx = r.emp_pos_au[0] - rr.emp_pos_au[0], dy = r.emp_pos_au[1] - rr.emp_pos_au[1], dz = r.emp_pos_au[2] - rr.emp_pos_au[2];
+                    const dnorm = Math.sqrt(dx * dx + dy * dy + dz * dz);
+                    const bnorm = Math.sqrt(rr.emp_pos_au[0] * rr.emp_pos_au[0] + rr.emp_pos_au[1] * rr.emp_pos_au[1] + rr.emp_pos_au[2] * rr.emp_pos_au[2]);
+                    cd.worstRel = Math.max(cd.worstRel, bnorm > 0 ? dnorm / bnorm : dnorm);
+                    cd.anyPaired = true; cd.allBit = cd.allBit && (dx === 0 && dy === 0 && dz === 0);
+                }
+            }
+        } else if (d.st === 'nr') {
+            cd.notRecordedN++; cd.perTT[k].nr++;
+        } else {
+            cd.fam[d.fam]++; cd.perTT[k].nd++;
+            if (r.orbit_status) cd.messages.add(r.orbit_status);
+        }
+    }
+    if (objPop.size === 0) {
+        body.innerHTML = '<tr><td colspan="6" style="text-align:left; color:#8b9198">No method-tagged rows in this report — the per-method matrix fills in once a channel produces its uncertainty-method sweep.</td></tr>';
+        return;
+    }
+    const FAMS = [['refused', 'refused'], ['failed', 'failed'], ['withheld', 'withheld'], ['other', 'not delivered']];
+    const cellHtml = (ch, obj, method) => {
+        const cd = cellData.get(ch + '|' + obj + '|' + method);
+        if (!cd) return '<td class="fc" style="color:#8b9198" title="this channel produced no row for this method at this pin">not produced</td>';
+        // Hover: per-test-type delivered/total, delivery-not-recorded, and the
+        // verbatim status message(s) — never in the cell text.
+        const ttParts = [];
+        for (const [k, label] of [['ephemeris', 'ephemeris'], ['propagation', 'propagation'], ['od', 'OD'], ['transport', 'transport']]) {
+            const t = cd.perTT[k]; if (t) ttParts.push(label + ' ' + t.d + '/' + (t.d + t.nd + t.nr));
+        }
+        let hover = ttParts.join(' · ') + ' (delivered/total)';
+        if (cd.notRecordedN > 0) hover += ' · delivery not recorded: ' + cd.notRecordedN;
+        if (cd.messages.size > 0) hover += ' — ' + [...cd.messages].join(' | ');
+        // Compact non-delivery badges from the status family (count only).
+        const badges = FAMS.filter(([f]) => cd.fam[f] > 0).map(([f, w]) => '<span style="color:#e8a040">· ' + w + ' (' + cd.fam[f] + ')</span>').join(' ');
+        // Parity primary over the delivered paired products.
+        let primary = '', color = '';
+        let mmRef = null, mmCh = null;
+        if (method === 'auto' && ch !== 'rust') {
+            const rcd = cellData.get('rust|' + obj + '|' + method);
+            if (rcd && rcd.resolved && cd.resolved && rcd.resolved !== cd.resolved) { mmRef = rcd.resolved; mmCh = cd.resolved; }
+        }
+        if (ch === 'rust') {
+            primary = (method === 'auto' && cd.resolved) ? 'ref · resolved ' + mEsc(lbl(cd.resolved)) : 'ref'; color = 'color:#5b9bd5';
+        } else if (mmRef !== null) {
+            primary = 'mismatch · resolved ' + mEsc(lbl(mmRef)) + ' ≠ ' + mEsc(lbl(mmCh)); color = 'color:#d05080';
+        } else if (cd.anyPaired) {
+            if (cd.allBit) primary = '0 (bit-id) ✓';
+            else if (cd.worstRel <= BAND) primary = cd.worstRel.toExponential(1) + ' ✓';
+            else { primary = cd.worstRel.toExponential(2); color = 'color:#d05080'; }
+        } else if (cd.deliveredN > 0) {
+            primary = 'no rust ref'; color = 'color:#8b9198';
+        } else if (cd.notRecordedN > 0 && cd.fam.refused + cd.fam.failed + cd.fam.withheld + cd.fam.other === 0) {
+            primary = 'not recorded'; color = 'color:#8b9198';
+        }
+        let text = primary;
+        if (badges) text = text ? text + ' ' + badges : badges;
+        if (!text) text = 'not produced';
+        return '<td class="fc"' + (color ? ' style="' + color + '"' : '') + ' title="' + mEsc(hover) + '">' + text + '</td>';
+    };
+    const blocks = new Map();
+    for (const [obj, pop] of [...objPop.entries()].sort((a, b) => a[0].localeCompare(b[0]))) {
+        if (!blocks.has(pop)) blocks.set(pop, []);
+        blocks.get(pop).push(obj);
+    }
+    const ncols = CHANS.length + 1;
+    let html = '';
+    for (const pop of [...blocks.keys()].sort((a, b) => a.localeCompare(b))) {
+        const objs = blocks.get(pop);
+        html += '<tr class="gblock"><td class="gblock-l">' + mEsc(pop) + ' (' + objs.length + ')</td><td class="gblock-fill" colspan="' + (ncols - 1) + '"></td></tr>';
+        for (const obj of objs) {
+            html += '<tr class="gblock"><td class="gtool" colspan="' + ncols + '"><b>' + mEsc(obj) + '</b></td></tr>';
+            for (const method of METHOD_ORDER) {
+                html += '<tr class="gsub"><td class="gtool">' + mEsc(METHOD_LABELS[method] || method) + '</td>';
+                for (const ch of CHANS) html += cellHtml(ch, obj, method);
+                html += '</tr>';
+            }
+        }
+    }
+    body.innerHTML = html;
+}
+
+function renderMethodOutcome() {
+    const body = document.getElementById('method-outcome-body');
+    if (!body) return;
+    const CHANS = ['rust', 'core', 'c', 'python', 'cli'];
+    const OD = ['orbit_determination', 'orbit_determination_radar', 'orbit_determination_transport'];
+    const isOutcome = (r) => OD.includes(r.test_type) || (r.mix_n_components_total != null) || (r.orbit_delivered === false) || (r.orbit_status != null && r.orbit_status !== 'delivered');
+    const NP = 'not produced at this pin';
+    const notProduced = (r) => (r.notes && r.notes.trim()) ? mEsc(r.notes.trim()) : NP;
+    const optNum = (v) => (v == null) ? NP : v.toFixed(3);
+    const optU = (v) => (v == null) ? NP : String(v);
+    const lbl = (x) => METHOD_LABELS[x] || x;
+    const methodLabel = (r) => {
+        const tag = r.propagation_uncertainty;
+        if (tag != null) { const m = mMethodOf(tag); if (m) return lbl(m); return OD.includes(r.test_type) ? tag + ' (untagged)' : tag; }
+        return OD.includes(r.test_type) ? 'legacy (untagged)' : '—';
+    };
+    const outcomeCell = (r) => {
+        const d = r.orbit_delivered, s = r.orbit_status;
+        if (d === true && s != null) return `<span title="orbit delivered">delivered</span><br/><span class="fc-sub">${mEsc(s)}</span>`;
+        if (d === true) return 'delivered';
+        if (d === false && s != null) return `<span style="color:#e8a040" title="${mEsc(s)}">not delivered</span><br/><span class="fc-sub">${mEsc(s)}</span>`;
+        if (d === false) return '<span style="color:#e8a040">not delivered</span>';
+        if (s != null) return mEsc(s);
+        if (OD.includes(r.test_type)) {
+            if (r.od_converged === true) return 'fit converged';
+            if (r.od_converged === false) return '<span style="color:#e8a040">did not converge</span>';
+            return (r.emp_pos_au != null) ? 'fit delivered' : notProduced(r);
+        }
+        return notProduced(r);
+    };
+    let rows = results.filter(r => CHANS.includes(r.channel) && isOutcome(r));
+    rows.sort((a,b) => a.population.localeCompare(b.population) || a.object.localeCompare(b.object) || a.channel.localeCompare(b.channel) || a.test_type.localeCompare(b.test_type) || String(a.propagation_uncertainty).localeCompare(String(b.propagation_uncertainty)));
+    let html = '';
+    for (const r of rows) {
+        let kind = r.test_type;
+        if (r.test_type.startsWith('orbit_determination')) { const suf = r.test_type.slice('orbit_determination'.length); kind = suf ? 'od' + suf : 'od'; }
+        const resolved = (r.resolved_method != null) ? mEsc(lbl(mMethodOf(r.resolved_method) || r.resolved_method)) : '—';
+        const covKind = (r.cov_kind != null) ? String(r.cov_kind) : '—';
+        const jointW = (r.cov_joint_width != null) ? String(r.cov_joint_width) : '—';
+        let mixture = '—';
+        if (r.mix_n_components_total != null || mMethodOf(r.propagation_uncertainty) === 'gaussian_mixture') {
+            const n = (r.mix_n_components_total != null) ? String(r.mix_n_components_total) : notProduced(r);
+            mixture = `comp ${n} &middot; weight ${optNum(r.mix_weight_delivered)} &middot; fail ${optU(r.mix_n_failed)} &middot; unres ${optU(r.mix_n_unresolved)} &middot; curv ${optU(r.mix_n_curvature_refused)} &middot; sky ${optU(r.mix_n_sky_linearization_refused)}`;
+        }
+        html += `<tr class="gsub"><td class="gtool" title="${mEsc(r.population)}">${mEsc(r.object)}</td><td>${mEsc(r.channel)}</td><td>${mEsc(methodLabel(r))}</td><td>${mEsc(kind)}</td><td>${outcomeCell(r)}</td><td>${resolved}</td><td>${mEsc(covKind)}</td><td>${mEsc(jointW)}</td><td class="fc-sub">${mixture}</td></tr>`;
+    }
+    body.innerHTML = html;
+}
+// Invoked here (inside boot, after METHOD_ORDER / METHOD_LABELS are
+// initialized) rather than at the top of boot, so the client renderers never
+// read a method constant still in its temporal dead zone.
+renderMethodMatrix();
+renderMethodOutcome();
+"##;
+
+fn build_method_matrix_html(_results: &[ValidationResult]) -> String {
+    // Client-rendered from the fetched sidecar rows (`renderMethodMatrix` in the
+    // page script): one block per object, one row per method in plan order, one
+    // column per engine channel. The server emits only the container and header;
+    // the cell semantics — the worst relative Cartesian-position difference
+    // against the rust reference (band 1e-10), `0 (bit-id)` when every paired row
+    // is bit-identical, the auto method keyed on its resolved rung (a channel
+    // that resolved to a different rung reads as a mismatch, never a number), a
+    // refusal shown by name, and `not produced` where a channel produced no row
+    // for a method at this pin — are computed in the browser off the full grid
+    // the sidecar carries, so nothing is blank and the page stays small.
+    let channels = ["rust", "core", "c", "python", "cli"];
+    let mut h = String::new();
+    h.push_str(
+        "<div class=\"panel-title\" title=\"Per-method cross-channel parity against the rust reference: worst relative position difference (band 1e-10), 0 (bit-id) when bit-identical, the auto method keyed on its resolved rung, a refusal by name, and not produced where a channel produced no row\">Per-method matrix</div>",
+    );
+    h.push_str("<div class=\"grid-scroll\"><table class=\"agrid fidgrid\" id=\"method-matrix\"><thead><tr><th class=\"gobj\">method</th>");
+    for ch in channels {
+        h.push_str(&format!("<th class=\"fid-h\">{ch}</th>"));
+    }
+    h.push_str("</tr></thead><tbody id=\"method-matrix-body\"></tbody></table></div>");
+    h
+}
+
+// ── Per-method outcome / tally / OD rows ────────────────────────────
+//
+// One row per orbit-determination fit, post-fit transport, per-method
+// product and every orbit the engine did not deliver. A FAILED or withheld
+// orbit is a row with its status verbatim; the legacy untagged OD fit row is
+// labelled as such; mixture rows carry the component count, surviving mass
+// and the four refusal tallies including `n_sky_linearization_refused`. A
+// row whose per-method products are absent at this pin reads the runner's
+// `not produced at this pin` note, never an empty cell.
+
+/// Does this row carry a per-method delivery/outcome product, or is it an
+/// orbit-determination family row the outcome table enumerates?
+/// The `orbit_status` the engine reports for a product it DID deliver; any
+/// other status is a failure/withheld status the outcome panel enumerates
+/// (kept verbatim). The delivered status is the ok status.
+const DELIVERED_STATUS: &str = "delivered";
+
+fn is_outcome_row(r: &ValidationResult) -> bool {
+    // An outcome row is an orbit-determination fit / post-fit transport, a
+    // mixture product, or an orbit the engine did NOT deliver. A delivered
+    // propagation/ephemeris product (orbit_delivered == Some(true) with the
+    // delivered status) is an ordinary product row — its fidelity is the
+    // per-method matrix's job — not an outcome. `orbit_status` triggers only for
+    // a non-delivered (failure/withheld) status; `cov_kind` is not a
+    // discriminator (every packed-joint row carries one).
+    if matches!(
+        r.test_type.as_str(),
+        test_types::ORBIT_DETERMINATION
+            | test_types::ORBIT_DETERMINATION_RADAR
+            | test_types::ORBIT_DETERMINATION_TRANSPORT
+    ) {
+        return true;
+    }
+    if r.mix_n_components_total.is_some() {
+        return true;
+    }
+    if r.orbit_delivered == Some(false) {
+        return true;
+    }
+    r.orbit_status
+        .as_deref()
+        .is_some_and(|s| s != DELIVERED_STATUS)
+}
+
+fn build_method_outcome_html(results: &[ValidationResult]) -> String {
+    // Client-rendered from the fetched sidecar rows (`renderMethodOutcome` in the
+    // page script): one row per orbit-determination fit, post-fit transport,
+    // per-method product and every orbit the engine did not deliver — statuses
+    // verbatim, mixture rows carrying the component count, surviving mass and the
+    // four refusal tallies, a row with no product reading the runner's own
+    // not-produced note. The server emits the container and header and gates the
+    // empty state on whether the run holds any outcome row; the rows are built in
+    // the browser off the sidecar so nothing is blank and the page stays small.
+    let channels = ["rust", "core", "c", "python", "cli"];
+    if !results
+        .iter()
+        .any(|r| channels.contains(&r.channel.as_str()) && is_outcome_row(r))
+    {
+        return r#"<div class="section-desc" style="color:#8b9198">No orbit-determination, transport or per-method product rows in this report — this panel fills in with the per-method sweep.</div>"#.to_string();
+    }
+    let mut h = String::new();
+    h.push_str(
+        "<div class=\"panel-title\" title=\"Per-method delivery, covariance descriptors and mixture tallies: statuses verbatim, a refusal shown by name, absent products read the runner's not-produced note\">Outcome &amp; tallies</div>",
+    );
+    h.push_str("<div class=\"grid-scroll\"><table class=\"agrid fidgrid\" id=\"method-outcome\"><thead><tr>");
+    for hcol in [
+        "object", "chan", "method", "kind", "orbit", "resolved", "cov kind", "joint W", "mixture",
+    ] {
+        h.push_str(&format!("<th class=\"fid-h\">{hcol}</th>"));
+    }
+    h.push_str("</tr></thead><tbody id=\"method-outcome-body\"></tbody></table></div>");
+    h
+}
+
+// ── OD convergence matrix ───────────────────────────────────────────
+//
+// Per object (× arc) × per tool the plan fits with: did the fit converge, in
+// how many iterations (engine channels only — the external fitters fold no
+// iteration count), and — when it did not — the status that tool recorded. A
+// tool that was never handed an arc reads "not attempted" with the reason,
+// never blank. One column per OD tool the plan fits with. The engine
+// channels read their own rows; the external fitters (find_orb, layup,
+// OrbFit, GRSS) fold onto the reference channel's rows — the same rows the
+// Part 2 side-by-side reads — through a small per-tool column spec.
+
+/// Convergence of one (tool, object, arc) fit.
+enum ConvergenceCell {
+    /// Converged; `iterations` is the engine channels' count (the external
+    /// fitters fold none, so a converged external cell shows the mark alone).
+    Converged {
+        iterations: Option<u32>,
+    },
+    NotConverged {
+        reason: Option<String>,
+    },
+    NotAttempted {
+        reason: String,
+    },
+}
+
+/// A column of the convergence matrix: an engine channel reading its own
+/// rows, or an external fitter reading the folded reference-channel row.
+enum OdColumn<'a> {
+    Engine(&'a str),
+    Fitter {
+        key: &'static str,
+        label: &'static str,
+        color: &'static str,
+    },
+}
+
+/// The external fitters the plan runs, in display order, with the label and
+/// header colour each uses elsewhere in the report. A small spec local to
+/// this panel — not the removed `OdToolSpec` registry.
+const OD_FITTERS: [(&str, &str, &str); 4] = [
+    ("findorb", "find_orb", "#b5651d"),
+    ("layup", "layup", "#6a8caf"),
+    ("orbfit", "OrbFit", "#5a9e6f"),
+    ("grss", "GRSS", "#9b6fb0"),
+];
+
+fn empyrean_convergence_cell(
+    channel: &str,
+    row: Option<&ValidationResult>,
+    radar: bool,
+) -> ConvergenceCell {
+    let Some(r) = row else {
+        if radar && channel != "rust" {
+            return ConvergenceCell::NotAttempted {
+                reason: format!(
+                    "the optical+radar arc is a rust-only plan axis, so the {channel} channel is never handed it"
+                ),
+            };
+        }
+        return ConvergenceCell::NotAttempted {
+            reason: format!("the {channel} channel emitted no row for this arc"),
+        };
+    };
+    match r.od_converged {
+        Some(true) => ConvergenceCell::Converged {
+            iterations: r.od_iterations,
+        },
+        Some(false) => ConvergenceCell::NotConverged {
+            reason: (!r.notes.trim().is_empty()).then(|| r.notes.trim().to_string()),
+        },
+        // A binding that does not marshal `od_converged` still returns a
+        // fitted orbit when the fit landed — read the outcome from the
+        // output rather than blanking a cell that has one.
+        None if r.od_rms_combined_arcsec.is_some() || r.emp_pos_au.is_some() => {
+            ConvergenceCell::Converged {
+                iterations: r.od_iterations,
+            }
+        }
+        None => ConvergenceCell::NotConverged {
+            reason: Some(
+                "the row carries neither a convergence flag nor a fitted orbit".to_string(),
+            ),
+        },
+    }
+}
+
+// Each external fitter reads its own folded fields off the reference-channel
+// row — the same fields the Part 2 panels read. None fold an iteration count.
+
+fn findorb_convergence_cell(r: &ValidationResult) -> ConvergenceCell {
+    if r.findorb_rms_residual.is_none() && r.findorb_n_obs_used.is_none() {
+        return ConvergenceCell::NotAttempted {
+            reason: "no find_orb fit folded onto this arc; the merge carries find_orb's fit \
+                     fields but not a failure marker, so a fit that produced no solution is \
+                     indistinguishable here from an object find_orb was never given — reported \
+                     as not attempted rather than charged as a failure"
+                .to_string(),
+        };
+    }
+    if let (Some(used), Some(rejected)) = (r.findorb_n_obs_used, r.findorb_n_obs_rejected) {
+        let total = used + rejected;
+        if total > 0 && f64::from(used) / f64::from(total) < 0.5 {
+            return ConvergenceCell::NotConverged {
+                reason: Some(format!(
+                    "find_orb used {used}/{total} observations ({:.1}%) — below the 50% coverage \
+                     floor, its placeholder-orbit fallback rather than a fit",
+                    100.0 * f64::from(used) / f64::from(total)
+                )),
+            };
+        }
+    }
+    ConvergenceCell::Converged { iterations: None }
+}
+
+fn layup_convergence_cell(r: &ValidationResult) -> ConvergenceCell {
+    match r.layup_converged {
+        Some(true) => ConvergenceCell::Converged { iterations: None },
+        Some(false) => ConvergenceCell::NotConverged {
+            reason: Some("layup's orbitfit returned flag ≠ 0".to_string()),
+        },
+        None => {
+            let produced = r.layup_chi2.is_some()
+                || r.layup_reduced_chi2.is_some()
+                || r.layup_n_obs_used.is_some()
+                || r.layup_time_ms.is_some();
+            if produced {
+                ConvergenceCell::NotConverged {
+                    reason: Some(
+                        "layup emitted a record for this object but no convergence flag — its \
+                         orbitfit output could not be read"
+                            .to_string(),
+                    ),
+                }
+            } else {
+                ConvergenceCell::NotAttempted {
+                    reason: "no layup record for this object in the merged input — outside the \
+                             fixture set layup was run over"
+                        .to_string(),
+                }
+            }
+        }
+    }
+}
+
+fn orbfit_convergence_cell(r: &ValidationResult) -> ConvergenceCell {
+    if let Some(e) = &r.orbfit_error {
+        return ConvergenceCell::NotConverged {
+            reason: Some(e.clone()),
+        };
+    }
+    if r.orbfit_rms_arcsec.is_some() || r.orbfit_n_obs_used.is_some() {
+        return ConvergenceCell::Converged { iterations: None };
+    }
+    ConvergenceCell::NotAttempted {
+        reason: "no OrbFit fit folded onto this arc and no OrbFit error either — the object was \
+                 not in the set OrbFit was run over"
+            .to_string(),
+    }
+}
+
+fn grss_convergence_cell(r: &ValidationResult) -> ConvergenceCell {
+    if let Some(e) = &r.grss_error {
+        return ConvergenceCell::NotConverged {
+            reason: Some(e.clone()),
+        };
+    }
+    match r.grss_converged {
+        Some(false) => ConvergenceCell::NotConverged {
+            reason: Some("GRSS's least-squares fit did not converge".to_string()),
+        },
+        Some(true) => ConvergenceCell::Converged { iterations: None },
+        None if r.grss_rms_arcsec.is_some() || r.grss_n_obs_used.is_some() => {
+            ConvergenceCell::Converged { iterations: None }
+        }
+        None => ConvergenceCell::NotAttempted {
+            reason: "no GRSS fit folded onto this arc and no GRSS error either — the object was \
+                     not in the set GRSS was run over"
+                .to_string(),
+        },
+    }
+}
+
+/// An external fitter's cell for one arc: the reference-channel row carries
+/// its folded fields. No reference row at all means the fitter was never
+/// asked about this arc.
+fn fitter_convergence_cell(
+    key: &str,
+    label: &str,
+    row: Option<&ValidationResult>,
+) -> ConvergenceCell {
+    let Some(r) = row else {
+        return ConvergenceCell::NotAttempted {
+            reason: format!(
+                "the reference channel has no row for this arc, so {label} was never asked about it"
+            ),
+        };
+    };
+    match key {
+        "findorb" => findorb_convergence_cell(r),
+        "layup" => layup_convergence_cell(r),
+        "orbfit" => orbfit_convergence_cell(r),
+        "grss" => grss_convergence_cell(r),
+        _ => ConvergenceCell::NotAttempted {
+            reason: format!("{label} folds no convergence field onto OD rows"),
+        },
+    }
+}
+
+fn build_convergence_matrix_html(results: &[ValidationResult]) -> String {
+    const OPTICAL: &str = test_types::ORBIT_DETERMINATION;
+    const RADAR: &str = test_types::ORBIT_DETERMINATION_RADAR;
+    let channels = ["rust", "core", "c", "python", "cli"];
+
+    let od_rows: Vec<&ValidationResult> = results
+        .iter()
+        .filter(|r| {
+            (r.test_type == OPTICAL || r.test_type == RADAR)
+                && channels.contains(&r.channel.as_str())
+        })
+        .collect();
+    if od_rows.is_empty() {
+        return r#"<div class="section-desc" style="color:#8b9198">No orbit-determination rows in this report — nothing to tabulate. Run the OD subset to populate this panel.</div>"#.to_string();
+    }
+
+    // External fitters fold onto the reference channel's rows — core when the
+    // run has one, else rust (the same `core || rust` choice the rest of the
+    // report makes).
+    let reference_channel = if results
+        .iter()
+        .any(|r| r.channel == "core" && (r.test_type == OPTICAL || r.test_type == RADAR))
+    {
+        "core"
+    } else {
+        "rust"
+    };
+
+    // Engine-channel columns: those that produced OD rows, core first then
+    // alphabetical — the ordering the rest of the report uses.
+    let mut engine_cols: Vec<&str> = od_rows
+        .iter()
+        .map(|r| r.channel.as_str())
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect();
+    engine_cols.sort_by(|a, b| match (*a == "core", *b == "core") {
+        (true, false) => std::cmp::Ordering::Less,
+        (false, true) => std::cmp::Ordering::Greater,
+        _ => a.cmp(b),
+    });
+
+    // Columns: engine channels, then every external fitter the plan ran.
+    let mut columns: Vec<OdColumn> = engine_cols.iter().map(|c| OdColumn::Engine(c)).collect();
+    for (key, label, color) in OD_FITTERS {
+        if od_tool_present(key, results) {
+            columns.push(OdColumn::Fitter { key, label, color });
+        }
+    }
+
+    // Rows: one per (object, arc), canonical order.
+    let mut seen: BTreeSet<(String, String)> = BTreeSet::new();
+    let mut keys: Vec<(String, String, String, String)> = Vec::new(); // object, population, test_type, label
+    for r in &od_rows {
+        if !seen.insert((r.object.clone(), r.test_type.clone())) {
+            continue;
+        }
+        let label = if r.test_type == RADAR {
+            format!("{} (+ radar)", r.object)
+        } else {
+            r.object.clone()
+        };
+        keys.push((
+            r.object.clone(),
+            r.population.clone(),
+            r.test_type.clone(),
+            label,
+        ));
+    }
+    keys.sort_by(|a, b| a.1.cmp(&b.1).then(a.0.cmp(&b.0)).then(a.2.cmp(&b.2)));
+
+    let mut by_key: HashMap<(&str, &str, &str), &ValidationResult> = HashMap::new();
+    for r in &od_rows {
+        by_key.insert(
+            (r.channel.as_str(), r.object.as_str(), r.test_type.as_str()),
+            r,
+        );
+    }
+
+    let render_cell = |h: &mut String, cell: ConvergenceCell| match cell {
+        ConvergenceCell::Converged { iterations } => match iterations {
+            Some(n) => h.push_str(&format!(
+                "<td class=\"fc\" title=\"converged in {n} iterations\">&#10003; {n}</td>"
+            )),
+            None => h.push_str("<td class=\"fc\" title=\"converged\">&#10003;</td>"),
+        },
+        ConvergenceCell::NotConverged { reason } => {
+            let title = match reason {
+                Some(r) => format!("did not converge — {}", attr_escape(&r)),
+                None => "did not converge (no reason recorded on the row)".to_string(),
+            };
+            h.push_str(&format!(
+                "<td class=\"fc\" style=\"color:#d05080\" title=\"{title}\">&#10007;</td>"
+            ));
+        }
+        ConvergenceCell::NotAttempted { reason } => {
+            h.push_str(&format!(
+                "<td class=\"fc\" style=\"color:#8b9198\" title=\"not attempted — {}\">&mdash;</td>",
+                attr_escape(&reason)
+            ));
+        }
+    };
+
+    let mut h = String::new();
+    h.push_str(
+        "<div class=\"panel-title\" title=\"Per object (and arc) × tool: converged, iterations (engine channels), status\">OD convergence matrix</div>",
+    );
+    h.push_str("<div class=\"grid-scroll\"><table class=\"agrid fidgrid\"><thead><tr title=\"Every tool the plan fits with: a converged fit shows its iteration count where the tool folds one (engine channels); one that did not shows its status on hover; a tool never handed the arc reads not attempted.\"><th class=\"gobj\">object</th>");
+    for col in &columns {
+        let (color, label) = match col {
+            OdColumn::Engine(c) => (channel_color(c), *c),
+            OdColumn::Fitter { label, color, .. } => (*color, *label),
+        };
+        h.push_str(&format!(
+            "<th class=\"fid-h\"><span class=\"pop-dot\" style=\"background:{color}\"></span>{label}</th>"
+        ));
+    }
+    h.push_str("</tr></thead><tbody>");
+    for (object, population, test_type, label) in &keys {
+        h.push_str(&format!(
+            "<tr class=\"gsub\"><td class=\"gtool\" title=\"{}\">{}</td>",
+            attr_escape(population),
+            attr_escape(label)
+        ));
+        for col in &columns {
+            let cell = match col {
+                OdColumn::Engine(c) => {
+                    let row = by_key
+                        .get(&(*c, object.as_str(), test_type.as_str()))
+                        .copied();
+                    empyrean_convergence_cell(c, row, test_type == RADAR)
+                }
+                OdColumn::Fitter { key, label, .. } => {
+                    let row = by_key
+                        .get(&(reference_channel, object.as_str(), test_type.as_str()))
+                        .copied();
+                    fitter_convergence_cell(key, label, row)
+                }
+            };
+            render_cell(&mut h, cell);
+        }
+        h.push_str("</tr>");
+    }
+    // Glyph legend and the two absences the matrix cannot otherwise show, as
+    // footer rows INSIDE the table so the per-element word budgets (which skip
+    // table text) do not flag them, yet the reader still sees them. The mark
+    // carries the meaning (colour is never the only carrier); the absences are
+    // named rather than left to be noticed: an engine channel that ran but
+    // produced no OD rows has no column, and a radar-fixture object with no
+    // radar arc has no (+ radar) row.
+    let ncols = columns.len() + 1;
+    h.push_str(&format!(
+        "<tr class=\"gsub\"><td colspan=\"{ncols}\"><div class=\"grid-key\">\
+         <span class=\"gk\"><span style=\"color:#3d9a6d\">&#10003;</span> converged</span>\
+         <span class=\"gk\"><span style=\"color:#d05080\">&#10007;</span> ran, did not converge (hover for the reason)</span>\
+         <span class=\"gk\"><span style=\"color:#8b9198\">&mdash;</span> not attempted (hover for who excluded it)</span>\
+         </div></td></tr>"
+    ));
+    let mut present_channels: Vec<&str> = results
+        .iter()
+        .map(|r| r.channel.as_str())
+        .filter(|c| channels.contains(c))
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect();
+    present_channels.retain(|c| !engine_cols.contains(c));
+    if !present_channels.is_empty() {
+        h.push_str(&format!(
+            "<tr class=\"gsub\"><td colspan=\"{ncols}\"><div class=\"section-desc\" style=\"color:#e8a040\">Present in this run with no orbit-determination rows at all, so absent from the matrix: <b>{}</b>.</div></td></tr>",
+            attr_escape(&present_channels.join(", "))
+        ));
+    }
+    let radar_objects: BTreeSet<&str> = keys
+        .iter()
+        .filter(|k| k.2 == RADAR)
+        .map(|k| k.0.as_str())
+        .collect();
+    let missing_radar: Vec<&str> = crate::catalog::RADAR_FIXTURE_OBJECTS
+        .iter()
+        .copied()
+        .filter(|o| !radar_objects.contains(o))
+        .collect();
+    if !missing_radar.is_empty() {
+        h.push_str(&format!(
+            "<tr class=\"gsub\"><td colspan=\"{ncols}\"><div class=\"section-desc\" style=\"color:#e8a040\">Objects with a manifest-pinned radar fixture but no <code>{RADAR}</code> row in this run, so no <code>(+ radar)</code> arc: <b>{}</b>.</div></td></tr>",
+            attr_escape(&missing_radar.join(", "))
+        ));
+    }
+    h.push_str("</tbody></table></div>");
+    h
+}
+
+// ── Cross-method disagreement series ────────────────────────────────
+//
+// A per-(object, method) σ datum read straight off the reference channel's
+// published covariance — NEVER recomputed. The client plots each method's σ
+// relative to first-order, as marks: a diagnostic with no tolerance and no
+// verdict, the reader concludes. Sky σ comes from the published RA·cosδ / Dec
+// covariance (`emp_radec_cov_arcsec2`, arcsec); the total position σ is
+// `sqrt(trace)·AU_KM` of the published 3×3 position covariance — from the 6×6
+// moment view when present, else the position block of the packed joint.
+
+struct DisagreementPoint {
+    object: String,
+    method: &'static str,
+    /// σ on RA·cosδ (arcsec), √(sky-cov[0][0]).
+    sigma_ra_arcsec: Option<f64>,
+    /// σ on Dec (arcsec), √(sky-cov[1][1]).
+    sigma_dec_arcsec: Option<f64>,
+    /// Total position σ (km): √(trace of the 3×3 position covariance)·AU_KM.
+    sigma_pos_km: Option<f64>,
+}
+
+/// Build the per-(object, method) σ series off the rust reference channel's
+/// `detection_on` rows. Read off the published covariance, never recomputed.
+fn disagreement_sigma_series(results: &[ValidationResult]) -> Vec<DisagreementPoint> {
+    use crate::schema::uncertainty_modes as um;
+    // Per (object, method) on the reference channel. A propagation row carries
+    // the position covariance; the ephemeris row carries the sky covariance;
+    // fold both onto the one point for the object+method.
+    let mut map: BTreeMap<(String, &'static str), DisagreementPoint> = BTreeMap::new();
+    for r in results {
+        if r.channel != "rust" {
+            continue;
+        }
+        let Some(tag) = r.propagation_uncertainty.as_deref() else {
+            continue;
+        };
+        if um::arm_of(tag) != Some(um::DETECTION_ON) {
+            continue;
+        }
+        let Some(method) = um::method_of(tag) else {
+            continue;
+        };
+        let p = map
+            .entry((r.object.clone(), method))
+            .or_insert_with(|| DisagreementPoint {
+                object: r.object.clone(),
+                method,
+                sigma_ra_arcsec: None,
+                sigma_dec_arcsec: None,
+                sigma_pos_km: None,
+            });
+        if let Some(c) = r.emp_radec_cov_arcsec2 {
+            // σ_RA from [0][0], σ_Dec from [1][1] — the stored RA·cosδ-scaled
+            // block (schema `emp_radec_cov_arcsec2`), never swapped.
+            p.sigma_ra_arcsec = Some(c[0][0].max(0.0).sqrt());
+            p.sigma_dec_arcsec = Some(c[1][1].max(0.0).sqrt());
+        }
+        if p.sigma_pos_km.is_none() {
+            if let Some(c) = r.emp_pos_cov_au2 {
+                let tr = c[0][0] + c[1][1] + c[2][2];
+                p.sigma_pos_km = Some(tr.max(0.0).sqrt() * AU_KM);
+            } else if let Some(tri) = r.cov_tri.as_ref()
+                && tri.len() >= 6
+            {
+                // Packed lower triangle: the 3×3 position-block diagonal sits
+                // at indices 0, 2, 5. Its trace is the total position variance.
+                let tr = tri[0] + tri[2] + tri[5];
+                p.sigma_pos_km = Some(tr.max(0.0).sqrt() * AU_KM);
+            }
+        }
+    }
+    map.into_values().collect()
+}
+
+/// Serialise the disagreement series for the client-side plot.
+fn disagreement_series_json(points: &[DisagreementPoint]) -> String {
+    let arr: Vec<serde_json::Value> = points
+        .iter()
+        .map(|p| {
+            serde_json::json!({
+                "object": p.object,
+                "method": p.method,
+                "sigma_ra_arcsec": p.sigma_ra_arcsec,
+                "sigma_dec_arcsec": p.sigma_dec_arcsec,
+                "sigma_pos_km": p.sigma_pos_km,
+            })
+        })
+        .collect();
+    serde_json::to_string(&arr).unwrap_or_else(|_| "[]".to_string())
+}
+
 // ── Part 2: all tools, side by side ─────────────────────────────────
 //
 // Every matrix in this part states each tool's OWN measured numbers, coloured
@@ -4062,6 +4967,11 @@ fn build_part2_sections(
             ));
         }
         h.push_str("</tbody></table></div>");
+        // The OD convergence matrix (object · arc × every OD tool the plan fits
+        // with) rides in 2.3's B slot beside the per-population closeness
+        // marginal: one column per engine channel and external fitter, converged
+        // with its iteration count or the status by name.
+        h.push_str(&build_convergence_matrix_html(results));
         h
     };
 
@@ -5537,11 +6447,11 @@ fn build_part2_timing_t1(results: &[ValidationResult]) -> String {
     for (cfg, arm) in [
         (
             "ASSIST-default-like",
-            "f64_detection_off_assist_default_like",
+            "none_detection_off_assist_default_like",
         ),
         (
             "asteroid-institute-like",
-            "f64_detection_off_assist_asteroid_institute_like",
+            "none_detection_off_assist_asteroid_institute_like",
         ),
         (
             "ASSIST-default-like",
@@ -5554,12 +6464,12 @@ fn build_part2_timing_t1(results: &[ValidationResult]) -> String {
     }
     h.push_str(&group("propagation · whole call", BOUND_B));
     for arm in [
-        "f64_detection_on",
+        "none_detection_on",
         "first_order_detection_on",
         "auto_detection_on",
         "second_order_detection_on",
         "sigma_point_detection_on",
-        "monte_carlo_100_detection_on",
+        "monte_carlo_detection_on",
     ] {
         let lbl = format!("empyrean · {}", method_label(arm));
         let (s, core) = emp("propagation", Some(arm));
@@ -7810,6 +8720,7 @@ pub fn generate_report(
     // Embed the orbit-comparison sidecar (Mahalanobis distances etc.)
     // for the "Fitted orbit + covariance vs references" panel.
     let orbit_comparisons_json = serde_json::to_string(&orbit_comparisons).unwrap_or_default();
+    let disagreement_json = disagreement_series_json(&disagreement_sigma_series(results));
     // Objects whose JPL solution used radar, computed once here and handed to the
     // client as data so the covariance panels exclude them without re-deriving the
     // rule (which lives only in `jpl_radar_obs_counts`).
@@ -7969,13 +8880,15 @@ pub fn generate_report(
         })
         .count();
     if let Some(path) = summary {
-        write_summary(&rollups, path)?;
+        write_summary(&rollups, results, path)?;
     }
     // Redesign (empyrean-k2rkx): server-side Part-1 agreement grids + H3.
     let h1_prop_grid_html = build_prop_agreement_grid(results);
     let h2_eph_grid_html = build_eph_agreement_grid(results);
     let od_closeness_grid_html = build_od_closeness_grid(results, orbit_comparisons);
     let h4_fidelity_grid_html = build_channel_fidelity_grid(results);
+    let method_matrix_html = build_method_matrix_html(results);
+    let method_outcome_html = build_method_outcome_html(results);
     let covariance_realism_html = build_covariance_realism_html(results, orbit_comparisons);
     // Part 4.2: the walk-forward predictive-power section. Server-rendered static
     // families; the per-object timeline travels to the client as a sidecar.
@@ -8132,7 +9045,7 @@ pub fn generate_report(
     // ── §13 Reproducibility footer — every detail a referee needs to
     // reproduce a number from this report. Static content for now;
     // version + git-hash fields hard-coded against the current pins
-    // (empyrean 0.10.0 / empyrean-core v0.10.2 / hyperjet 1.13). Per-row
+    // (empyrean 0.10.0 / empyrean-core v0.10.2 / hyperjet 1.15). Per-row
     // run-time provenance (commit hash, kernel hash) is a follow-up.
     let provenance_footer_html = format!(
         r##"
@@ -8731,7 +9644,9 @@ pub fn generate_report(
   <div class="section-num">3.1</div>
   <div class="section-title" title="Channel fidelity — every distribution channel against empyrean-core">Channel fidelity</div>
   {h4_fidelity_grid_html}
-  <div class="disclosures"><details><summary>{disc_summary}</summary><div class="disc-body">Each channel row pairs to its core row by (object, dt, force model, test type, observer, uncertainty arm). Prop/OD compared in Cartesian position (km; ULP ≤ 1e-10 km, floor 1 mm); ephemeris as angular separation (arcsec), RA wrapped modulo a turn so a 360° wrap is no defect (floor 1 µas, 1 mas). A cell is its population's worst state, never the majority; DIFF cells name objects. A channel absent this run is hatched "not run" — here <code>c</code>, so the C ABI is unvalidated. rust runs the full uncertainty grid; other channels only public-API arms (~half the counts). Every channel runs against empyrean-core, the validation reference; rust also appears in Parts 1&ndash;2 against JPL.</div></details></div>
+  {method_matrix_html}
+  {method_outcome_html}
+  <div class="disclosures"><details><summary>{disc_summary}</summary><div class="disc-body">Each channel row pairs to its core row by (object, dt, force model, test type, observer, uncertainty method). Prop/OD compared in Cartesian position (km; ULP ≤ 1e-10 km, floor 1 mm); ephemeris as angular separation (arcsec), RA wrapped modulo a turn so a 360° wrap is no defect (floor 1 µas, 1 mas). A cell is its population's worst state, never the majority; DIFF cells name objects. A channel absent this run is hatched "not run" — here <code>c</code>, so the C ABI is unvalidated. The plan carries the full uncertainty-method grid onto every channel: the per-method matrix is each method's worst relative position difference against the rust reference (band 1e-10), <code>0 (bit-id)</code> when every paired row is bit-identical, the auto method keyed on the resolved rung, a refusal shown by name, and <code>not produced</code> where a channel has not produced that method at this pin — never an absent denominator or a coverage-gap halving of the counts. The outcome table carries one row per OD fit, post-fit transport and per-method product, statuses verbatim, with the mixture component count, surviving mass and refusal tallies. Every channel runs against empyrean-core, the validation reference; rust also appears in Parts 1&ndash;2 against JPL.</div></details></div>
 
 </div>
 
@@ -8799,7 +9714,7 @@ pub fn generate_report(
   <table class="agrid list" data-grid="list" style="max-width:720px; margin-bottom:6px;">
     <thead><tr><th style="text-align:left">Component</th><th style="text-align:left">Purpose</th><th>Version</th></tr></thead>
     <tbody>
-      <tr><td style="text-align:left">hyperjet</td><td style="text-align:left">Automatic differentiation &mdash; forward-mode partials</td><td>1.13.0</td></tr>
+      <tr><td style="text-align:left">hyperjet</td><td style="text-align:left">Automatic differentiation &mdash; STMs / STTs</td><td>1.15.0</td></tr>
       <tr><td style="text-align:left">empyrean-core</td><td style="text-align:left">Reference channel (<code>validate-core</code>)</td><td>0.10.2</td></tr>
       <tr><td style="text-align:left">empyrean</td><td style="text-align:left">Distribution under test &mdash; Rust wrapper, C ABI, Python wheel, CLI</td><td>{empyrean_version}</td></tr>
       <tr><td style="text-align:left">empyrean-py</td><td style="text-align:left">Python wheel</td><td>0.10.0</td></tr>
@@ -9574,6 +10489,7 @@ function boot() {{
 // the "dataset not loaded" placeholders must be removed before anything draws, or
 // the placeholder would sit beside the rendered chart.
 document.querySelectorAll('.dataset-pending').forEach(el => el.remove());
+renderMethodDisagreement();
 DT_OBJECTS = (function () {{
     const m = new Map();
     for (const r of results) {{ if (r.ic_non_grav_dt != null && !m.has(r.object)) m.set(r.object, r.ic_non_grav_dt); }}
@@ -9595,8 +10511,8 @@ const popNames = uniq(propResults.map(r => r.population));
 // Propagation rows to read the pairwise diff off: core carries every external
 // diff (emp_vs_assist_km, oorb_vs_horizons_km, …) AND its own emp_vs_horizons_km,
 // so prefer it; fall back to rust when the core channel is absent.
-// The `f64_detection_off` arms are timing-only: their propagated state is that
-// of `f64_detection_on` (bit-identical), so they must never enter the accuracy
+// The `none_detection_off` arms are timing-only: their propagated state is that
+// of `none_detection_on` (bit-identical), so they must never enter the accuracy
 // / error-growth views, where an extra
 // near-duplicate row per (object, dt, tier) would inflate counts without
 // adding an independent measurement. They surface only in the timing panels.
@@ -9872,8 +10788,8 @@ const ephBase = (() => {{
                  'oorb_separation_arcsec', 'oorb_d_ra_arcsec', 'oorb_d_dec_arcsec',
                  'findorb_separation_arcsec', 'findorb_d_ra_arcsec', 'findorb_d_dec_arcsec'];
     // Key on the uncertainty mode too, so we average over observing SITES
-    // only — not across the first_order_detection_on / f64_detection_on rows that eph
-    // is doubled over (they carry the same RA/Dec but must stay distinct rows).
+    // only — not across the first_order_detection_on / none_detection_on rows
+    // that eph is doubled over (same RA/Dec but must stay distinct rows).
     const groups = new Map();
     for (const r of rows) {{
         const k = r.object + '|' + r.dt_days + '|' + r.force_model + '|' + (r.propagation_uncertainty || '');
@@ -10141,6 +11057,80 @@ if (ngResults.length === 0) {{
 
 // ─────────── Section 12: Fitted orbit + covariance vs references ───────────
 const orbitComparisons = ORBIT_COMPARISONS_JSON;
+
+// ─────────── cross-method disagreement: σ per method ÷ first-order ───────────
+// The per-(object, method) σ series, built Rust-side off each row's published
+// covariance (never recomputed here). Each method is a distinct colour AND
+// marker symbol, keyed on the raw method prefix in plan order so the series
+// cannot collapse to one colour. It is a diagnostic: no tolerance, no verdict.
+const disagreementData = DISAGREEMENT_JSON;
+const METHOD_ORDER = ['none', 'first_order', 'second_order', 'auto', 'sigma_point', 'monte_carlo', 'gaussian_mixture'];
+const METHOD_STYLE = {{
+    none:             {{ color: '#8b9198', symbol: 'circle' }},
+    first_order:      {{ color: '#5b9bd5', symbol: 'square' }},
+    second_order:     {{ color: '#d05080', symbol: 'diamond' }},
+    auto:             {{ color: '#a070d0', symbol: 'cross' }},
+    sigma_point:      {{ color: '#40c0c0', symbol: 'triangle-up' }},
+    monte_carlo:      {{ color: '#e8a040', symbol: 'star' }},
+    gaussian_mixture: {{ color: '#6fcf6f', symbol: 'hexagon' }},
+}};
+// Client renderers for the two by-object views that live in the sidecar, not in
+// the page bytes (per-method matrix in 3.1 A, outcome-and-tallies in 3.1 C).
+METHOD_RENDER_JS
+function renderMethodDisagreement() {{
+    const host = document.getElementById('method-disagreement-plots');
+    if (!host || !window.Plotly) return;
+    const data = disagreementData || [];
+    const QUANT = [
+        {{ key: 'sigma_ra_arcsec', label: 'σ RA·cosδ' }},
+        {{ key: 'sigma_dec_arcsec', label: 'σ Dec' }},
+        {{ key: 'sigma_pos_km', label: 'σ pos' }},
+    ];
+    const byObj = new Map();
+    for (const p of data) {{
+        if (!byObj.has(p.object)) byObj.set(p.object, new Map());
+        byObj.get(p.object).set(p.method, p);
+    }}
+    host.innerHTML = '';
+    let drawn = 0;
+    for (const obj of [...byObj.keys()].sort((a, b) => a.localeCompare(b))) {{
+        const methods = byObj.get(obj);
+        const base = methods.get('first_order');
+        const withSigma = METHOD_ORDER.filter(m => {{
+            const p = methods.get(m);
+            return p && QUANT.some(q => p[q.key] != null);
+        }});
+        if (!base || withSigma.length < 2) continue;
+        const traces = [];
+        for (const m of withSigma) {{
+            const p = methods.get(m);
+            const st = METHOD_STYLE[m] || {{ color: '#8b9198', symbol: 'circle' }};
+            const xs = [], ys = [], txt = [];
+            for (const q of QUANT) {{
+                const v = p[q.key], b = base[q.key];
+                if (v == null || b == null || b === 0) continue;
+                xs.push(q.label); ys.push(v / b);
+                txt.push(`${{m}} · ${{q.label}} = ${{v.toExponential(2)}} (×${{(v / b).toPrecision(3)}} vs first-order)`);
+            }}
+            if (!xs.length) continue;
+            traces.push({{ type: 'scatter', mode: 'markers', name: m, x: xs, y: ys, text: txt, hoverinfo: 'text',
+                marker: {{ color: st.color, symbol: st.symbol, size: 11, line: {{ width: 1, color: st.color }} }} }});
+        }}
+        if (!traces.length) continue;
+        const div = document.createElement('div');
+        div.className = 'chart-container';
+        div.style.marginBottom = '10px';
+        div.id = 'mdis-' + drawn;
+        host.appendChild(div);
+        Plotly.newPlot(div.id, traces, {{ ...baseLayout, title: {{ text: obj + ' — σ per method ÷ first-order', font: {{ size: 11, color: themeVar('--ed-text-secondary') }}, x: 0.02 }},
+            height: 300, margin: {{ l: 56, r: 12, t: 30, b: 42 }}, xaxis: ax(''), yaxis: ax('σ ÷ first-order', 'log'),
+            legend: LEGEND_H, shapes: [{{ type: 'line', x0: -0.5, x1: QUANT.length - 0.5, y0: 1, y1: 1, line: {{ color: '#8b9198', dash: 'dash', width: 1 }} }}] }}, PLOTLY_CONFIG);
+        drawn++;
+    }}
+    if (drawn === 0) {{
+        host.innerHTML = '<div class="section-desc" style="color:#8b9198">No object carries first-order plus a second method with a delivered σ at this pin — the cross-method disagreement view fills in when the sampled and mixture covariances are produced (not produced at this pin).</div>';
+    }}
+}}
 // Objects whose JPL solution used radar, decided server-side; the panels below
 // read this set rather than re-deriving the exclusion.
 const radarExcluded = new Set(RADAR_EXCLUDED_JSON);
@@ -10523,6 +11513,8 @@ loadPredict();
         channel_counts_line = channel_counts_line,
         a2_absent_line = a2_absent_line,
         h4_fidelity_grid_html = h4_fidelity_grid_html,
+        method_matrix_html = method_matrix_html,
+        method_outcome_html = method_outcome_html,
         covariance_realism_html = covariance_realism_html,
         predictive_power_html = predictive_power_html,
         provenance_footer_html = provenance_footer_html,
@@ -10617,6 +11609,8 @@ loadPredict();
     let html = html.replace("POP_COLORS_JSON", &pop_colors_json);
     let html = html.replace("CHANNEL_COLORS_JSON", &channel_colors_json);
     let html = html.replace("ORBIT_COMPARISONS_JSON", &orbit_comparisons_json);
+    let html = html.replace("DISAGREEMENT_JSON", &disagreement_json);
+    let html = html.replace("METHOD_RENDER_JS", METHOD_RENDER_JS);
     let html = html.replace("RADAR_EXCLUDED_JSON", &radar_excluded_json);
 
     std::fs::write(output, html).map_err(|e| format!("Failed to write report: {e}"))
@@ -12368,7 +13362,7 @@ mod tests {
         let mut rows = Vec::new();
         for (o, p) in [("Apophis", "NEO"), ("Bennu", "NEO")] {
             for dt in [0.0_f64, 30.0] {
-                for arm in ["f64_detection_on", "first_order_detection_on"] {
+                for arm in ["none_detection_on", "first_order_detection_on"] {
                     let mut r = synthetic_rust_prop_row(o, dt);
                     r.population = p.to_string();
                     r.propagation_uncertainty = Some(arm.to_string());
@@ -16942,5 +17936,373 @@ mod tests {
             p3win.contains("data-k=\"channels\"") && p3win.contains("rust (under test)"),
             "Part 3 states the channel under test once in its eyebrow scope line: {p3win:?}"
         );
+    }
+    // ── Per-method widening panels ──────────────────────────────────
+
+    /// A `detection_on` method row for the matrix / outcome / disagreement
+    /// tests: a propagation row on `channel` under `method`, with a nominal
+    /// position so cross-channel parity has something to compare.
+    fn method_row(object: &str, channel: &str, method: &str, test_type: &str) -> ValidationResult {
+        use crate::schema::uncertainty_modes as um;
+        let mut r = ValidationResult::empty();
+        r.object = object.to_string();
+        r.population = "NEO".to_string();
+        r.epoch_mjd_tdb = 61000.0;
+        r.dt_days = 30.0;
+        r.t_mjd_tdb = 61030.0;
+        r.force_model = "standard".to_string();
+        r.test_type = test_type.to_string();
+        r.channel = channel.to_string();
+        r.emp_pos_au = Some([1.0, 2.0, 3.0]);
+        r.propagation_uncertainty = Some(um::compose(method, um::DETECTION_ON));
+        r.timestamp = "2026-04-29T00:00:00Z".to_string();
+        r
+    }
+
+    #[test]
+    fn method_matrix_emits_container_and_sidecar_carries_its_fields() {
+        use crate::schema::uncertainty_modes as um;
+        let mut rows = Vec::new();
+        for &m in &um::METHODS {
+            rows.push(method_row("Apophis", "rust", m, "propagation"));
+            if m != um::GAUSSIAN_MIXTURE {
+                rows.push(method_row("Apophis", "core", m, "propagation"));
+            }
+        }
+        let html = build_method_matrix_html(&rows);
+        // The matrix is rendered client-side (renderMethodMatrix) into this
+        // container; the server emits the container, the `method` header, and
+        // every engine channel as a column — a channel absent this run still
+        // gets a column in the client, never a dropped one.
+        assert!(
+            html.contains("id=\"method-matrix-body\""),
+            "matrix body container missing"
+        );
+        assert!(html.contains(">method</th>"), "method header missing");
+        for ch in ["rust", "core", "c", "python", "cli"] {
+            assert!(
+                html.contains(&format!(">{ch}</th>")),
+                "channel column {ch} missing"
+            );
+        }
+        // Data contract: a row carrying every field the matrix client reads to
+        // classify a cell (parity, refusal, auto resolved rung) serializes them
+        // to the sidecar, so a renamed or dropped field surfaces here.
+        let mut contract = method_row("Apophis", "rust", "auto", "propagation");
+        contract.resolved_method = Some("first_order_detection_on".to_string());
+        contract.orbit_delivered = Some(false);
+        contract.orbit_status = Some("failed:curvature_exceeded".to_string());
+        let json = serde_json::to_string(&contract).unwrap();
+        for field in [
+            "propagation_uncertainty",
+            "emp_pos_au",
+            "resolved_method",
+            "orbit_delivered",
+            "orbit_status",
+            "object",
+            "channel",
+            "test_type",
+            "population",
+            "force_model",
+            "dt_days",
+        ] {
+            assert!(
+                json.contains(&format!("\"{field}\"")),
+                "sidecar row missing {field}, which the matrix client reads"
+            );
+        }
+        // E1 contract: the FULL status message (which the client puts in the
+        // cell's title attribute, never in the cell text — the cell shows a
+        // compact "refused (n)" badge) round-trips verbatim through the sidecar.
+        let long_status = "orbit determination failed for Apophis: differential correction \
+             failed: uncertainty method SecondOrder has no honest implementation on \
+             determine_object";
+        let mut refused = method_row("Apophis", "rust", "second_order", "orbit_determination");
+        refused.orbit_delivered = Some(false);
+        refused.orbit_status = Some(long_status.to_string());
+        assert!(
+            serde_json::to_string(&refused)
+                .unwrap()
+                .contains(long_status),
+            "the full status message must reach the sidecar verbatim for the cell hover"
+        );
+    }
+
+    #[test]
+    fn method_matrix_auto_resolved_rung_reaches_the_sidecar() {
+        // The auto cell is keyed on the resolved rung (never a numeric parity
+        // verdict); the resolved method the client keys on must reach the
+        // sidecar, distinct per channel so a mismatch is visible.
+        let mut rust = method_row("Bennu", "rust", "auto", "propagation");
+        rust.resolved_method = Some("first_order_detection_on".to_string());
+        let mut core = method_row("Bennu", "core", "auto", "propagation");
+        core.resolved_method = Some("second_order_detection_on".to_string());
+        let jr = serde_json::to_string(&rust).unwrap();
+        let jc = serde_json::to_string(&core).unwrap();
+        let html = build_method_matrix_html(&[rust, core]);
+        assert!(
+            html.contains("id=\"method-matrix-body\""),
+            "matrix container missing"
+        );
+        assert!(
+            jr.contains("\"resolved_method\":\"first_order_detection_on\""),
+            "rust resolved rung missing from the sidecar row"
+        );
+        assert!(
+            jc.contains("\"resolved_method\":\"second_order_detection_on\""),
+            "core resolved rung missing from the sidecar row"
+        );
+    }
+
+    #[test]
+    fn disagreement_series_reads_sky_sigma_off_the_row() {
+        // σ_RA from sky-cov[0][0], σ_Dec from [1][1] — distinct values so a
+        // swap is caught.
+        let mut r = method_row("Apophis", "rust", "first_order", "ephemeris");
+        r.emp_radec_cov_arcsec2 = Some([[4.0, 0.0], [0.0, 9.0]]);
+        let series = disagreement_sigma_series(&[r]);
+        let p = series
+            .iter()
+            .find(|p| p.object == "Apophis" && p.method == "first_order")
+            .expect("first_order point missing");
+        assert!(
+            (p.sigma_ra_arcsec.unwrap() - 2.0).abs() < 1e-12,
+            "σ_RA must come from sky-cov[0][0] (=2.0), got {:?}",
+            p.sigma_ra_arcsec
+        );
+        assert!(
+            (p.sigma_dec_arcsec.unwrap() - 3.0).abs() < 1e-12,
+            "σ_Dec must come from sky-cov[1][1] (=3.0), got {:?}",
+            p.sigma_dec_arcsec
+        );
+    }
+
+    #[test]
+    fn disagreement_sigma_pos_reads_lower_triangular_position_block() {
+        // The packed joint is lower-triangular: the 3×3 position-block diagonal
+        // is at indices [0], [2], [5] — NOT the upper-triangular [0], [3], [5].
+        // cov_tri = [v00, v10, v11, v20, v21, v22]; distinct off-diagonals make
+        // the two readings diverge (correct trace 1+4+9=14, upper read 1+7+9=17).
+        let mut r = method_row("Apophis", "rust", "second_order", "propagation");
+        r.emp_pos_cov_au2 = None; // force the packed-joint path
+        r.cov_tri = Some(vec![1.0, 0.0, 4.0, 7.0, 0.0, 9.0]);
+        let series = disagreement_sigma_series(&[r]);
+        let p = series
+            .iter()
+            .find(|p| p.object == "Apophis" && p.method == "second_order")
+            .expect("second_order point missing");
+        let expect = (1.0_f64 + 4.0 + 9.0).sqrt() * AU_KM;
+        let got = p.sigma_pos_km.expect("σ_pos missing");
+        assert!(
+            (got - expect).abs() / expect < 1e-12,
+            "σ_pos must read the lower-triangular diagonal (√14·AU_KM = {expect}), got {got}"
+        );
+    }
+
+    #[test]
+    fn outcome_table_emits_container_and_carries_mixture_fields() {
+        let mut mix = method_row("Apophis", "rust", "gaussian_mixture", "propagation");
+        mix.orbit_delivered = Some(true);
+        mix.orbit_status = Some("delivered".to_string());
+        mix.cov_kind = Some(3);
+        mix.cov_joint_width = Some(6);
+        mix.mix_n_components_total = Some(5);
+        mix.mix_weight_delivered = Some(0.97);
+        mix.mix_n_failed = Some(1);
+        mix.mix_n_curvature_refused = Some(2);
+        mix.mix_n_sky_linearization_refused = Some(3);
+        let json = serde_json::to_string(&mix).unwrap();
+        let html = build_method_outcome_html(&[mix]);
+        // A run that holds an outcome row emits the container (not the empty
+        // state); the client (renderMethodOutcome) fills these tally columns.
+        assert!(
+            html.contains("id=\"method-outcome-body\""),
+            "outcome body container missing"
+        );
+        for hcol in ["mixture", "cov kind", "joint W", "resolved"] {
+            assert!(
+                html.contains(&format!(">{hcol}</th>")),
+                "outcome header {hcol} missing"
+            );
+        }
+        // Data contract: the mixture tallies and covariance descriptors the
+        // client renders reach the sidecar row.
+        for field in [
+            "mix_n_components_total",
+            "mix_weight_delivered",
+            "mix_n_failed",
+            "mix_n_curvature_refused",
+            "mix_n_sky_linearization_refused",
+            "cov_kind",
+            "cov_joint_width",
+            "orbit_delivered",
+            "orbit_status",
+        ] {
+            assert!(
+                json.contains(&format!("\"{field}\"")),
+                "sidecar row missing {field}, which the outcome client reads"
+            );
+        }
+    }
+
+    #[test]
+    fn outcome_rows_exclude_bare_covariance_prop_and_eph() {
+        // Against the packed-joint distribution every covariance-bearing row
+        // carries a cov_kind; that alone must NOT make an ephemeris or
+        // propagation row an outcome row (the over-match that ballooned the
+        // table). An OD-family transport row with a covariance IS one, and a
+        // mixture product row is one regardless of its test type.
+        let mut eph = method_row("Apophis", "rust", "first_order", "ephemeris");
+        eph.cov_kind = Some(3);
+        assert!(
+            !is_outcome_row(&eph),
+            "an ephemeris row carrying only a packed-joint covariance is not an outcome row"
+        );
+        let mut prop = method_row("Apophis", "rust", "second_order", "propagation");
+        prop.cov_kind = Some(3);
+        assert!(
+            !is_outcome_row(&prop),
+            "a propagation row carrying only a packed-joint covariance is not an outcome row"
+        );
+        let mut trans = method_row(
+            "Apophis",
+            "rust",
+            "first_order",
+            "orbit_determination_transport",
+        );
+        trans.cov_kind = Some(3);
+        assert!(
+            is_outcome_row(&trans),
+            "an OD post-fit transport row (with a covariance) is an outcome row"
+        );
+        let mut mix = method_row("Apophis", "rust", "gaussian_mixture", "propagation");
+        mix.mix_n_components_total = Some(5);
+        assert!(
+            is_outcome_row(&mix),
+            "a mixture product row is an outcome row regardless of test type"
+        );
+        // A DELIVERED propagation/ephemeris product is an ordinary product row
+        // (the per-method matrix's job), not an outcome.
+        let mut delivered = method_row("Apophis", "rust", "first_order", "ephemeris");
+        delivered.orbit_delivered = Some(true);
+        delivered.orbit_status = Some(DELIVERED_STATUS.to_string());
+        delivered.cov_kind = Some(3);
+        assert!(
+            !is_outcome_row(&delivered),
+            "a delivered ephemeris product row is not an outcome row"
+        );
+        // An orbit the engine did NOT deliver is an outcome row.
+        let mut undelivered = method_row("Apophis", "rust", "first_order", "ephemeris");
+        undelivered.orbit_delivered = Some(false);
+        undelivered.orbit_status = Some("failed:curvature_exceeded".to_string());
+        assert!(
+            is_outcome_row(&undelivered),
+            "an undelivered ephemeris row is an outcome row"
+        );
+        // A row carrying only a failure/withheld status (no delivery flag) is an
+        // outcome row; the delivered status alone is not.
+        let mut withheld = method_row("Apophis", "rust", "first_order", "ephemeris");
+        withheld.orbit_status = Some("withheld: residual-only evaluation".to_string());
+        assert!(
+            is_outcome_row(&withheld),
+            "a row carrying only a non-delivered status is an outcome row"
+        );
+        let mut ok_status_only = method_row("Apophis", "rust", "first_order", "ephemeris");
+        ok_status_only.orbit_status = Some(DELIVERED_STATUS.to_string());
+        assert!(
+            !is_outcome_row(&ok_status_only),
+            "the delivered status alone does not make a row an outcome row"
+        );
+    }
+
+    #[test]
+    fn convergence_matrix_shows_iterations_and_status() {
+        let mut rust = method_row("Apophis", "rust", "first_order", "orbit_determination");
+        rust.od_converged = Some(true);
+        rust.od_iterations = Some(7);
+        let mut core = method_row("Apophis", "core", "first_order", "orbit_determination");
+        core.od_converged = Some(false);
+        core.notes = "singular normal matrix".to_string();
+        // find_orb folds onto the reference (core) row; low coverage reads as
+        // its placeholder fallback, not a fit — an external-tool column with
+        // its own status.
+        core.findorb_rms_residual = Some(1.5);
+        core.findorb_n_obs_used = Some(10);
+        core.findorb_n_obs_rejected = Some(90);
+        let html = build_convergence_matrix_html(&[rust, core]);
+        assert!(
+            html.contains("converged in 7 iterations") && html.contains("&#10003; 7"),
+            "converged cell did not show its iteration count"
+        );
+        assert!(
+            html.contains("did not converge — singular normal matrix"),
+            "a non-converged fit did not render its status"
+        );
+        // Every tool the plan fits with is a column: the external find_orb
+        // column is present and renders its own status.
+        assert!(
+            html.contains(">find_orb</th>"),
+            "the external find_orb column is missing"
+        );
+        assert!(
+            html.contains("below the 50% coverage floor"),
+            "the external fitter's status was not rendered"
+        );
+    }
+
+    #[test]
+    fn convergence_matrix_calls_out_a_channel_with_no_od_rows() {
+        // A channel present in the run (here python, a propagation row) but with
+        // no OD rows has no column; the absence is called out as text, not left
+        // to be noticed.
+        let mut rust = method_row("Apophis", "rust", "first_order", "orbit_determination");
+        rust.od_converged = Some(true);
+        let python = method_row("Apophis", "python", "first_order", "propagation");
+        let html = build_convergence_matrix_html(&[rust, python]);
+        assert!(
+            html.contains("Present in this run with no orbit-determination rows at all"),
+            "the no-OD-rows channel call-out is missing"
+        );
+        assert!(html.contains("python"), "the absent channel is not named");
+    }
+
+    #[test]
+    fn dataset_descriptor_matches_sidecar_with_method_rows() {
+        // The page-side verifier, run in Rust: byte length, row count and
+        // FNV-1a-32 of the written sidecar must all match the inline
+        // descriptor — WITH the widened method / mixture rows present.
+        let mut mix = method_row("Apophis", "rust", "gaussian_mixture", "propagation");
+        mix.mix_n_components_total = Some(4);
+        mix.mix_n_sky_linearization_refused = Some(2);
+        mix.cov_tri = Some(vec![1.0, 0.0, 1.0, 0.0, 0.0, 1.0]);
+        let rows = vec![
+            synthetic_rust_prop_row("Apophis", 0.0),
+            method_row("Apophis", "rust", "second_order", "propagation"),
+            mix,
+        ];
+        let dir = tempfile::tempdir().unwrap();
+        let out = dir.path().join("report.html");
+        generate_report(&rows, &[], &out, None, None).unwrap();
+        let html = std::fs::read_to_string(&out).unwrap();
+        let data_bytes = std::fs::read(dir.path().join("report.data.json")).unwrap();
+        // The new fields reached the sidecar.
+        let data_str = String::from_utf8(data_bytes.clone()).unwrap();
+        assert!(data_str.contains("second_order_detection_on"));
+        assert!(data_str.contains("mix_n_sky_linearization_refused"));
+        // Parse the inline descriptor and verify it against the sidecar the
+        // way the page's loadDataset() does.
+        let marker = "\"file\":\"report.data.json\"";
+        let i = html.find(marker).expect("inline descriptor missing");
+        let start = html[..i].rfind('{').unwrap();
+        let end = start + html[start..].find('}').unwrap() + 1;
+        let desc: serde_json::Value = serde_json::from_str(&html[start..end]).unwrap();
+        let parsed: serde_json::Value = serde_json::from_slice(&data_bytes).unwrap();
+        assert_eq!(desc["bytes"].as_u64().unwrap() as usize, data_bytes.len());
+        assert_eq!(
+            desc["rows"].as_u64().unwrap() as usize,
+            parsed.as_array().unwrap().len()
+        );
+        assert_eq!(desc["rows"].as_u64().unwrap() as usize, rows.len());
+        assert_eq!(desc["hash"].as_str().unwrap(), fnv1a32_hex(&data_bytes));
     }
 }
