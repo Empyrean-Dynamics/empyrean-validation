@@ -2244,7 +2244,40 @@ fn aggregate(
         per_window_note,
         calibration,
         calibration_note,
+        engine_versions: collect_engine_versions(windows),
     }
+}
+
+/// The distinct `engine_version` strings each (tool, config arm) series' window
+/// rows recorded, grouped per series — the per-series engine identity the
+/// aggregate carries from the walk. A series whose rows recorded no version
+/// contributes no entry (a walk written before the field, or a tool that never
+/// records one), so a walk with no engine identity at all yields an empty
+/// vector and the report marks the engine "not recorded by the walk" rather
+/// than fabricating a build. Order is stable (series sorted, versions sorted
+/// and deduplicated).
+fn collect_engine_versions(
+    windows: &[WalkWindowRecord],
+) -> Vec<crate::predict_schema::SeriesEngineVersions> {
+    let mut per_series: BTreeMap<(String, String), BTreeSet<String>> = BTreeMap::new();
+    for w in windows {
+        if let Some(v) = &w.engine_version {
+            per_series
+                .entry((w.tool.clone(), w.config_arm.clone()))
+                .or_default()
+                .insert(v.clone());
+        }
+    }
+    per_series
+        .into_iter()
+        .map(
+            |((tool, config_arm), versions)| crate::predict_schema::SeriesEngineVersions {
+                tool,
+                config_arm,
+                versions: versions.into_iter().collect(),
+            },
+        )
+        .collect()
 }
 
 /// The profile a walk was scored under, derived from the window manifest and
@@ -2935,7 +2968,37 @@ mod tests {
             predict_time_ms: Some(1.0),
             captured: None,
             covariance_provenance: None,
+            engine_version: None,
         }
+    }
+
+    #[test]
+    fn engine_versions_group_per_series_dedup_and_skip_absent() {
+        let mk = |tool: &str, arm: &str, ver: Option<&str>| {
+            let mut w = window_record(tool, arm, Some(1.0));
+            w.engine_version = ver.map(Into::into);
+            w
+        };
+        let ws = vec![
+            mk("rust", "efcc.adap.nonight.n", Some("empyrean 0.10.0")),
+            mk("rust", "efcc.adap.nonight.n", Some("empyrean 0.10.0")), // duplicate
+            mk("rust", "efcc.blun.nonight.t4", Some("empyrean 0.10.0")),
+            mk("rust", "efcc.blun.nonight.t4", None), // absent → no contribution
+        ];
+        let ev = collect_engine_versions(&ws);
+        assert_eq!(ev.len(), 2, "one entry per (tool, config arm) series");
+        for e in &ev {
+            assert_eq!(
+                e.versions,
+                vec!["empyrean 0.10.0".to_string()],
+                "duplicate versions are deduplicated"
+            );
+        }
+        // A walk that recorded no engine version at all contributes nothing, so
+        // the aggregate's engine_versions stays empty (the report then states
+        // "engine not recorded by the walk").
+        let none = vec![mk("rust", "efcc.adap.nonight.n", None)];
+        assert!(collect_engine_versions(&none).is_empty());
     }
 
     // ── Part 4.2A coverage v2: arc split, trust-unconditioned, per-row ──────
@@ -3666,6 +3729,7 @@ mod tests {
             predict_time_ms: Some(1.0),
             captured: None,
             covariance_provenance: None,
+            engine_version: None,
         }];
         let (scored, sp, __ec) = score_all(&m, &preds, &windows, &opts()).unwrap();
         assert_eq!(scored.len(), n);

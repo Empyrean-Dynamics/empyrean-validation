@@ -6602,6 +6602,7 @@ pub fn merge_predict_aggregates(
         merged.per_window.extend(next.per_window);
         merged.reduced_chi2.extend(next.reduced_chi2);
         merged.calibration.extend(next.calibration);
+        merged.engine_versions.extend(next.engine_versions);
         // A budget note from any input describes the merged family too — the
         // reduction already happened upstream and cannot be undone here.
         for (src, dst) in [
@@ -6797,6 +6798,7 @@ fn pw_arm_factors(arm: &str) -> [&'static str; 4] {
             "adap" => f[1] = "adap",
             "cmc" => f[1] = "cmc",
             "norej" => f[1] = "norej",
+            "blun" => f[1] = "blun",
             "nonight" => f[2] = "nonight",
             "vfc" => f[2] = "vfc",
             "mc" => f[3] = "mc",
@@ -6807,13 +6809,52 @@ fn pw_arm_factors(arm: &str) -> [&'static str; 4] {
     f
 }
 
+/// Whether an arm token is a Student-t error-model level `t<ν>` (`t4`, `t6`, …):
+/// a `t` followed by one or more digits. One definition so the error-model
+/// factor decodes the same wherever it appears.
+fn pw_is_student_t_token(tok: &str) -> bool {
+    tok.len() >= 2 && tok.starts_with('t') && tok.as_bytes()[1..].iter().all(u8::is_ascii_digit)
+}
+
+/// The reader word for the error-model level an arm carries: `n` → "normal",
+/// `t<ν>` → "Student-t (ν=<ν>)" (owner, 2026-10-18: add error model). `None`
+/// when the arm declares no error law (every production arm), so the factor
+/// does not apply to it. The raw token never leaves this function.
+fn pw_error_model_word(arm: &str) -> Option<String> {
+    for t in pw_arm_tokens(arm) {
+        if t == "n" {
+            return Some("normal".to_string());
+        }
+        if pw_is_student_t_token(t) {
+            return Some(format!("Student-t (ν={})", &t[1..]));
+        }
+    }
+    None
+}
+
+/// The reader word for the covariance-information level an arm carries: `exp`
+/// → "expected information", otherwise the recorded default "observed
+/// information". `None` for an arm that declares no error law, since the two
+/// axes are recorded together; the raw token never leaves this function.
+fn pw_information_word(arm: &str) -> Option<&'static str> {
+    pw_error_model_word(arm)?;
+    if pw_arm_tokens(arm).any(|t| t == "exp") {
+        Some("expected information")
+    } else {
+        Some("observed information")
+    }
+}
+
 /// The factor a single arm token belongs to (for the main-effects factor column).
 fn pw_token_factor(tok: &str) -> &'static str {
     match tok {
         "efcc" | "nodeb" => "debias",
-        "adap" | "cmc" | "norej" => "rejection",
+        "adap" | "cmc" | "norej" | "blun" => "rejection",
         "nonight" | "vfc" => "nightly",
         "mc" | "sp" => "transport",
+        "n" => "error model",
+        "exp" => "information",
+        _ if pw_is_student_t_token(tok) => "error model",
         _ => "",
     }
 }
@@ -6833,6 +6874,7 @@ fn pw_factor_word(factor: usize, tok: &str) -> &'static str {
         (1, "adap") => "adaptive",
         (1, "cmc") => "CMC",
         (1, "norej") => "no rejection",
+        (1, "blun") => "blunder",
         (2, "vfc") => "nightly",
         (2, "nonight") => "per-obs",
         (3, "mc") => "Monte Carlo",
@@ -6872,6 +6914,90 @@ fn pw_arm_chip(arm: &str) -> String {
         attr_escape(arm),
         attr_escape(&words)
     )
+}
+
+/// A configuration factor a walk run can sweep, in page display order. The
+/// error-model and information factors are the 2026-10-18 additions (owner:
+/// "add error model"). One definition so the run block's factor × level table,
+/// arm list and ranking all name and order factors identically, and every
+/// level renders as a reader word (never a raw arm token).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PwFactor {
+    Debias,
+    Rejection,
+    Nightly,
+    ErrorModel,
+    Information,
+    Transport,
+}
+
+impl PwFactor {
+    /// Every factor in page display order.
+    const ALL: [PwFactor; 6] = [
+        PwFactor::Debias,
+        PwFactor::Rejection,
+        PwFactor::Nightly,
+        PwFactor::ErrorModel,
+        PwFactor::Information,
+        PwFactor::Transport,
+    ];
+
+    /// The factor's reader name for a header or factor column.
+    fn name(self) -> &'static str {
+        match self {
+            PwFactor::Debias => "debias",
+            PwFactor::Rejection => "rejection",
+            PwFactor::Nightly => "nightly",
+            PwFactor::ErrorModel => "error model",
+            PwFactor::Information => "information",
+            PwFactor::Transport => "transport",
+        }
+    }
+
+    /// The reader word for the level an arm carries under this factor, or `None`
+    /// when the factor does not apply to the arm (then it is not a level). Raw
+    /// tokens never leave this function.
+    fn level(self, arm: &str) -> Option<String> {
+        let f = pw_arm_factors(arm);
+        let word = |idx: usize, tok: &str| {
+            let w = pw_factor_word(idx, tok);
+            (w != "—").then(|| w.to_string())
+        };
+        match self {
+            PwFactor::Debias => word(0, f[0]),
+            PwFactor::Rejection => word(1, f[1]),
+            PwFactor::Nightly => word(2, f[2]),
+            // Transport always applies — an arm with neither `mc` nor `sp` is
+            // linear, the recorded default.
+            PwFactor::Transport => Some(pw_factor_word(3, f[3]).to_string()),
+            PwFactor::ErrorModel => pw_error_model_word(arm),
+            PwFactor::Information => pw_information_word(arm).map(str::to_string),
+        }
+    }
+}
+
+/// The factors that VARY across an arm set — those with ≥ 2 distinct applicable
+/// levels — in display order. A factor with one level (or none that apply) is
+/// not swept and is not a column (today's rule, owner 2026-10-17).
+fn pw_varying_factors(arms: &[&str]) -> Vec<PwFactor> {
+    PwFactor::ALL
+        .into_iter()
+        .filter(|f| {
+            let levels: BTreeSet<String> = arms.iter().filter_map(|a| f.level(a)).collect();
+            levels.len() >= 2
+        })
+        .collect()
+}
+
+/// An arm rendered as the reader words of the given factors, joined by " · " —
+/// the arm's identity with no raw token on the page (neither visible nor on
+/// hover). Used by the run block's arm list and log-score ranking.
+fn pw_arm_words(arm: &str, factors: &[PwFactor]) -> String {
+    factors
+        .iter()
+        .filter_map(|f| f.level(arm))
+        .collect::<Vec<_>>()
+        .join(" · ")
 }
 
 /// The in-table calibration ruler for a 4.2C realism column: states the neutral
@@ -7786,13 +7912,183 @@ fn pw_marginals_html(agg: &PredictAggregates) -> String {
 }
 
 /// 4.2D — the configuration arms: arm × {median realism (joint, along, cross),
+/// An additional walk run rendered as its own 4.2 block, after the production
+/// 4.2D content: a head line (run · snapshot · profile · engine · arms · scored
+/// rows), the factor × level table over the factors that VARY in the run, the
+/// full arm list fold, the populated D-003 law-aware log-score ranking, and one
+/// ▸Method fold. It reuses [`pw_main_effects_html`] (factor sweep) and
+/// [`pw_log_score_table`]; it is never merged into the `--predict-agg` shards,
+/// and every absent provenance value is a named state, never blank.
+fn pw_run_block_html(agg: &PredictAggregates, label: &str) -> String {
+    // The arms the run walked (rust per-object presence), full axis order; the
+    // factors that distinguish them are the run's swept factors.
+    let all_arms = pw_all_arms(agg);
+    let run_arms: Vec<&str> = all_arms
+        .iter()
+        .copied()
+        .filter(|a| {
+            agg.per_object
+                .iter()
+                .any(|p| p.tool == "rust" && p.config_arm == *a)
+        })
+        .collect();
+    let factors = pw_varying_factors(&run_arms);
+
+    // Head-line provenance — each field a value or a NAMED absent state.
+    let profile = if agg.profile == "unstated" {
+        "profile unstated".to_string()
+    } else {
+        format!("profile {}", attr_escape(&agg.profile))
+    };
+    // Engine: the distinct versions the walk recorded on its window rows, or the
+    // named absent state when the walk recorded none (no hidden fallback).
+    let engine = {
+        let mut vers: BTreeSet<&str> = BTreeSet::new();
+        for e in &agg.engine_versions {
+            for v in &e.versions {
+                vers.insert(v.as_str());
+            }
+        }
+        if vers.is_empty() {
+            "engine not recorded".to_string()
+        } else {
+            format!(
+                "engine {}",
+                attr_escape(&vers.into_iter().collect::<Vec<_>>().join(", "))
+            )
+        }
+    };
+    // Rows scored into the ranking: the held-out rows pooled per arm under its
+    // own law (the overall, class = all calibration cells).
+    let scored_rows: u64 = agg
+        .calibration
+        .iter()
+        .filter(|c| c.stratum == "overall" && c.class == "all" && c.mean_log_score.is_some())
+        .map(|c| u64::from(c.n_rows))
+        .sum();
+
+    let mut h = String::new();
+    h.push_str(&format!(
+        "<div class=\"panel-title\">{}</div>",
+        attr_escape(label)
+    ));
+    // Plain grid-summary (not a `reading` line): the head states every field on
+    // the face. Table bodies below carry the numbers (table-exempt).
+    h.push_str(&format!(
+        "<div class=\"grid-summary\" title=\"snapshot · profile · engine as the walk's window rows recorded it · arms · held-out rows scored per arm under its own law · populations pooled\">snapshot {} · {} · {} · {} arms · {} rows · all populations</div>",
+        attr_escape(&agg.snapshot_id),
+        profile,
+        engine,
+        run_arms.len(),
+        scored_rows,
+    ));
+
+    // The factor × level table over the factors that vary within this run.
+    h.push_str(&pw_main_effects_html(
+        agg,
+        &run_arms,
+        MainEffectsMode::Factors,
+    ));
+
+    // The full arm list fold: one row per arm, the varying factors as columns
+    // (reader words, never a raw slug) and the observed 1σ/2σ coverage.
+    let cov_cell = |v: Option<f64>| match v {
+        Some(x) => format!("<td class=\"gc\"><span class=\"cn\">{x:.3}</span></td>"),
+        None => "<td class=\"gc hatch\" title=\"no covered cell for this arm\"></td>".to_string(),
+    };
+    h.push_str("<details class=\"more-tables\"><summary>full arm list</summary>");
+    h.push_str("<div class=\"grid-scroll\"><table class=\"agrid pw-grid\" data-grid=\"predict\"><thead><tr>");
+    let mut first = true;
+    for f in &factors {
+        if first {
+            h.push_str(&format!("<th class=\"gobj\">{}</th>", f.name()));
+            first = false;
+        } else {
+            h.push_str(&format!("<th>{}</th>", f.name()));
+        }
+    }
+    if factors.is_empty() {
+        h.push_str("<th class=\"gobj\">arm</th>");
+    }
+    h.push_str(&format!(
+        "<th title=\"observed 1σ inside-ellipse fraction · normal-law χ²₂ expectation 0.3935\">{}</th><th title=\"observed 2σ inside-ellipse fraction · normal-law χ²₂ expectation 0.8647\">{}</th></tr></thead><tbody>",
+        uhdr("1σ obs"),
+        uhdr("2σ obs"),
+    ));
+    for arm in &run_arms {
+        let c1 = pw_median(
+            agg.cells
+                .iter()
+                .filter(|c| c.tool == "rust" && c.config_arm == **arm && c.n_objects >= 3)
+                .filter_map(|c| c.cov_1s),
+        );
+        let c2 = pw_median(
+            agg.cells
+                .iter()
+                .filter(|c| c.tool == "rust" && c.config_arm == **arm && c.n_objects >= 3)
+                .filter_map(|c| c.cov_2s),
+        );
+        h.push_str("<tr>");
+        if factors.is_empty() {
+            h.push_str(&format!(
+                "<td class=\"gtool\">{}</td>",
+                attr_escape(&pw_arm_words(arm, &PwFactor::ALL))
+            ));
+        } else {
+            let mut cells = factors.iter().enumerate();
+            for (i, f) in cells.by_ref() {
+                let lvl = f.level(arm).unwrap_or_else(|| "—".into());
+                if i == 0 {
+                    h.push_str(&format!("<td class=\"gtool\">{}</td>", attr_escape(&lvl)));
+                } else {
+                    h.push_str(&format!("<td>{}</td>", attr_escape(&lvl)));
+                }
+            }
+        }
+        h.push_str(&cov_cell(c1));
+        h.push_str(&cov_cell(c2));
+        h.push_str("</tr>");
+    }
+    h.push_str("</tbody></table></div></details>");
+
+    // The D-003 law-aware log-score ranking from this run's calibration cells.
+    h.push_str(&pw_log_score_table(agg));
+
+    // One ▸Method fold — the method only, no narrative about what ships where.
+    h.push_str("<div class=\"disclosures\"><details><summary>");
+    h.push_str(DISCLOSURE_SUMMARY);
+    h.push_str("</summary><div class=\"disc-body\">An additional walk run, scored by this report's own scorer and rendered on its own, never pooled with the production walk. Each arm is scored under its own recorded error law: normal, or Student-t with ν degrees of freedom as both the per-observation error law in the fit and the predictive density in scoring. The log score is the mean log predictive density under that arm's own law; a higher (less negative) value is the better predictive density. It is shown over two regimes: all held-out rows, and the observation-dominated rows (prediction-to-observation trace ratio &lt; 0.1), where the propagated covariance is small against the observation σ, so the predictive covariance is essentially the σ table and the score tests the error law and the σ table; the remaining rows (trace ratio ≥ 0.1) are where the propagated covariance carries the prediction and the score tests it — the two differ by a factor of two to three, so each is named. The standard error is night-clustered. Δ vs the baseline arm is the difference of the two arms' observation-dominated means with the standard error in quadrature — a difference of means, not a paired statistic. The factor × level table sweeps one factor over the arms that vary and marginalizes the rest; the full arm list is every arm, its varying-factor levels and observed 1σ/2σ coverage. Every absent value is a named state, never blank.</div></details></div>");
+    h
+}
+
+/// Which 4.2D view [`pw_arms_calibration_html`] renders.
+enum ArmsView<'a> {
+    /// The production 4.2D: token-sweep main effects, the full factor grid, the
+    /// full arm list, the `log-score absent` mark, and the ranking gated on a
+    /// Student-t arm. One ▸Method fold.
+    Production,
+    /// An additional walk run as its own block after the production 4.2D
+    /// content: a head line, the factor × level table over the factors that
+    /// vary, the full arm list fold, and the populated D-003 log-score ranking.
+    /// One ▸Method fold describing the method only.
+    Run { label: &'a str },
+}
+
 /// χ²₂-99% tail, median reduced-χ²}, plus a main-effects sub-matrix. Every arm
 /// at once, numbers only, no ranking word.
 /// 4.2D — configuration arms and calibration, merged (S3 item 2): one factor ×
 /// level table (marginal realism · 1σ obs · 2σ obs · arms), one `full factor
 /// grid`, one `full arm list`, one Method. The `log-score absent` mark stays and
 /// the D-003 log-score ranking table (populated or awaiting Student-t) follows.
-fn pw_arms_calibration_html(agg: &PredictAggregates) -> String {
+///
+/// With [`ArmsView::Run`] the same builders render an additional run as its own
+/// block (head line, factor × level over the factors that vary, full arm list
+/// fold, populated ranking) rather than the production 4.2D — never merged into
+/// the `--predict-agg` shards.
+fn pw_arms_calibration_html(agg: &PredictAggregates, view: ArmsView) -> String {
+    if let ArmsView::Run { label } = view {
+        return pw_run_block_html(agg, label);
+    }
     // Every arm present in the aggregate (the shared full arm axis), so the count
     // reconciles with 4.2A and no arm is silently dropped. Per-arm statistics below
     // come from the rust per-object summaries (the true per-object statistic); an
@@ -7865,7 +8161,11 @@ fn pw_arms_calibration_html(agg: &PredictAggregates) -> String {
                 .any(|p| p.tool == "rust" && p.config_arm == *a)
         })
         .collect();
-    h.push_str(&pw_main_effects_html(agg, &rust_arms));
+    h.push_str(&pw_main_effects_html(
+        agg,
+        &rust_arms,
+        MainEffectsMode::Tokens,
+    ));
     h.push_str("<details class=\"more-tables\"><summary>full factor grid</summary>");
     h.push_str(&format!(
         "<div class=\"grid-scroll\"><table class=\"agrid pw-grid\" data-grid=\"predict\"><thead><tr><th class=\"gobj\">debias</th><th>rejection</th><th>nightly</th><th>transport</th><th title=\"joint median realism\">{}{RV_RULER}</th><th title=\"along-track median realism\">{}{RV_RULER}</th><th title=\"cross-track median realism\">{}{RV_RULER}</th><th>{}</th><th>{}</th><th>objects</th></tr></thead><tbody>",
@@ -8040,22 +8340,66 @@ fn pw_arms_calibration_html(agg: &PredictAggregates) -> String {
     h
 }
 
-/// The 4.2D main-effects table: for each factor token that varies across the arm
-/// set, the marginal median realism and the observed 1σ/2σ coverage at each of
-/// its levels — Configuration arms and Calibration merged into one (S3 item 2).
-fn pw_main_effects_html(agg: &PredictAggregates, arms: &[&str]) -> String {
-    // Treat each distinct factor token (debias efcc/nodeb, rejection adap/cmc/norej,
-    // nightly nonight/vfc, transport mc/sp) as a level and group the arms that carry
-    // it. Tokens come from [`pw_arm_tokens`] (the real `.`/`+`/`_` delimiters);
-    // splitting on `_` alone left each slug one token and emptied the sub-matrix.
-    // A token carried by only one arm is not a swept level and is skipped below.
-    let mut tokens: BTreeSet<&str> = BTreeSet::new();
-    for a in arms {
-        for t in pw_arm_tokens(a) {
-            tokens.insert(t);
+/// How [`pw_main_effects_html`] enumerates the swept levels.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum MainEffectsMode {
+    /// Production 4.2D: one row per arm TOKEN carried by ≥ 2 arms, the factor
+    /// name from [`pw_token_factor`] and the raw token as the level. Byte-stable
+    /// with the pre-2026-10-18 render.
+    Tokens,
+    /// An additional run: one row per LEVEL of each factor that has ≥ 2 distinct
+    /// applicable levels among the arms (the factors that VARY), levels as
+    /// reader words, the absent-token default level included. Raw tokens never
+    /// reach the page.
+    Factors,
+}
+
+/// The 4.2D main-effects table: for each factor that varies across the arm set,
+/// the marginal median realism and the observed 1σ/2σ coverage at each of its
+/// levels — Configuration arms and Calibration merged into one (S3 item 2).
+fn pw_main_effects_html(agg: &PredictAggregates, arms: &[&str], mode: MainEffectsMode) -> String {
+    // The sweep rows as (factor name, level display, matching arms). Tokens mode
+    // treats each distinct `.`/`+`/`_` token in ≥ 2 arms as a level with the raw
+    // token shown; Factors mode groups arms by each varying factor's reader-word
+    // level (and so represents an absent-token default level like "observed
+    // information", which the token sweep cannot). The row render below is one
+    // path for both.
+    let mut sweeps: Vec<(&str, String, Vec<&str>)> = Vec::new();
+    match mode {
+        MainEffectsMode::Tokens => {
+            let mut tokens: BTreeSet<&str> = BTreeSet::new();
+            for a in arms {
+                for t in pw_arm_tokens(a) {
+                    tokens.insert(t);
+                }
+            }
+            for tok in tokens {
+                let matching: Vec<&str> = arms
+                    .iter()
+                    .copied()
+                    .filter(|a| pw_arm_tokens(a).any(|t| t == tok))
+                    .collect();
+                if matching.len() < 2 {
+                    continue; // a token carried by one arm is not a swept level
+                }
+                sweeps.push((pw_token_factor(tok), tok.to_string(), matching));
+            }
+        }
+        MainEffectsMode::Factors => {
+            for f in pw_varying_factors(arms) {
+                let mut by_level: BTreeMap<String, Vec<&str>> = BTreeMap::new();
+                for a in arms {
+                    if let Some(lvl) = f.level(a) {
+                        by_level.entry(lvl).or_default().push(a);
+                    }
+                }
+                for (lvl, matching) in by_level {
+                    sweeps.push((f.name(), lvl, matching));
+                }
+            }
         }
     }
-    if tokens.is_empty() {
+    if sweeps.is_empty() {
         return String::new();
     }
     // The sub-matrix label rides in the header cell (table content, exempt from
@@ -8075,15 +8419,7 @@ fn pw_main_effects_html(agg: &PredictAggregates, arms: &[&str]) -> String {
         uhdr("1σ obs"),
         uhdr("2σ obs"),
     ));
-    for tok in &tokens {
-        let matching: Vec<&str> = arms
-            .iter()
-            .copied()
-            .filter(|a| pw_arm_tokens(a).any(|t| t == *tok))
-            .collect();
-        if matching.len() < 2 {
-            continue; // a token carried by one arm is not a swept level
-        }
+    for (factor, level, matching) in &sweeps {
         let real = pw_median(
             agg.per_object
                 .iter()
@@ -8094,32 +8430,24 @@ fn pw_main_effects_html(agg: &PredictAggregates, arms: &[&str]) -> String {
             Some(v) => (realism_bin(v).0, format!("{v:.2}")),
             None => ("rv0", "—".into()),
         };
-        let c1 = pw_median(
-            agg.cells
-                .iter()
-                .filter(|c| {
-                    c.tool == "rust"
-                        && c.n_objects >= 3
-                        && matching.iter().any(|a| *a == c.config_arm)
-                })
-                .filter_map(|c| c.cov_1s),
-        );
-        let c2 = pw_median(
-            agg.cells
-                .iter()
-                .filter(|c| {
-                    c.tool == "rust"
-                        && c.n_objects >= 3
-                        && matching.iter().any(|a| *a == c.config_arm)
-                })
-                .filter_map(|c| c.cov_2s),
-        );
+        let cov_med = |pick: fn(&SurfaceCell) -> Option<f64>| {
+            pw_median(
+                agg.cells
+                    .iter()
+                    .filter(|c| {
+                        c.tool == "rust"
+                            && c.n_objects >= 3
+                            && matching.iter().any(|a| *a == c.config_arm)
+                    })
+                    .filter_map(pick),
+            )
+        };
         h.push_str(&format!(
             "<tr><td class=\"gtool\">{}</td><td>{}</td><td class=\"gc {cls}\"><span class=\"cn\">{txt}</span></td>{}{}<td class=\"r1c\"><span class=\"cn-n\">{}</span></td></tr>",
-            pw_token_factor(tok),
-            attr_escape(tok),
-            cov_cell(c1),
-            cov_cell(c2),
+            factor,
+            attr_escape(level),
+            cov_cell(cov_med(|c| c.cov_1s)),
+            cov_cell(cov_med(|c| c.cov_2s)),
             matching.len(),
         ));
     }
@@ -8223,40 +8551,120 @@ fn pw_objects_html(agg: &PredictAggregates) -> String {
     h
 }
 
-/// The populated log-score ranking table, drawn only when a calibration cell
-/// carries a `mean_log_score` (i.e. a Student-t arm has run). A stated number
-/// with its SE — never a winner word.
+/// The D-003 law-aware log-score ranking, drawn from the run's (class = all)
+/// calibration cells — each arm under its own recorded law. The two regimes
+/// differ by a factor of two to three, so a single unlabelled column would
+/// mislead: each arm names both the `overall` stratum ("all held-out rows")
+/// and the `trace_band == "<0.1"` stratum ("observation-dominated rows"), each
+/// a mean log predictive density ± SE. Δ vs the run's baseline arm is the
+/// difference of the two arms' observation-dominated means, SE in quadrature
+/// (the cells carry no paired difference — never called paired). The arm is
+/// reader words (never a raw slug); the block is sorted by the
+/// observation-dominated column, best first. A stated number — never a winner
+/// word, never a rank mark.
 fn pw_log_score_table(agg: &PredictAggregates) -> String {
-    let mut rows: Vec<&CalibrationCell> = agg
-        .calibration
-        .iter()
-        .filter(|c| {
-            c.stratum == "overall"
+    // A (class = all) calibration cell for an arm at a given stratum / trace band.
+    let cell = |arm: &str, stratum: &str, band: Option<&str>| -> Option<&CalibrationCell> {
+        agg.calibration.iter().find(|c| {
+            c.config_arm == arm
                 && c.class == "all"
-                && c.scoring_law == "student-t"
+                && c.stratum == stratum
+                && c.trace_band.as_deref() == band
                 && c.mean_log_score.is_some()
         })
-        .collect();
-    rows.sort_by(|a, b| {
-        b.mean_log_score
-            .partial_cmp(&a.mean_log_score)
+    };
+    // One ranked arm per overall (class = all) cell that carries a score.
+    let mut arms: Vec<&str> = {
+        let mut v: BTreeSet<&str> = BTreeSet::new();
+        for c in &agg.calibration {
+            if c.stratum == "overall" && c.class == "all" && c.mean_log_score.is_some() {
+                v.insert(c.config_arm.as_str());
+            }
+        }
+        v.into_iter().collect()
+    };
+    // The observation-dominated mean is the sort key (best / least negative
+    // first); an arm with no such cell sorts last, never silently dropped.
+    let obsdom = |arm: &str| cell(arm, "trace_band", Some("<0.1")).and_then(|c| c.mean_log_score);
+    arms.sort_by(|a, b| {
+        obsdom(b)
+            .partial_cmp(&obsdom(a))
             .unwrap_or(std::cmp::Ordering::Equal)
     });
+    // Arm identity as the words of the factors that vary across the ranked arms.
+    let factors = pw_varying_factors(&arms);
+    // The run's baseline arm (the series the difference is taken against).
+    let baseline = agg
+        .calibration
+        .iter()
+        .find_map(|c| c.baseline_series.clone());
+    let base_obsdom = baseline
+        .as_deref()
+        .and_then(|b| cell(b, "trace_band", Some("<0.1")));
+
+    let num = |c: Option<&CalibrationCell>| match c.and_then(|c| c.mean_log_score) {
+        Some(v) => {
+            let se = c.and_then(|c| c.mean_log_score_se);
+            match se {
+                Some(s) => format!("<span class=\"cn\">{v:.3} ± {s:.3}</span>"),
+                None => format!("<span class=\"cn\">{v:.3}</span>"),
+            }
+        }
+        None => "<span class=\"cn\">—</span>".to_string(),
+    };
+
     let mut h = String::from(
-        "<div class=\"grid-scroll\"><table class=\"agrid pw-grid\" data-grid=\"predict\"><thead><tr><th class=\"gobj\">log-score ranking — arm</th><th>",
+        "<div class=\"grid-scroll\"><table class=\"agrid pw-grid\" data-grid=\"predict\"><thead><tr><th class=\"gobj\">log-score ranking — arm</th><th>law</th><th title=\"mean log predictive density over every held-out row · ± night-clustered SE\">",
     );
-    h.push_str(&uhdr("mean log-score"));
-    h.push_str("</th><th>");
-    h.push_str(&uhdr("SE"));
-    h.push_str("</th><th>nights</th></tr></thead><tbody>");
-    for c in &rows {
+    h.push_str(&uhdr("all held-out rows"));
+    h.push_str("</th><th title=\"mean log predictive density over the observation-dominated rows (prediction-to-observation trace ratio &lt; 0.1), where the predicted covariance is small against the observation σ · ± night-clustered SE\">");
+    h.push_str(&uhdr("observation-dominated rows (trace ratio &lt; 0.1)"));
+    h.push_str("</th><th title=\"difference of means; SE in quadrature\">");
+    h.push_str(&uhdr("Δ vs baseline"));
+    h.push_str("</th><th title=\"observation-dominated nights\">nights</th></tr></thead><tbody>");
+    for arm in &arms {
+        let law = match cell(arm, "overall", None).map(|c| c.scoring_law.as_str()) {
+            Some("normal") => "normal".to_string(),
+            Some("student-t") => "Student-t".to_string(),
+            Some(other) => other.to_string(),
+            None => "—".to_string(),
+        };
+        let ov = cell(arm, "overall", None);
+        let od = cell(arm, "trace_band", Some("<0.1"));
+        let is_baseline = baseline.as_deref() == Some(*arm);
+        // Δ on the observation-dominated regime: the difference of this arm's and
+        // the baseline arm's means, SE in quadrature — not a paired statistic.
+        let delta = if is_baseline {
+            "baseline".to_string()
+        } else {
+            match (
+                od.and_then(|c| c.mean_log_score),
+                base_obsdom.and_then(|c| c.mean_log_score),
+            ) {
+                (Some(m), Some(mb)) => {
+                    let d = m - mb;
+                    match (
+                        od.and_then(|c| c.mean_log_score_se),
+                        base_obsdom.and_then(|c| c.mean_log_score_se),
+                    ) {
+                        (Some(s), Some(sb)) => {
+                            format!("{d:+.3} ± {:.3}", (s * s + sb * sb).sqrt())
+                        }
+                        _ => format!("{d:+.3}"),
+                    }
+                }
+                _ => "—".to_string(),
+            }
+        };
+        let nights = od.map(|c| c.n_nights).unwrap_or(0);
         h.push_str(&format!(
-            "<tr><td class=\"gtool\" title=\"{}\">{}</td><td class=\"gc\"><span class=\"cn\">{}</span></td><td class=\"gc\"><span class=\"cn\">{}</span></td><td class=\"r1c\"><span class=\"cn-n\">{}</span></td></tr>",
-            attr_escape(&c.scoring_law),
-            attr_escape(&c.config_arm),
-            c.mean_log_score.map(|v| format!("{v:.3}")).unwrap_or_else(|| "—".into()),
-            c.mean_log_score_se.map(|v| format!("{v:.3}")).unwrap_or_else(|| "—".into()),
-            c.n_nights,
+            "<tr><td class=\"gtool\">{}</td><td>{}</td><td class=\"gc\">{}</td><td class=\"gc\">{}</td><td class=\"gc\"><span class=\"cn\">{}</span></td><td class=\"r1c\"><span class=\"cn-n\">{}</span></td></tr>",
+            attr_escape(&pw_arm_words(arm, &factors)),
+            attr_escape(&law),
+            num(ov),
+            num(od),
+            attr_escape(&delta),
+            nights,
         ));
     }
     h.push_str("</tbody></table></div>");
@@ -8296,9 +8704,24 @@ fn pw_timeline_shell(agg: &PredictAggregates) -> String {
 
 /// Build Part 4.2 "Predictive power" — the `s15` section body. `None` (no walk
 /// loaded) renders the empty state; the section shell always renders.
-fn build_predictive_power_html(agg: Option<&PredictAggregates>) -> String {
+fn build_predictive_power_html(
+    agg: Option<&PredictAggregates>,
+    runs: &[PredictAggregates],
+) -> String {
     let Some(agg) = agg else {
-        return "<div class=\"grid-summary\" title=\"No walk-forward aggregate was supplied (report --predict-agg). Run score-predictions and pass its aggregate to populate this section.\">No walk-forward data in this report.</div>".to_string();
+        let mut h = String::from(
+            "<div class=\"grid-summary\" title=\"No walk-forward aggregate was supplied (report --predict-agg). Run score-predictions and pass its aggregate to populate this section.\">No walk-forward data in this report.</div>",
+        );
+        // An additional run still renders its own block — the production
+        // aggregate is independent of it.
+        for (i, run) in runs.iter().enumerate() {
+            let label = pw_run_label(runs.len(), i);
+            h.push_str(&pw_arms_calibration_html(
+                run,
+                ArmsView::Run { label: &label },
+            ));
+        }
+        return h;
     };
     // Provenance label (arms/classes/snapshot) is baked into 4.2A's one reading
     // line, server-side, so it is stated without a second reading line and
@@ -8315,10 +8738,29 @@ fn build_predictive_power_html(agg: Option<&PredictAggregates>) -> String {
     // 4.2E per-object walk, 4.2G timeline.
     h.push_str(&pw_surfaces_html(agg, &profile));
     h.push_str(&pw_marginals_html(agg));
-    h.push_str(&pw_arms_calibration_html(agg));
+    h.push_str(&pw_arms_calibration_html(agg, ArmsView::Production));
     h.push_str(&pw_objects_html(agg));
     h.push_str(&pw_timeline_shell(agg));
+    // Each additional walk RUN as its own block, after the production 4.2
+    // content; never merged into the --predict-agg shards.
+    for (i, run) in runs.iter().enumerate() {
+        let label = pw_run_label(runs.len(), i);
+        h.push_str(&pw_arms_calibration_html(
+            run,
+            ArmsView::Run { label: &label },
+        ));
+    }
     h
+}
+
+/// The head label for one additional run block: "Additional run" when the report
+/// carries a single extra run, else "Additional run N" (1-based).
+fn pw_run_label(total: usize, idx: usize) -> String {
+    if total <= 1 {
+        "Additional run".to_string()
+    } else {
+        format!("Additional run {}", idx + 1)
+    }
 }
 
 /// Generate the interactive HTML validation report.
@@ -8615,6 +9057,7 @@ pub fn generate_report(
     output: &Path,
     summary: Option<&Path>,
     predict_agg: Option<&crate::predict_schema::PredictAggregates>,
+    predict_runs: &[crate::predict_schema::PredictAggregates],
 ) -> Result<(), String> {
     let core_results: Vec<&ValidationResult> =
         results.iter().filter(|r| r.channel == "core").collect();
@@ -8892,7 +9335,7 @@ pub fn generate_report(
     let covariance_realism_html = build_covariance_realism_html(results, orbit_comparisons);
     // Part 4.2: the walk-forward predictive-power section. Server-rendered static
     // families; the per-object timeline travels to the client as a sidecar.
-    let predictive_power_html = build_predictive_power_html(predict_agg);
+    let predictive_power_html = build_predictive_power_html(predict_agg, predict_runs);
     // Timing (empyrean-52esa pass 6): the selected pair's per-object / per-population
     // wall clock in Section 1 (one per axis, 1.1C/1.2C/1.3C), all cross-tool
     // wall-clock matrices in Part 2 (§2.2). One place resolves the empyrean
@@ -11777,7 +12220,7 @@ mod tests {
         let rows = vec![synthetic_rust_prop_row("Apophis", 0.0)];
         let dir = tempfile::tempdir().unwrap();
         let out = dir.path().join("report.html");
-        generate_report(&rows, &[], &out, None, None).unwrap();
+        generate_report(&rows, &[], &out, None, None, &[]).unwrap();
         let html = std::fs::read_to_string(&out).unwrap();
 
         // The light page ground the finding measured against.
@@ -11873,7 +12316,7 @@ mod tests {
         let (rows, cmps) = radar_scenario();
         let dir = tempfile::tempdir().unwrap();
         let out = dir.path().join("report.html");
-        generate_report(&rows, &cmps, &out, None, None).unwrap();
+        generate_report(&rows, &cmps, &out, None, None, &[]).unwrap();
         let raw = std::fs::read_to_string(&out).unwrap();
         // Excise <script>/<style> so `<th>` literals in the client JS source
         // (headers the browser builds at runtime) are not scanned as markup.
@@ -11932,7 +12375,7 @@ mod tests {
         ];
         let dir = tempfile::tempdir().unwrap();
         let out = dir.path().join("report.html");
-        let result = generate_report(&rows, &[], &out, None, None);
+        let result = generate_report(&rows, &[], &out, None, None, &[]);
         assert!(result.is_ok(), "generate_report failed: {result:?}");
         let html = std::fs::read_to_string(&out).unwrap();
         assert!(html.contains("EMPYREAN"), "missing brand title");
@@ -11948,7 +12391,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let html = dir.path().join("report.html");
         let summary = dir.path().join("summary.json");
-        let result = generate_report(&rows, &[], &html, Some(&summary), None);
+        let result = generate_report(&rows, &[], &html, Some(&summary), None, &[]);
         assert!(result.is_ok());
         let summary_json = std::fs::read_to_string(&summary).unwrap();
         let v: serde_json::Value = serde_json::from_str(&summary_json).unwrap();
@@ -11986,7 +12429,7 @@ mod tests {
         }];
         let dir = tempfile::tempdir().unwrap();
         let out = dir.path().join("report.html");
-        generate_report(&rows, &comps, &out, None, None).unwrap();
+        generate_report(&rows, &comps, &out, None, None, &[]).unwrap();
         let html = std::fs::read_to_string(&out).unwrap();
         assert!(
             html.contains("Covariance realism"),
@@ -12090,7 +12533,7 @@ mod tests {
         ];
         let dir = tempfile::tempdir().unwrap();
         let out = dir.path().join("report.html");
-        generate_report(&rows, &[], &out, None, None).unwrap();
+        generate_report(&rows, &[], &out, None, None, &[]).unwrap();
         std::fs::read_to_string(&out).unwrap()
     }
 
@@ -12222,7 +12665,7 @@ mod tests {
         let agg = synthetic_predict_aggregates("snap");
         let dir = tempfile::tempdir().unwrap();
         let out = dir.path().join("report.html");
-        generate_report(&rows, &[], &out, None, Some(&agg)).unwrap();
+        generate_report(&rows, &[], &out, None, Some(&agg), &[]).unwrap();
         let raw = std::fs::read_to_string(&out).unwrap();
         let html = strip_tag(&strip_tag(&raw, "script"), "style");
         if let Some((tok, sid, ctx)) = scan(&html) {
@@ -12449,7 +12892,7 @@ mod tests {
         ];
         let dir = tempfile::tempdir().unwrap();
         let out = dir.path().join("report.html");
-        generate_report(&rows, &[], &out, None, None).unwrap();
+        generate_report(&rows, &[], &out, None, None, &[]).unwrap();
         let html = std::fs::read_to_string(&out).unwrap();
 
         // (1) the sibling dataset holds the verbatim serialization.
@@ -12581,8 +13024,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let a = dir.path().join("report_a.html");
         let b = dir.path().join("report_b.html");
-        generate_report(&rows, &[], &a, None, None).unwrap();
-        generate_report(&rows, &[], &b, None, None).unwrap();
+        generate_report(&rows, &[], &a, None, None, &[]).unwrap();
+        generate_report(&rows, &[], &b, None, None, &[]).unwrap();
         assert!(dir.path().join("report_a.data.json").exists());
         assert!(dir.path().join("report_b.data.json").exists());
         assert!(
@@ -12614,8 +13057,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let out1 = dir.path().join("r1.html");
         let out2 = dir.path().join("r2.html");
-        generate_report(&rows, &[], &out1, None, None).unwrap();
-        generate_report(&rows, &[], &out2, None, None).unwrap();
+        generate_report(&rows, &[], &out1, None, None, &[]).unwrap();
+        generate_report(&rows, &[], &out2, None, None, &[]).unwrap();
         // The ONLY intended difference is the dataset file name each page cites.
         let s1 = std::fs::read_to_string(&out1)
             .unwrap()
@@ -12670,7 +13113,7 @@ mod tests {
         }
         let dir = tempfile::tempdir().unwrap();
         let out = dir.path().join("report.html");
-        generate_report(&rows, &[], &out, None, None).unwrap();
+        generate_report(&rows, &[], &out, None, None, &[]).unwrap();
         let html = std::fs::read_to_string(&out).unwrap();
 
         // Exactly one hatch definition, everywhere on the page.
@@ -13467,7 +13910,7 @@ mod tests {
         let rows = timing_fixture();
         let dir = tempfile::tempdir().unwrap();
         let out = dir.path().join("report.html");
-        generate_report(&rows, &[], &out, None, None).unwrap();
+        generate_report(&rows, &[], &out, None, None, &[]).unwrap();
         let html = std::fs::read_to_string(&out).unwrap();
 
         let all = ["empyrean", "assist", "findorb", "jpl", "kete", "jorbit"];
@@ -13720,7 +14163,7 @@ mod tests {
     fn run_summary_is_ordered_into_the_appendix_and_the_page_opens_on_part_one() {
         let dir = tempfile::tempdir().unwrap();
         let out = dir.path().join("report.html");
-        generate_report(&timing_fixture(), &[], &out, None, None).unwrap();
+        generate_report(&timing_fixture(), &[], &out, None, None, &[]).unwrap();
         let html = std::fs::read_to_string(&out).unwrap();
         // S7 item 3: DOM order == visual order — no flex `order` reorders the
         // column, so byte position IS the on-page order. The page opens on Part 1
@@ -13751,7 +14194,7 @@ mod tests {
     fn part_two_hatched_cells_carry_their_reason_on_hover_only() {
         let dir = tempfile::tempdir().unwrap();
         let out = dir.path().join("report.html");
-        generate_report(&timing_fixture(), &[], &out, None, None).unwrap();
+        generate_report(&timing_fixture(), &[], &out, None, None, &[]).unwrap();
         let html = std::fs::read_to_string(&out).unwrap();
         // S7: Part 2 is the three sections between the part2 and part3 heads.
         let start = html.find("id=\"part2\"").expect("Part 2 head");
@@ -13828,7 +14271,7 @@ mod tests {
 
         let dir = tempfile::tempdir().unwrap();
         let out = dir.path().join("report.html");
-        generate_report(&timing_fixture(), &[], &out, None, None).unwrap();
+        generate_report(&timing_fixture(), &[], &out, None, None, &[]).unwrap();
         let html = std::fs::read_to_string(&out).unwrap();
         // S7: the rail names 2.1 by its axis (Propagation), never a "side by
         // side" ranking label.
@@ -13941,7 +14384,7 @@ mod tests {
         // console stays clean on the owner's local server.
         let dir = tempfile::tempdir().unwrap();
         let out = dir.path().join("report.html");
-        generate_report(&timing_fixture(), &[], &out, None, None).unwrap();
+        generate_report(&timing_fixture(), &[], &out, None, None, &[]).unwrap();
         let html = std::fs::read_to_string(&out).unwrap();
         let head = &html[..html.find("</head>").expect("head present")];
         assert!(
@@ -13955,7 +14398,7 @@ mod tests {
         let rows = timing_fixture();
         let dir = tempfile::tempdir().unwrap();
         let out = dir.path().join("report.html");
-        generate_report(&rows, &[], &out, None, None).unwrap();
+        generate_report(&rows, &[], &out, None, None, &[]).unwrap();
         let html = std::fs::read_to_string(&out).unwrap();
 
         let p2 = html.find("id=\"part2\"").expect("part2 anchor");
@@ -14009,7 +14452,7 @@ mod tests {
         assert_eq!(emp_eph_channel(&rows), ("core", true));
         let dir = tempfile::tempdir().unwrap();
         let out = dir.path().join("report.html");
-        generate_report(&rows, &[], &out, None, None).unwrap();
+        generate_report(&rows, &[], &out, None, None, &[]).unwrap();
         let html = std::fs::read_to_string(&out).unwrap();
         assert!(
             html.contains("core channel</span>"),
@@ -14038,7 +14481,7 @@ mod tests {
         assert_eq!(picked, vec![5.0], "the rust ephemeris value must be used");
         let dir2 = tempfile::tempdir().unwrap();
         let out2 = dir2.path().join("report.html");
-        generate_report(&rows2, &[], &out2, None, None).unwrap();
+        generate_report(&rows2, &[], &out2, None, None, &[]).unwrap();
         let html2 = std::fs::read_to_string(&out2).unwrap();
         assert!(
             !html2.contains("core channel</span>"),
@@ -14130,6 +14573,7 @@ mod tests {
             &out,
             None,
             None,
+            &[],
         )
         .unwrap();
         let html = std::fs::read_to_string(&out).unwrap();
@@ -14340,7 +14784,7 @@ mod tests {
     fn render_rows(rows: &[ValidationResult]) -> String {
         let dir = tempfile::tempdir().unwrap();
         let out = dir.path().join("report.html");
-        generate_report(rows, &[], &out, None, None).unwrap();
+        generate_report(rows, &[], &out, None, None, &[]).unwrap();
         std::fs::read_to_string(&out).unwrap()
     }
 
@@ -14682,7 +15126,7 @@ mod tests {
         let agg = synthetic_predict_aggregates("snap");
         let dir = tempfile::tempdir().unwrap();
         let out = dir.path().join("report.html");
-        generate_report(&rows, &[], &out, None, Some(&agg)).unwrap();
+        generate_report(&rows, &[], &out, None, Some(&agg), &[]).unwrap();
         let html = std::fs::read_to_string(&out).unwrap();
         let f = html
             .find("function drawWalkTimeline(")
@@ -14718,7 +15162,7 @@ mod tests {
         let agg = synthetic_predict_aggregates("snap");
         let dir = tempfile::tempdir().unwrap();
         let out = dir.path().join("report.html");
-        generate_report(&rows, &[], &out, None, Some(&agg)).unwrap();
+        generate_report(&rows, &[], &out, None, Some(&agg), &[]).unwrap();
         let html = std::fs::read_to_string(&out).unwrap();
         let mut n_tables = 0usize;
         let mut idx = 0usize;
@@ -14937,7 +15381,7 @@ mod tests {
         // inside the merged 1.2 section (s06), between the B and C slot anchors.
         let dir = tempfile::tempdir().unwrap();
         let out = dir.path().join("report.html");
-        generate_report(&timing_fixture(), &[], &out, None, None).unwrap();
+        generate_report(&timing_fixture(), &[], &out, None, None, &[]).unwrap();
         let html = std::fs::read_to_string(&out).unwrap();
 
         // The old split sections no longer exist as section anchors.
@@ -14990,7 +15434,7 @@ mod tests {
         // section.
         let dir = tempfile::tempdir().unwrap();
         let out = dir.path().join("report.html");
-        generate_report(&timing_fixture(), &[], &out, None, None).unwrap();
+        generate_report(&timing_fixture(), &[], &out, None, None, &[]).unwrap();
         let html = std::fs::read_to_string(&out).unwrap();
         let num = |sid: &str| -> String {
             let at = html
@@ -15043,7 +15487,7 @@ mod tests {
         // read from the rows, in the eyebrow role under the title.
         let dir = tempfile::tempdir().unwrap();
         let out = dir.path().join("report.html");
-        generate_report(&timing_fixture(), &[], &out, None, None).unwrap();
+        generate_report(&timing_fixture(), &[], &out, None, None, &[]).unwrap();
         let html = std::fs::read_to_string(&out).unwrap();
         let bar = html.find("id=\"part1-bar\"").expect("part1-bar");
         let p2 = html[bar..].find("id=\"part2\"").map(|e| bar + e).unwrap();
@@ -15078,7 +15522,7 @@ mod tests {
         // · error growth / · cost / · outliers entries are gone.
         let dir = tempfile::tempdir().unwrap();
         let out = dir.path().join("report.html");
-        generate_report(&timing_fixture(), &[], &out, None, None).unwrap();
+        generate_report(&timing_fixture(), &[], &out, None, None, &[]).unwrap();
         let html = std::fs::read_to_string(&out).unwrap();
         let rail_at = html.find("<nav class=\"rail\"").expect("rail");
         let rail_end = html[rail_at..].find("</nav>").map(|e| rail_at + e).unwrap();
@@ -15120,7 +15564,7 @@ mod tests {
         // also keeps the ▸outliers itemised runaway list.
         let dir = tempfile::tempdir().unwrap();
         let out = dir.path().join("report.html");
-        generate_report(&timing_fixture(), &[], &out, None, None).unwrap();
+        generate_report(&timing_fixture(), &[], &out, None, None, &[]).unwrap();
         let html = std::fs::read_to_string(&out).unwrap();
         let count_methods = |a: &str, b: &str| -> usize {
             let lo = html.find(a).unwrap();
@@ -15161,7 +15605,7 @@ mod tests {
         let (rows, cmp) = radar_scenario();
         let dir = tempfile::tempdir().unwrap();
         let out = dir.path().join("report.html");
-        generate_report(&rows, &cmp, &out, None, None).unwrap();
+        generate_report(&rows, &cmp, &out, None, None, &[]).unwrap();
         let html = std::fs::read_to_string(&out).unwrap();
         assert!(
             !html.contains("Δr @epoch") && !html.contains("not in the sidecar schema yet"),
@@ -15194,7 +15638,7 @@ mod tests {
         // per-chart drawers and the divergent gMed estimator are gone.
         let dir = tempfile::tempdir().unwrap();
         let out = dir.path().join("report.html");
-        generate_report(&timing_fixture(), &[], &out, None, None).unwrap();
+        generate_report(&timing_fixture(), &[], &out, None, None, &[]).unwrap();
         let html = std::fs::read_to_string(&out).unwrap();
         assert_eq!(
             html.matches("function drawGrowthChart(").count(),
@@ -15241,7 +15685,7 @@ mod tests {
         // ephemeris canonical, 520px). The card class is defined exactly once.
         let dir = tempfile::tempdir().unwrap();
         let out = dir.path().join("report.html");
-        generate_report(&timing_fixture(), &[], &out, None, None).unwrap();
+        generate_report(&timing_fixture(), &[], &out, None, None, &[]).unwrap();
         let html = std::fs::read_to_string(&out).unwrap();
         assert_eq!(
             html.matches(".chart-container {").count(),
@@ -15272,7 +15716,7 @@ mod tests {
         // token, re-theme on a flip, and keep the legend clear of the title band.
         let dir = tempfile::tempdir().unwrap();
         let out = dir.path().join("report.html");
-        generate_report(&timing_fixture(), &[], &out, None, None).unwrap();
+        generate_report(&timing_fixture(), &[], &out, None, None, &[]).unwrap();
         let html = std::fs::read_to_string(&out).unwrap();
 
         // The invisible ghost-grey literal is gone everywhere.
@@ -15593,7 +16037,7 @@ mod tests {
         let agg = synthetic_predict_aggregates("snap");
         let dir = tempfile::tempdir().unwrap();
         let out = dir.path().join("report.html");
-        generate_report(&rows, &[], &out, None, Some(&agg)).unwrap();
+        generate_report(&rows, &[], &out, None, Some(&agg), &[]).unwrap();
         let html = std::fs::read_to_string(&out).unwrap();
         // The 4.2 panel titles carry no hover caption (fails on the old structure).
         assert!(
@@ -16570,7 +17014,374 @@ mod tests {
             // Empty: the D-003 family has no data until a Student-t arm runs.
             calibration: Vec::new(),
             calibration_note: None,
+            // Empty: the production synthetic walk records no engine version,
+            // so the fixture exercises the "engine not recorded" marked state.
+            engine_versions: Vec::new(),
         }
+    }
+
+    /// A minimal per-object walk summary for the run-block fixture.
+    fn run_ows(object: &str, arm: &str, med_d2: f64) -> ObjectWalkSummary {
+        ObjectWalkSummary {
+            object: object.into(),
+            class: "NEA".into(),
+            tool: "rust".into(),
+            config_arm: arm.into(),
+            n_windows_expected: 4,
+            n_windows_converged: 4,
+            n_windows_failed: 0,
+            n_predictions: 16,
+            med_d2_norm: Some(med_d2),
+            n_predictions_incl_flagged: 0,
+            med_d2_norm_incl_flagged: None,
+            flag_counts: Default::default(),
+            trust_reasons: Default::default(),
+            med_sep_arcsec: Some(0.9),
+            cov_1s: Some(0.39),
+            cov_2s: Some(0.86),
+            cov_3s: Some(0.98),
+            cov_1s_at: Some(0.66),
+            cov_2s_at: Some(0.94),
+            cov_3s_at: Some(0.99),
+            cov_1s_ct: Some(0.71),
+            cov_2s_ct: Some(0.96),
+            cov_3s_ct: Some(0.99),
+            n_nights: 8,
+            med_z2_at_norm: Some(med_d2),
+            med_z2_ct_norm: Some(med_d2 * 0.8),
+            n_z_at: 8,
+            n_z_ct: 8,
+        }
+    }
+
+    /// A (class = all) calibration cell for the run-block fixture, at a given
+    /// stratum / trace band.
+    #[allow(clippy::too_many_arguments)]
+    fn run_cal(
+        arm: &str,
+        law: &str,
+        ref_law: &str,
+        mls: f64,
+        se: f64,
+        stratum: &str,
+        band: Option<&str>,
+    ) -> crate::predict_schema::CalibrationCell {
+        crate::predict_schema::CalibrationCell {
+            tool: "rust".into(),
+            config_arm: arm.into(),
+            sigma_table: "pinned".into(),
+            class: "all".into(),
+            scoring_law: law.into(),
+            reference_law: ref_law.into(),
+            stratum: stratum.into(),
+            arc_lo_days: None,
+            arc_hi_days: None,
+            dt_lo_days: None,
+            dt_hi_days: None,
+            trace_band: band.map(Into::into),
+            n_rows: 1000,
+            n_nights: 500,
+            mean_log_score: Some(mls),
+            mean_log_score_se: Some(se),
+            baseline_series: Some("efcc.adap.nonight.n".into()),
+            paired_dlog_score: None,
+            paired_dlog_score_se: None,
+            n_paired_nights: None,
+            n_paired_rows: None,
+            cvm_all_rows: None,
+            n_pit: 0,
+            cvm_per_night: None,
+            n_pit_nights: 0,
+            pit_hist: Vec::new(),
+            cov_obs_1: None,
+            cov_obs_4: None,
+            cov_obs_9: None,
+            cov_exp_1: None,
+            cov_exp_4: None,
+            cov_exp_9: None,
+            n_cov: 0,
+            cov_obs_1_at: None,
+            cov_obs_4_at: None,
+            cov_obs_9_at: None,
+            cov_obs_1_ct: None,
+            cov_obs_4_ct: None,
+            cov_obs_9_ct: None,
+            cov_exp_1_dir: None,
+            cov_exp_4_dir: None,
+            cov_exp_9_dir: None,
+            med_z2_at_norm: None,
+            med_z2_ct_norm: None,
+            n_cov_at: 0,
+            n_cov_ct: 0,
+        }
+    }
+
+    /// A synthetic additional-RUN aggregate: three arms over the error-model
+    /// (normal / Student-t ν=4) × rejection (adaptive / blunder) × information
+    /// (observed / expected) axes, each scored under its own law, with a
+    /// populated calibration ranking. `engine` sets the recorded engine
+    /// version(s) (None → the walk recorded none).
+    fn synthetic_run_aggregate(engine: Option<&str>) -> PredictAggregates {
+        // (arm, law, ref_law, overall mLS, overall SE, obs-dominated mLS, obs SE).
+        let arms = [
+            (
+                "efcc.adap.nonight.n",
+                "normal",
+                "chi2_2",
+                -5.69f64,
+                0.38,
+                -3.06,
+                0.23,
+            ),
+            (
+                "efcc.blun.nonight.t4",
+                "student-t",
+                "student_t(nu=4)",
+                -2.70,
+                0.11,
+                -1.66,
+                0.03,
+            ),
+            (
+                "efcc.blun.nonight.exp.t4",
+                "student-t",
+                "student_t(nu=4)",
+                -2.67,
+                0.12,
+                -1.71,
+                0.03,
+            ),
+        ];
+        let mut cells = Vec::new();
+        let mut per_object = Vec::new();
+        let mut calibration = Vec::new();
+        for (i, (arm, law, ref_law, mls, se, od_mls, od_se)) in arms.iter().enumerate() {
+            // One well-populated surface cell per arm (n ≥ 3) so coverage reads.
+            cells.push(pw_surface_cell(
+                ("NEA", "rust", arm),
+                (1.0, 3.0),
+                (0.3, 1.0),
+                5,
+                (Some(0.9), Some(1.0 + i as f64 * 0.1)),
+            ));
+            // Three objects per arm so the realism median has support.
+            for obj in ["Apophis", "Bennu", "Eros"] {
+                per_object.push(run_ows(obj, arm, 1.0 + i as f64 * 0.1));
+            }
+            // Both strata of the ranking: all held-out rows (overall) and the
+            // observation-dominated rows (trace ratio < 0.1).
+            calibration.push(run_cal(arm, law, ref_law, *mls, *se, "overall", None));
+            calibration.push(run_cal(
+                arm,
+                law,
+                ref_law,
+                *od_mls,
+                *od_se,
+                "trace_band",
+                Some("<0.1"),
+            ));
+        }
+        let engine_versions = engine
+            .map(|v| {
+                arms.iter()
+                    .map(|(arm, ..)| crate::predict_schema::SeriesEngineVersions {
+                        tool: "rust".into(),
+                        config_arm: (*arm).into(),
+                        versions: vec![v.to_string()],
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        PredictAggregates {
+            snapshot_id: "2026-07-29-75ab459bc8b2".into(),
+            profile: "ci".into(),
+            cells,
+            coverage_cells: Vec::new(),
+            per_object,
+            d2_histograms: Vec::new(),
+            per_window: Vec::new(),
+            reduced_chi2: Vec::new(),
+            per_window_note: None,
+            calibration,
+            calibration_note: None,
+            engine_versions,
+        }
+    }
+
+    #[test]
+    fn error_model_vocabulary_maps_tokens_to_reader_words() {
+        // The new factor tokens decode to reader words; the raw tokens never
+        // escape the mapping functions.
+        assert!(pw_is_student_t_token("t4"));
+        assert!(pw_is_student_t_token("t12"));
+        assert!(!pw_is_student_t_token("nonight"));
+        assert!(!pw_is_student_t_token("t"));
+        assert_eq!(
+            pw_error_model_word("efcc.adap.nonight.n").as_deref(),
+            Some("normal")
+        );
+        assert_eq!(
+            pw_error_model_word("efcc.blun.nonight.t4").as_deref(),
+            Some("Student-t (ν=4)")
+        );
+        assert_eq!(
+            pw_error_model_word("efcc.blun.nonight.t6").as_deref(),
+            Some("Student-t (ν=6)")
+        );
+        assert_eq!(pw_error_model_word("efcc.adap.vfc"), None);
+        assert_eq!(
+            pw_information_word("efcc.blun.nonight.exp.t4"),
+            Some("expected information")
+        );
+        assert_eq!(
+            pw_information_word("efcc.blun.nonight.t4"),
+            Some("observed information")
+        );
+        assert_eq!(pw_information_word("efcc.adap.vfc"), None);
+        assert_eq!(pw_token_factor("n"), "error model");
+        assert_eq!(pw_token_factor("t4"), "error model");
+        assert_eq!(pw_token_factor("exp"), "information");
+        assert_eq!(pw_token_factor("blun"), "rejection");
+        assert_eq!(pw_factor_word(1, "blun"), "blunder");
+    }
+
+    #[test]
+    fn varying_factors_include_error_model_and_information_not_constants() {
+        let arms = [
+            "efcc.adap.nonight.n",
+            "efcc.blun.nonight.t4",
+            "efcc.blun.nonight.exp.t4",
+        ];
+        let varying = pw_varying_factors(&arms);
+        // debias (all efcc) and nightly (all nonight) and transport (all linear)
+        // are constant → not swept. Rejection, error model, information vary.
+        assert!(varying.contains(&PwFactor::Rejection));
+        assert!(varying.contains(&PwFactor::ErrorModel));
+        assert!(varying.contains(&PwFactor::Information));
+        assert!(!varying.contains(&PwFactor::Debias));
+        assert!(!varying.contains(&PwFactor::Nightly));
+        assert!(!varying.contains(&PwFactor::Transport));
+    }
+
+    #[test]
+    fn run_block_renders_its_own_block_with_vocabulary_and_ranking() {
+        let rows = vec![synthetic_rust_prop_row("Apophis", 0.0)];
+        let agg = synthetic_predict_aggregates("2026-07-29-75ab459bc8b2");
+        let run = synthetic_run_aggregate(None);
+        let dir = tempfile::tempdir().unwrap();
+        let out = dir.path().join("report.html");
+        generate_report(
+            &rows,
+            &[],
+            &out,
+            None,
+            Some(&agg),
+            std::slice::from_ref(&run),
+        )
+        .unwrap();
+        let html = std::fs::read_to_string(&out).unwrap();
+
+        // The block renders as its own section with a head line.
+        assert!(
+            html.contains(">Additional run</div>"),
+            "run block panel-title"
+        );
+        // Head line fields, each a named value (engine not recorded by this walk).
+        assert!(
+            html.contains("engine not recorded"),
+            "a walk with no recorded engine version states the named absent state"
+        );
+        assert!(
+            html.contains("snapshot 2026-07-29-75ab459bc8b2"),
+            "head states the snapshot"
+        );
+        assert!(html.contains("3 arms"), "head states the arm count");
+        assert!(
+            html.contains("rows · all populations"),
+            "head names the pooled population scope (every population, class = all)"
+        );
+        // Error-model + information vocabulary on the page; never the raw tokens.
+        assert!(
+            html.contains("Student-t (ν=4)"),
+            "the error-model word renders"
+        );
+        assert!(
+            html.contains("expected information"),
+            "the information word renders"
+        );
+        assert!(
+            html.contains("observed information"),
+            "the default information word renders"
+        );
+        assert!(
+            html.contains("blunder"),
+            "the blunder rejection word renders"
+        );
+        // The populated D-003 ranking: both stratum columns named, the
+        // difference-of-means Δ column, and the baseline mark.
+        assert!(
+            html.contains("all held-out rows"),
+            "the ranking names the all-held-out-rows regime"
+        );
+        assert!(
+            html.contains("observation-dominated rows (trace ratio &lt; 0.1)"),
+            "the ranking names the observation-dominated regime"
+        );
+        assert!(
+            html.contains("Δ vs baseline"),
+            "the ranking carries the difference-vs-baseline column"
+        );
+        assert!(
+            html.contains("difference of means; SE in quadrature"),
+            "the Δ header hover states it is a difference of means, not paired"
+        );
+        assert!(
+            html.contains(">baseline</span>"),
+            "the baseline arm's Δ cell is marked, not blank"
+        );
+        assert!(
+            !html.contains("awaiting Student-t chain</td><td"),
+            "the run block's ranking is populated, not the marked-absent state"
+        );
+
+        // No raw arm slug leaks onto the page (text or hover) for the run arms.
+        for slug in [
+            "efcc.blun.nonight.exp.t4",
+            "efcc.blun.nonight.t4",
+            "efcc.adap.nonight.n",
+        ] {
+            assert!(
+                !html.contains(slug),
+                "the raw arm slug {slug} must never appear on the page"
+            );
+        }
+    }
+
+    #[test]
+    fn run_block_prints_recorded_engine_version() {
+        let rows = vec![synthetic_rust_prop_row("Apophis", 0.0)];
+        let agg = synthetic_predict_aggregates("2026-07-29-75ab459bc8b2");
+        let run = synthetic_run_aggregate(Some("empyrean 0.10.0"));
+        let dir = tempfile::tempdir().unwrap();
+        let out = dir.path().join("report.html");
+        generate_report(
+            &rows,
+            &[],
+            &out,
+            None,
+            Some(&agg),
+            std::slice::from_ref(&run),
+        )
+        .unwrap();
+        let html = std::fs::read_to_string(&out).unwrap();
+        assert!(
+            html.contains("engine empyrean 0.10.0"),
+            "a walk that recorded its engine version prints it in the head line"
+        );
+        assert!(
+            !html.contains("engine not recorded"),
+            "the recorded-engine head must not also state the absent marker"
+        );
     }
 
     /// True when the page carries a "D-00<digit>" ruling id anywhere.
@@ -16607,7 +17418,7 @@ mod tests {
         let agg = synthetic_predict_aggregates("2026-07-29-snap");
         let dir = tempfile::tempdir().unwrap();
         let out = dir.path().join("report.html");
-        generate_report(&rows, &[], &out, None, Some(&agg)).unwrap();
+        generate_report(&rows, &[], &out, None, Some(&agg), &[]).unwrap();
         let html = std::fs::read_to_string(&out).unwrap();
         assert!(html.contains("id=\"s15\""), "missing 4.2 anchor");
         assert!(html.contains("class=\"agrid pw-grid\""), "no 4.2 grids");
@@ -16644,7 +17455,7 @@ mod tests {
         let agg = synthetic_predict_aggregates("snap");
         let dir = tempfile::tempdir().unwrap();
         let out = dir.path().join("report.html");
-        generate_report(&rows, &[], &out, None, Some(&agg)).unwrap();
+        generate_report(&rows, &[], &out, None, Some(&agg), &[]).unwrap();
         let html = std::fs::read_to_string(&out).unwrap();
 
         // Count the numeric value spans (`<span class="cn">…`) inside one panel's
@@ -16709,7 +17520,7 @@ mod tests {
         let agg = synthetic_predict_aggregates("snap");
         let dir = tempfile::tempdir().unwrap();
         let out = dir.path().join("report.html");
-        generate_report(&rows, &[], &out, None, Some(&agg)).unwrap();
+        generate_report(&rows, &[], &out, None, Some(&agg), &[]).unwrap();
         let html = std::fs::read_to_string(&out).unwrap();
 
         let cs = html.find(">Coverage</div>").expect("4.2A Coverage panel");
@@ -16789,7 +17600,7 @@ mod tests {
         let agg = synthetic_predict_aggregates("snap");
         let dir = tempfile::tempdir().unwrap();
         let out = dir.path().join("report.html");
-        generate_report(&rows, &[], &out, None, Some(&agg)).unwrap();
+        generate_report(&rows, &[], &out, None, Some(&agg), &[]).unwrap();
         let html = std::fs::read_to_string(&out).unwrap();
         let cs = html.find(">Coverage</div>").expect("4.2A Coverage panel");
         let ce = html[cs..].find("Surfaces</div>").map(|i| cs + i).unwrap();
@@ -16855,7 +17666,7 @@ mod tests {
         ));
         let dir = tempfile::tempdir().unwrap();
         let out = dir.path().join("report.html");
-        generate_report(&rows, &[], &out, None, Some(&agg)).unwrap();
+        generate_report(&rows, &[], &out, None, Some(&agg), &[]).unwrap();
         let html = std::fs::read_to_string(&out).unwrap();
         let cs = html.find(">Coverage</div>").expect("4.2A Coverage panel");
         let ce = html[cs..].find("Surfaces</div>").map(|i| cs + i).unwrap();
@@ -16920,7 +17731,7 @@ mod tests {
         let agg = synthetic_predict_aggregates("snap");
         let dir = tempfile::tempdir().unwrap();
         let out = dir.path().join("report.html");
-        generate_report(&rows, &[], &out, None, Some(&agg)).unwrap();
+        generate_report(&rows, &[], &out, None, Some(&agg), &[]).unwrap();
         let html = std::fs::read_to_string(&out).unwrap();
         assert!(
             html.contains("σ_pred-dominated 75% of rows"),
@@ -17061,7 +17872,7 @@ mod tests {
         let rows = vec![synthetic_rust_prop_row("Apophis", 0.0)];
         let dir = tempfile::tempdir().unwrap();
         let out = dir.path().join("report.html");
-        generate_report(&rows, &[], &out, None, None).unwrap();
+        generate_report(&rows, &[], &out, None, None, &[]).unwrap();
         let html = std::fs::read_to_string(&out).unwrap();
         assert!(html.contains("id=\"s15\""), "the 4.2 shell always renders");
         assert!(
@@ -17088,7 +17899,7 @@ mod tests {
         let agg = synthetic_predict_aggregates("snap");
         let dir = tempfile::tempdir().unwrap();
         let out = dir.path().join("report.html");
-        generate_report(&rows, &[], &out, None, Some(&agg)).unwrap();
+        generate_report(&rows, &[], &out, None, Some(&agg), &[]).unwrap();
         let html = std::fs::read_to_string(&out).unwrap();
         // The n=2 thin cell renders hatched with its count + reason, never as a
         // coloured value (its 0.3 realism / 0.5 sep must not appear as a cell).
@@ -17104,7 +17915,7 @@ mod tests {
         let agg = synthetic_predict_aggregates("snap"); // calibration is empty
         let dir = tempfile::tempdir().unwrap();
         let out = dir.path().join("report.html");
-        generate_report(&rows, &[], &out, None, Some(&agg)).unwrap();
+        generate_report(&rows, &[], &out, None, Some(&agg), &[]).unwrap();
         let html = std::fs::read_to_string(&out).unwrap();
         assert!(
             html.contains("awaiting Student-t chain"),
@@ -17118,7 +17929,7 @@ mod tests {
         let agg = synthetic_predict_aggregates("snap");
         let dir = tempfile::tempdir().unwrap();
         let out = dir.path().join("report.html");
-        generate_report(&rows, &[], &out, None, Some(&agg)).unwrap();
+        generate_report(&rows, &[], &out, None, Some(&agg), &[]).unwrap();
         let html = std::fs::read_to_string(&out).unwrap();
         // The large per-object family must not ride inline on the page.
         assert!(
@@ -17151,8 +17962,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let a = dir.path().join("a.html");
         let b = dir.path().join("b.html");
-        generate_report(&rows, &[], &a, None, Some(&agg)).unwrap();
-        generate_report(&rows, &[], &b, None, Some(&agg)).unwrap();
+        generate_report(&rows, &[], &a, None, Some(&agg), &[]).unwrap();
+        generate_report(&rows, &[], &b, None, Some(&agg), &[]).unwrap();
         let sa = std::fs::read(predict_path_for(&a)).unwrap();
         let sb = std::fs::read(predict_path_for(&b)).unwrap();
         assert_eq!(sa, sb, "the predict sidecar must be byte-reproducible");
@@ -17477,7 +18288,7 @@ mod tests {
         let agg = synthetic_predict_aggregates("snap");
         let dir = tempfile::tempdir().unwrap();
         let out = dir.path().join("report.html");
-        generate_report(&rows, &[], &out, None, Some(&agg)).unwrap();
+        generate_report(&rows, &[], &out, None, Some(&agg), &[]).unwrap();
         let html = std::fs::read_to_string(&out).unwrap();
         // One merged section: no separate Calibration panel-title.
         assert!(
@@ -17588,7 +18399,7 @@ mod tests {
         let (rows, cmp) = radar_scenario();
         let dir = tempfile::tempdir().unwrap();
         let out = dir.path().join("report.html");
-        generate_report(&rows, &cmp, &out, None, None).unwrap();
+        generate_report(&rows, &cmp, &out, None, None, &[]).unwrap();
         let html = std::fs::read_to_string(&out).unwrap();
 
         // 2.1 "By object and fitter": the empyrean σ_eq column is dropped (1.3A
@@ -17631,7 +18442,7 @@ mod tests {
         let agg = synthetic_predict_aggregates("snap");
         let dir = tempfile::tempdir().unwrap();
         let out = dir.path().join("report.html");
-        generate_report(&rows, &[], &out, None, Some(&agg)).unwrap();
+        generate_report(&rows, &[], &out, None, Some(&agg), &[]).unwrap();
         let html = std::fs::read_to_string(&out).unwrap();
         assert!(
             html.contains(">empyrean <span class=\"pwarm\" title=\"arm efcc.adap.nonight\">EFCC · adaptive · per-obs · linear</span>"),
@@ -17799,7 +18610,7 @@ mod tests {
     fn s5_item6_timing_key_line_and_a2_absent_line_is_data_driven() {
         let dir = tempfile::tempdir().unwrap();
         let out = dir.path().join("report.html");
-        generate_report(&timing_fixture(), &[], &out, None, None).unwrap();
+        generate_report(&timing_fixture(), &[], &out, None, None, &[]).unwrap();
         let html = std::fs::read_to_string(&out).unwrap();
         // The 2.2 timing tables carry ONE visible key line; the header-row hover
         // sentence is gone from the speed matrix. Delta 9: the key line is a terse
@@ -17881,7 +18692,7 @@ mod tests {
 
         let dir = tempfile::tempdir().unwrap();
         let out = dir.path().join("report.html");
-        generate_report(&timing_fixture(), &[], &out, None, None).unwrap();
+        generate_report(&timing_fixture(), &[], &out, None, None, &[]).unwrap();
         let html = std::fs::read_to_string(&out).unwrap();
         // The key lines this delta governs are the Part 1 and Part 2 unit keys
         // (the C·cost timing keys and the Part-2 readout keys km/mas/σ_eq); scan
@@ -17909,7 +18720,7 @@ mod tests {
     fn delta9_masthead_has_no_rust_channel_under_test() {
         let dir = tempfile::tempdir().unwrap();
         let out = dir.path().join("report.html");
-        generate_report(&timing_fixture(), &[], &out, None, None).unwrap();
+        generate_report(&timing_fixture(), &[], &out, None, None, &[]).unwrap();
         let html = std::fs::read_to_string(&out).unwrap();
         let mstart = html.find("<div class=\"masthead\">").expect("masthead");
         let mend = mstart
@@ -18282,7 +19093,7 @@ mod tests {
         ];
         let dir = tempfile::tempdir().unwrap();
         let out = dir.path().join("report.html");
-        generate_report(&rows, &[], &out, None, None).unwrap();
+        generate_report(&rows, &[], &out, None, None, &[]).unwrap();
         let html = std::fs::read_to_string(&out).unwrap();
         let data_bytes = std::fs::read(dir.path().join("report.data.json")).unwrap();
         // The new fields reached the sidecar.
