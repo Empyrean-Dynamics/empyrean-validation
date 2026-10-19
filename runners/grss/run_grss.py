@@ -1107,14 +1107,19 @@ def run_radar_pass(
     if objects is not None:
         wanted = [p for p in psv_files if _unsafe_name(p.stem).lower() in objects]
         if not wanted:
+            # A subset run whose objects carry no radar astrometry has no radar
+            # rows to fit: the pass is empty, and says so. (find_orb's radar
+            # pass behaves the same way on the same subset.) A full run never
+            # reaches this branch — `objects` is None — so an empty radar
+            # directory still stops above.
             print(
-                f"ERROR: --objects matched none of the {len(psv_files)} radar fixtures "
-                f"in {fixtures_dir}.\n"
-                f"       Requested: {', '.join(sorted(objects))}\n"
-                f"       Available: {', '.join(_unsafe_name(p.stem) for p in psv_files)}",
+                f"NOTE: --objects matched none of the {len(psv_files)} radar fixtures "
+                f"in {fixtures_dir}; the radar pass has no rows for this subset.\n"
+                f"      Requested: {', '.join(sorted(objects))}\n"
+                f"      Radar fixtures: {', '.join(_unsafe_name(p.stem) for p in psv_files)}",
                 file=sys.stderr,
             )
-            raise SystemExit(1)
+            return []
         psv_files = wanted
 
     ic_rows = _ic_rows_by_object(plan)
@@ -1445,7 +1450,10 @@ def main() -> int:
     else:
         rows = run_plan_pass(ctx, plan, fixtures_dir)
 
-    if not rows:
+    # The one legitimate empty result: a radar pass over an explicit object
+    # subset that carries no radar astrometry (run_radar_pass said so above).
+    # An empty full run, or an empty plan pass, is still a refusal.
+    if not rows and not (args.radar and objects is not None):
         print(
             "ERROR: GRSS produced zero rows. Nothing was compared, and an empty "
             "result file reads\n       downstream as 'GRSS compared everything and "
@@ -1488,7 +1496,9 @@ def main() -> int:
             )
         )
     )
-    if n_computed == 0:
+    # An explicit radar subset with no radar astrometry measured nothing by design
+    # (see run_radar_pass); every other empty measurement is a refusal.
+    if n_computed == 0 and not (args.radar and objects is not None):
         print(
             f"ERROR: none of the {len(rows)} GRSS rows carries a computed comparison. "
             "Every row is a\n       failure row; the channel ran and measured nothing. "

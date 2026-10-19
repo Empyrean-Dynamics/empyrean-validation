@@ -45,6 +45,39 @@ mkdir -p "$BUILD_DIR" "$PREFIX/bin"
 # skip and by the report, never silently substituted. (Invoked as an
 # `if` condition, so `set -e` is suspended inside it and the explicit
 # `|| return 1` guards drive the control flow.)
+# find_orb REQUIRES a config directory and asserts if it cannot find one
+# (see the comment inside). The directory lives in $HOME, outside the cached
+# build tree, so a cached build on a fresh runner has no config dir: this runs
+# on every build, and `./setup.sh --config-only` runs it alone at run time when
+# the binary is already in place.
+install_config_dir() {
+    echo
+    echo "Installing find_orb config directory (~/.find_orb)..."
+    (
+        cd "$BUILD_DIR/find_orb" || exit 1
+        files=$(sed -n '/^INSTALL_FILES[[:space:]]*=/,/[^\\]$/p' makefile \
+                | sed 's/^INSTALL_FILES[[:space:]]*=//; s/\\$//' | tr '\n' ' ')
+        test -n "$files" || {
+            echo "ERROR: could not read INSTALL_FILES from find_orb's makefile." >&2
+            exit 1; }
+        mkdir -p "$HOME/.find_orb"
+        n=0
+        for f in $files; do
+            for g in $f; do
+                [ -f "$g" ] && { cp "$g" "$HOME/.find_orb/"; n=$((n + 1)); }
+            done
+        done
+        # cospar.txt is the specific file the assertion probes for; if it is not
+        # there, fo aborts on every fit, so fail here where the cause is obvious.
+        test -f "$HOME/.find_orb/cospar.txt" || {
+            echo "ERROR: ~/.find_orb/cospar.txt missing after copying $n files." >&2
+            echo "       find_orb asserts on a missing config dir (miscell.cpp)." >&2
+            exit 1; }
+        echo "  installed $n config files"
+    ) || return 1
+    return 0
+}
+
 build_findorb() {
     # Clone / update the four repos.
     cd "$BUILD_DIR"
@@ -115,33 +148,20 @@ build_findorb() {
     # INSTALL_FILES is read from the makefile rather than hardcoded, so an
     # upstream addition to the list is picked up instead of silently missing.
     # One entry is a glob (`?findorb.txt`), hence the inner loop.
-    echo
-    echo "Installing find_orb config directory (~/.find_orb)..."
-    (
-        cd "$BUILD_DIR/find_orb" || exit 1
-        files=$(sed -n '/^INSTALL_FILES[[:space:]]*=/,/[^\\]$/p' makefile \
-                | sed 's/^INSTALL_FILES[[:space:]]*=//; s/\\$//' | tr '\n' ' ')
-        test -n "$files" || {
-            echo "ERROR: could not read INSTALL_FILES from find_orb's makefile." >&2
-            exit 1; }
-        mkdir -p "$HOME/.find_orb"
-        n=0
-        for f in $files; do
-            for g in $f; do
-                [ -f "$g" ] && { cp "$g" "$HOME/.find_orb/"; n=$((n + 1)); }
-            done
-        done
-        # cospar.txt is the specific file the assertion probes for; if it is not
-        # there, fo aborts on every fit, so fail here where the cause is obvious.
-        test -f "$HOME/.find_orb/cospar.txt" || {
-            echo "ERROR: ~/.find_orb/cospar.txt missing after copying $n files." >&2
-            echo "       find_orb asserts on a missing config dir (miscell.cpp)." >&2
-            exit 1; }
-        echo "  installed $n config files"
-    ) || return 1
+    install_config_dir || return 1
 
     return 0
 }
+
+if [ "${1:-}" = "--config-only" ]; then
+    if [ ! -x "$PREFIX/bin/fo" ] || [ ! -d "$BUILD_DIR/find_orb" ]; then
+        echo "ERROR: --config-only needs the built binary ($PREFIX/bin/fo) and the" >&2
+        echo "       source tree ($BUILD_DIR/find_orb); run ./setup.sh without flags first." >&2
+        exit 1
+    fi
+    install_config_dir || exit 1
+    exit 0
+fi
 
 if build_findorb; then
     echo
