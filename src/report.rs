@@ -76,6 +76,326 @@ const PART_NAME_4: &str = "Part 4 · Covariance realism";
 /// Appendix name, shared by rail and part head.
 const PART_NAME_APPENDIX: &str = "Appendix";
 
+/// S5 item 1: a Part head reads as a mono eyebrow over a Syne title. The part
+/// name is `"Part N · Title"`; split it so `"Part N"` becomes the eyebrow and
+/// the clause after the middle dot becomes the title. Names without a dot (the
+/// Appendix) render as a title alone. One source, so the rail and the head stay
+/// in step.
+fn part_head_inner(name: &str) -> String {
+    match name.split_once(" · ") {
+        Some((eyebrow, title)) => format!(
+            "<span class=\"ph-eyebrow\">{eyebrow}</span><span class=\"ph-title\">{title}</span>"
+        ),
+        None => format!("<span class=\"ph-title\">{name}</span>"),
+    }
+}
+
+/// Delta 9 item 1: Part 3's scope line — the channels the Internals part
+/// compares against core, stated once in the eyebrow role under the Part 3
+/// title, so the masthead no longer carries "Rust channel under test". It reuses
+/// the shared `.ph-facts` idiom (the Part 1 head facts): the "CHANNELS" label
+/// and the "·" separators are CSS, the channel names are the only words that
+/// count, all lowercase. `rust` is the channel under test (Parts 1–2, against
+/// JPL); `core` is the validation reference. Derived from the rows, so an absent
+/// distribution channel (here `c`) does not appear. Terse, never a sentence.
+fn part3_scope_html(results: &[ValidationResult]) -> String {
+    const CHANNELS: [&str; 4] = ["rust", "python", "cli", "c"];
+    let mut present: BTreeSet<&str> = BTreeSet::new();
+    for r in results {
+        if let Some(&ch) = CHANNELS.iter().find(|&&c| c == r.channel) {
+            present.insert(ch);
+        }
+    }
+    let mut vals = String::new();
+    for &ch in CHANNELS.iter().filter(|c| present.contains(*c)) {
+        let label = if ch == "rust" {
+            "rust (under test)"
+        } else {
+            ch
+        };
+        vals.push_str(&format!("<span class=\"phf-v\">{label}</span>"));
+    }
+    vals.push_str("<span class=\"phf-v\">core</span>");
+    format!(
+        "<div class=\"ph-facts\"><span class=\"phf\" data-k=\"channels\" title=\"every distribution channel is compared against empyrean-core; rust is the channel under test in Parts 1–2 against JPL\">{vals}</span></div>"
+    )
+}
+
+/// S6: the Part 1 head-line facts, read from the rows and stated once in the
+/// sticky Part 1 bar under the title (the eyebrow role). The per-fact label and
+/// the " · " separators are CSS, not DOM text; the terse values below are the
+/// only words that count toward the H5 budget.
+struct Part1Facts {
+    /// Modal IC epoch over propagation/ephemeris rows (the shared t0).
+    epoch_mjd: f64,
+    /// That epoch as a UTC calendar date (TDB/UTC differ by < 70 s, so the day
+    /// is the same).
+    epoch_utc: String,
+    /// Distinct ephemeris observer MPC codes, first-seen order, slash-joined.
+    sites: String,
+}
+
+/// Gather the Part 1 head facts from the rows (never hand-typed). The epoch is
+/// the modal propagation/ephemeris t0; the OD fits use each object's own IC
+/// epoch, stated on the fact's hover.
+fn part1_facts(results: &[ValidationResult]) -> Part1Facts {
+    let mut counts: HashMap<i64, (f64, usize)> = HashMap::new();
+    for r in results {
+        if r.test_type == "propagation" || r.test_type == "ephemeris" {
+            let key = (r.epoch_mjd_tdb * 1000.0).round() as i64;
+            let e = counts.entry(key).or_insert((r.epoch_mjd_tdb, 0));
+            e.1 += 1;
+        }
+    }
+    let epoch_mjd = counts
+        .values()
+        .max_by_key(|(_, n)| *n)
+        .map(|(e, _)| *e)
+        .unwrap_or(0.0);
+    // unix_days = MJD - 40587; the date is the same in TDB and UTC to the day.
+    let (y, m, d) = ymd_from_unix_days(epoch_mjd.floor() as i64 - 40587);
+    let epoch_utc = format!("{y:04}-{m:02}-{d:02}");
+    let mut sites: Vec<&str> = Vec::new();
+    for r in results {
+        if r.test_type != "ephemeris" {
+            continue;
+        }
+        let Some(o) = r.observer.as_deref() else {
+            continue;
+        };
+        if !o.is_empty() && !sites.contains(&o) {
+            sites.push(o);
+        }
+    }
+    Part1Facts {
+        epoch_mjd,
+        epoch_utc,
+        sites: sites.join("/"),
+    }
+}
+
+/// S6 item 2: the Part 1 head line — the mono eyebrow + Syne title (as every
+/// Part head) followed, in the eyebrow role, by the four facts the reader needs
+/// once: test epoch (MJD TDB + UTC), the frame per metric, the force-model pair
+/// (empyrean / reference, as A.4 records them), and the ephemeris observing
+/// sites (MPC codes). Each fact's value spans are < 4 words so none reads as a
+/// free-standing sentence; the fact label and separators are CSS.
+fn part1_head_html() -> String {
+    // S8 item 3: the head line is the eyebrow + title ONLY. The facts render as a
+    // full-width second row of the sticky bar (part1_facts_html), so the title
+    // line and the two Compare selects share one line that never wraps.
+    "<span class=\"ph-eyebrow\">Part 1</span><span class=\"ph-title\">Reference agreement</span>"
+        .to_string()
+}
+
+/// S8 item 3: the Part 1 head facts as the sticky bar's full-width second row
+/// (own line under the title/Compare line). Same four facts, same eyebrow role,
+/// same words as before — only their position moved.
+fn part1_facts_html(f: &Part1Facts) -> String {
+    let mjd = if f.epoch_mjd.fract() == 0.0 {
+        format!("{:.1}", f.epoch_mjd)
+    } else {
+        format!("{:.3}", f.epoch_mjd)
+    };
+    format!(
+        "<div class=\"ph-facts\">\
+<span class=\"phf\" data-k=\"epoch\" title=\"propagation / ephemeris t0; OD fits use each object's own IC epoch\"><span class=\"phf-v\">MJD {mjd} TDB</span><span class=\"phf-v\">{utc} UTC</span></span>\
+<span class=\"phf\" data-k=\"frames\" title=\"propagation: ICRF/J2000 barycentric Cartesian · ephemeris: topocentric astrometric RA/Dec · orbit determination: Sun-centred ecliptic J2000\"><span class=\"phf-v\">prop ICRF/J2000</span><span class=\"phf-v\">eph RA/Dec</span><span class=\"phf-v\">OD ecliptic J2000</span></span>\
+<span class=\"phf\" data-k=\"force\" title=\"empyrean: DE440 + 16 SB441-N16 asteroids, 1PN GR, Marsden non-grav; reference: JPL Horizons/SBDB on DE441\"><span class=\"phf-v\">empyrean DE440+16ast</span><span class=\"phf-v\">JPL DE441</span></span>\
+<span class=\"phf\" data-k=\"sites\" title=\"ephemeris observing sites (MPC codes), from the rows\"><span class=\"phf-v\">{sites}</span></span>\
+</div>",
+        mjd = mjd,
+        utc = f.epoch_utc,
+        sites = f.sites,
+    )
+}
+
+/// S6 item 1/3: one slot eyebrow (the single uppercase eyebrow role). It is also
+/// the scroll-spy anchor its rail sub-entry targets. The slot LETTER and the
+/// " · " separator are CSS (`::before content: attr(data-slot)`), so only the
+/// name counts toward the word budget, and the rail (nav) text is uncounted.
+fn slot_eyebrow(anchor: &str, slot: &str, name: &str) -> String {
+    format!(
+        "<div class=\"slot-eyebrow spy-anchor\" id=\"{anchor}\" data-slot=\"{slot}\">{name}</div>"
+    )
+}
+
+/// S6 item 1: render one Part-1 section with the fixed slots — head
+/// (number · title) → A · by object → B · by population → C · cost → fold. The
+/// slot anchors are `{sec_id}-a/-b/-c`; the rail sub-entries scroll to them.
+/// `sec_id` reuses the former grid-section anchor (s02/s06/s08b) so deep links
+/// (§1.3A, scroll-margin) keep resolving. One renderer, so the three sections
+/// cannot drift in shape.
+/// The one fixed-slot section renderer. `readout` is the summary slot between
+/// the head and the A slot (brief: head → readout → A · B · C → fold); it is the
+/// empty string where a section states its readout inside the A grid (Part 1,
+/// S6) and a `grid-summary` + summary table for Part 2 (S7). One renderer, so
+/// Part 1 and Part 2 cannot drift in shape.
+#[allow(clippy::too_many_arguments)]
+fn part1_section(
+    sec_id: &str,
+    num: &str,
+    title: &str,
+    title_attr: &str,
+    readout: &str,
+    a_grid: &str,
+    b_slot: &str,
+    c_cost: &str,
+    fold: &str,
+) -> String {
+    format!(
+        "<div class=\"section\" id=\"{sec_id}\">\n  <div class=\"section-num\">{num}</div>\n  <div class=\"section-title\" id=\"{sec_id}-title\" title=\"{title_attr}\">{title}</div>\n  {readout}{a_eye}\n  {a_grid}\n  {b_eye}\n  {b_slot}\n  {c_eye}\n  {c_cost}\n  {fold}\n</div>\n",
+        a_eye = slot_eyebrow(&format!("{sec_id}-a"), "A", "by object"),
+        b_eye = slot_eyebrow(&format!("{sec_id}-b"), "B", "by population"),
+        c_eye = slot_eyebrow(&format!("{sec_id}-c"), "C", "cost"),
+    )
+}
+
+/// One rail block for a fixed-slot section (Part 1 and Part 2): the section
+/// entry plus the three sub-entries (A · B · C) that scroll to the slot anchors
+/// `{sec}-a/-b/-c`. Shared by `part1_rail_html` and `build_rail_html` so the
+/// rail and the DOM cannot drift.
+fn rail_section_abc(sec: &str, num: &str, title: &str) -> String {
+    let mut h = format!("  <a data-target=\"{sec}\" href=\"#{sec}\">{num} {title}</a>\n");
+    for (letter, name) in [
+        ("a", "A · by object"),
+        ("b", "B · by population"),
+        ("c", "C · cost"),
+    ] {
+        h.push_str(&format!(
+            "  <a data-target=\"{sec}-{letter}\" href=\"#{sec}-{letter}\">&nbsp;&nbsp;{name}</a>\n"
+        ));
+    }
+    h
+}
+
+/// A flat rail entry (Parts 3–4 sections and the appendix): one link whose text
+/// reads exactly the section title it scrolls to.
+fn rail_entry(sec: &str, label: &str) -> String {
+    format!("  <a data-target=\"{sec}\" href=\"#{sec}\">{label}</a>\n")
+}
+
+/// S6 item 3: the Part 1 rail block, generated from the same (section, slot)
+/// tree the sections are built from (1.1/1.2/1.3, each A · B · C).
+fn part1_rail_html() -> String {
+    let mut h = String::new();
+    for (sec, num, title) in [
+        ("s02", "1.1", "Propagation"),
+        ("s06", "1.2", "Ephemeris"),
+        ("s08b", "1.3", "Orbit determination"),
+    ] {
+        h.push_str(&rail_section_abc(sec, num, title));
+    }
+    h
+}
+
+/// S7 item 3: the WHOLE sidebar, generated from the full part/section tree so
+/// the rail and the DOM emit in one order and cannot drift. Part 1 and Part 2
+/// are the fixed-slot sections (A · B · C sub-entries); Parts 3–4 and the
+/// appendix are flat entries whose text matches their section title. Rail text
+/// lives in <nav class="rail"> and is uncounted by H5.
+fn build_rail_html() -> String {
+    let mut h = String::new();
+    h.push_str(&format!("  <div class=\"rail-part\">{PART_NAME_1}</div>\n"));
+    h.push_str(&part1_rail_html());
+    h.push_str(&format!("  <div class=\"rail-part\">{PART_NAME_2}</div>\n"));
+    for (sec, num, title) in [
+        ("s-prop", "2.1", "Propagation"),
+        ("s-eph", "2.2", "Ephemeris"),
+        ("s-od", "2.3", "Orbit determination"),
+    ] {
+        h.push_str(&rail_section_abc(sec, num, title));
+    }
+    h.push_str(&format!("  <div class=\"rail-part\">{PART_NAME_3}</div>\n"));
+    for (sec, label) in [
+        ("s10", "3.1 Channel fidelity"),
+        ("s05", "3.2 Derivatives"),
+        ("s09b", "3.3 Non-grav recovery"),
+    ] {
+        h.push_str(&rail_entry(sec, label));
+    }
+    h.push_str(&format!("  <div class=\"rail-part\">{PART_NAME_4}</div>\n"));
+    for (sec, label) in [
+        ("s12", "4.1 Consistency with JPL at epoch"),
+        ("s15", "4.2 Predictive power"),
+    ] {
+        h.push_str(&rail_entry(sec, label));
+    }
+    h.push_str(&format!(
+        "  <div class=\"rail-part\">{PART_NAME_APPENDIX}</div>\n"
+    ));
+    for (sec, label) in [
+        ("s01", "Run summary"),
+        ("s01b", "External tools"),
+        ("s05c", "Configurations"),
+        ("s13", "Provenance"),
+    ] {
+        h.push_str(&rail_entry(sec, label));
+    }
+    h
+}
+
+/// The report's single population-order switch.
+///
+/// The 13 catalog populations (see [`crate::catalog`]) in one fixed order,
+/// nested inside the six Part-4 classes
+/// ([`crate::predict_schema::classes::from_population`]): NEA, Comet, ISO,
+/// MainBelt, Trojan, Outer. **Every grid that lists populations** — the
+/// per-object group rows and the protected agreement/cost heatmaps
+/// ([`prop_like_ordered_blocks`]), the 1.3 OD panels, the 2.1 tool-ranking
+/// by-population rows, the 2.2 timing grids, the 3.1 fidelity grid, the
+/// per-population legend group order, and (via [`class_rank`]) the 4.2
+/// class grids — orders its population blocks by this one slice, so a reader
+/// carries an object's row from one grid to the next. Within a block the
+/// objects keep their worst-first order and the WORST / MEDIAN column is
+/// unchanged, so no offender is hidden. Flip the order policy for the whole
+/// report by reordering this one array; `class_rank` follows it.
+pub const POPULATION_ORDER: [&str; 13] = [
+    // class NEA
+    "NEO",
+    "Short-arc NEO",
+    "TCO",
+    "Impactor",
+    // class Comet
+    "Comet",
+    // class ISO
+    "ISO",
+    // class MainBelt
+    "MBA",
+    "Self-Perturber",
+    // class Trojan
+    "Jupiter Trojan",
+    "Earth Trojan",
+    "Neptune Trojan",
+    // class Outer
+    "Centaur",
+    "TNO",
+];
+
+/// Rank of a population in [`POPULATION_ORDER`] — the sort key every grid
+/// uses for its population blocks. A population not in the slice sorts last
+/// (stable, after all known populations) so an unmapped population stays
+/// visible at the end rather than silently reordered into the middle.
+fn population_rank(pop: &str) -> usize {
+    POPULATION_ORDER
+        .iter()
+        .position(|&p| p == pop)
+        .unwrap_or(POPULATION_ORDER.len())
+}
+
+/// Rank of a Part-4 class in the order [`POPULATION_ORDER`] induces on the
+/// six classes — the index of the first population whose class is `class`
+/// (NEA → 0, Comet → 4, ISO → 5, MainBelt → 6, Trojan → 8, Outer → 11).
+/// `"all"` and any unmapped class sort last. The one switch therefore drives
+/// both the population grids and the 4.2 class grids.
+fn class_rank(class: &str) -> usize {
+    POPULATION_ORDER
+        .iter()
+        .map(|&p| crate::predict_schema::classes::from_population(p))
+        .position(|c| c == class)
+        .unwrap_or(usize::MAX)
+}
+
 /// Channel display color from the brand palette.
 fn channel_color(channel: &str) -> &'static str {
     match channel {
@@ -670,18 +990,20 @@ fn ladder_css() -> String {
     let mut s = String::new();
     for (i, &(bg, ink)) in LADDER_DARK.iter().enumerate() {
         let n = i + 1;
-        s.push_str(&format!("  .gb{n} {{ background: {bg}; }}\n"));
         s.push_str(&format!(
-            "  .gb{n} .cn, .lchip.gb{n}, .odgrid td.oc.gb{n} .ocg {{ color: {ink}; }}\n"
+            "  .gb{n}, .lchip[data-gb=\"{n}\"] {{ background: {bg}; }}\n"
+        ));
+        s.push_str(&format!(
+            "  .gb{n} .cn, .lchip[data-gb=\"{n}\"], .odgrid td.oc.gb{n} .ocg {{ color: {ink}; }}\n"
         ));
     }
     for (i, &(bg, ink)) in LADDER_LIGHT.iter().enumerate() {
         let n = i + 1;
         s.push_str(&format!(
-            "  :root.theme-light .gb{n} {{ background: {bg}; }}\n"
+            "  :root.theme-light .gb{n}, :root.theme-light .lchip[data-gb=\"{n}\"] {{ background: {bg}; }}\n"
         ));
         s.push_str(&format!(
-            "  :root.theme-light .gb{n} .cn, :root.theme-light .lchip.gb{n}, :root.theme-light .odgrid td.oc.gb{n} .ocg {{ color: {ink}; }}\n"
+            "  :root.theme-light .gb{n} .cn, :root.theme-light .lchip[data-gb=\"{n}\"], :root.theme-light .odgrid td.oc.gb{n} .ocg {{ color: {ink}; }}\n"
         ));
     }
     s
@@ -1094,11 +1416,13 @@ fn grid_cell(
     }
 }
 
-/// Order the population blocks and their objects by one tool's worst value on
-/// the grid axis (design §3.3): populations by their worst object, objects by
-/// their own worst, both descending. `order_vals` is the tool that fixes the
-/// order — empyrean vs the default reference — so every pair panel AND the
-/// Section-1 cost heatmap reuse this one order and their rows line up.
+/// Order the population blocks by the one canonical order ([`POPULATION_ORDER`])
+/// and the objects within each block by one tool's worst value on the grid axis,
+/// descending. `order_vals` is the tool that fixes the within-block object order
+/// — empyrean vs the default reference — so every pair panel AND the Section-1
+/// cost heatmap reuse this one order and their rows line up, and the WORST column
+/// still shows each row's worst horizon. Population order is the single switch in
+/// [`POPULATION_ORDER`]; worst value only breaks ties within a rank (none today).
 fn prop_like_ordered_blocks<'a>(
     objects: &[(&'a str, &'a str)],
     dts: &[i64],
@@ -1120,10 +1444,17 @@ fn prop_like_ordered_blocks<'a>(
             .fold(f64::NEG_INFINITY, f64::max)
     };
     let mut block_order: Vec<(&'a str, Vec<&'a str>)> = blocks.into_iter().collect();
+    // Populations in the one canonical order (POPULATION_ORDER); the tool's
+    // worst value only breaks ties within a rank (none today — each population
+    // is listed once). The WORST column still shows each row's worst.
     block_order.sort_by(|a, b| {
-        block_worst(&b.1)
-            .partial_cmp(&block_worst(&a.1))
-            .unwrap_or(std::cmp::Ordering::Equal)
+        population_rank(a.0)
+            .cmp(&population_rank(b.0))
+            .then_with(|| {
+                block_worst(&b.1)
+                    .partial_cmp(&block_worst(&a.1))
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            })
     });
     for (_, objs) in block_order.iter_mut() {
         objs.sort_by(|a, b| {
@@ -1156,7 +1487,11 @@ fn prop_like_axes(results: &[ValidationResult]) -> PropLikeAxes<'_> {
             objects.push((r.object.as_str(), r.population.as_str()));
         }
     }
-    objects.sort_by(|a, b| a.1.cmp(b.1).then(a.0.cmp(b.0)));
+    objects.sort_by(|a, b| {
+        population_rank(a.1)
+            .cmp(&population_rank(b.1))
+            .then(a.0.cmp(b.0))
+    });
 
     let mut dts: Vec<i64> = results
         .iter()
@@ -1247,7 +1582,7 @@ fn render_grid_table(t: &GridTable, block_order: &[(&str, Vec<&str>)]) -> String
     let n_forward = dts.iter().filter(|&&d| d > 0).count();
     let mut h = String::new();
     h.push_str(&format!(
-        "<div class=\"grid-scroll agrid-scroll\"><table class=\"agrid ahgrid\" id=\"{}\"><thead><tr>",
+        "<div class=\"grid-scroll agrid-scroll\"><table class=\"agrid ahgrid\" data-grid=\"agreement\" id=\"{}\"><thead><tr>",
         t.table_id
     ));
     h.push_str("<th class=\"gobj\">object</th>");
@@ -1453,8 +1788,18 @@ fn render_agreement_grid(
             continue;
         }
         let (summary_line, summary_title) = summary_for(tool);
+        // Ephemeris sky-plane only (S3 item 4): the summary line carries the
+        // runaway count — the rows beyond ±100 mas on this pair that §1.2A's
+        // folded `outliers` list itemises. `buildEphScatter` fills the span for
+        // the selected pair from the same rows it lists, so the number and the
+        // list cannot disagree; the em-dash placeholder shows until it runs.
+        let rw_suffix = if id == "h2-eph" {
+            " · <span class=\"rwn\" title=\"rows beyond ±100 mas on this pair — the folded outliers list itemises them\">— runaway</span>"
+        } else {
+            ""
+        };
         h.push_str(&format!(
-            "<div class=\"grid-summary\" id=\"{table_id}-summary\" title=\"{summary_title}\">{summary_line}</div>"
+            "<div class=\"grid-summary\" id=\"{table_id}-summary\" title=\"{summary_title}\">{summary_line}{rw_suffix}</div>"
         ));
         // ASSIST omits force terms (Marsden ΔT, self-perturbers) some objects
         // need, so mark the model gap whenever ASSIST is on either side.
@@ -2095,10 +2440,13 @@ fn od_state_cell(
             } else if has_record {
                 // A record exists but sigma is null: Σ_ref not SPD at the
                 // common epoch, so the Cholesky factor does not exist.
-                "<td class=\"oc conv undef\" title=\"converged · Σ_ref not SPD at the common epoch — metric undefined, no regularisation\"><span class=\"ocg\">?</span></td>".to_string()
+                // S8 item 1: one null token (—); the reason rides the hover.
+                "<td class=\"oc conv undef\" title=\"converged · Σ_ref not SPD at the common epoch — metric undefined, no regularisation\"><span class=\"ocg\">—</span></td>".to_string()
             } else {
+                // S8 item 1: converged with no comparison record → the one null
+                // token (—); the specific reason rides the hover.
                 format!(
-                    "<td class=\"oc conv nocov\" title=\"{}\"><span class=\"ocg\">·</span></td>",
+                    "<td class=\"oc conv nocov\" title=\"{}\"><span class=\"ocg\">—</span></td>",
                     attr_escape(nocov_title)
                 )
             }
@@ -2158,7 +2506,9 @@ fn od_panel_table(
     radar_counts: &BTreeMap<&str, (u32, u32)>,
 ) {
     // object / arc + one tool cell + four diagnostics.
-    let n_cols = 1 + 1 + 4;
+    // S6: object/arc + one tool cell + three diagnostics. The former Δr@epoch
+    // column (all "—", the Cartesian |Δr| is not in the sidecar schema) is gone.
+    let n_cols = 1 + 1 + 3;
     let fmt_num = |v: Option<f64>| -> String {
         match v {
             Some(x) if x.is_finite() => format!("{x:.3}"),
@@ -2173,11 +2523,10 @@ fn od_panel_table(
         panel.tool_color, panel.tool_label
     ));
     h.push_str(&format!(
-        "<th class=\"od-d\">{}</th><th class=\"od-d\">{}</th><th class=\"od-d\">{}</th><th class=\"od-d\">{}</th>",
+        "<th class=\"od-d\">{}</th><th class=\"od-d\">{}</th><th class=\"od-d\">{}</th>",
         uhdr("n_obs"),
         uhdr("χ²ᵣ"),
         uhdr("σ_eq"),
-        uhdr("Δr @epoch"),
     ));
     h.push_str("</tr></thead><tbody>");
 
@@ -2213,8 +2562,10 @@ fn od_panel_table(
         } else {
             format!("{converged}/{attempted} · σ_eq {med_val}")
         };
+        // S8 item 2: the population header is the gpophdr/gpopname form every other
+        // grid uses; the converged/median summary rides a second cell on that row.
         h.push_str(&format!(
-            "<tr class=\"gblock\"><td class=\"gblock-l\">{} ({attempted})</td><td class=\"gblock-fill\" colspan=\"{}\" title=\"converged {converged} of {attempted} · median σ_eq over {n_med} object(s)\">{fill_vis}</td></tr>",
+            "<tr class=\"gpophdr\"><td class=\"gpopname\">{} ({attempted})</td><td class=\"gpop-sum\" colspan=\"{}\" title=\"converged {converged} of {attempted} · median σ_eq over {n_med} object(s)\">{fill_vis}</td></tr>",
             attr_escape(pop),
             n_cols - 1,
         ));
@@ -2222,18 +2573,18 @@ fn od_panel_table(
         for obj in objs {
             let oc = panel.optical.get(*obj);
             let conv = oc.and_then(|c| c.converged);
+            // S8 item 2: one row per arc — the object name IS the optical row's
+            // first cell (no separate name row); the gobjr/gobjname2 form matches
+            // every other grid. The radar arc stays an indented sub-row below.
             let name_cls = if conv == Some(false) {
-                "gobjname od-fail-name"
+                "gobjname2 od-fail-name"
             } else {
-                "gobjname"
+                "gobjname2"
             };
             h.push_str(&format!(
-                "<tr class=\"gobjrow\"><td class=\"{name_cls}\" colspan=\"{n_cols}\">{}</td></tr>",
+                "<tr class=\"gobjr odrow\"><td class=\"{name_cls}\">{}</td>",
                 attr_escape(obj)
             ));
-
-            // Optical arc row.
-            h.push_str("<tr class=\"gsub odrow\"><td class=\"gtool\">optical</td>");
             // JPL used radar for this object: an optical-only fit is not like for
             // like with JPL's radar-informed solution, so the JPL-comparison cells
             // (the σ_eq fill cell and every column drawn from the comparison record)
@@ -2249,8 +2600,10 @@ fn od_panel_table(
                     let hover = attr_escape(&jpl_radar_hover(del, dop));
                     // The convergence mark stays on the hatch so the own fit's
                     // convergence is not lost; the fill and σ_eq carry no number.
+                    // S8 item 1: the "converged, no closeness number" glyph is the
+                    // one null token (—); a failed fit keeps ✕ (a state, not null).
                     let glyph = match c.converged {
-                        Some(true) => "·",
+                        Some(true) => "—",
                         Some(false) => "✕",
                         None => "",
                     };
@@ -2260,7 +2613,7 @@ fn od_panel_table(
                     let nobs = c.n_obs.map(|n| n.to_string()).unwrap_or_else(|| "—".into());
                     let chi2 = fmt_num(c.chi2);
                     h.push_str(&format!(
-                        "<td class=\"od-d\">{nobs}</td><td class=\"od-d\">{chi2}</td><td class=\"od-d hatch\" title=\"{hover}\"></td><td class=\"od-d hatch\" title=\"{hover}\"></td></tr>"
+                        "<td class=\"od-d\">{nobs}</td><td class=\"od-d\">{chi2}</td><td class=\"od-d hatch\" title=\"{hover}\"></td></tr>"
                     ));
                 }
                 Some(c) => {
@@ -2272,19 +2625,25 @@ fn od_panel_table(
                     ));
                     let nobs = c.n_obs.map(|n| n.to_string()).unwrap_or_else(|| "—".into());
                     let chi2 = fmt_num(c.chi2);
-                    let seq = match (c.sigma, c.has_record) {
-                        (Some(s), _) => format!("{s:.2}"),
-                        (None, true) => "n/d".to_string(),
-                        (None, false) => "—".to_string(),
+                    // S8 item 1: one null token (—) for "no σ_eq"; when a record
+                    // exists but the metric is undefined, the reason rides the hover.
+                    let (seq, seq_attr) = match (c.sigma, c.has_record) {
+                        (Some(s), _) => (format!("{s:.2}"), String::new()),
+                        (None, true) => (
+                            "—".to_string(),
+                            " title=\"σ_eq not determined — Σ_ref not positive-definite at the common epoch\""
+                                .to_string(),
+                        ),
+                        (None, false) => ("—".to_string(), String::new()),
                     };
                     h.push_str(&format!(
-                        "<td class=\"od-d\">{nobs}</td><td class=\"od-d\">{chi2}</td><td class=\"od-d\">{seq}</td><td class=\"od-d\" title=\"Cartesian |Δr| at the common epoch is not in the sidecar schema yet\">—</td></tr>"
+                        "<td class=\"od-d\">{nobs}</td><td class=\"od-d\">{chi2}</td><td class=\"od-d\"{seq_attr}>{seq}</td></tr>"
                     ));
                 }
                 None => {
                     // This tool ran no optical fit for this object.
                     h.push_str(&od_state_cell(None, None, false, panel.nocov_title));
-                    h.push_str("<td class=\"od-d\">—</td><td class=\"od-d\">—</td><td class=\"od-d\">—</td><td class=\"od-d\">—</td></tr>");
+                    h.push_str("<td class=\"od-d\">—</td><td class=\"od-d\">—</td><td class=\"od-d\">—</td></tr>");
                 }
             }
 
@@ -2297,12 +2656,12 @@ fn od_panel_table(
                         let rnobs = c.n_obs.map(|n| n.to_string()).unwrap_or_else(|| "—".into());
                         let rchi2 = fmt_num(c.chi2);
                         h.push_str(&format!(
-                            "<td class=\"od-d\">{rnobs}</td><td class=\"od-d\">{rchi2}</td><td class=\"od-d hatch\" colspan=\"2\" title=\"the radar comparison record is not generated yet\"></td></tr>"
+                            "<td class=\"od-d\">{rnobs}</td><td class=\"od-d\">{rchi2}</td><td class=\"od-d hatch\" title=\"the radar comparison record is not generated yet\"></td></tr>"
                         ));
                     }
                     None => {
                         h.push_str(&od_state_cell(None, None, false, panel.nocov_title));
-                        h.push_str("<td class=\"od-d\">—</td><td class=\"od-d\">—</td><td class=\"od-d hatch\" colspan=\"2\" title=\"this tool ran no radar arc in this run\"></td></tr>");
+                        h.push_str("<td class=\"od-d\">—</td><td class=\"od-d\">—</td><td class=\"od-d hatch\" title=\"this tool ran no radar arc in this run\"></td></tr>");
                     }
                 }
             }
@@ -2374,10 +2733,17 @@ fn build_od_closeness_grid(
     }
     let sigma_key = |o: &str| -> f64 { sigma.get(o).and_then(|v| *v).unwrap_or(-1.0) };
     let mut block_order: Vec<(&str, Vec<&str>)> = blocks.into_iter().collect();
+    // Populations in the one canonical order (POPULATION_ORDER); σ_eq only
+    // breaks ties within a rank. Objects within a block stay offender-first
+    // (below), so the worst σ_eq is still at the top of its population.
     block_order.sort_by(|a, b| {
-        let am = a.1.iter().map(|o| sigma_key(o)).fold(f64::MIN, f64::max);
-        let bm = b.1.iter().map(|o| sigma_key(o)).fold(f64::MIN, f64::max);
-        bm.partial_cmp(&am).unwrap_or(std::cmp::Ordering::Equal)
+        population_rank(a.0)
+            .cmp(&population_rank(b.0))
+            .then_with(|| {
+                let am = a.1.iter().map(|o| sigma_key(o)).fold(f64::MIN, f64::max);
+                let bm = b.1.iter().map(|o| sigma_key(o)).fold(f64::MIN, f64::max);
+                bm.partial_cmp(&am).unwrap_or(std::cmp::Ordering::Equal)
+            })
     });
     for (_, objs) in block_order.iter_mut() {
         objs.sort_by(|a, b| {
@@ -2442,8 +2808,8 @@ fn build_od_closeness_grid(
             |c: &&crate::schema::OrbitComparison| radar_counts.contains_key(c.object.as_str());
         // The exclusion is stated in OBJECTS, drawn from the one exclusion set
         // (`radar_counts`, the JPL-radar objects) so §1.3A and §4.1 report the
-        // same count; the per-record tally rides in the summary hover.
-        let n_radar_excl_recs = orbit_comparisons.iter().filter(is_radar).count();
+        // same count. (The per-record tally rode the summary hover until S4
+        // removed it; §4.1's covtab still reports the record count.)
         let n_radar_excl_objs = radar_counts.len();
         let n_compared = orbit_comparisons.iter().filter(|c| !is_radar(c)).count();
         let finite: Vec<f64> = orbit_comparisons
@@ -2468,9 +2834,11 @@ fn build_od_closeness_grid(
             n_compared,
             within3,
         );
-        let summary_title = format!(
-            "Arcs converged of attempted · median σ_eq over finite of compared records · within-3σ count. JPL delay/Doppler radar on {n_radar_excl_objs} objects: optical-only is not like-for-like, kept in the grid marked, out of these stats; {n_radar_excl_recs} records, both epoch sources."
-        );
+        // S4 text-to-marks: the summary line keeps numbers only; the words that
+        // name each number and the radar-exclusion rationale ride §1.3A's Method
+        // fold (σ_eq definition + "objects whose JPL solution used radar are not
+        // like-for-like — hatched, counted, out of statistics"), not this hover.
+        let summary_title = String::new();
 
         // Failures list (empyrean rows that did not converge).
         let mut fails: Vec<String> = Vec::new();
@@ -2560,8 +2928,10 @@ fn build_od_closeness_grid(
     h.push_str("<span class=\"gk\"><span class=\"gk-sw gb4\" title=\"σ_eq 3–10\"></span></span>");
     h.push_str("<span class=\"gk\"><span class=\"gk-sw gb5\" title=\"σ_eq 10–100\"></span></span>");
     h.push_str("<span class=\"gk\"><span class=\"gk-sw gb6 rw\" title=\"σ_eq &gt;100 — runaway\"></span>&gt;100</span>");
-    h.push_str("<span class=\"gk\" title=\"reference covariance not positive-definite\">?</span>");
-    h.push_str("<span class=\"gk\" title=\"converged, no comparison record\">·</span>");
+    // S8 item 1: one null token — the reference covariance being non-positive-
+    // definite and "converged, no comparison record" both read as —, with the
+    // specific reason on each cell's hover.
+    h.push_str("<span class=\"gk\" title=\"no closeness number — the cell hover gives the reason (reference covariance not positive-definite, or no comparison record)\">—</span>");
     h.push_str("<span class=\"gk\" title=\"ran, did not converge\">✕</span>");
     h.push_str(&format!("<span class=\"gk\"><span class=\"gk-sw hatch\" title=\"{HATCH_NOT_ATTEMPTED}\"></span>{HATCH_NOT_ATTEMPTED}</span>"));
     h.push_str("</div>");
@@ -2590,7 +2960,7 @@ fn build_od_closeness_grid(
         od_panel_table(&mut h, panel, &block_order, &radar_objs, &radar_counts);
         if !panel.fails.is_empty() {
             h.push_str(&format!(
-                "<div class=\"od-fails\"><div class=\"od-fails-h\" title=\"did not converge on this run\">Did not converge ({})</div><table class=\"od-fails-t\"><tbody>{}</tbody></table></div>",
+                "<div class=\"od-fails\"><div class=\"od-fails-h\" title=\"did not converge on this run\">Did not converge ({})</div><table class=\"agrid odfails\"><tbody>{}</tbody></table></div>",
                 panel.fails.len(),
                 panel.fails.join("")
             ));
@@ -2601,6 +2971,101 @@ fn build_od_closeness_grid(
     // that runs no fit) collapses to one hatched line, never an empty panel.
     h.push_str("<div class=\"pair-notcompared generic\" hidden>Not compared &mdash; this tool and reference share no orbit-determination comparison in this run. Choose a fitted tool paired with the reference.</div>");
     h.push_str("</div>");
+    h
+}
+
+/// S6 item 1 (1.3 B · by population): a fit-quality marginal built from the
+/// existing orbit-determination rows — the median observation count, reduced
+/// χ², post-fit RMS″ and σ_eq to JPL per population (1.3A keeps the per-object
+/// values). The quantities the rows do not carry — the rejected fraction
+/// (empyrean records none) and JPL's published solution date — render as a
+/// NAMED "not measured" state with the reason on hover, never a blank, so the
+/// reader sees what is and is not measured. A per-population median of an
+/// existing row, no new run.
+fn build_od_fit_quality_panel(
+    results: &[ValidationResult],
+    orbit_comparisons: &[crate::schema::OrbitComparison],
+) -> String {
+    let radar_counts = jpl_radar_obs_counts(results);
+    let mut obj_pop: HashMap<&str, &str> = HashMap::new();
+    let mut nobs: HashMap<&str, Vec<f64>> = HashMap::new();
+    let mut chi2: HashMap<&str, Vec<f64>> = HashMap::new();
+    let mut rms: HashMap<&str, Vec<f64>> = HashMap::new();
+    let mut sig: HashMap<&str, Vec<f64>> = HashMap::new();
+    for r in results {
+        if r.channel == "rust"
+            && (r.test_type == "orbit_determination" || r.test_type == "orbit_determination_radar")
+        {
+            obj_pop
+                .entry(r.object.as_str())
+                .or_insert(r.population.as_str());
+            let pop = r.population.as_str();
+            if let Some(n) = r.n_obs_used {
+                nobs.entry(pop).or_default().push(n as f64);
+            }
+            if let Some(c) = r.od_reduced_chi2.filter(|c| c.is_finite()) {
+                chi2.entry(pop).or_default().push(c);
+            }
+            if let Some(v) = r.od_rms_combined_arcsec.filter(|v| v.is_finite()) {
+                rms.entry(pop).or_default().push(v);
+            }
+        }
+    }
+    for c in orbit_comparisons {
+        if c.common_epoch_source != "sbdb"
+            || !c.sigma_equiv_combined.is_finite()
+            || radar_counts.contains_key(c.object.as_str())
+        {
+            continue;
+        }
+        if let Some(pop) = obj_pop.get(c.object.as_str()) {
+            sig.entry(*pop).or_default().push(c.sigma_equiv_combined);
+        }
+    }
+    let mut pops: Vec<&str> = nobs.keys().copied().collect();
+    pops.sort_by(|a, b| population_rank(a).cmp(&population_rank(b)).then(a.cmp(b)));
+
+    let med = |m: &HashMap<&str, Vec<f64>>, pop: &str| -> Option<f64> {
+        m.get(pop).filter(|v| !v.is_empty()).map(|v| {
+            let mut s = v.clone();
+            percentile(&mut s, 0.5)
+        })
+    };
+    let n_cell = |o: Option<f64>| o.map(|x| format!("{x:.0}")).unwrap_or_else(|| "—".into());
+    let f2 = |o: Option<f64>| o.map(|x| format!("{x:.2}")).unwrap_or_else(|| "—".into());
+
+    let mut h = String::new();
+    h.push_str("<div class=\"grid-scroll\"><table class=\"agrid odgrid\"><thead><tr>");
+    h.push_str("<th class=\"gobj\">population</th>");
+    h.push_str(&format!(
+        "<th class=\"od-d\">{}</th><th class=\"od-d\">{}</th><th class=\"od-d\">{}</th><th class=\"od-d\">{}</th><th class=\"od-d\">rejected %</th><th class=\"od-d\">JPL date</th>",
+        uhdr("n_obs"),
+        uhdr("χ²ᵣ"),
+        uhdr("RMS″"),
+        uhdr("σ_eq"),
+    ));
+    h.push_str("</tr></thead><tbody>");
+    if pops.is_empty() {
+        h.push_str("<tr class=\"gobjrow\"><td class=\"gobjname\" colspan=\"7\">no orbit-determination rows in this run</td></tr>");
+    }
+    for pop in &pops {
+        let n = nobs.get(pop).map(|v| v.len()).unwrap_or(0);
+        h.push_str(&format!(
+            "<tr class=\"gobjrow\"><td class=\"gobjname\" title=\"median over {n} fit(s)\">{}</td>",
+            attr_escape(pop)
+        ));
+        h.push_str(&format!(
+            "<td class=\"od-d\">{}</td><td class=\"od-d\">{}</td><td class=\"od-d\">{}</td><td class=\"od-d\">{}</td>",
+            n_cell(med(&nobs, pop)),
+            f2(med(&chi2, pop)),
+            f2(med(&rms, pop)),
+            f2(med(&sig, pop)),
+        ));
+        h.push_str("<td class=\"od-d hatch\" title=\"empyrean records no rejected-observation count in this run — not measured\">not measured</td>");
+        h.push_str("<td class=\"od-d hatch\" title=\"JPL's published solution date is not in the comparison record — not measured\">not measured</td>");
+        h.push_str("</tr>");
+    }
+    h.push_str("</tbody></table></div>");
     h
 }
 
@@ -2842,7 +3307,7 @@ fn build_channel_fidelity_grid(results: &[ValidationResult]) -> String {
         .count();
     let mut h = String::new();
     h.push_str(&format!(
-        "<div class=\"grid-summary\" title=\"Each counted channel reproduces empyrean-core to ≤ ULP on at least one axis. Every channel runs against empyrean-core, the validation reference; rust also appears in Parts 1–2 against JPL.\">{n_clean} of {n_present} channels ≤ ULP on ≥1 axis</div>"
+        "<div class=\"grid-summary\">{n_clean} of {n_present} channels ≤ ULP on ≥1 axis</div>"
     ));
     // State key: glyph + word for the four states (the mark the per-object cells
     // print), meaning on the swatch hover; the hatched "not run" stays. Built from
@@ -2858,7 +3323,7 @@ fn build_channel_fidelity_grid(results: &[ValidationResult]) -> String {
     h.push_str("</div>");
 
     // ── Channel × test-type four-state grid ───────────────────────────
-    h.push_str("<div class=\"grid-scroll\"><table class=\"agrid fidgrid\"><thead><tr><th class=\"gobj\">channel</th>");
+    h.push_str("<div class=\"grid-scroll\"><table class=\"agrid fidgrid\" data-grid=\"fidelity\"><thead><tr><th class=\"gobj\">channel</th>");
     for (_, disp, _, _, _) in &test_types {
         h.push_str(&format!("<th class=\"fid-h\">{disp}</th>"));
     }
@@ -2912,7 +3377,11 @@ fn build_channel_fidelity_grid(results: &[ValidationResult]) -> String {
             objects.push((r.object.as_str(), r.population.as_str()));
         }
     }
-    objects.sort_by(|a, b| a.1.cmp(b.1).then(a.0.cmp(b.0)));
+    objects.sort_by(|a, b| {
+        population_rank(a.1)
+            .cmp(&population_rank(b.1))
+            .then(a.0.cmp(b.0))
+    });
     let present_ch: Vec<&str> = channels
         .iter()
         .copied()
@@ -2925,7 +3394,7 @@ fn build_channel_fidelity_grid(results: &[ValidationResult]) -> String {
     // Two-level grouped header: the channel spans its test-type columns once
     // (no repeated channel word), the test type sits under it. In-table, so no
     // visible-word budget cost.
-    h.push_str("<div class=\"grid-scroll\"><table class=\"agrid fidgrid\"><thead><tr><th class=\"gobj\" rowspan=\"2\">object</th>");
+    h.push_str("<div class=\"grid-scroll\"><table class=\"agrid fidgrid\" data-grid=\"fidelity\"><thead><tr><th class=\"gobj\" rowspan=\"2\">object</th>");
     for &ch in &present_ch {
         h.push_str(&format!(
             "<th class=\"fo-h fo-grp\" colspan=\"{}\">{ch}</th>",
@@ -2939,11 +3408,14 @@ fn build_channel_fidelity_grid(results: &[ValidationResult]) -> String {
         }
     }
     h.push_str("</tr></thead><tbody>");
-    // Group by population.
-    let mut blocks: BTreeMap<&str, Vec<&str>> = BTreeMap::new();
+    // Group by population, then order the blocks by the one canonical order
+    // (a BTreeMap would re-alphabetize them on iteration).
+    let mut block_map: BTreeMap<&str, Vec<&str>> = BTreeMap::new();
     for &(o, p) in &objects {
-        blocks.entry(p).or_default().push(o);
+        block_map.entry(p).or_default().push(o);
     }
+    let mut blocks: Vec<(&str, Vec<&str>)> = block_map.into_iter().collect();
+    blocks.sort_by_key(|(p, _)| population_rank(p));
     let ncols = present_ch.len() * test_types.len() + 1;
     for (pop, objs) in &blocks {
         h.push_str(&format!(
@@ -3044,9 +3516,12 @@ fn eph_vs_jpl_mas(results: &[ValidationResult]) -> (ByObjDt, ByObjDt) {
 /// numbers (p50 and p90) side by side.
 fn ladder_chip(axis: GridAxis, v: f64) -> String {
     let bin = axis.bin(v);
-    let rw = if bin == 7 { " rw" } else { "" };
+    // S5 item 3: the decade bin rides a data attribute, not a `gbN` class, so
+    // every inline value chip shares one class signature (`.lchip`); runaway is
+    // a `data-rw` flag, likewise off the class. One key component, not seven.
+    let rw = if bin == 7 { " data-rw=\"1\"" } else { "" };
     format!(
-        "<span class=\"lchip gb{bin}{rw}\" title=\"{}\">{}</span>",
+        "<span class=\"lchip\" data-gb=\"{bin}\"{rw} title=\"{}\">{}</span>",
         attr_escape(&grid_fmt(axis, v)),
         grid_compact(axis, v)
     )
@@ -3077,12 +3552,17 @@ fn part2_cell(axis: GridAxis, v: Option<f64>, is_gap: bool, n: Option<usize>) ->
     }
 }
 
-/// Build Part 2: three matrices that state every tool's own numbers, coloured
-/// on the report's one decade ladder — R1 by axis, R2 by population, R3 by
-/// object. No cell ranks the tools or names a winner; the reader compares.
-fn build_tool_ranking_html(
+/// Build Part 2 (S7): three fixed-slot sections — 2.1 Propagation · 2.2
+/// Ephemeris · 2.3 Orbit determination — each via the one `part1_section`
+/// renderer. Per section: head → readout (every tool's own number for that
+/// axis, the former "By tool and axis" row) → A · by object → B · by population
+/// → C · cost → one Method fold. Every matrix states a tool's OWN numbers on the
+/// report's one decade ladder; no cell ranks the tools or names a winner.
+fn build_part2_sections(
     results: &[ValidationResult],
     orbit_comparisons: &[crate::schema::OrbitComparison],
+    emp_eph_ch: (&'static str, bool),
+    emp_od_ch: (&'static str, bool),
 ) -> String {
     // Objects whose JPL solution used radar: their optical fit is not compared
     // with JPL, so they are hatched in the by-object view and left out of the
@@ -3197,7 +3677,7 @@ fn build_tool_ranking_html(
         }
     };
 
-    // OD convergence + closeness.
+    // OD convergence + closeness (empyrean) and find_orb convergence.
     let od_conv = results
         .iter()
         .filter(|r| {
@@ -3240,38 +3720,8 @@ fn build_tool_ranking_html(
         })
         .count();
 
-    // Timing p50 + sample count per tool at its own boundary.
-    let p50_n = |f: &dyn Fn(&ValidationResult) -> Option<f64>| -> (Option<f64>, usize) {
-        let mut v: Vec<f64> = results
-            .iter()
-            .filter_map(f)
-            .filter(|x| x.is_finite())
-            .collect();
-        let n = v.len();
-        if v.is_empty() {
-            (None, 0)
-        } else {
-            (Some(percentile(&mut v, 0.5)), n)
-        }
-    };
-    let (emp_ms, emp_ms_n) = p50_n(&|r| {
-        if r.channel == "rust"
-            && r.test_type == "propagation"
-            && r.propagation_uncertainty.as_deref() == Some("first_order_detection_on")
-        {
-            r.emp_time_ms
-        } else {
-            None
-        }
-    });
-    let (assist_ms, assist_ms_n) = p50_n(&|r| r.assist_time_ms);
-    let (fo_ms, fo_ms_n) = p50_n(&|r| r.findorb_time_ms);
-    let (kete_ms, kete_ms_n) = p50_n(&|r| r.kete_time_ms);
-    let (jorbit_ms, jorbit_ms_n) = p50_n(&|r| r.jorbit_time_ms);
-
     let km = GridAxis::PropKm;
     let mas = GridAxis::EphMas;
-    let tms = GridAxis::TimingMs;
     let chip_pair = |axis: GridAxis, p50: Option<f64>, p90: Option<f64>, n: usize| -> String {
         match (p50, p90) {
             (Some(a), Some(b)) => format!(
@@ -3282,40 +3732,8 @@ fn build_tool_ranking_html(
             _ => format!("<td class=\"r1c hatch\" title=\"{HATCH_NOT_COMPARED}\">—</td>"),
         }
     };
-    let timing_td = |ms: Option<f64>, n: usize, boundary: &str| -> String {
-        match ms {
-            Some(v) => format!(
-                "<td class=\"r1c\">{}<br/><span class=\"cn-n\">n {n} · {boundary}</span></td>",
-                ladder_chip(tms, v)
-            ),
-            None => "<td class=\"r1c hatch\" title=\"not timed\">—</td>".to_string(),
-        }
-    };
-
-    let mut h = String::new();
-
-    // ── R1: tool × axis ──
-    h.push_str("<div class=\"panel-title\">By tool and axis</div>");
-    h.push_str("<div class=\"grid-scroll\"><table class=\"agrid r1grid\"><thead><tr title=\"Each cell is that tool's own number on the column-head axis (prop/eph km·mas, OD fits + median σ_eq, timing ms at its own boundary). One decade ladder; smaller is closer; read each column within itself; n per cell.\">");
-    h.push_str(
-        "<th class=\"gobj\">tool</th>\
-         <th>propagation<br/><span class=\"r1sub\">p50 · p90 · km vs JPL</span></th>\
-         <th>ephemeris<br/><span class=\"r1sub\">p50 · p90 · mas vs JPL</span></th>\
-         <th>orbit determination<br/><span class=\"r1sub\">converged / attempted · median σ_eq</span></th>\
-         <th>timing<br/><span class=\"r1sub\">p50 · ms · own boundary</span></th></tr></thead><tbody>",
-    );
-    // empyrean.
-    h.push_str(&format!(
-        "<tr class=\"gsub\"><td class=\"gtool\">empyrean <span class=\"r1ref\">(under test)</span></td>{}{}<td class=\"r1c\">{}/{}<br/><span class=\"cn-n\">σ_eq {}</span></td>{}</tr>",
-        chip_pair(km, pct(&emp, 0.5), pct(&emp, 0.9), n_rows(&emp)),
-        chip_pair(mas, pct(&emp_eph, 0.5), pct(&emp_eph, 0.9), n_rows(&emp_eph)),
-        od_conv,
-        od_att,
-        med_sig_s,
-        timing_td(emp_ms, emp_ms_n, "whole call"),
-    ));
-    // ASSIST — propagation states its all-rows and excl-gap medians (numbers only).
-    let assist_prop = {
+    // ASSIST propagation states its all-rows and excl-gap medians (numbers only).
+    let assist_prop_cell = {
         let line = |label: &str, p50: Option<f64>, p90: Option<f64>, n: usize| -> String {
             match (p50, p90) {
                 (Some(a), Some(b)) => format!(
@@ -3343,88 +3761,9 @@ fn build_tool_ranking_html(
             )
         )
     };
-    h.push_str(&format!(
-        "<tr class=\"gsub\"><td class=\"gtool\">ASSIST</td>{}<td class=\"r1c hatch\" title=\"ASSIST runs no ephemeris axis\"></td><td class=\"r1c hatch\" title=\"ASSIST runs no fit\"></td>{}</tr>",
-        assist_prop,
-        timing_td(assist_ms, assist_ms_n, "integrate only"),
-    ));
-    // find_orb.
-    h.push_str(&format!(
-        "<tr class=\"gsub\"><td class=\"gtool\">find_orb</td>{}{}<td class=\"r1c\">{}<br/><span class=\"cn-n\">σ_eq: {HATCH_NO_RECORD}</span></td>{}</tr>",
-        chip_pair(km, pct(&findorb, 0.5), pct(&findorb, 0.9), n_rows(&findorb)),
-        chip_pair(mas, pct(&fo_eph, 0.5), pct(&fo_eph, 0.9), n_rows(&fo_eph)),
-        fo_conv,
-        timing_td(fo_ms, fo_ms_n, "per fit"),
-    ));
-    // kete / jorbit (timing only).
-    for (nm, ms, n) in [
-        ("kete", kete_ms, kete_ms_n),
-        ("jorbit", jorbit_ms, jorbit_ms_n),
-    ] {
-        h.push_str(&format!(
-            "<tr class=\"gsub\"><td class=\"gtool\">{nm}</td><td class=\"r1c hatch\" title=\"timing only\"></td><td class=\"r1c hatch\" title=\"timing only\"></td><td class=\"r1c hatch\" title=\"runs no fit\"></td>{}</tr>",
-            timing_td(ms, n, "whole call"),
-        ));
-    }
-    // JPL reference row.
-    h.push_str(&format!(
-        "<tr class=\"gsub\"><td class=\"gtool\">JPL Horizons/SBDB</td><td class=\"r1c hatch\" title=\"reference\"></td><td class=\"r1c hatch\" title=\"reference\"></td><td class=\"r1c hatch\" title=\"reference\"></td><td class=\"r1c hatch\" title=\"{HATCH_NOT_TIMED}\"></td></tr>"
-    ));
-    // Tools with no rows in this run.
-    for nm in ["OpenOrb", "GRSS", "OrbFit", "layup"] {
-        h.push_str(&format!(
-            "<tr class=\"gsub\"><td class=\"gtool\">{nm}</td><td class=\"r1c hatch\" colspan=\"4\" title=\"{HATCH_NOT_IN_RUN}\"></td></tr>"
-        ));
-    }
-    h.push_str("</tbody></table></div>");
-    // ── R2: tool × population ──
-    let mut pops: Vec<&str> = obj2pop
-        .values()
-        .copied()
-        .collect::<BTreeSet<_>>()
-        .into_iter()
-        .collect();
-    let pop_worst = |pop: &str| -> f64 {
-        scoped(&emp, pop)
-            .into_iter()
-            .fold(f64::NEG_INFINITY, f64::max)
-    };
-    pops.sort_by(|a, b| {
-        pop_worst(b)
-            .partial_cmp(&pop_worst(a))
-            .unwrap_or(std::cmp::Ordering::Equal)
-    });
-    h.push_str("<div class=\"panel-title\">By tool and population</div>");
-    h.push_str("<div class=\"grid-scroll\"><table class=\"agrid r2grid\"><thead><tr title=\"Each cell: that tool's median km offset from JPL Horizons over a population's objects (n stated); one decade ladder, smaller closer; dagger = a population with an object ASSIST cannot model.\"><th class=\"gobj\">population</th><th>empyrean</th><th>ASSIST</th><th>find_orb</th></tr></thead><tbody>");
-    for &pop in &pops {
-        let pop_gap = obj2pop
-            .iter()
-            .any(|(o, p)| *p == pop && model_gap.contains(*o));
-        h.push_str(&format!(
-            "<tr class=\"gsub\"><td class=\"gtool\">{}</td>{}{}{}</tr>",
-            attr_escape(pop),
-            part2_cell(
-                km,
-                median_of(scoped(&emp, pop)),
-                false,
-                Some(scoped_nobj(&emp, pop))
-            ),
-            part2_cell(
-                km,
-                median_of(scoped(&assist, pop)),
-                pop_gap,
-                Some(scoped_nobj(&assist, pop))
-            ),
-            part2_cell(
-                km,
-                median_of(scoped(&findorb, pop)),
-                false,
-                Some(scoped_nobj(&findorb, pop))
-            ),
-        ));
-    }
-    h.push_str("</tbody></table></div>");
-    // ── R3: tool × object (grouped by population, heatmap order) ──
+
+    // Per-population object blocks in the one canonical order, worst-first inside
+    // a block. Shared by every A · by object grid in Part 2.
     let objects: Vec<(&str, &str)> = obj2pop.iter().map(|(&o, &p)| (o, p)).collect();
     let mut by_pop: BTreeMap<&str, Vec<&str>> = BTreeMap::new();
     for &(o, p) in &objects {
@@ -3444,120 +3783,634 @@ fn build_tool_ranking_html(
             .fold(f64::NEG_INFINITY, f64::max)
     };
     blocks.sort_by(|a, b| {
-        block_worst(&b.1)
-            .partial_cmp(&block_worst(&a.1))
-            .unwrap_or(std::cmp::Ordering::Equal)
+        population_rank(a.0)
+            .cmp(&population_rank(b.0))
+            .then_with(|| {
+                block_worst(&b.1)
+                    .partial_cmp(&block_worst(&a.1))
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            })
     });
-    // The two per-object tables (50 rows each) sit behind one toggle; the
-    // per-population rows above are the default view. The summary is the toggle;
-    // its body is hidden by default, so the two panel-titles cost no visible
-    // words until the reader opens it. Nothing is dropped — only folded.
-    h.push_str("<details class=\"more-tables\"><summary class=\"more-sum\">per object</summary>");
-    h.push_str("<div class=\"panel-title\">By tool and object</div>");
-    h.push_str("<div class=\"grid-scroll\"><table class=\"agrid r3grid\"><thead><tr title=\"Each cell: that tool's median km difference from JPL Horizons across the seventeen horizons; smaller closer; one decade ladder; hatched where the tool has no rows; dagger = an object ASSIST cannot model.\"><th class=\"gobj\">object</th><th>empyrean</th><th>ASSIST</th><th>find_orb</th></tr></thead><tbody>");
-    for (pop, objs) in &blocks {
-        h.push_str(&format!(
-            "<tr class=\"gpophdr\"><td class=\"gpopname\" colspan=\"4\">{} ({})</td></tr>",
-            attr_escape(pop),
-            objs.len()
-        ));
-        for &obj in objs {
-            let is_gap = model_gap.contains(obj);
+
+    // Populations in the one canonical order, worst-first within a rank.
+    let mut pops: Vec<&str> = obj2pop
+        .values()
+        .copied()
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect();
+    let pop_worst = |pop: &str| -> f64 {
+        scoped(&emp, pop)
+            .into_iter()
+            .fold(f64::NEG_INFINITY, f64::max)
+    };
+    pops.sort_by(|a, b| {
+        population_rank(a).cmp(&population_rank(b)).then_with(|| {
+            pop_worst(b)
+                .partial_cmp(&pop_worst(a))
+                .unwrap_or(std::cmp::Ordering::Equal)
+        })
+    });
+
+    // ── readouts (the former "By tool and axis" row, split per axis) ──
+    let readout_prop = format!(
+        "<div class=\"grid-summary\">km</div><div class=\"grid-scroll\"><table class=\"agrid r1grid\"><thead><tr><th class=\"gobj\">tool</th><th>propagation vs JPL</th></tr></thead><tbody>\
+         <tr class=\"gsub\"><td class=\"gtool\">empyrean <span class=\"r1ref\">(under test)</span></td>{}</tr>\
+         <tr class=\"gsub\"><td class=\"gtool\">ASSIST</td>{}</tr>\
+         <tr class=\"gsub\"><td class=\"gtool\">find_orb</td>{}</tr>\
+         </tbody></table></div>",
+        chip_pair(km, pct(&emp, 0.5), pct(&emp, 0.9), n_rows(&emp)),
+        assist_prop_cell,
+        chip_pair(km, pct(&findorb, 0.5), pct(&findorb, 0.9), n_rows(&findorb)),
+    );
+    let readout_eph = format!(
+        "<div class=\"grid-summary\">mas</div><div class=\"grid-scroll\"><table class=\"agrid r1grid\"><thead><tr><th class=\"gobj\">tool</th><th>ephemeris vs JPL</th></tr></thead><tbody>\
+         <tr class=\"gsub\"><td class=\"gtool\">empyrean <span class=\"r1ref\">(under test)</span></td>{}</tr>\
+         <tr class=\"gsub\"><td class=\"gtool\">find_orb</td>{}</tr>\
+         </tbody></table></div>",
+        chip_pair(
+            mas,
+            pct(&emp_eph, 0.5),
+            pct(&emp_eph, 0.9),
+            n_rows(&emp_eph)
+        ),
+        chip_pair(mas, pct(&fo_eph, 0.5), pct(&fo_eph, 0.9), n_rows(&fo_eph)),
+    );
+    let readout_od = format!(
+        "<div class=\"grid-summary\">{}</div><div class=\"grid-scroll\"><table class=\"agrid r1grid\"><thead><tr><th class=\"gobj\">tool</th><th>orbit determination vs JPL</th></tr></thead><tbody>\
+         <tr class=\"gsub\"><td class=\"gtool\">empyrean <span class=\"r1ref\">(under test)</span></td><td class=\"r1c\">{od_conv}/{od_att}<br/><span class=\"cn-n\">{} {med_sig_s}</span></td></tr>\
+         <tr class=\"gsub\"><td class=\"gtool\">find_orb</td><td class=\"r1c\">{fo_conv}<br/><span class=\"cn-n\">{}: {HATCH_NO_RECORD}</span></td></tr>\
+         </tbody></table></div>",
+        uhdr("σ_eq"),
+        uhdr("σ_eq"),
+        uhdr("σ_eq"),
+    );
+
+    // ── A · by object (folded behind one `per object` disclosure per section) ──
+    let a_prop = {
+        let mut h = String::new();
+        h.push_str(
+            "<details class=\"more-tables\"><summary class=\"more-sum\">per object</summary>",
+        );
+        h.push_str("<div class=\"panel-title\">By tool and object</div>");
+        h.push_str("<div class=\"grid-scroll\"><table class=\"agrid r3grid\"><thead><tr title=\"Each cell: that tool's median km difference from JPL Horizons across the seventeen horizons; smaller closer; one decade ladder; hatched where the tool has no rows; dagger = an object ASSIST cannot model.\"><th class=\"gobj\">object</th><th>empyrean</th><th>ASSIST</th><th>find_orb</th></tr></thead><tbody>");
+        for (pop, objs) in &blocks {
             h.push_str(&format!(
-                "<tr class=\"gobjr\"><td class=\"gobjname2\">{}</td>{}{}{}</tr>",
-                attr_escape(obj),
-                part2_cell(km, obj_median(&emp, obj), false, None),
-                part2_cell(km, obj_median(&assist, obj), is_gap, None),
-                part2_cell(km, obj_median(&findorb, obj), false, None),
+                "<tr class=\"gpophdr\"><td class=\"gpopname\" colspan=\"4\">{} ({})</td></tr>",
+                attr_escape(pop),
+                objs.len()
             ));
-        }
-    }
-    h.push_str("</tbody></table></div>");
-    // ── OD closeness by object and fitter (numbers-only) ──
-    // The by-object cross-fitter view the one-tool §1.3A grid deliberately
-    // omits: every fitter's own convergence, with empyrean's sigma-equivalent
-    // distance to JPL. find_orb publishes no covariance, so it carries only its
-    // convergence.
-    {
-        let mut od_sig: HashMap<&str, Option<f64>> = HashMap::new();
-        for c in orbit_comparisons {
-            if c.common_epoch_source == "sbdb" {
-                let v = if c.sigma_equiv_combined.is_finite() {
-                    Some(c.sigma_equiv_combined)
-                } else {
-                    None
-                };
-                od_sig.insert(c.object.as_str(), v);
+            for &obj in objs {
+                let is_gap = model_gap.contains(obj);
+                h.push_str(&format!(
+                    "<tr class=\"gobjr\"><td class=\"gobjname2\">{}</td>{}{}{}</tr>",
+                    attr_escape(obj),
+                    part2_cell(km, obj_median(&emp, obj), false, None),
+                    part2_cell(km, obj_median(&assist, obj), is_gap, None),
+                    part2_cell(km, obj_median(&findorb, obj), false, None),
+                ));
             }
         }
-        let mut emp_od: HashMap<&str, &ValidationResult> = HashMap::new();
+        h.push_str("</tbody></table></div></details>");
+        h
+    };
+    let a_eph = {
+        let mut h = String::new();
+        h.push_str(
+            "<details class=\"more-tables\"><summary class=\"more-sum\">per object</summary>",
+        );
+        h.push_str("<div class=\"panel-title\">By tool and object</div>");
+        if emp_eph.is_empty() && fo_eph.is_empty() {
+            h.push_str("<div class=\"grid-scroll\"><table class=\"agrid r3grid\"><tbody><tr class=\"gobjr\"><td class=\"gobjname2 hatch\" title=\"no ephemeris comparison rows in this run — not measured\">not measured</td></tr></tbody></table></div>");
+        } else {
+            h.push_str("<div class=\"grid-scroll\"><table class=\"agrid r3grid\"><thead><tr title=\"Each cell: that tool's median sky separation from JPL Horizons across the horizons (mas); smaller closer; one decade ladder; hatched where the tool has no rows.\"><th class=\"gobj\">object</th><th>empyrean</th><th>find_orb</th></tr></thead><tbody>");
+            for (pop, objs) in &blocks {
+                h.push_str(&format!(
+                    "<tr class=\"gpophdr\"><td class=\"gpopname\" colspan=\"3\">{} ({})</td></tr>",
+                    attr_escape(pop),
+                    objs.len()
+                ));
+                for &obj in objs {
+                    h.push_str(&format!(
+                        "<tr class=\"gobjr\"><td class=\"gobjname2\">{}</td>{}{}</tr>",
+                        attr_escape(obj),
+                        part2_cell(mas, obj_median(&emp_eph, obj), false, None),
+                        part2_cell(mas, obj_median(&fo_eph, obj), false, None),
+                    ));
+                }
+            }
+            h.push_str("</tbody></table></div>");
+        }
+        h.push_str("</details>");
+        h
+    };
+    let a_od = {
+        // De-duplication (S3 item 6): §1.3A owns the per-object empyrean σ_eq vs
+        // JPL, so this cross-fitter view keeps only what §1.3A lacks — the
+        // external fitters' own convergence — and links to §1.3A. find_orb
+        // publishes no covariance, so it carries only its convergence.
         let mut fo_od: HashMap<&str, &ValidationResult> = HashMap::new();
         for r in results {
-            if r.test_type == "orbit_determination" {
-                if r.channel == "rust" {
-                    emp_od.insert(r.object.as_str(), r);
-                } else if r.channel == "core"
-                    && (r.findorb_rms_residual.is_some() || r.findorb_n_obs_used.is_some())
-                {
-                    fo_od.insert(r.object.as_str(), r);
-                }
+            if r.test_type == "orbit_determination"
+                && r.channel == "core"
+                && (r.findorb_rms_residual.is_some() || r.findorb_n_obs_used.is_some())
+            {
+                fo_od.insert(r.object.as_str(), r);
             }
         }
-        let emp_cell = |obj: &str| -> String {
-            // JPL used radar for this object: the σ_eq comparison is not like for
-            // like, so the cell is the one hatch (marked, counted out of the stat),
-            // never dropped. The reason rides the hover.
-            if let Some((del, dop)) = radar_counts.get(obj) {
-                return format!(
-                    "<td class=\"r1c hatch\" title=\"{}\"></td>",
-                    attr_escape(&jpl_radar_hover(*del, *dop))
-                );
-            }
-            match emp_od.get(obj).and_then(|r| r.od_converged) {
-                Some(true) => {
-                    if let Some(s) = od_sig.get(obj).and_then(|v| *v) {
-                        let bin = od_sigma_bin(s);
-                        format!("<td class=\"r1c gb{bin}\">{s:.2}</td>")
-                    } else if od_sig.contains_key(obj) {
-                        // The OD grid's glyphs: ? for a converged fit whose
-                        // metric is undefined, · for one with no record.
-                        "<td class=\"r1c\" title=\"converged · Σ_ref not SPD at the common epoch — metric undefined\">?</td>"
-                            .to_string()
-                    } else {
-                        format!("<td class=\"r1c\" title=\"converged · {HATCH_NO_RECORD}\">·</td>")
-                    }
-                }
-                Some(false) => "<td class=\"r1c\" title=\"did not converge\">✕</td>".to_string(),
-                None => format!("<td class=\"r1c hatch\" title=\"{HATCH_NOT_ATTEMPTED}\"></td>"),
-            }
-        };
         let fo_cell = |obj: &str| -> String {
             match fo_od.get(obj).map(|r| r.findorb_rms_residual.is_some()) {
-                Some(true) => "<td class=\"r1c\" title=\"converged · find_orb publishes no covariance, so no σ_eq\">·</td>".to_string(),
+                Some(true) => "<td class=\"r1c\" title=\"converged · find_orb publishes no covariance, so no σ_eq\">—</td>".to_string(),
                 _ => format!("<td class=\"r1c hatch\" title=\"{HATCH_NOT_ATTEMPTED}\"></td>"),
             }
         };
-        h.push_str("<div class=\"panel-title\" title=\"By object and fitter — orbit determination (σ_eq to JPL)\">By object and fitter</div>");
-        h.push_str("<div class=\"grid-scroll\"><table class=\"agrid r3grid\"><thead><tr title=\"Each empyrean cell is that object's σ-equivalent distance to the JPL SBDB solution, on the same σ_eq ladder as §1.3A; smaller is closer. find_orb publishes no covariance, so its cell shows only whether it fit the arc.\"><th class=\"gobj\">object</th><th>empyrean</th><th>find_orb</th></tr></thead><tbody>");
+        let mut h = String::new();
+        h.push_str(
+            "<details class=\"more-tables\"><summary class=\"more-sum\">per object</summary>",
+        );
+        h.push_str("<div class=\"panel-title\" title=\"By object and fitter — the external fitters' own convergence; empyrean's per-object σ_eq to JPL lives in §1.3A\">By object and fitter <a class=\"xref\" href=\"#s08b\" title=\"empyrean's per-object σ_eq to JPL\">§1.3A</a></div>");
+        h.push_str("<div class=\"grid-scroll\"><table class=\"agrid r3grid\"><thead><tr title=\"Each external fitter's own convergence on the SBDB arc; empyrean's per-object σ_eq to JPL lives in §1.3A. find_orb publishes no covariance, so its cell shows only whether it fit the arc.\"><th class=\"gobj\">object</th><th>find_orb</th></tr></thead><tbody>");
         for (pop, objs) in &blocks {
             h.push_str(&format!(
-                "<tr class=\"gpophdr\"><td class=\"gpopname\" colspan=\"3\">{} ({})</td></tr>",
+                "<tr class=\"gpophdr\"><td class=\"gpopname\" colspan=\"2\">{} ({})</td></tr>",
                 attr_escape(pop),
                 objs.len()
             ));
             for &obj in objs {
                 h.push_str(&format!(
-                    "<tr class=\"gobjr\"><td class=\"gobjname2\">{}</td>{}{}</tr>",
+                    "<tr class=\"gobjr\"><td class=\"gobjname2\">{}</td>{}</tr>",
                     attr_escape(obj),
-                    emp_cell(obj),
                     fo_cell(obj),
                 ));
             }
         }
+        h.push_str("</tbody></table></div></details>");
+        h
+    };
+
+    // ── B · by population (visible; the slot eyebrow and section name it) ──
+    let b_prop = {
+        let mut h = String::new();
+        h.push_str("<div class=\"grid-scroll\"><table class=\"agrid r2grid\"><thead><tr title=\"Each cell: that tool's median km offset from JPL Horizons over a population's objects (n stated); one decade ladder, smaller closer; dagger = a population with an object ASSIST cannot model.\"><th class=\"gobj\">population</th><th>empyrean</th><th>ASSIST</th><th>find_orb</th></tr></thead><tbody>");
+        for &pop in &pops {
+            let pop_gap = obj2pop
+                .iter()
+                .any(|(o, p)| *p == pop && model_gap.contains(*o));
+            h.push_str(&format!(
+                "<tr class=\"gsub\"><td class=\"gtool\">{}</td>{}{}{}</tr>",
+                attr_escape(pop),
+                part2_cell(
+                    km,
+                    median_of(scoped(&emp, pop)),
+                    false,
+                    Some(scoped_nobj(&emp, pop))
+                ),
+                part2_cell(
+                    km,
+                    median_of(scoped(&assist, pop)),
+                    pop_gap,
+                    Some(scoped_nobj(&assist, pop))
+                ),
+                part2_cell(
+                    km,
+                    median_of(scoped(&findorb, pop)),
+                    false,
+                    Some(scoped_nobj(&findorb, pop))
+                ),
+            ));
+        }
         h.push_str("</tbody></table></div>");
+        h
+    };
+    let b_eph = {
+        let mut h = String::new();
+        h.push_str("<div class=\"grid-scroll\"><table class=\"agrid r2grid\"><thead><tr title=\"Each cell: that tool's median sky separation from JPL Horizons over a population's objects (mas, n stated); one decade ladder, smaller closer.\"><th class=\"gobj\">population</th><th>empyrean</th><th>find_orb</th></tr></thead><tbody>");
+        for &pop in &pops {
+            h.push_str(&format!(
+                "<tr class=\"gsub\"><td class=\"gtool\">{}</td>{}{}</tr>",
+                attr_escape(pop),
+                part2_cell(
+                    mas,
+                    median_of(scoped(&emp_eph, pop)),
+                    false,
+                    Some(scoped_nobj(&emp_eph, pop))
+                ),
+                part2_cell(
+                    mas,
+                    median_of(scoped(&fo_eph, pop)),
+                    false,
+                    Some(scoped_nobj(&fo_eph, pop))
+                ),
+            ));
+        }
+        h.push_str("</tbody></table></div>");
+        h
+    };
+    let b_od = {
+        // empyrean median σ_eq per population (same rows §1.3A's marginal uses);
+        // find_orb's convergence count per population. Numbers only, never a rank.
+        let mut sig_pop: HashMap<&str, Vec<f64>> = HashMap::new();
+        for c in orbit_comparisons {
+            if c.common_epoch_source != "sbdb"
+                || !c.sigma_equiv_combined.is_finite()
+                || radar_counts.contains_key(c.object.as_str())
+            {
+                continue;
+            }
+            if let Some(pop) = obj2pop.get(c.object.as_str()) {
+                sig_pop
+                    .entry(*pop)
+                    .or_default()
+                    .push(c.sigma_equiv_combined);
+            }
+        }
+        let mut fo_pop: HashMap<&str, (usize, usize)> = HashMap::new();
+        for r in results {
+            if r.test_type == "orbit_determination"
+                && r.channel == "core"
+                && (r.findorb_rms_residual.is_some() || r.findorb_n_obs_used.is_some())
+                && let Some(pop) = obj2pop.get(r.object.as_str())
+            {
+                let e = fo_pop.entry(*pop).or_insert((0, 0));
+                e.1 += 1;
+                if r.findorb_rms_residual.is_some() {
+                    e.0 += 1;
+                }
+            }
+        }
+        let mut h = String::new();
+        h.push_str(&format!(
+            "<div class=\"grid-scroll\"><table class=\"agrid odgrid\"><thead><tr title=\"empyrean: median σ-equivalent distance to JPL over a population's objects (radar-solution objects excluded); find_orb: fits converged of attempted. Numbers, never a rank.\"><th class=\"gobj\">population</th><th class=\"od-d\">empyrean {}</th><th class=\"od-d\">find_orb conv.</th></tr></thead><tbody>",
+            uhdr("σ_eq")
+        ));
+        for &pop in &pops {
+            let es = sig_pop.get(pop).filter(|v| !v.is_empty()).map(|v| {
+                let mut s = v.clone();
+                format!("{:.2}", percentile(&mut s, 0.5))
+            });
+            let emp_c = match es {
+                Some(s) => format!("<td class=\"od-d\">{s}</td>"),
+                None => "<td class=\"od-d hatch\" title=\"no finite σ_eq for this population in this run — not measured\">not measured</td>".to_string(),
+            };
+            let fo_c = match fo_pop.get(pop) {
+                Some((c, a)) => format!("<td class=\"od-d\">{c}/{a}</td>"),
+                None => format!("<td class=\"od-d hatch\" title=\"{HATCH_NOT_ATTEMPTED}\"></td>"),
+            };
+            h.push_str(&format!(
+                "<tr class=\"gobjrow\"><td class=\"gobjname\">{}</td>{emp_c}{fo_c}</tr>",
+                attr_escape(pop)
+            ));
+        }
+        h.push_str("</tbody></table></div>");
+        h
+    };
+
+    // ── C · cost (the per-axis timing tables; the per-object G grid folded) ──
+    let fold_grid = |g: String| -> String {
+        format!(
+            "<details class=\"more-tables\"><summary class=\"more-sum\">per object</summary>{g}</details>"
+        )
+    };
+    let c_prop = format!(
+        "{}{}{}",
+        build_part2_timing_t1(results),
+        build_part2_timing_t2_axis(results, "propagation", emp_eph_ch, emp_od_ch),
+        fold_grid(build_timing_grid_axis(
+            results,
+            "propagation",
+            emp_eph_ch,
+            emp_od_ch
+        )),
+    );
+    let c_eph = format!(
+        "{}{}",
+        build_part2_timing_t2_axis(results, "ephemeris", emp_eph_ch, emp_od_ch),
+        fold_grid(build_timing_grid_axis(
+            results,
+            "ephemeris",
+            emp_eph_ch,
+            emp_od_ch
+        )),
+    );
+    let c_od = format!(
+        "{}{}",
+        build_part2_timing_t2_axis(results, "orbit_determination", emp_eph_ch, emp_od_ch),
+        fold_grid(build_timing_grid_axis(
+            results,
+            "orbit_determination",
+            emp_eph_ch,
+            emp_od_ch
+        )),
+    );
+
+    // ── Method folds (one per section; the former §2.1 disclosure, by axis) ──
+    let method_prop = "<div class=\"disclosures\"><details><summary>Method</summary><div class=\"disc-body\">Each tool states its own numbers against JPL on the one decade ladder. Propagation cells: median and p90 offset from Horizons (km). A tool omitting the Marsden &Delta;T term and the self-perturber forces the daggered objects need shows a force-model gap there (with-gap and excl-gap medians both). Timing: p50 wall clock at its own boundary &mdash; integrate-only (ASSIST), whole-call (tool under test), per-fit (find_orb) &mdash; read down a row; the capped (loud-FAIL) rows count in the n column, never substituted. kete and jorbit emit timing only; find_orb is fit-then-propagate; OpenOrb, GRSS, OrbFit, layup have no rows and stay hatched. In the cost tables, compare arms only within a boundary and read each population column down.</div></details></div>";
+    let method_eph = "<div class=\"disclosures\"><details><summary>Method</summary><div class=\"disc-body\">Ephemeris cells: median and p90 sky separation from JPL Horizons (mas), averaged over the observing sites. Timing: p50 wall clock at the whole-call boundary; the empyrean column names its channel when the rust channel carries no wall clock for an arm in this run. In the cost table, read each population column down.</div></details></div>";
+    let method_od = "<div class=\"disclosures\"><details><summary>Method</summary><div class=\"disc-body\">OD cell: fits converged of attempted and median &sigma;-equivalent distance to JPL; empyrean's per-object &sigma;_eq lives in &sect;1.3A. find_orb publishes no covariance, so it shows only whether it fit the arc. Objects whose JPL solution used radar are out of the &sigma;_eq statistic, counted, never dropped. The cost table is per-fit wall clock; read each population column down.</div></details></div>";
+
+    format!(
+        "{}{}{}",
+        part1_section(
+            "s-prop",
+            "2.1",
+            "Propagation",
+            "Propagation — every tool's own offset from JPL",
+            &readout_prop,
+            &a_prop,
+            &b_prop,
+            &c_prop,
+            method_prop,
+        ),
+        part1_section(
+            "s-eph",
+            "2.2",
+            "Ephemeris",
+            "Ephemeris — every tool's own sky separation from JPL",
+            &readout_eph,
+            &a_eph,
+            &b_eph,
+            &c_eph,
+            method_eph,
+        ),
+        part1_section(
+            "s-od",
+            "2.3",
+            "Orbit determination",
+            "Orbit determination — every fitter's own convergence &amp; closeness",
+            &readout_od,
+            &a_od,
+            &b_od,
+            &c_od,
+            method_od,
+        ),
+    )
+}
+
+/// Part-2 cost: the population × tool median wall-clock table for ONE axis, on
+/// the TimingMs ladder via `part2_cell`, hatched where untimed. S7 splits the
+/// former three-axis `build_part2_timing_t2` so each Part-2 section owns its C.
+fn build_part2_timing_t2_axis(
+    results: &[ValidationResult],
+    axis: &str,
+    emp_eph: (&'static str, bool),
+    emp_od: (&'static str, bool),
+) -> String {
+    let (eph_ch, eph_fallback) = emp_eph;
+    let (od_ch, od_fallback) = emp_od;
+    let mut pops: Vec<&str> = results
+        .iter()
+        .filter(|r| r.channel == "rust" && r.test_type == "propagation")
+        .map(|r| r.population.as_str())
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect();
+    pops.sort_by_key(|p| population_rank(p));
+    let mut pop_objs: BTreeMap<&str, BTreeSet<&str>> = BTreeMap::new();
+    for r in results {
+        if r.channel == "rust" && r.test_type == "propagation" {
+            pop_objs
+                .entry(r.population.as_str())
+                .or_default()
+                .insert(r.object.as_str());
+        }
     }
-    h.push_str("</details>");
+    let tms = GridAxis::TimingMs;
+    let pop_cell =
+        |test_type: &str, pop: &str, getter: &dyn Fn(&ValidationResult) -> Option<f64>| -> String {
+            let objs = pop_objs.get(pop);
+            let mut vals: Vec<f64> = results
+                .iter()
+                .filter(|r| r.test_type == test_type)
+                .filter(|r| objs.map(|s| s.contains(r.object.as_str())).unwrap_or(false))
+                .filter_map(getter)
+                .filter(|v| v.is_finite())
+                .collect();
+            if vals.is_empty() {
+                part2_cell(tms, None, false, None)
+            } else {
+                let n = vals.len();
+                let m = percentile(&mut vals, 0.5);
+                part2_cell(tms, Some(m), false, Some(n))
+            }
+        };
+    let (columns, id, reading): (Vec<Part2TimingColumn<'_>>, &str, &str) = match axis {
+        "ephemeris" => (
+            vec![
+                (
+                    "empyrean",
+                    Some(BOUND_B),
+                    if eph_fallback { Some(CORE_NOTE) } else { None },
+                    emp_eph_getter(eph_ch),
+                ),
+                (
+                    "kete",
+                    Some(BOUND_B),
+                    None,
+                    Box::new(|r: &ValidationResult| r.kete_time_ms),
+                ),
+                (
+                    "jorbit",
+                    Some(BOUND_B),
+                    None,
+                    Box::new(|r: &ValidationResult| r.jorbit_time_ms),
+                ),
+            ],
+            "t2-eph-time",
+            "median ms · by population",
+        ),
+        "orbit_determination" => (
+            vec![
+                (
+                    "empyrean",
+                    Some(BOUND_C),
+                    if od_fallback { Some(CORE_NOTE) } else { None },
+                    emp_od_getter(od_ch),
+                ),
+                (
+                    "find_orb",
+                    Some(BOUND_C),
+                    None,
+                    Box::new(|r: &ValidationResult| r.findorb_time_ms),
+                ),
+            ],
+            "t2-od-time",
+            "median ms · by population",
+        ),
+        _ => (
+            vec![
+                (
+                    "empyrean",
+                    Some(BOUND_B),
+                    None,
+                    rust_arm("first_order_detection_on"),
+                ),
+                ("ASSIST", Some(BOUND_A), None, assist_prop_getter()),
+                (
+                    "kete",
+                    Some(BOUND_B),
+                    None,
+                    Box::new(|r: &ValidationResult| r.kete_time_ms),
+                ),
+                (
+                    "jorbit",
+                    Some(BOUND_B),
+                    None,
+                    Box::new(|r: &ValidationResult| r.jorbit_time_ms),
+                ),
+            ],
+            "t2-prop-time",
+            "median ms · by population",
+        ),
+    };
+    let tt = match axis {
+        "ephemeris" => "ephemeris",
+        "orbit_determination" => "orbit_determination",
+        _ => "propagation",
+    };
+    let mut h = String::new();
+    // S7: no panel-title — the "C · cost" slot eyebrow and the section axis name
+    // this table; the one visible key line (the reading guidance) stays.
+    h.push_str(&format!(
+        "<div class=\"grid-summary\">{}</div>",
+        attr_escape(reading)
+    ));
+    h.push_str(&format!(
+        "<div class=\"{GRID_SCROLL_STICKY}\"><table class=\"agrid r2grid\" id=\"{id}\"><thead><tr><th class=\"gobj\">population</th>"
+    ));
+    for (label, _boundary, note, _) in &columns {
+        let mut chips = String::new();
+        if let Some((txt, hover)) = note {
+            chips.push_str(&format!(
+                "<span class=\"tbnote\" title=\"{}\">{}</span>",
+                attr_escape(hover),
+                txt
+            ));
+        }
+        h.push_str(&format!("<th>{}{chips}</th>", attr_escape(label)));
+    }
+    h.push_str("</tr></thead><tbody>");
+    for &pop in &pops {
+        h.push_str(&format!(
+            "<tr class=\"gsub\"><td class=\"gtool\">{}</td>",
+            attr_escape(pop)
+        ));
+        for (_, _, _, getter) in &columns {
+            h.push_str(&pop_cell(tt, pop, getter.as_ref()));
+        }
+        h.push_str("</tr>");
+    }
+    h.push_str("</tbody></table></div>");
     h
+}
+
+/// Part-2 cost: the per-object timing grid for ONE axis (G1 propagation, G2
+/// ephemeris, G3 orbit-determination), on the TimingMs ladder with its boundary
+/// chips and one reading line. Every tool keeps its place; a tool untimed on an
+/// axis is hatched, never dropped. S7 splits the former `build_timing_grids`.
+fn build_timing_grid_axis(
+    results: &[ValidationResult],
+    axis: &str,
+    emp_eph: (&'static str, bool),
+    emp_od: (&'static str, bool),
+) -> String {
+    let (eph_ch, eph_fallback) = emp_eph;
+    let (od_ch, od_fallback) = emp_od;
+    match axis {
+        "ephemeris" => {
+            let emp_g2 = {
+                let col = TimingCol::timed("empyrean", emp_eph_getter(eph_ch), BOUND_B);
+                if eph_fallback {
+                    col.with_note(CORE_NOTE)
+                } else {
+                    col
+                }
+            };
+            let g2: Vec<TimingCol> = vec![
+                emp_g2,
+                TimingCol::timed(
+                    "kete",
+                    Box::new(|r: &ValidationResult| r.kete_time_ms),
+                    BOUND_B,
+                ),
+                TimingCol::timed(
+                    "jorbit",
+                    Box::new(|r: &ValidationResult| r.jorbit_time_ms),
+                    BOUND_B,
+                ),
+                TimingCol::untimed("OpenOrb", format!("OpenOrb: {HATCH_NOT_IN_RUN}")),
+                TimingCol::untimed("GRSS", format!("GRSS: {HATCH_NOT_IN_RUN}")),
+            ];
+            build_timing_grid(
+                results,
+                "g2-eph-time",
+                "G2 · per-object ephemeris",
+                "ephemeris",
+                &g2,
+                false,
+                "Each cell is that tool's median ephemeris wall clock for an object; the empyrean column names its channel. Read down a column.",
+            )
+        }
+        "orbit_determination" => {
+            let emp_g3 = {
+                let col = TimingCol::timed("empyrean", emp_od_getter(od_ch), BOUND_C);
+                if od_fallback {
+                    col.with_note(CORE_NOTE)
+                } else {
+                    col
+                }
+            };
+            let g3: Vec<TimingCol> = vec![
+                emp_g3,
+                TimingCol::timed(
+                    "find_orb",
+                    Box::new(|r: &ValidationResult| r.findorb_time_ms),
+                    BOUND_C,
+                ),
+                TimingCol::untimed("layup", format!("layup: {HATCH_NOT_IN_RUN}")),
+                TimingCol::untimed("GRSS", format!("GRSS: {HATCH_NOT_IN_RUN}")),
+            ];
+            build_timing_grid(
+                results,
+                "g3-od-time",
+                "G3 · per-object orbit-determination",
+                "orbit_determination",
+                &g3,
+                false,
+                "Each cell is that tool's median per-fit wall clock for an object on the ms ladder. Read down a column.",
+            )
+        }
+        _ => {
+            let g1: Vec<TimingCol> = vec![
+                TimingCol::timed("emp state only", rust_arm("f64_detection_on"), BOUND_B),
+                TimingCol::timed(
+                    "emp first order",
+                    rust_arm("first_order_detection_on"),
+                    BOUND_B,
+                ),
+                TimingCol::timed("ASSIST", assist_prop_getter(), BOUND_A),
+                TimingCol::timed(
+                    "kete",
+                    Box::new(|r: &ValidationResult| r.kete_time_ms),
+                    BOUND_B,
+                ),
+                TimingCol::timed(
+                    "jorbit",
+                    Box::new(|r: &ValidationResult| r.jorbit_time_ms),
+                    BOUND_B,
+                ),
+                TimingCol::untimed("find_orb", "find_orb: wall clock measured per OD fit only"),
+            ];
+            build_timing_grid(
+                results,
+                "g1-prop-time",
+                "G1 · per-object propagation",
+                "propagation",
+                &g1,
+                false,
+                "Each cell is that arm's median wall clock over an object's rows; the chip marks its boundary. Read down a column, not across.",
+            )
+        }
+    }
 }
 
 // ── Part 4: covariance realism ──────────────────────────────────────
@@ -3664,7 +4517,7 @@ fn build_covariance_realism_html(
 
     let mut h = String::new();
     h.push_str(&format!(
-        "<div class=\"grid-summary\" title=\"A stated one sigma tested against JPL: empyrean's fitted covariances run about {0:.0}% too tight at the median, with a heavy right tail; a sigma-consistency test is not a coverage test.\">Median σ_eq {med:.2} vs 0.94 expected (6-DOF); ~{0:.0}% too tight.</div>",
+        "<div class=\"grid-summary\">Median σ_eq {med:.2} vs 0.94 expected (6-DOF); ~{0:.0}% too tight.</div>",
         (med / 0.944 - 1.0) * 100.0
     ));
 
@@ -3681,9 +4534,12 @@ fn build_covariance_realism_html(
 
     // Complete per-object table.
     h.push_str("<div class=\"panel-title\" title=\"Complete per-object table — every object with a comparison record\">Complete per-object table</div>");
+    // De-duplication (S3 item 6): the duplicate per-object σ_eq column is dropped
+    // here — §1.3A owns the per-object σ_eq vs JPL and the CDF panel above already
+    // shows its distribution. This table keeps the pathology fingerprint, the
+    // paired reduced-χ², the σ ratio and the JPL data arc, which live nowhere else.
     h.push_str(&format!(
-        "<div class=\"grid-scroll\"><table class=\"agrid covtab\"><thead><tr><th class=\"gobj\">object<br/><span class=\"cn-n\">empyrean vs JPL</span></th><th>{}</th><th>pathology</th><th>{}</th><th>{}</th><th>arc (days)</th></tr></thead><tbody>",
-        uhdr("σ_eq"),
+        "<div class=\"grid-scroll\"><table class=\"agrid covtab\"><thead><tr><th class=\"gobj\">object<br/><span class=\"cn-n\">empyrean vs JPL</span></th><th>pathology</th><th>{}</th><th>{}</th><th>arc (days)</th></tr></thead><tbody>",
         uhdr("χ²ᵣ emp / JPL"),
         uhdr("σ ratio (a)"),
     ));
@@ -3703,22 +4559,6 @@ fn build_covariance_realism_html(
     });
     for c in rows {
         let o = c.object.as_str();
-        // A radar-informed JPL object stays in the table but its σ_eq is the one
-        // hatch (out of the statistics above), reason on hover.
-        let seq = if let Some((del, dop)) = radar_counts.get(o) {
-            format!(
-                "<td class=\"r1c hatch\" title=\"{}\"></td>",
-                attr_escape(&jpl_radar_hover(*del, *dop))
-            )
-        } else if c.sigma_equiv_combined.is_finite() {
-            let bin = od_sigma_bin(c.sigma_equiv_combined);
-            format!(
-                "<td class=\"r1c gb{bin}\">{:.2}</td>",
-                c.sigma_equiv_combined
-            )
-        } else {
-            "<td class=\"r1c undef\" title=\"Σ_ref not positive-definite at the common epoch — no regularisation\">n/d</td>".to_string()
-        };
         let chi_pair = match (emp_chi.get(o), jpl_chi.get(o)) {
             (Some(e), Some(j)) => format!("{e:.2} / {j:.2}"),
             (Some(e), None) => format!("{e:.2} / —"),
@@ -3739,7 +4579,7 @@ fn build_covariance_realism_html(
             .map(|v| v.to_string())
             .unwrap_or_else(|| "—".into());
         h.push_str(&format!(
-            "<tr class=\"gsub\"><td class=\"gtool\">{}</td>{seq}<td class=\"r1c\">{}</td><td class=\"r1c\">{chi_pair}</td><td class=\"r1c\">{sr}</td><td class=\"r1c\">{arc_d}</td></tr>",
+            "<tr class=\"gsub\"><td class=\"gtool\">{}</td><td class=\"r1c\">{}</td><td class=\"r1c\">{chi_pair}</td><td class=\"r1c\">{sr}</td><td class=\"r1c\">{arc_d}</td></tr>",
             attr_escape(o),
             cov_pathology(c),
         ));
@@ -4004,11 +4844,19 @@ fn build_timing_grid(
             objects.push((r.object.as_str(), r.population.as_str()));
         }
     }
-    objects.sort_by(|a, b| a.1.cmp(b.1).then(a.0.cmp(b.0)));
-    let mut blocks: BTreeMap<&str, Vec<&str>> = BTreeMap::new();
+    objects.sort_by(|a, b| {
+        population_rank(a.1)
+            .cmp(&population_rank(b.1))
+            .then(a.0.cmp(b.0))
+    });
+    // Order the population blocks by the one canonical order (a BTreeMap would
+    // re-alphabetize them on iteration).
+    let mut block_map: BTreeMap<&str, Vec<&str>> = BTreeMap::new();
     for &(o, p) in &objects {
-        blocks.entry(p).or_default().push(o);
+        block_map.entry(p).or_default().push(o);
     }
+    let mut blocks: Vec<(&str, Vec<&str>)> = block_map.into_iter().collect();
+    blocks.sort_by_key(|(p, _)| population_rank(p));
     let tt_rows: Vec<&ValidationResult> = results
         .iter()
         .filter(|r| r.test_type == test_type)
@@ -4050,17 +4898,13 @@ fn build_timing_grid(
         format!(" title=\"{}\"", attr_escape(reading))
     };
     h.push_str(&format!(
-        "<div class=\"{GRID_SCROLL_STICKY}\"><table class=\"agrid fidgrid\" id=\"{id}\"><thead><tr{rtr}><th class=\"gobj\">object</th>"
+        "<div class=\"{GRID_SCROLL_STICKY}\"><table class=\"agrid fidgrid\" data-grid=\"fidelity\" id=\"{id}\"><thead><tr{rtr}><th class=\"gobj\">object</th>"
     ));
     for col in columns {
         let mut chips = String::new();
-        if let Some((letter, hover)) = col.boundary {
-            chips.push_str(&format!(
-                "<span class=\"tbchip\" title=\"{}\">{}</span>",
-                attr_escape(hover),
-                letter
-            ));
-        }
+        // The A/B/C boundary chip is removed (S4 text-to-marks): the boundary
+        // names ride the group labels and the §2.1 method fold; col.boundary is
+        // still read by cost_member to drive the per-pair cost heatmaps.
         if let Some((txt, hover)) = col.note {
             chips.push_str(&format!(
                 "<span class=\"tbnote\" title=\"{}\">{}</span>",
@@ -4320,21 +5164,16 @@ fn cost_member(
     }
 }
 
-/// The tool-name heading above one cost heatmap: the tool label, its
-/// timing-boundary chip and, for empyrean's ephemeris core fall-back, the
-/// labelled core-channel chip.
+/// The tool-name heading above one cost heatmap: the tool label and, for
+/// empyrean's ephemeris core fall-back, the labelled core-channel chip. The
+/// A/B/C boundary chip is dropped (S4 text-to-marks); the H6-protected heading
+/// structure (the `panel-title` div) is kept intact, replaced with nothing.
 fn cost_heatmap_heading(
     label: &str,
-    boundary: (char, &'static str),
+    _boundary: (char, &'static str),
     note: Option<(&'static str, &'static str)>,
 ) -> String {
-    let (letter, hover) = boundary;
-    let mut s = format!(
-        "<div class=\"panel-title\">{}<span class=\"tbchip\" title=\"{}\">{}</span>",
-        attr_escape(label),
-        attr_escape(hover),
-        letter
-    );
+    let mut s = format!("<div class=\"panel-title\">{}", attr_escape(label),);
     if let Some((txt, hover)) = note {
         s.push_str(&format!(
             "<span class=\"tbnote\" title=\"{}\">{}</span>",
@@ -4592,6 +5431,22 @@ fn build_part2_timing_t1(results: &[ValidationResult]) -> String {
                 .collect(),
         )
     };
+    // S3 item 5: the capped (loud-FAIL) count per ASSIST arm — a row whose
+    // adaptive step collapsed before the target epoch carries a null
+    // `assist_time_ms`, so it is excluded from the percentiles above. Counted
+    // from the same population the `assist` helper draws from (so n + capped =
+    // the arm's total rows); this is where §A.3's per-horizon timing table used
+    // to report it, moved here so nothing is lost when that table is dropped.
+    let capped = |arm: &'static str| -> usize {
+        results
+            .iter()
+            .filter(|r| {
+                r.channel == "assist"
+                    && r.propagation_uncertainty.as_deref() == Some(arm)
+                    && r.assist_time_ms.is_none()
+            })
+            .count()
+    };
     let tms = GridAxis::TimingMs;
     let row = |label: &str, note: Option<(&str, &str)>, st: Option<TStat>| -> String {
         let lbl = match note {
@@ -4616,38 +5471,68 @@ fn build_part2_timing_t1(results: &[ValidationResult]) -> String {
             ),
         }
     };
-    let group = |title: &str, chip: (char, &str)| -> String {
+    // An ASSIST arm row that carries its capped count in the n column (S3 item 5).
+    let assist_row = |label: &str, arm: &'static str| -> String {
+        let k = capped(arm);
+        match assist(arm) {
+            Some(s) => {
+                let n_cell = if k > 0 {
+                    format!(
+                        "{} <span class=\"tbnote\" title=\"{k} row(s) hit the per-row wall-clock cap (loud FAIL) and are excluded from the percentiles — never substituted\">(capped {k})</span>",
+                        s.n
+                    )
+                } else {
+                    s.n.to_string()
+                };
+                format!(
+                    "<tr class=\"gsub\"><td class=\"gtool\">{}</td><td>{}</td><td>{}</td><td>{}</td><td class=\"cn-n\">{n_cell}</td></tr>",
+                    attr_escape(label),
+                    ladder_chip(tms, s.p5),
+                    ladder_chip(tms, s.p50),
+                    ladder_chip(tms, s.p95),
+                )
+            }
+            None if k > 0 => format!(
+                "<tr class=\"gsub\"><td class=\"gtool\">{}</td><td class=\"gc hatch\" colspan=\"4\" title=\"all {k} row(s) hit the per-row wall-clock cap (loud FAIL) — no timed row\"></td></tr>",
+                attr_escape(label),
+            ),
+            None => format!(
+                "<tr class=\"gsub\"><td class=\"gtool\">{}</td><td class=\"gc hatch\" colspan=\"4\" title=\"{HATCH_NOT_IN_RUN}\"></td></tr>",
+                attr_escape(label),
+            ),
+        }
+    };
+    let group = |title: &str, _chip: (char, &str)| -> String {
+        // The boundary name rides the group title itself (e.g. "propagation ·
+        // integrate only"); the A/B/C chip is dropped (S4 text-to-marks).
         format!(
-            "<tr class=\"gblock\"><td class=\"gblock-l\">{}<span class=\"tbchip\" title=\"{}\">{}</span></td><td class=\"gblock-fill\" colspan=\"4\"></td></tr>",
+            "<tr class=\"gblock\"><td class=\"gblock-l\">{}</td><td class=\"gblock-fill\" colspan=\"4\"></td></tr>",
             attr_escape(title),
-            attr_escape(chip.1),
-            chip.0
         )
     };
 
     let mut h = String::new();
     h.push_str("<div class=\"panel-title\" title=\"Wall clock per row — every arm\">Per row</div>");
-    h.push_str(&format!("<div class=\"{GRID_SCROLL_STICKY}\"><table class=\"agrid r1grid\" id=\"t1-speed-matrix\"><thead><tr title=\"Each row is one arm's wall clock (ms): p5, p50, p95 and n rows, grouped by boundary. Read within a boundary; the boundaries differ.\"><th class=\"gobj\">arm</th><th>p5</th><th>p50</th><th>p95</th><th>n</th></tr></thead><tbody>"));
+    // S5 item 6 / delta 9: ONE terse unit key (no sentence); the reading
+    // guidance ("compare arms within a boundary") rides §2.1's Method fold.
+    h.push_str("<div class=\"grid-summary\">ms · p5 p50 p95 · n · by boundary</div>");
+    h.push_str(&format!("<div class=\"{GRID_SCROLL_STICKY}\"><table class=\"agrid r1grid\" id=\"t1-speed-matrix\"><thead><tr><th class=\"gobj\">arm</th><th>p5</th><th>p50</th><th>p95</th><th>n</th></tr></thead><tbody>"));
     h.push_str(&group("propagation · integrate only", BOUND_A));
-    h.push_str(&row(
-        "ASSIST default (f64)",
-        None,
-        assist("assist_default_variational_off"),
+    h.push_str(&assist_row(
+        "ASSIST default (state only)",
+        "assist_default_variational_off",
     ));
-    h.push_str(&row(
-        "ASSIST default (variational)",
-        None,
-        assist("assist_default_variational_on"),
+    h.push_str(&assist_row(
+        "ASSIST default (first order)",
+        "assist_default_variational_on",
     ));
-    h.push_str(&row(
-        "ASSIST layup (f64)",
-        None,
-        assist("assist_layup_variational_off"),
+    h.push_str(&assist_row(
+        "ASSIST layup (state only)",
+        "assist_layup_variational_off",
     ));
-    h.push_str(&row(
-        "ASSIST asteroid-institute (f64)",
-        None,
-        assist("assist_asteroid_institute_variational_off"),
+    h.push_str(&assist_row(
+        "ASSIST asteroid-institute (state only)",
+        "assist_asteroid_institute_variational_off",
     ));
     for (cfg, arm) in [
         (
@@ -4743,314 +5628,9 @@ fn build_part2_timing_t1(results: &[ValidationResult]) -> String {
     h
 }
 
-/// Part-2 T2: a population × tool median wall-clock matrix per axis, on the
-/// TimingMs ladder via `part2_cell`, hatched where untimed.
-fn build_part2_timing_t2(
-    results: &[ValidationResult],
-    emp_eph: (&'static str, bool),
-    emp_od: (&'static str, bool),
-) -> String {
-    let (od_ch, od_fallback) = emp_od;
-    let mut pops: Vec<&str> = results
-        .iter()
-        .filter(|r| r.channel == "rust" && r.test_type == "propagation")
-        .map(|r| r.population.as_str())
-        .collect::<BTreeSet<_>>()
-        .into_iter()
-        .collect();
-    pops.sort();
-    let mut pop_objs: BTreeMap<&str, BTreeSet<&str>> = BTreeMap::new();
-    for r in results {
-        if r.channel == "rust" && r.test_type == "propagation" {
-            pop_objs
-                .entry(r.population.as_str())
-                .or_default()
-                .insert(r.object.as_str());
-        }
-    }
-    let tms = GridAxis::TimingMs;
-    let pop_cell =
-        |test_type: &str, pop: &str, getter: &dyn Fn(&ValidationResult) -> Option<f64>| -> String {
-            let objs = pop_objs.get(pop);
-            let mut vals: Vec<f64> = results
-                .iter()
-                .filter(|r| r.test_type == test_type)
-                .filter(|r| objs.map(|s| s.contains(r.object.as_str())).unwrap_or(false))
-                .filter_map(getter)
-                .filter(|v| v.is_finite())
-                .collect();
-            if vals.is_empty() {
-                part2_cell(tms, None, false, None)
-            } else {
-                let n = vals.len();
-                let m = percentile(&mut vals, 0.5);
-                part2_cell(tms, Some(m), false, Some(n))
-            }
-        };
-    let render = |title: &str,
-                  id: &str,
-                  test_type: &str,
-                  columns: Vec<Part2TimingColumn<'_>>,
-                  _reading: &str,
-                  reading_title: &str|
-     -> String {
-        let mut h = String::new();
-        h.push_str(&format!(
-            "<div class=\"panel-title\">{}</div>",
-            attr_escape(title)
-        ));
-        let rt = attr_escape(reading_title);
-        h.push_str(&format!(
-            "<div class=\"{GRID_SCROLL_STICKY}\"><table class=\"agrid r2grid\" id=\"{id}\"><thead><tr title=\"{rt}\"><th class=\"gobj\">population</th>"
-        ));
-        for (label, boundary, note, _) in &columns {
-            let mut chips = String::new();
-            if let Some((letter, hover)) = boundary {
-                chips.push_str(&format!(
-                    "<span class=\"tbchip\" title=\"{}\">{}</span>",
-                    attr_escape(hover),
-                    letter
-                ));
-            }
-            if let Some((txt, hover)) = note {
-                chips.push_str(&format!(
-                    "<span class=\"tbnote\" title=\"{}\">{}</span>",
-                    attr_escape(hover),
-                    txt
-                ));
-            }
-            h.push_str(&format!("<th>{}{chips}</th>", attr_escape(label)));
-        }
-        h.push_str("</tr></thead><tbody>");
-        for &pop in &pops {
-            h.push_str(&format!(
-                "<tr class=\"gsub\"><td class=\"gtool\">{}</td>",
-                attr_escape(pop)
-            ));
-            for (_, _, _, getter) in &columns {
-                h.push_str(&pop_cell(test_type, pop, getter.as_ref()));
-            }
-            h.push_str("</tr>");
-        }
-        h.push_str("</tbody></table></div>");
-        h
-    };
-
-    let (eph_ch, eph_fallback) = emp_eph;
-    let mut h = String::new();
-    h.push_str(&render(
-        "By population — propagation",
-        "t2-prop-time",
-        "propagation",
-        vec![
-            (
-                "empyrean",
-                Some(BOUND_B),
-                None,
-                rust_arm("first_order_detection_on"),
-            ),
-            ("ASSIST", Some(BOUND_A), None, assist_prop_getter()),
-            (
-                "kete",
-                Some(BOUND_B),
-                None,
-                Box::new(|r: &ValidationResult| r.kete_time_ms),
-            ),
-            (
-                "jorbit",
-                Some(BOUND_B),
-                None,
-                Box::new(|r: &ValidationResult| r.jorbit_time_ms),
-            ),
-        ],
-        "Median propagation ms per population; read down a column.",
-        "Each cell is that tool's median propagation wall clock across a population's objects (ms), over n rows. Read down a column; boundaries differ.",
-    ));
-    h.push_str(&render(
-        "By population — ephemeris",
-        "t2-eph-time",
-        "ephemeris",
-        vec![
-            (
-                "empyrean",
-                Some(BOUND_B),
-                if eph_fallback { Some(CORE_NOTE) } else { None },
-                emp_eph_getter(eph_ch),
-            ),
-            (
-                "kete",
-                Some(BOUND_B),
-                None,
-                Box::new(|r: &ValidationResult| r.kete_time_ms),
-            ),
-            (
-                "jorbit",
-                Some(BOUND_B),
-                None,
-                Box::new(|r: &ValidationResult| r.jorbit_time_ms),
-            ),
-        ],
-        "Median ephemeris ms per population; read down a column.",
-        "Each cell is that tool's median ephemeris wall clock over a population's rows (ms); the empyrean column names its channel.",
-    ));
-    h.push_str(&render(
-        "By population — orbit-determination",
-        "t2-od-time",
-        "orbit_determination",
-        vec![
-            (
-                "empyrean",
-                Some(BOUND_C),
-                if od_fallback { Some(CORE_NOTE) } else { None },
-                emp_od_getter(od_ch),
-            ),
-            (
-                "find_orb",
-                Some(BOUND_C),
-                None,
-                Box::new(|r: &ValidationResult| r.findorb_time_ms),
-            ),
-        ],
-        "Median per-fit ms per population; read down a column.",
-        "Each cell is that tool's median per-fit wall clock across a population's objects (ms), over n rows. Read down a column.",
-    ));
-    h
-}
-
-/// Part-2 T3: the per-object timing grids G1 (propagation), G2 (ephemeris) and
-/// G3 (orbit determination), each on the TimingMs ladder with its boundary chips
-/// and one reading line. Every tool keeps its place; a tool untimed on an axis is
-/// hatched, never dropped.
-fn build_timing_grids(
-    results: &[ValidationResult],
-    emp_eph: (&'static str, bool),
-    emp_od: (&'static str, bool),
-) -> String {
-    let (eph_ch, eph_fallback) = emp_eph;
-    let (od_ch, od_fallback) = emp_od;
-    let g1: Vec<TimingCol> = vec![
-        TimingCol::timed("emp state only", rust_arm("f64_detection_on"), BOUND_B),
-        TimingCol::timed(
-            "emp first order",
-            rust_arm("first_order_detection_on"),
-            BOUND_B,
-        ),
-        TimingCol::timed("ASSIST", assist_prop_getter(), BOUND_A),
-        TimingCol::timed(
-            "kete",
-            Box::new(|r: &ValidationResult| r.kete_time_ms),
-            BOUND_B,
-        ),
-        TimingCol::timed(
-            "jorbit",
-            Box::new(|r: &ValidationResult| r.jorbit_time_ms),
-            BOUND_B,
-        ),
-        TimingCol::untimed("find_orb", "find_orb: wall clock measured per OD fit only"),
-    ];
-    let emp_g2 = {
-        let col = TimingCol::timed("empyrean", emp_eph_getter(eph_ch), BOUND_B);
-        if eph_fallback {
-            col.with_note(CORE_NOTE)
-        } else {
-            col
-        }
-    };
-    let g2: Vec<TimingCol> = vec![
-        emp_g2,
-        TimingCol::timed(
-            "kete",
-            Box::new(|r: &ValidationResult| r.kete_time_ms),
-            BOUND_B,
-        ),
-        TimingCol::timed(
-            "jorbit",
-            Box::new(|r: &ValidationResult| r.jorbit_time_ms),
-            BOUND_B,
-        ),
-        TimingCol::untimed("OpenOrb", format!("OpenOrb: {HATCH_NOT_IN_RUN}")),
-        TimingCol::untimed("GRSS", format!("GRSS: {HATCH_NOT_IN_RUN}")),
-    ];
-    let emp_g3 = {
-        let col = TimingCol::timed("empyrean", emp_od_getter(od_ch), BOUND_C);
-        if od_fallback {
-            col.with_note(CORE_NOTE)
-        } else {
-            col
-        }
-    };
-    let g3: Vec<TimingCol> = vec![
-        emp_g3,
-        TimingCol::timed(
-            "find_orb",
-            Box::new(|r: &ValidationResult| r.findorb_time_ms),
-            BOUND_C,
-        ),
-        TimingCol::untimed("layup", format!("layup: {HATCH_NOT_IN_RUN}")),
-        TimingCol::untimed("GRSS", format!("GRSS: {HATCH_NOT_IN_RUN}")),
-    ];
-    let mut h = String::new();
-    h.push_str(&build_timing_grid(
-        results,
-        "g1-prop-time",
-        "G1 · per-object propagation",
-        "propagation",
-        &g1,
-        false,
-        "Each cell is that arm's median wall clock over an object's rows; the chip marks its boundary. Read down a column, not across.",
-    ));
-    h.push_str(&build_timing_grid(
-        results,
-        "g2-eph-time",
-        "G2 · per-object ephemeris",
-        "ephemeris",
-        &g2,
-        false,
-        "Each cell is that tool's median ephemeris wall clock for an object; the empyrean column names its channel. Read down a column.",
-    ));
-    h.push_str(&build_timing_grid(
-        results,
-        "g3-od-time",
-        "G3 · per-object orbit-determination",
-        "orbit_determination",
-        &g3,
-        false,
-        "Each cell is that tool's median per-fit wall clock for an object on the ms ladder. Read down a column.",
-    ));
-    h
-}
-
-/// Part-2 §2.2: the cross-tool wall-clock matrices — T1 every arm, T2 by
-/// population, T3 by object — numbers only, all on the one ladder.
-fn build_part2_timing_matrices(
-    results: &[ValidationResult],
-    emp_eph: (&'static str, bool),
-    emp_od: (&'static str, bool),
-) -> String {
-    let mut h = String::new();
-    h.push_str(&build_part2_timing_t1(results));
-    h.push_str(&build_part2_timing_t2(results, emp_eph, emp_od));
-    h.push_str(&build_timing_grids(results, emp_eph, emp_od));
-    h
-}
-
-/// One pair chip for a Part 1 section title: the selected comparison pair in the
-/// two tools' colours. Server-rendered for the default pair (empyrean vs JPL);
-/// its JS twin `updatePairTitles` rewrites every chip on a pair change. The
-/// `pair-chip` class scopes its words as a chip (not title words) for the audit,
-/// and `data-tool` / `data-ref` let the invariant confirm it names the selection.
-/// Colours come from the theme-aware `--tool-<slug>` tokens (AA-safe in both
-/// themes); `updatePairTitles` repaints them from the same tokens on a pair change.
-fn pair_chip_html() -> &'static str {
-    "<span class=\"pair-chip\" data-tool=\"empyrean\" data-ref=\"jpl\">\
-<span class=\"pc-t\" style=\"color:var(--tool-empyrean)\">empyrean</span> \
-<span class=\"pc-vs\">vs</span> \
-<span class=\"pc-r\" style=\"color:var(--tool-jpl)\">JPL</span></span>"
-}
-
 /// The per-tool text colours as theme-aware CSS custom properties — one source
-/// for both themes. A tool NAME rendered as text (the Part 1 compare-bar selects
-/// and the section-title pair chips) reads its `--tool-<slug>` token so it clears
+/// for both themes. A tool NAME rendered as text (the Part 1 compare-bar selects)
+/// reads its `--tool-<slug>` token so it clears
 /// WCAG AA (>= 4.5:1) on the card / input surface in BOTH themes; the light values
 /// are darkened exactly as `--ed-accent` is. Plotly traces keep the literal hex in
 /// the client `TOOLS` map because a chart library cannot resolve a CSS variable.
@@ -5328,10 +5908,66 @@ fn pw_token_factor(tok: &str) -> &'static str {
     }
 }
 
+/// The reader-facing name of a predictive-power tool slug in a 4.2 group header:
+/// the `rust` channel IS the product, so it reads `empyrean`; every other tool
+/// keeps its own name. One place, so every 4.2 group header agrees.
+fn pw_tool_label(tool: &str) -> &str {
+    if tool == "rust" { "empyrean" } else { tool }
+}
+
+/// One factor level rendered as its reader word (for a 4.2 group-header chip).
+fn pw_factor_word(factor: usize, tok: &str) -> &'static str {
+    match (factor, tok) {
+        (0, "efcc") => "EFCC",
+        (0, "nodeb") => "no debias",
+        (1, "adap") => "adaptive",
+        (1, "cmc") => "CMC",
+        (1, "norej") => "no rejection",
+        (2, "vfc") => "nightly",
+        (2, "nonight") => "per-obs",
+        (3, "mc") => "Monte Carlo",
+        (3, "sp") => "sigma-point",
+        (3, "linear") => "linear",
+        _ => "—",
+    }
+}
+
+/// A configuration arm rendered as a 4.2 group-header chip: the four factor
+/// levels in plain words (e.g. `EFCC · adaptive · nightly · linear`), with the
+/// raw slug on hover only. An arm that carries no empyrean factor structure (an
+/// external tool's `default+mc`) renders its own tokens prettified instead of a
+/// row of em dashes, so no information is lost.
+fn pw_arm_chip(arm: &str) -> String {
+    let f = pw_arm_factors(arm);
+    let words = if f[0] == "—" && f[1] == "—" && f[2] == "—" {
+        let parts: Vec<&str> = pw_arm_tokens(arm)
+            .map(|t| match t {
+                "mc" => "Monte Carlo",
+                "sp" => "sigma-point",
+                other => other,
+            })
+            .collect();
+        parts.join(" · ")
+    } else {
+        [
+            pw_factor_word(0, f[0]),
+            pw_factor_word(1, f[1]),
+            pw_factor_word(2, f[2]),
+            pw_factor_word(3, f[3]),
+        ]
+        .join(" · ")
+    };
+    format!(
+        "<span class=\"pwarm\" title=\"arm {}\">{}</span>",
+        attr_escape(arm),
+        attr_escape(&words)
+    )
+}
+
 /// The in-table calibration ruler for a 4.2C realism column: states the neutral
 /// point of the diverging realism scale. Wrapped in a no-transform span so the
 /// header-uppercase rule leaves it alone (and H7 skips it).
-const RV_RULER: &str = "<div class=\"rvruler\"><span class=\"r1sub\">1 = calibrated</span></div>";
+const RV_RULER: &str = "<div class=\"rvnote\"><span class=\"r1sub\">1 = calibrated</span></div>";
 
 /// Every configuration arm present in the aggregate's surface cells (across all
 /// tools), stable order. One definition so the surfaces' arm count, the arm grid
@@ -5522,7 +6158,7 @@ fn pw_surface_grid(
     // table content (exempt from the visible-word budget) rather than a caption.
     let label = if realism { "realism" } else { "accuracy" };
     let mut h = String::from(
-        "<div class=\"grid-scroll\"><table class=\"agrid pw-grid\"><thead><tr><th class=\"gobj\">",
+        "<div class=\"grid-scroll\"><table class=\"agrid pw-grid\" data-grid=\"predict\"><thead><tr><th class=\"gobj\">",
     );
     h.push_str(&uhdr(&format!("{label} · arc ╲ dt")));
     h.push_str("</th>");
@@ -5701,13 +6337,15 @@ fn pw_coverage_matrix(agg: &PredictAggregates, dir: CovDir, dt_bins: &[(f64, f64
     // Classes and tools from the surface cells, so the row groups reconcile with
     // the 4.2B tool selector; a tool with no pooled coverage renders its group
     // all-hatched (never a dropped tool).
-    let classes: Vec<&str> = {
+    let mut classes: Vec<&str> = {
         let mut v: BTreeSet<&str> = BTreeSet::new();
         for c in &agg.cells {
             v.insert(c.class.as_str());
         }
         v.into_iter().collect()
     };
+    // The one canonical class order (class_rank, driven by POPULATION_ORDER).
+    classes.sort_by_key(|c| class_rank(c));
     // Tools in a fixed order; the reference-PA tool (rust) first, then externals.
     let mut tools: Vec<&str> = {
         let mut v: BTreeSet<&str> = BTreeSet::new();
@@ -5743,18 +6381,14 @@ fn pw_coverage_matrix(agg: &PredictAggregates, dir: CovDir, dt_bins: &[(f64, f64
     // line's chip hover. Marked and counted, never dropped; the screens of empty
     // hatch are reclaimed. The fold decision is made per row below (has_numeric).
     let mut h = String::from(
-        "<div class=\"grid-scroll\"><table class=\"agrid pw-grid\"><thead><tr><th class=\"gobj\">",
+        "<div class=\"grid-scroll\"><table class=\"agrid pw-grid\" data-grid=\"predict\"><thead><tr><th class=\"gobj\">",
     );
-    // The whole matrix reading rides in the corner header (table content, exempt
-    // from the word budget): the direction and its dof, that the cell is the
-    // trust-off observed 2σ inside-ellipse percent computed on Σ_pred-dominated
-    // rows only, the tool ╲ dt layout, and the horizon unit. The scope (σ_pred
-    // nights only) is the one load-bearing caveat, so it rides the always-visible
-    // header beside trust-off, not only the hover and the collapsed method body.
-    h.push_str(&uhdr(&format!(
-        "{} · trust-off · σ_pred-only 2σ% · tool ╲ dt · days",
-        dir.label()
-    )));
+    // S4 text-to-marks: the corner header keeps only the quantity name — the
+    // direction and its dof. The scope (trust-off observed 2σ inside-ellipse
+    // percent on Σ_pred-dominated rows, the tool ╲ dt layout, the day unit) is the
+    // one load-bearing caveat; it moved to the always-visible scope key line under
+    // the Coverage panel title (pw_coverage_html), not this corner or the hover.
+    h.push_str(&uhdr(dir.label()));
     h.push_str("</th>");
     for &(lo, hi) in dt_bins {
         h.push_str(&format!(
@@ -5780,7 +6414,7 @@ fn pw_coverage_matrix(agg: &PredictAggregates, dir: CovDir, dt_bins: &[(f64, f64
                 "<tr class=\"gpophdr\"><td class=\"gpopname\" colspan=\"{}\" title=\"no walk ran for {}\">{} — {HATCH_NOT_IN_RUN}</td></tr>",
                 dt_bins.len() + 1,
                 attr_escape(tool),
-                attr_escape(tool),
+                attr_escape(pw_tool_label(tool)),
             ));
             continue;
         };
@@ -5788,11 +6422,11 @@ fn pw_coverage_matrix(agg: &PredictAggregates, dir: CovDir, dt_bins: &[(f64, f64
         // (its Monte-Carlo sky covariance for an external tool). The arm is the
         // provenance of the whole row group, so it rides visibly beside the tool.
         h.push_str(&format!(
-            "<tr class=\"gpophdr\"><td class=\"gpopname\" colspan=\"{}\" title=\"covariance arm {}\">{} <span class=\"pwarm\">{}</span></td></tr>",
+            "<tr class=\"gpophdr\"><td class=\"gpopname\" colspan=\"{}\" title=\"covariance arm {}\">{} {}</td></tr>",
             dt_bins.len() + 1,
             attr_escape(arm),
-            attr_escape(tool),
-            attr_escape(arm),
+            attr_escape(pw_tool_label(tool)),
+            pw_arm_chip(arm),
         ));
         // Rows with no numeric cell for this (tool, direction) fold into one
         // "no predictive windows" line per tool; a row with at least one numeric
@@ -5957,7 +6591,11 @@ fn pw_coverage_key(agg: &PredictAggregates) -> String {
 fn pw_coverage_html(agg: &PredictAggregates) -> String {
     let dt_bins = pw_axis(agg.cells.iter().map(|c| (c.dt_lo_days, c.dt_hi_days)));
     let mut h = String::new();
-    h.push_str("<div class=\"panel-title\" title=\"How often the next observations land inside the predicted state ellipse, per tool, class and horizon, against the expected rate. One matrix per direction (joint, along-track, cross-track); the cell is the trust-unconditioned 2σ inside-ellipse rate, pooled equal-weight-per-object over the row's arc bins, with the trust-gated and per-row figures on hover.\">Coverage</div>");
+    h.push_str("<div class=\"panel-title\">Coverage</div>");
+    // S4: the matrix scope (what each cell is, and the row/column layout) moved off
+    // the per-matrix corner header into one always-visible units key under the
+    // summary — units and symbols, not a sentence.
+    h.push_str("<div class=\"grid-summary\">trust-off · σ_pred-only 2σ% · tool ╲ dt · days</div>");
     // The diverging key and the expected anchors lead, directly under the title and
     // above the first matrix, so a reader meets the red/blue scale and the expected
     // percentages before the grids they colour, never after.
@@ -5996,13 +6634,15 @@ fn pw_surfaces_html(agg: &PredictAggregates, profile: &str) -> String {
     let dt_bins = pw_axis(agg.cells.iter().map(|c| (c.dt_lo_days, c.dt_hi_days)));
 
     // Distinct selector dimensions, stable order.
-    let classes: Vec<&str> = {
+    let mut classes: Vec<&str> = {
         let mut v: BTreeSet<&str> = BTreeSet::new();
         for c in &agg.cells {
             v.insert(c.class.as_str());
         }
         v.into_iter().collect()
     };
+    // The one canonical class order (class_rank, driven by POPULATION_ORDER).
+    classes.sort_by_key(|c| class_rank(c));
     let tools: Vec<&str> = {
         let mut v: BTreeSet<&str> = BTreeSet::new();
         for c in &agg.cells {
@@ -6048,13 +6688,7 @@ fn pw_surfaces_html(agg: &PredictAggregates, profile: &str) -> String {
         .unwrap_or("");
 
     let mut h = String::new();
-    h.push_str(&format!(
-        "<div class=\"panel-title\" title=\"Walk-forward accuracy (separation, decade ladder) and realism (normalized d², diverging log₂ scale), per (class, tool, arm) over the arc × dt plane. {na} arms, {nc} classes, {profile}, snapshot {snap}.\">Surfaces</div>",
-        na = arms.len(),
-        nc = classes.len(),
-        profile = attr_escape(profile),
-        snap = attr_escape(&agg.snapshot_id),
-    ));
+    h.push_str("<div class=\"panel-title\">Surfaces</div>");
     // Selector bar (a sibling of the Part-1 pair-panel selector).
     h.push_str("<div class=\"pw-select\">");
     for (id, label, opts, def) in [
@@ -6083,8 +6717,9 @@ fn pw_surfaces_html(agg: &PredictAggregates, profile: &str) -> String {
     h.push_str(&grid_key_html(GridAxis::SepArcsec));
     h.push_str(&realism_key_html());
 
-    // The surfaces provenance (arms, classes, profile, snapshot) is folded into
-    // the panel-title hover above, so no separate reading line is spent here.
+    // The surfaces provenance (arms, classes, profile, snapshot) rides the
+    // Method fold below (S4: the panel-title caption moved there), so no separate
+    // reading line is spent here.
 
     // The panels, one per present (class, tool, arm) group; all hidden but the
     // default selection, toggled by the selector.
@@ -6114,7 +6749,13 @@ fn pw_surfaces_html(agg: &PredictAggregates, profile: &str) -> String {
     // Method.
     h.push_str("<div class=\"disclosures\"><details><summary>");
     h.push_str(DISCLOSURE_SUMMARY);
-    h.push_str("</summary><div class=\"disc-body\">Walk-forward: fit a growing per-night window, predict each held-out sky position with its 2×2, score d². Accuracy is the equal-weight-per-object median separation on the one decade ladder; realism is the equal-weight-per-object median(d²)/(2 ln 2) on the one diverging log₂ scale — 1 is calibrated, &lt;1 over-conservative (blue), &gt;1 over-confident (red). Support is triangular: a long horizon exists only from early arc cuts. The scoring σ is pinned and identical across arms, so a difference between arms is the fitted covariance, not the scoring table. A cell with fewer than three objects is hatched, never pooled.</div></details></div>");
+    h.push_str(&format!(
+        "</summary><div class=\"disc-body\">Walk-forward accuracy (separation, decade ladder) and realism (normalized d², diverging log₂ scale), per (class, tool, arm) over the arc × dt plane; {na} arms, {nc} classes, {profile}, snapshot {snap}. Walk-forward: fit a growing per-night window, predict each held-out sky position with its 2×2, score d². Accuracy is the equal-weight-per-object median separation on the one decade ladder; realism is the equal-weight-per-object median(d²)/(2 ln 2) on the one diverging log₂ scale — 1 is calibrated, &lt;1 over-conservative (blue), &gt;1 over-confident (red). Support is triangular: a long horizon exists only from early arc cuts. The scoring σ is pinned and identical across arms, so a difference between arms is the fitted covariance, not the scoring table. A cell with fewer than three objects is hatched, never pooled.</div></details></div>",
+        na = arms.len(),
+        nc = classes.len(),
+        profile = attr_escape(profile),
+        snap = attr_escape(&agg.snapshot_id),
+    ));
     h
 }
 
@@ -6122,26 +6763,28 @@ fn pw_surfaces_html(agg: &PredictAggregates, profile: &str) -> String {
 /// separation and realism), for the rust `default` arm, every dt bin at once.
 fn pw_marginals_html(agg: &PredictAggregates) -> String {
     let dt_bins = pw_axis(agg.cells.iter().map(|c| (c.dt_lo_days, c.dt_hi_days)));
-    let classes: Vec<&str> = {
+    let mut classes: Vec<&str> = {
         let mut v: BTreeSet<&str> = BTreeSet::new();
         for c in &agg.cells {
             v.insert(c.class.as_str());
         }
         v.into_iter().collect()
     };
+    // The one canonical class order (class_rank, driven by POPULATION_ORDER).
+    classes.sort_by_key(|c| class_rank(c));
     // The single (tool, arm) this marginal is taken over: the primary series the
     // other single-arm views share, so it is never an empty (tool, arm) slice.
     let (tool, arm) = pw_primary_series(agg);
 
     let mut h = String::new();
-    h.push_str("<div class=\"panel-title\" title=\"Horizon marginals per class for the primary (tool, arm): each cell an equal-weight-per-object marginal of the surfaces over the arc axis within one horizon bin — never a pooled one-dimensional statistic. The metric selector chooses what each cell shows (accuracy or realism joint / along-track / cross-track) on the surfaces' ladder; the other three ride the cell hover.\">Horizon marginals</div>");
+    h.push_str("<div class=\"panel-title\">Horizon marginals</div>");
     // Metric toggle (owner, 2026-10-17): one number per cell instead of four
     // stacked, chosen here — accuracy on the decade ladder, realism joint (the
     // default) / along-track / cross-track on the diverging scale. The <select>
     // is skip-counted, so the toggle costs no visible words; the surfaces' two
     // keys above carry the ladder legend for the chosen metric.
     h.push_str("<div class=\"pw-select\"><label class=\"pw-sel-label\"><select id=\"pw-marg-metric\" aria-label=\"metric\" title=\"metric\"><option value=\"acc\">accuracy</option><option value=\"rj\" selected>realism joint</option><option value=\"at\">realism along-track</option><option value=\"ct\">realism cross-track</option></select></label></div>");
-    h.push_str("<div class=\"grid-scroll\"><table class=\"agrid pw-grid\"><thead><tr><th class=\"gobj\">class</th>");
+    h.push_str("<div class=\"grid-scroll\"><table class=\"agrid pw-grid\" data-grid=\"predict\"><thead><tr><th class=\"gobj\">class</th>");
     for &(lo, hi) in &dt_bins {
         // Plain-text title: an `uhdr` span (it carries a double-quote) interpolated
         // into a `title="…"` attribute closed the attribute early and leaked a
@@ -6235,7 +6878,11 @@ fn pw_marginals_html(agg: &PredictAggregates) -> String {
 /// 4.2D — the configuration arms: arm × {median realism (joint, along, cross),
 /// χ²₂-99% tail, median reduced-χ²}, plus a main-effects sub-matrix. Every arm
 /// at once, numbers only, no ranking word.
-fn pw_arms_html(agg: &PredictAggregates) -> String {
+/// 4.2D — configuration arms and calibration, merged (S3 item 2): one factor ×
+/// level table (marginal realism · 1σ obs · 2σ obs · arms), one `full factor
+/// grid`, one `full arm list`, one Method. The `log-score absent` mark stays and
+/// the D-003 log-score ranking table (populated or awaiting Student-t) follows.
+fn pw_arms_calibration_html(agg: &PredictAggregates) -> String {
     // Every arm present in the aggregate (the shared full arm axis), so the count
     // reconciles with 4.2A and no arm is silently dropped. Per-arm statistics below
     // come from the rust per-object summaries (the true per-object statistic); an
@@ -6292,7 +6939,10 @@ fn pw_arms_html(agg: &PredictAggregates) -> String {
     };
 
     let mut h = String::new();
-    h.push_str("<div class=\"panel-title\" title=\"The full factorial of configuration arms over debias, outlier rejection, nightly bundling and covariance transport: median realism, χ²₂ 99% tail exceedance, and median reduced-χ² per arm; an arm no rust walk produced is hatched, never dropped. The reader compares the numbers; nothing is ranked.\">Configuration arms</div>");
+    h.push_str("<div class=\"panel-title\">Configuration arms</div>");
+    // The calibration mark stays (S3 item 2): the law-aware log-score ranking has
+    // no data until a Student-t arm runs.
+    h.push_str("<div class=\"grid-summary reading\" title=\"observed 1σ/2σ coverage against the normal-law χ²₂ expectation 0.3935 / 0.8647; the law-aware log-score ranking has no data until a Student-t arm runs\">log-score absent</div>");
     // Main effects first (owner, 2026-10-17); the full factor grid sits behind a
     // toggle. Swept over the rust factorial only — the other tools' single arms
     // carry no factor structure, so they are not part of a swept level.
@@ -6308,7 +6958,7 @@ fn pw_arms_html(agg: &PredictAggregates) -> String {
     h.push_str(&pw_main_effects_html(agg, &rust_arms));
     h.push_str("<details class=\"more-tables\"><summary>full factor grid</summary>");
     h.push_str(&format!(
-        "<div class=\"grid-scroll\"><table class=\"agrid pw-grid\"><thead><tr><th class=\"gobj\">debias</th><th>rejection</th><th>nightly</th><th>transport</th><th title=\"joint median realism\">{}{RV_RULER}</th><th title=\"along-track median realism\">{}{RV_RULER}</th><th title=\"cross-track median realism\">{}{RV_RULER}</th><th>{}</th><th>{}</th><th>objects</th></tr></thead><tbody>",
+        "<div class=\"grid-scroll\"><table class=\"agrid pw-grid\" data-grid=\"predict\"><thead><tr><th class=\"gobj\">debias</th><th>rejection</th><th>nightly</th><th>transport</th><th title=\"joint median realism\">{}{RV_RULER}</th><th title=\"along-track median realism\">{}{RV_RULER}</th><th title=\"cross-track median realism\">{}{RV_RULER}</th><th>{}</th><th>{}</th><th>objects</th></tr></thead><tbody>",
         uhdr("median realism"),
         uhdr("along"),
         uhdr("cross"),
@@ -6398,14 +7048,91 @@ fn pw_arms_html(agg: &PredictAggregates) -> String {
     h.push_str("</tbody></table></div>");
     h.push_str("</details>");
 
+    // ── Calibration: the full per-arm 1σ/2σ coverage list (S3 item 2) ──
+    // The rust factorial as factor columns; the external tools' single arms as
+    // tool-named rows (no factor structure). One fold, beside the full factor grid.
+    let cov_cell = |v: Option<f64>| match v {
+        Some(x) => format!("<td class=\"gc\"><span class=\"cn\">{x:.3}</span></td>"),
+        None => "<td class=\"gc hatch\" title=\"no covered cell for this arm\"></td>".to_string(),
+    };
+    h.push_str("<details class=\"more-tables\"><summary>full arm list</summary>");
+    h.push_str(&format!(
+        "<div class=\"grid-scroll\"><table class=\"agrid pw-grid\" data-grid=\"predict\"><thead><tr><th class=\"gobj\">debias</th><th>rejection</th><th>nightly</th><th>transport</th><th title=\"normal-law χ²₂ expectation 0.3935\">{}</th><th title=\"normal-law χ²₂ expectation 0.8647\">{}</th></tr></thead><tbody>",
+        uhdr("1σ obs"),
+        uhdr("2σ obs"),
+    ));
+    for arm in &arms {
+        let has_rust = agg
+            .cells
+            .iter()
+            .any(|c| c.tool == "rust" && c.config_arm == *arm);
+        if !has_rust {
+            // External tool's single arm: a row named by tool, no factor structure.
+            let tool = agg
+                .cells
+                .iter()
+                .find(|c| c.config_arm == *arm)
+                .map(|c| c.tool.as_str())
+                .unwrap_or("");
+            h.push_str(&format!(
+                "<tr><td class=\"gtool\" title=\"{}\">{} · {}</td><td>—</td><td>—</td><td>—</td><td class=\"gc hatch\" title=\"no rust walk for this arm\"></td><td class=\"gc hatch\" title=\"no rust walk for this arm\"></td></tr>",
+                attr_escape(arm),
+                attr_escape(pw_tool_label(tool)),
+                attr_escape(arm),
+            ));
+            continue;
+        }
+        let fac = pw_arm_factors(arm);
+        let c1 = pw_median(
+            agg.cells
+                .iter()
+                .filter(|c| c.tool == "rust" && c.config_arm == *arm && c.n_objects >= 3)
+                .filter_map(|c| c.cov_1s),
+        );
+        let c2 = pw_median(
+            agg.cells
+                .iter()
+                .filter(|c| c.tool == "rust" && c.config_arm == *arm && c.n_objects >= 3)
+                .filter_map(|c| c.cov_2s),
+        );
+        h.push_str(&format!(
+            "<tr><td class=\"gtool\" title=\"{}\">{}</td><td>{}</td><td>{}</td><td>{}</td>{}{}</tr>",
+            attr_escape(arm),
+            fac[0], fac[1], fac[2], fac[3],
+            cov_cell(c1),
+            cov_cell(c2),
+        ));
+    }
+    h.push_str("</tbody></table></div>");
+    h.push_str("</details>");
+
+    // D-003 log-score ranking: populated only when a Student-t arm has run,
+    // otherwise the marked-absent hatched row (the log-score absent mark above).
+    if agg
+        .calibration
+        .iter()
+        .any(|c| c.scoring_law == "student-t" && c.mean_log_score.is_some())
+    {
+        h.push_str(&pw_log_score_table(agg));
+    } else {
+        h.push_str(&format!(
+            "<div class=\"grid-scroll\"><table class=\"agrid pw-grid\" data-grid=\"predict\"><thead><tr><th class=\"gobj\">log-score ranking — arm</th><th>{}</th><th>{}</th><th>nights</th></tr></thead><tbody><tr><td class=\"gc hatch\" title=\"{AWAITING_STUDENT_T}\" colspan=\"4\">{AWAITING_STUDENT_T}</td></tr></tbody></table></div>",
+            uhdr("mean log-score"),
+            uhdr("SE"),
+        ));
+    }
+
+    // One Method (S3 item 2): the merged bodies of Configuration arms and
+    // Calibration, so the section carries a single ▸Method fold.
     h.push_str("<div class=\"disclosures\"><details><summary>");
     h.push_str(DISCLOSURE_SUMMARY);
-    h.push_str("</summary><div class=\"disc-body\">The full factorial over debias, outlier rejection, nightly bundling and covariance transport. Median realism is the surfaces realism statistic over the arm's objects, with the along-track and cross-track medians beside the joint; the χ²₂ 99% tail is the fraction of held-out d² beyond 9.21; the reduced-χ² is the in-sample fit statistic, whose expected central interval depends on ν (shown per arm). Main effects sweep one factor and marginalize the rest. An arm no rust walk produced is hatched. No arm is ranked — the reader compares the numbers.</div></details></div>");
+    h.push_str("</summary><div class=\"disc-body\">The full factorial over debias, outlier rejection, nightly bundling and covariance transport. Median realism is the surfaces realism statistic over the arm's objects; the χ²₂ 99% tail is the fraction of held-out d² beyond 9.21; the reduced-χ² is the in-sample fit statistic (expected central interval depends on ν). Observed 1σ/2σ coverage is the equal-weight-per-object median over the surface cells of the fraction of held-out d² within 1σ and 2σ, against the normal-law χ²₂ expectation (0.3935, 0.8647). Main effects sweep one factor and marginalize the rest; the factor-level rows take that same median over all the level's cells (rust, n ≥ 3), so they reconcile with the full-arm-list rows. The proper scoring rule — mean log predictive density — and the law-aware coverage, PIT and Cramér–von Mises statistics are empty until a Student-t arm runs; their row is hatched \"awaiting Student-t chain\", never fabricated. An arm no rust walk produced is hatched. No arm is ranked — the reader compares the numbers.</div></details></div>");
     h
 }
 
-/// The 4.2C main-effects sub-matrix: for each factor token that varies across the
-/// arm set, the marginal median realism at each of its levels.
+/// The 4.2D main-effects table: for each factor token that varies across the arm
+/// set, the marginal median realism and the observed 1σ/2σ coverage at each of
+/// its levels — Configuration arms and Calibration merged into one (S3 item 2).
 fn pw_main_effects_html(agg: &PredictAggregates, arms: &[&str]) -> String {
     // Treat each distinct factor token (debias efcc/nodeb, rejection adap/cmc/norej,
     // nightly nonight/vfc, transport mc/sp) as a level and group the arms that carry
@@ -6422,11 +7149,21 @@ fn pw_main_effects_html(agg: &PredictAggregates, arms: &[&str]) -> String {
         return String::new();
     }
     // The sub-matrix label rides in the header cell (table content, exempt from
-    // the visible-word budget) rather than a separate counted panel-title.
-    let mut h = String::from("<div class=\"grid-scroll\"><table class=\"agrid pw-grid\"><thead>");
+    // the visible-word budget) rather than a separate counted panel-title. S3
+    // item 2: realism (from the per-object summaries) and observed 1σ/2σ coverage
+    // (from the surface cells, rust, n ≥ 3) share one row per factor level.
+    let cov_cell = |v: Option<f64>| match v {
+        Some(x) => format!("<td class=\"gc\"><span class=\"cn\">{x:.3}</span></td>"),
+        None => "<td class=\"gc hatch\" title=\"no covered cell for this level\"></td>".to_string(),
+    };
+    let mut h = String::from(
+        "<div class=\"grid-scroll\"><table class=\"agrid pw-grid\" data-grid=\"predict\"><thead>",
+    );
     h.push_str(&format!(
-        "<tr><th class=\"gobj\">factor</th><th>level</th><th>{}{RV_RULER}</th><th>arms</th></tr></thead><tbody>",
+        "<tr><th class=\"gobj\">factor</th><th>level</th><th title=\"marginal median realism over the level's objects · 1 = calibrated\">{}{RV_RULER}</th><th title=\"median over the level's cells (rust, n ≥ 3) · normal-law χ²₂ expectation 0.3935\">{}</th><th title=\"median over the level's cells (rust, n ≥ 3) · normal-law χ²₂ expectation 0.8647\">{}</th><th>arms</th></tr></thead><tbody>",
         uhdr("marginal realism"),
+        uhdr("1σ obs"),
+        uhdr("2σ obs"),
     ));
     for tok in &tokens {
         let matching: Vec<&str> = arms
@@ -6447,10 +7184,32 @@ fn pw_main_effects_html(agg: &PredictAggregates, arms: &[&str]) -> String {
             Some(v) => (realism_bin(v).0, format!("{v:.2}")),
             None => ("rv0", "—".into()),
         };
+        let c1 = pw_median(
+            agg.cells
+                .iter()
+                .filter(|c| {
+                    c.tool == "rust"
+                        && c.n_objects >= 3
+                        && matching.iter().any(|a| *a == c.config_arm)
+                })
+                .filter_map(|c| c.cov_1s),
+        );
+        let c2 = pw_median(
+            agg.cells
+                .iter()
+                .filter(|c| {
+                    c.tool == "rust"
+                        && c.n_objects >= 3
+                        && matching.iter().any(|a| *a == c.config_arm)
+                })
+                .filter_map(|c| c.cov_2s),
+        );
         h.push_str(&format!(
-            "<tr><td class=\"gtool\">{}</td><td>{}</td><td class=\"gc {cls}\"><span class=\"cn\">{txt}</span></td><td class=\"r1c\"><span class=\"cn-n\">{}</span></td></tr>",
+            "<tr><td class=\"gtool\">{}</td><td>{}</td><td class=\"gc {cls}\"><span class=\"cn\">{txt}</span></td>{}{}<td class=\"r1c\"><span class=\"cn-n\">{}</span></td></tr>",
             pw_token_factor(tok),
             attr_escape(tok),
+            cov_cell(c1),
+            cov_cell(c2),
             matching.len(),
         ));
     }
@@ -6470,16 +7229,17 @@ fn pw_objects_html(agg: &PredictAggregates) -> String {
         .iter()
         .filter(|p| p.tool == tool && p.config_arm == arm)
         .collect();
-    rows.sort_by(|a, b| a.class.cmp(&b.class).then(a.object.cmp(&b.object)));
+    rows.sort_by(|a, b| {
+        class_rank(&a.class)
+            .cmp(&class_rank(&b.class))
+            .then(a.object.cmp(&b.object))
+    });
 
     let mut h = String::new();
-    h.push_str(&format!(
-        "<div class=\"panel-title\" title=\"Per-object walk for the primary (tool, arm) over {} objects: windows converged of expected, realism (joint, along, cross), median separation. A partially-failed walk shows its fraction; an object no window converged on is hatched, never dropped.\">Per-object walk</div>",
-        rows.len()
-    ));
+    h.push_str("<div class=\"panel-title\">Per-object walk</div>");
     h.push_str("<div class=\"grid-key\"><span class=\"gk\"><span class=\"gk-sw hatch\" title=\"no window converged for this object\"></span>none converged</span></div>");
     h.push_str(&format!(
-        "<div class=\"grid-scroll\"><table class=\"agrid pw-grid\"><thead><tr><th class=\"gobj\">object</th><th>class</th><th>windows</th><th title=\"joint realism\">{}</th><th title=\"along-track realism\">{}</th><th title=\"cross-track realism\">{}</th><th>{}</th></tr></thead><tbody>",
+        "<div class=\"grid-scroll\"><table class=\"agrid pw-grid\" data-grid=\"predict\"><thead><tr><th class=\"gobj\">object</th><th>class</th><th>windows</th><th title=\"joint realism\">{}</th><th title=\"along-track realism\">{}</th><th title=\"cross-track realism\">{}</th><th>{}</th></tr></thead><tbody>",
         uhdr("realism"),
         uhdr("along"),
         uhdr("cross"),
@@ -6553,164 +7313,6 @@ fn pw_objects_html(agg: &PredictAggregates) -> String {
     h
 }
 
-/// 4.2F — calibration: observed 1σ/2σ coverage per arm (from the surface cells,
-/// against the normal-law χ²₂ expectation), plus the D-003 log-score ranking,
-/// PIT / CvM and law-aware coverage, which are marked absent until a Student-t
-/// arm runs (D-005) — never fabricated.
-fn pw_calibration_html(agg: &PredictAggregates) -> String {
-    // The shared full arm axis, so the row count reconciles with 4.2A / 4.2C; an
-    // arm no rust walk produced renders as an explicit hatched row.
-    let arms = pw_all_arms(agg);
-    let mut h = String::new();
-    h.push_str("<div class=\"panel-title\" title=\"Calibration: observed 1σ/2σ coverage against the normal-law χ²₂ expectation. The law-aware log-score ranking has no data until a Student-t arm runs.\">Calibration</div>");
-    h.push_str("<div class=\"grid-summary reading\" title=\"observed 1σ/2σ coverage against the normal-law χ²₂ expectation 0.3935 / 0.8647; the law-aware log-score ranking has no data until a Student-t arm runs\">log-score absent</div>");
-    let cov_cell = |v: Option<f64>| match v {
-        Some(x) => format!("<td class=\"gc\"><span class=\"cn\">{x:.3}</span></td>"),
-        None => "<td class=\"gc hatch\" title=\"no covered cell for this arm\"></td>".to_string(),
-    };
-    let rust_arms: Vec<&str> = arms
-        .iter()
-        .copied()
-        .filter(|a| {
-            agg.cells
-                .iter()
-                .any(|c| c.tool == "rust" && c.config_arm == *a)
-        })
-        .collect();
-
-    // Main-effects summary first (owner, 2026-10-17): one factor swept, the rest
-    // marginalized over the rust factorial — the marginal 1σ/2σ coverage at each
-    // factor level, the same factor-column shape as Configuration arms.
-    h.push_str(&format!(
-        "<div class=\"grid-scroll\"><table class=\"agrid pw-grid\"><thead><tr><th class=\"gobj\">factor</th><th>level</th><th title=\"median over the level's cells (rust, n ≥ 3) · normal-law χ²₂ expectation 0.3935\">{}</th><th title=\"median over the level's cells (rust, n ≥ 3) · normal-law χ²₂ expectation 0.8647\">{}</th><th>arms</th></tr></thead><tbody>",
-        uhdr("1σ obs"),
-        uhdr("2σ obs"),
-    ));
-    {
-        let mut tokens: BTreeSet<&str> = BTreeSet::new();
-        for a in &rust_arms {
-            for t in pw_arm_tokens(a) {
-                tokens.insert(t);
-            }
-        }
-        for tok in &tokens {
-            let matching: Vec<&str> = rust_arms
-                .iter()
-                .copied()
-                .filter(|a| pw_arm_tokens(a).any(|t| t == *tok))
-                .collect();
-            if matching.len() < 2 {
-                continue; // a token carried by one arm is not a swept level
-            }
-            let c1 = pw_median(
-                agg.cells
-                    .iter()
-                    .filter(|c| {
-                        c.tool == "rust"
-                            && c.n_objects >= 3
-                            && matching.iter().any(|a| *a == c.config_arm)
-                    })
-                    .filter_map(|c| c.cov_1s),
-            );
-            let c2 = pw_median(
-                agg.cells
-                    .iter()
-                    .filter(|c| {
-                        c.tool == "rust"
-                            && c.n_objects >= 3
-                            && matching.iter().any(|a| *a == c.config_arm)
-                    })
-                    .filter_map(|c| c.cov_2s),
-            );
-            h.push_str(&format!(
-                "<tr><td class=\"gtool\">{}</td><td>{}</td>{}{}<td class=\"r1c\"><span class=\"cn-n\">{}</span></td></tr>",
-                pw_token_factor(tok),
-                attr_escape(tok),
-                cov_cell(c1),
-                cov_cell(c2),
-                matching.len(),
-            ));
-        }
-    }
-    h.push_str("</tbody></table></div>");
-
-    // The full per-arm list behind a toggle: the rust factorial as factor columns,
-    // the external tools' single arms as tool-named rows (no factor structure).
-    h.push_str("<details class=\"more-tables\"><summary>full arm list</summary>");
-    h.push_str(&format!(
-        "<div class=\"grid-scroll\"><table class=\"agrid pw-grid\"><thead><tr><th class=\"gobj\">debias</th><th>rejection</th><th>nightly</th><th>transport</th><th title=\"normal-law χ²₂ expectation 0.3935\">{}</th><th title=\"normal-law χ²₂ expectation 0.8647\">{}</th></tr></thead><tbody>",
-        uhdr("1σ obs"),
-        uhdr("2σ obs"),
-    ));
-    for arm in &arms {
-        let has_rust = agg
-            .cells
-            .iter()
-            .any(|c| c.tool == "rust" && c.config_arm == *arm);
-        if !has_rust {
-            // External tool's single arm: a row named by tool, no factor structure.
-            let tool = agg
-                .cells
-                .iter()
-                .find(|c| c.config_arm == *arm)
-                .map(|c| c.tool.as_str())
-                .unwrap_or("");
-            h.push_str(&format!(
-                "<tr><td class=\"gtool\" title=\"{}\">{} · {}</td><td>—</td><td>—</td><td>—</td><td class=\"gc hatch\" title=\"no rust walk for this arm\"></td><td class=\"gc hatch\" title=\"no rust walk for this arm\"></td></tr>",
-                attr_escape(arm),
-                attr_escape(tool),
-                attr_escape(arm),
-            ));
-            continue;
-        }
-        let fac = pw_arm_factors(arm);
-        let c1 = pw_median(
-            agg.cells
-                .iter()
-                .filter(|c| c.tool == "rust" && c.config_arm == *arm && c.n_objects >= 3)
-                .filter_map(|c| c.cov_1s),
-        );
-        let c2 = pw_median(
-            agg.cells
-                .iter()
-                .filter(|c| c.tool == "rust" && c.config_arm == *arm && c.n_objects >= 3)
-                .filter_map(|c| c.cov_2s),
-        );
-        h.push_str(&format!(
-            "<tr><td class=\"gtool\" title=\"{}\">{}</td><td>{}</td><td>{}</td><td>{}</td>{}{}</tr>",
-            attr_escape(arm),
-            fac[0], fac[1], fac[2], fac[3],
-            cov_cell(c1),
-            cov_cell(c2),
-        ));
-    }
-    h.push_str("</tbody></table></div>");
-    h.push_str("</details>");
-
-    // D-003 log-score ranking: marked absent until the Student-t chain runs
-    // (D-005). The cross-law ranking is only meaningful once a Student-t arm
-    // exists, so a normal-law-only run keeps the marked-absent state even though
-    // its calibration cells carry normal-law log scores. The sub-matrix label
-    // rides in its header cell (table content, exempt).
-    if agg
-        .calibration
-        .iter()
-        .any(|c| c.scoring_law == "student-t" && c.mean_log_score.is_some())
-    {
-        h.push_str(&pw_log_score_table(agg));
-    } else {
-        h.push_str(&format!(
-            "<div class=\"grid-scroll\"><table class=\"agrid pw-grid\"><thead><tr><th class=\"gobj\">log-score ranking — arm</th><th>{}</th><th>{}</th><th>nights</th></tr></thead><tbody><tr><td class=\"gc hatch\" title=\"{AWAITING_STUDENT_T}\" colspan=\"4\">{AWAITING_STUDENT_T}</td></tr></tbody></table></div>",
-            uhdr("mean log-score"),
-            uhdr("SE"),
-        ));
-    }
-    h.push_str("<div class=\"disclosures\"><details><summary>");
-    h.push_str(DISCLOSURE_SUMMARY);
-    h.push_str("</summary><div class=\"disc-body\">Observed coverage is the equal-weight-per-object median over the surface cells of the fraction of held-out d² within 1σ and 2σ, paired here with the normal-law χ²₂ expectation (0.3935, 0.8647). The main-effects rows take that same median over all the cells of the arms at a factor level (rust, n ≥ 3) — not a mean of per-arm values — so they reconcile with the full-arm-list rows; the linear transport baseline carries no main-effect row, being the absence of the mc/sp token. The proper scoring rule — mean log predictive density, resampled by night for a cluster-robust standard error — and the law-aware coverage, PIT and Cramér–von Mises statistics are empty until a Student-t arm runs; their rows are hatched \"awaiting Student-t chain\", never filled with a fabricated number.</div></details></div>");
-    h
-}
-
 /// The populated log-score ranking table, drawn only when a calibration cell
 /// carries a `mean_log_score` (i.e. a Student-t arm has run). A stated number
 /// with its SE — never a winner word.
@@ -6731,7 +7333,7 @@ fn pw_log_score_table(agg: &PredictAggregates) -> String {
             .unwrap_or(std::cmp::Ordering::Equal)
     });
     let mut h = String::from(
-        "<div class=\"grid-scroll\"><table class=\"agrid pw-grid\"><thead><tr><th class=\"gobj\">log-score ranking — arm</th><th>",
+        "<div class=\"grid-scroll\"><table class=\"agrid pw-grid\" data-grid=\"predict\"><thead><tr><th class=\"gobj\">log-score ranking — arm</th><th>",
     );
     h.push_str(&uhdr("mean log-score"));
     h.push_str("</th><th>");
@@ -6765,7 +7367,7 @@ fn pw_timeline_shell(agg: &PredictAggregates) -> String {
         .collect();
     objs.sort();
     let mut h = String::new();
-    h.push_str("<div class=\"panel-title\" title=\"One object's walk: normalized d² and separation versus window as the fit arc grows. The arc × dt surfaces marginalise exactly this per-window view.\">Walk timeline</div>");
+    h.push_str("<div class=\"panel-title\">Walk timeline</div>");
     h.push_str("<div class=\"pw-select\"><label class=\"pw-sel-label\"><select id=\"pw-timeline-object\" aria-label=\"object\" title=\"object\">");
     for (o, cl) in &objs {
         h.push_str(&format!(
@@ -6778,7 +7380,7 @@ fn pw_timeline_shell(agg: &PredictAggregates) -> String {
     h.push_str("<div id=\"pw-timeline-chart\" style=\"height:360px;\"></div>");
     h.push_str("<div class=\"disclosures\"><details><summary>");
     h.push_str(DISCLOSURE_SUMMARY);
-    h.push_str("</summary><div class=\"disc-body\">One point per fit window as the arc grows: normalized d² against the χ²₂ 50% / 95% bands, and median separation. Breaks are failed or empty windows; the curve is cut across apparition gaps. This chart reads the verified per-object sidecar fetched beside the dataset; it shows nothing until that file's byte length and hash match.</div></details></div>");
+    h.push_str("</summary><div class=\"disc-body\">One point per fit window as the arc grows: normalized d² against the χ²₂ 50% / 95% bands, and median separation. Breaks are failed or empty windows; the curve is cut across apparition gaps. This chart reads the verified per-object sidecar fetched beside the dataset; it shows nothing until that file's byte length and hash match. The arc &times; dt surfaces marginalise exactly this per-window view.</div></details></div>");
     h
 }
 
@@ -6799,13 +7401,12 @@ fn build_predictive_power_html(agg: Option<&PredictAggregates>) -> String {
     let mut h = String::new();
     // 4.2A Coverage leads — the predictive-power headline.
     h.push_str(&pw_coverage_html(agg));
-    // 4.2B surfaces, 4.2C marginals, 4.2D arms, 4.2E per-object, 4.2F
-    // calibration, 4.2G timeline.
+    // 4.2B surfaces, 4.2C marginals, 4.2D arms + calibration (merged, S3 item 2),
+    // 4.2E per-object walk, 4.2G timeline.
     h.push_str(&pw_surfaces_html(agg, &profile));
     h.push_str(&pw_marginals_html(agg));
-    h.push_str(&pw_arms_html(agg));
+    h.push_str(&pw_arms_calibration_html(agg));
     h.push_str(&pw_objects_html(agg));
-    h.push_str(&pw_calibration_html(agg));
     h.push_str(&pw_timeline_shell(agg));
     h
 }
@@ -6822,6 +7423,282 @@ fn build_predictive_power_html(agg: Option<&PredictAggregates>) -> String {
 /// small static families render server-side into the page; only the large
 /// per-object timeline family travels to the client, as a second verified
 /// sidecar beside the dataset.
+// ── S5a: the "Configurations" appendix (A.3, `s05c`) ───────────────────────
+// One subsection per EXTERNAL tool that has rows in this run, in the Part 2
+// tool order. A tool with no rows emits nothing (adam-core has no `adamcore_*`
+// fields in the schema, so its path produces nothing). empyrean is not an
+// external tool and has no subsection — its configuration stays in A.4
+// Provenance and in the §2.2 arms. Values come only from the rows (ASSIST's six
+// arms from each arm row's `config=` note; every other tool's version/settings
+// from its recorded fields). A setting the run did not record renders as the one
+// null token below, "not recorded" on hover; nothing is hand-typed.
+const CONFIG_TOOL_ORDER: [(&str, &str); 9] = [
+    ("assist", "ASSIST"),
+    ("findorb", "find_orb"),
+    ("layup", "layup"),
+    ("orbfit", "OrbFit"),
+    ("grss", "GRSS"),
+    ("kete", "kete"),
+    ("jorbit", "jorbit"),
+    ("oorb", "OpenOrb"),
+    ("adamcore", "adam-core"),
+];
+
+/// The one null token a configuration table shows for a setting the run did not
+/// record; the reason reads on hover.
+fn cfg_not_recorded() -> String {
+    "<span class=\"cfg-nd\" style=\"color:var(--ed-text-muted)\" title=\"not recorded\">&mdash;</span>"
+        .to_string()
+}
+
+/// True when this external tool has at least one row in the merged inputs.
+fn config_tool_present(results: &[ValidationResult], key: &str) -> bool {
+    match key {
+        "assist" => results
+            .iter()
+            .any(|r| r.channel == "assist" && r.test_type == "propagation"),
+        "findorb" => results.iter().any(|r| {
+            r.findorb_rms_residual.is_some()
+                || r.findorb_vs_horizons_km.is_some()
+                || r.findorb_d_ra_arcsec.is_some()
+        }),
+        "layup" => results
+            .iter()
+            .any(|r| r.layup_reduced_chi2.is_some() || r.layup_converged.is_some()),
+        "orbfit" => results.iter().any(|r| r.orbfit_rms_arcsec.is_some()),
+        "grss" => results.iter().any(|r| {
+            r.grss_vs_horizons_km.is_some()
+                || r.grss_separation_arcsec.is_some()
+                || r.grss_rms_arcsec.is_some()
+        }),
+        "kete" => results.iter().any(|r| r.kete_time_ms.is_some()),
+        "jorbit" => results.iter().any(|r| r.jorbit_time_ms.is_some()),
+        "oorb" => results
+            .iter()
+            .any(|r| r.oorb_vs_horizons_km.is_some() || r.oorb_separation_arcsec.is_some()),
+        // adam-core has no `adamcore_*` fields in the schema, so it never renders.
+        _ => false,
+    }
+}
+
+/// Parse an ASSIST `config=... key=value ... (assist X rebound Y)` note into its
+/// recorded key/value settings and the ASSIST version, if the note carries them.
+fn parse_assist_note(note: &str) -> (std::collections::HashMap<String, String>, Option<String>) {
+    let mut kv = std::collections::HashMap::new();
+    for tok in note.split_whitespace() {
+        if let Some((k, v)) = tok.split_once('=') {
+            kv.insert(k.to_string(), v.to_string());
+        }
+    }
+    let version = note.find("(assist ").and_then(|a| {
+        note[a + "(assist ".len()..]
+            .split_whitespace()
+            .next()
+            .map(|t| t.trim_end_matches(')').to_string())
+    });
+    (kv, version)
+}
+
+/// The subsection head line: `tool · version` (version in mono, or the null
+/// token when the run recorded none). The anchor id (`s05c-<key>`) is for deep
+/// links; it need not appear in the rail.
+fn config_subsection_head(anchor: &str, display: &str, version: Option<&str>) -> String {
+    let ver = match version {
+        Some(v) => format!("<code>{v}</code>"),
+        None => cfg_not_recorded(),
+    };
+    format!(
+        "  <div class=\"cfg-head\" style=\"font-family:var(--ed-font-display);font-weight:700;font-size:15px;color:var(--ed-text-primary);margin:18px 0 6px;\" id=\"s05c-{anchor}\">{display} &middot; {ver}</div>\n"
+    )
+}
+
+/// ASSIST subsection: the six arms (three configurations × variational off/on)
+/// as rows of one configuration table, read from each arm row's `config=` note.
+fn config_assist_subsection(results: &[ValidationResult]) -> String {
+    const ARMS: [(&str, &str, &str); 6] = [
+        (
+            "assist_default_variational_off",
+            "ASSIST default",
+            "off &middot; state only",
+        ),
+        (
+            "assist_default_variational_on",
+            "ASSIST default",
+            "on &middot; first order (N=6)",
+        ),
+        (
+            "assist_layup_variational_off",
+            "ASSIST layup",
+            "off &middot; state only",
+        ),
+        (
+            "assist_layup_variational_on",
+            "ASSIST layup",
+            "on &middot; first order (N=6)",
+        ),
+        (
+            "assist_asteroid_institute_variational_off",
+            "ASSIST asteroid-institute",
+            "off &middot; state only",
+        ),
+        (
+            "assist_asteroid_institute_variational_on",
+            "ASSIST asteroid-institute",
+            "on &middot; first order (N=6)",
+        ),
+    ];
+    let mut rows_html = String::new();
+    let mut version: Option<String> = None;
+    for (arm, cfg_label, variational) in ARMS {
+        let Some(rep) = results
+            .iter()
+            .find(|r| r.channel == "assist" && r.propagation_uncertainty.as_deref() == Some(arm))
+        else {
+            continue;
+        };
+        let (kv, ver) = parse_assist_note(&rep.notes);
+        if version.is_none() {
+            version = ver;
+        }
+        let cell = |k: &str| {
+            kv.get(k)
+                .map(|v| format!("<code>{v}</code>"))
+                .unwrap_or_else(cfg_not_recorded)
+        };
+        rows_html.push_str(&format!(
+            "<tr><td style=\"text-align:left\">{cfg_label}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td style=\"text-align:left\">{variational}</td></tr>",
+            cell("adaptive_mode"),
+            cell("epsilon"),
+            cell("min_dt"),
+            cell("initial_dt"),
+        ));
+    }
+    if rows_html.is_empty() {
+        return String::new();
+    }
+    let sum = DISCLOSURE_SUMMARY;
+    let head = config_subsection_head("assist", "ASSIST", version.as_deref());
+    format!(
+        "<div class=\"cfg-sub\">\n{head}  <div class=\"heatmap-container\">\n  <table class=\"agrid list\" data-grid=\"list\" style=\"font-size:11px;\">\n    <thead><tr><th style=\"text-align:left\">arm</th><th>adaptive mode</th><th>epsilon</th><th>min_dt <span class=\"u\">(d)</span></th><th>initial dt <span class=\"u\">(d)</span></th><th style=\"text-align:left\">variational</th></tr></thead>\n    <tbody>{rows_html}</tbody>\n  </table>\n  </div>\n  <div class=\"disclosures\"><details><summary>{sum}</summary><div class=\"disc-body\">N-body reference propagation and first-order partials from six variational particles. ASSIST models no Marsden &Delta;T term, so the five &Delta;T-bearing objects diverge under every configuration and are excluded from the Part 2 position medians &mdash; marked, never dropped.</div></details></div>\n</div>\n"
+    )
+}
+
+/// A generic external-tool subsection: head → two-column setting·value table →
+/// one Method fold. `settings` are the tool's configuration dimensions in order;
+/// a `None` value renders the one null token with "not recorded" on hover.
+fn config_generic_subsection(
+    anchor: &str,
+    display: &str,
+    version: Option<&str>,
+    settings: &[(&str, Option<&str>)],
+    method: &str,
+) -> String {
+    let sum = DISCLOSURE_SUMMARY;
+    let head = config_subsection_head(anchor, display, version);
+    let mut body = String::new();
+    for (name, val) in settings {
+        let v = match val {
+            Some(t) => format!("<code>{t}</code>"),
+            None => cfg_not_recorded(),
+        };
+        body.push_str(&format!(
+            "<tr><td style=\"text-align:left\">{name}</td><td style=\"text-align:left\">{v}</td></tr>"
+        ));
+    }
+    format!(
+        "<div class=\"cfg-sub\">\n{head}  <div class=\"heatmap-container\">\n  <table class=\"agrid list\" data-grid=\"list\" style=\"font-size:11px;\">\n    <thead><tr><th style=\"text-align:left\">setting</th><th style=\"text-align:left\">value</th></tr></thead>\n    <tbody>{body}</tbody>\n  </table>\n  </div>\n  <div class=\"disclosures\"><details><summary>{sum}</summary><div class=\"disc-body\">{method}</div></details></div>\n</div>\n"
+    )
+}
+
+/// The subsection for one external tool. Only recorded values appear; the setting
+/// names are the tool's known configuration dimensions (owner-specified in the
+/// S5a brief), their values the run's record or the null token.
+fn config_tool_subsection(results: &[ValidationResult], key: &str) -> String {
+    match key {
+        "assist" => config_assist_subsection(results),
+        "findorb" => config_generic_subsection(
+            "findorb",
+            "find_orb",
+            None,
+            &[
+                ("version", None),
+                ("&sigma; source", None),
+                ("over-observing rule", None),
+                ("DE ephemeris file", None),
+            ],
+            "Orbit determination from ADES astrometry (post-fit RMS reference); its fitted orbit is then propagated by find_orb itself to the plan's epochs for a fit-then-propagate comparison, so these diffs include the fit-vs-JPL-orbit difference.",
+        ),
+        "layup" => config_generic_subsection(
+            "layup",
+            "layup",
+            None,
+            &[
+                ("version", None),
+                ("weighting mode", None),
+                ("orbitfit flag", None),
+            ],
+            "Orbit determination from ADES; the reduced-&chi;&sup2; reference under Ver&eacute;s-2017 weighting.",
+        ),
+        "orbfit" => config_generic_subsection(
+            "orbfit",
+            "OrbFit",
+            None,
+            &[("version", None), ("rejection", None)],
+            "Orbit determination with the OrbFit Consortium / IAU MPC CMC2003 outlier rejection.",
+        ),
+        "grss" => config_generic_subsection(
+            "grss",
+            "GRSS",
+            None,
+            &[("version", None), ("perturbers", None)],
+            "Propagation, ephemeris and radar-capable orbit determination (Gauss-Radau Small-body Simulator); replays the plan's initial conditions and reports the suite's only post-fit radar residuals.",
+        ),
+        "kete" => config_generic_subsection(
+            "kete",
+            "kete",
+            None,
+            &[("version", None)],
+            "Dar Dahlen's independent Rust/Python NEO toolkit (originally Caltech IPAC / NEO Surveyor). This run records propagation wall-clock only; no comparison or configuration fields.",
+        ),
+        "jorbit" => config_generic_subsection(
+            "jorbit",
+            "jorbit",
+            None,
+            &[("version", None)],
+            "JAX autodiff propagator and orbit determination. This run records propagation wall-clock only; no comparison or configuration fields.",
+        ),
+        "oorb" => config_generic_subsection(
+            "oorb",
+            "OpenOrb",
+            None,
+            &[("version", None), ("perturbers", None)],
+            "N-body propagation and ephemeris (Bulirsch&ndash;Stoer, planets + Moon + Pluto, relativity on; no asteroid perturbers). Plan SSB states are converted to OpenOrb's heliocentric convention and back.",
+        ),
+        // adam-core has no `adamcore_*` fields in the schema: config_tool_present
+        // never reports it, and this arm never runs.
+        _ => String::new(),
+    }
+}
+
+/// The whole "Configurations" appendix (A.3, `s05c`): one subsection per present
+/// external tool, in the Part 2 tool order.
+fn render_configurations_section(results: &[ValidationResult]) -> String {
+    let mut subs = String::new();
+    for (key, _display) in CONFIG_TOOL_ORDER {
+        if config_tool_present(results, key) {
+            subs.push_str(&config_tool_subsection(results, key));
+        }
+    }
+    let body = if subs.is_empty() {
+        "  <div class=\"cfg-empty\" style=\"color:var(--ed-text-muted);font-size:12px;margin-top:8px;\">No external tool ran in this run.</div>\n".to_string()
+    } else {
+        subs
+    };
+    format!(
+        "<div class=\"section\" id=\"s05c\" data-page=\"empyrean\">\n  <div class=\"section-num\">A.3</div>\n  <div class=\"section-title\" title=\"Configuration of each external reference tool in this run\">Configurations</div>\n{body}</div>"
+    )
+}
+
 pub fn generate_report(
     results: &[ValidationResult],
     orbit_comparisons: &[crate::schema::OrbitComparison],
@@ -6856,8 +7733,13 @@ pub fn generate_report(
             objects.push((r.object.as_str(), r.population.as_str()));
         }
     }
-    // Sort by population then by object name.
-    objects.sort_by(|a, b| a.1.cmp(b.1).then(a.0.cmp(b.0)));
+    // Sort by the one canonical population order (POPULATION_ORDER), then by
+    // object name, so the embedded dataset's object order matches the grids.
+    objects.sort_by(|a, b| {
+        population_rank(a.1)
+            .cmp(&population_rank(b.1))
+            .then(a.0.cmp(b.0))
+    });
 
     let mut dt_values: Vec<i64> = prop_results
         .iter()
@@ -6881,7 +7763,9 @@ pub fn generate_report(
         .collect::<BTreeSet<_>>()
         .into_iter()
         .collect();
-    populations.sort();
+    // The population legend reads in the one canonical order (POPULATION_ORDER),
+    // so its group order matches every grid.
+    populations.sort_by_key(|p| population_rank(p));
 
     let mut channels: Vec<&str> = results
         .iter()
@@ -6967,6 +7851,10 @@ pub fn generate_report(
     }
     let tools_present_json = serde_json::to_string(&tools_present).unwrap_or_default();
 
+    // S5a: the "Configurations" appendix (A.3). One subsection per external
+    // tool with rows, server-rendered from the rows (empyrean is not one).
+    let configurations_section = render_configurations_section(results);
+
     // The dataset ships beside the page as "<output stem>.data.json" and the page
     // fetches it — the name derives from the output path so two reports written to
     // one directory never collide. The masthead download link points at it.
@@ -7026,29 +7914,45 @@ pub fn generate_report(
         bits.join(" · ")
     };
 
-    // Per-population object counts so the legend doubles as a coverage
-    // breakdown ("NEO (8)" rather than just "NEO").
+    // S5 items 3+4+5: A.1 drops its seven stat cards and the two coloured dot
+    // legends for ONE mono line of counts. The per-population and per-channel
+    // coverage the dot legends carried is kept as names-with-counts on the same
+    // line — no `.legend`, no `.pop-dot`, no categorical colour.
     let mut pop_obj_counts: BTreeMap<&str, usize> = BTreeMap::new();
     for &(_, pop) in &objects {
         *pop_obj_counts.entry(pop).or_default() += 1;
     }
-    let mut pop_legend = String::new();
-    for &pop in &populations {
-        let color = population_color(pop);
-        let n = pop_obj_counts.get(pop).copied().unwrap_or(0);
-        pop_legend.push_str(&format!(
-            "    <div class=\"legend-item\"><span class=\"pop-dot\" style=\"background:{color}\"></span>{pop} <span style=\"opacity:0.6\">({n})</span></div>\n"
-        ));
-    }
+    let pop_counts_line = populations
+        .iter()
+        .map(|&pop| format!("{pop} {}", pop_obj_counts.get(pop).copied().unwrap_or(0)))
+        .collect::<Vec<_>>()
+        .join(" · ");
+    let channel_counts_line = channels
+        .iter()
+        .map(|&ch| format!("{ch} {}", channel_coverage.get(ch).copied().unwrap_or(0)))
+        .collect::<Vec<_>>()
+        .join(" · ");
 
-    let mut channel_legend = String::new();
-    for &ch in &channels {
-        let color = channel_color(ch);
-        let n = channel_coverage.get(ch).copied().unwrap_or(0);
-        channel_legend.push_str(&format!(
-            "    <div class=\"legend-item\"><span class=\"pop-dot\" style=\"background:{color}\"></span>{ch} <span style=\"opacity:0.6\">({n})</span></div>\n"
-        ));
-    }
+    // S5 item 6: the A.2 "planned / opt-in" line names ONLY the candidate tools
+    // that truly have no rows in this run; a candidate that actually ran drops
+    // off the line, and when all three ran the line disappears entirely.
+    let a2_absent: Vec<&str> = [
+        ("OrbFit", od_tool_present("orbfit", results)),
+        ("kete", results.iter().any(|r| r.kete_time_ms.is_some())),
+        ("jorbit", results.iter().any(|r| r.jorbit_time_ms.is_some())),
+    ]
+    .into_iter()
+    .filter(|&(_, present)| !present)
+    .map(|(name, _)| name)
+    .collect();
+    let a2_absent_line = if a2_absent.is_empty() {
+        String::new()
+    } else {
+        format!(
+            "<tr style=\"opacity:0.55\"><td colspan=\"3\" title=\"Runner scripts live under runners/; their JSON merges into the report when the tool is run.\"><small style=\"color:var(--ed-text-muted)\"><b>Planned / opt-in:</b> {} (not in this run)</small></td></tr>",
+            a2_absent.join(" · ")
+        )
+    };
 
     let rollups = rollup_channels(results);
     // Hero-strip channel verdict: how many replay channels were compared
@@ -7072,7 +7976,6 @@ pub fn generate_report(
     let h2_eph_grid_html = build_eph_agreement_grid(results);
     let od_closeness_grid_html = build_od_closeness_grid(results, orbit_comparisons);
     let h4_fidelity_grid_html = build_channel_fidelity_grid(results);
-    let tool_ranking_html = build_tool_ranking_html(results, orbit_comparisons);
     let covariance_realism_html = build_covariance_realism_html(results, orbit_comparisons);
     // Part 4.2: the walk-forward predictive-power section. Server-rendered static
     // families; the per-object timeline travels to the client as a sidecar.
@@ -7090,7 +7993,67 @@ pub fn generate_report(
         build_pair_timing_panels(results, "ephemeris", "t2-eph", emp_eph, emp_od);
     let t3_od_timing_html =
         build_pair_timing_panels(results, "orbit_determination", "t3-od", emp_eph, emp_od);
-    let part2_timing_html = build_part2_timing_matrices(results, emp_eph, emp_od);
+    // S7: Part 2 is three fixed-slot sections (2.1/2.2/2.3) built by the one
+    // `part1_section` renderer; the former tool-ranking and wall-clock matrices
+    // are redistributed into their per-axis A · B · C slots.
+    let part2_sections = build_part2_sections(results, orbit_comparisons, emp_eph, emp_od);
+
+    // ── S6: Part 1 as three fixed-slot sections (1.1/1.2/1.3), the head line
+    // stated once, and the rail generated from the same tree ──────────────────
+    // The former eight sections (s02/s03/s-t1-prop · s06/s06b/s-t2-eph ·
+    // s08b/s-t3-od) merge into one `section()` per axis with the slots
+    // head → A·by object → B·by population → C·cost → fold. The grid-section
+    // anchors (s02/s06/s08b) are reused so §1.3A deep links and scroll-margins
+    // keep resolving; the lone-letter numbering is gone from Part 1.
+    let od_fit_quality_html = build_od_fit_quality_panel(results, orbit_comparisons);
+    let chart_h = FULL_CHART_HEIGHT_PX;
+    // 1.1 Propagation
+    let s1_1 = part1_section(
+        "s02",
+        "1.1",
+        "Propagation",
+        "Propagation — position agreement",
+        "",
+        &h1_prop_grid_html,
+        &format!(
+            "<div class=\"chart-container\"><div id=\"growth-chart\" style=\"height:{chart_h}px;\"></div></div>"
+        ),
+        &t1_prop_timing_html,
+        "<div class=\"disclosures\"><details><summary>Method</summary><div class=\"disc-body\">By object: each cell is the absolute position offset in km between the selected tool and the reference at that horizon, on the decade ladder; a cell not run, or an impactor horizon past impact, is hatched with the reason, never dropped. By population: the median offset per population at each horizon, log y; a labelled dashed series traces a force-model gap.</div></details></div>",
+    );
+    // 1.2 Ephemeris — the error-growth chart carries the pair/channels toggle;
+    // the itemised runaway list stays under 1.2 as the folded `outliers` table.
+    let s1_2 = part1_section(
+        "s06",
+        "1.2",
+        "Ephemeris",
+        "Ephemeris — sky-plane agreement",
+        "",
+        &h2_eph_grid_html,
+        &format!(
+            "<div class=\"channel-toggle\" id=\"s06b-toggle\"><button class=\"active\" data-mode=\"rust\">Selected pair</button><button data-mode=\"all\" data-requires=\"empyrean\">empyrean channels</button></div><div class=\"chart-container\"><div id=\"eph-sep-chart\" style=\"height:{chart_h}px;\" title=\"Separation vs propagation offset, by population\"></div></div>"
+        ),
+        &t2_eph_timing_html,
+        "<div class=\"disclosures\"><details class=\"more-tables\"><summary class=\"more-sum\">outliers</summary>\n  <div class=\"heatmap-container\">\n    <table class=\"agrid heatmap\" data-grid=\"outliers\" style=\"min-width:100%\" title=\"Rows beyond the sky-plane grid — the itemised runaway list for the selected pair\"><thead><tr><th style=\"text-align:left\">Object</th><th>Channel</th><th>dt</th><th>Observer</th><th><span class=\"u\">dRA·cos(δ)</span></th><th><span class=\"u\">dDec</span></th><th><span class=\"u\">‖d‖</span></th></tr></thead>\n      <tbody id=\"eph-outliers\"></tbody>\n    </table>\n  </div>\n  </details><details><summary>Method</summary><div class=\"disc-body\">By object: each cell is the mean angular separation in mas between the selected tool and the reference over the five sites, on the decade ladder; a cell not run is hatched. The folded outliers list every row beyond &plusmn;100 mas on the selected pair. By population: median separation per population at each horizon, log y, with the 1 mas Gaia single-frame floor.</div></details></div>",
+    );
+    // 1.3 Orbit determination — A the σ_eq closeness grid (1.3A), B the
+    // fit-quality population marginal, C the per-fit cost.
+    let s1_3 = part1_section(
+        "s08b",
+        "1.3",
+        "Orbit determination",
+        "Orbit determination — convergence &amp; closeness",
+        "",
+        &od_closeness_grid_html,
+        &od_fit_quality_html,
+        &t3_od_timing_html,
+        "<div class=\"disclosures\"><details><summary>Method</summary><div class=\"disc-body\">By object: fill = <code>σ_eq = √(Δᵀ(Σ_fit+Σ_ref)⁻¹Δ/6)</code>, the 6-DOF Mahalanobis distance in Sun-centred ecliptic J2000 elements at a common epoch; shape carries convergence. Objects whose JPL solution used radar are hatched, counted, out of statistics; nine of 82 lack a finite metric (Σ_ref not positive-definite). By population: median n_obs, χ²ᵣ, post-fit RMS″ and σ_eq; the rejected fraction and JPL's solution date are not in the rows.</div></details></div>",
+    );
+    let part1_sections = format!("{s1_1}{s1_2}{s1_3}");
+    let part1_head = part1_head_html();
+    let part1_facts = part1_facts_html(&part1_facts(results));
+    // S7 item 3: the whole sidebar generated from the part/section tree.
+    let rail_html = build_rail_html();
 
     // ── Hero "quality summary" line — features the cross-channel
     // pass counts and OD convergence rather than raw throughput. Built
@@ -7177,7 +8140,7 @@ pub fn generate_report(
   <div class="section-num">A.4</div>
   <div class="section-title" title="Reproducibility — provenance for this run: the frame, ephemeris, force model, and external references behind the numbers.">Provenance</div>
   <div class="heatmap-container">
-  <table class="od-table" style="font-size:11px;">
+  <table class="agrid list" data-grid="list" style="font-size:11px;">
     <thead><tr><th style="text-align:left">Component</th><th style="text-align:left">Value</th></tr></thead>
     <tbody>
       <tr><td>Frame</td><td>ICRF (J2000), barycentric</td></tr>
@@ -7235,7 +8198,7 @@ pub fn generate_report(
   .header {{ padding: 60px 60px 40px; max-width: 1400px; margin: 0 auto; border-bottom: 1px solid var(--ed-border); }}
   .header h1 {{ font-family: var(--ed-font-display); font-weight: 700; font-size: 36px; color: var(--ed-text-primary); letter-spacing: -0.5px; margin-bottom: 4px; }}
   .header h2 {{ font-family: var(--ed-font-display); font-weight: 700; font-size: 36px; color: rgba(232,232,236,0.40); letter-spacing: -0.5px; margin-bottom: 12px; }}
-  .header .subtitle {{ font-family: var(--ed-font-mono); font-size: 11px; color: var(--ed-accent); letter-spacing: 2px; text-transform: uppercase; }}
+  .header .subtitle {{ font-family: var(--ed-font-mono); font-size: 10px; color: var(--ed-accent); letter-spacing: 1.5px; text-transform: uppercase; }}
   .header .meta {{ font-family: var(--ed-font-mono); font-size: 11px; color: var(--ed-text-muted); margin-top: 8px; }}
   .header .provenance {{ font-family: var(--ed-font-mono); font-size: 11px; color: var(--ed-text-secondary); margin-top: 6px; line-height: 1.7; }}
 
@@ -7247,11 +8210,11 @@ pub fn generate_report(
   .page-tab:hover {{ color: var(--ed-text-primary); }}
   .page-tab.active {{ color: var(--ed-accent); border-bottom-color: var(--ed-accent); }}
   .section:last-child {{ border-bottom: none; }}
-  .section-num {{ font-family: var(--ed-font-mono); font-size: 11px; color: var(--ed-text-muted); letter-spacing: 2px; text-transform: uppercase; margin-bottom: 8px; }}
+  .section-num {{ font-family: var(--ed-font-mono); font-size: 10px; color: var(--ed-text-muted); letter-spacing: 1.5px; text-transform: uppercase; margin-bottom: 8px; }}
   .section small {{ font-size: 11px; }}
-  .section-title {{ font-family: var(--ed-font-display); font-weight: 700; font-size: 24px; color: var(--ed-text-primary); margin-bottom: 8px; }}
+  .section-title {{ font-family: var(--ed-font-display); font-weight: 700; font-size: 20px; color: var(--ed-text-primary); margin-bottom: 8px; }}
   .section-desc {{ font-size: 13px; color: var(--ed-text-secondary); line-height: 1.6; max-width: 900px; margin-bottom: 24px; }}
-  .panel-title {{ font-family: var(--ed-font-display); font-size: 14px; color: var(--ed-text-primary); margin: 24px 0 8px 0; }}
+  .panel-title {{ font-family: var(--ed-font-mono); font-weight: 300; font-size: 10px; letter-spacing: 1.5px; text-transform: uppercase; color: var(--ed-text-muted); margin: 24px 0 8px 0; }}
 
   .heatmap-container {{ overflow-x: auto; max-width: 100%; padding-bottom: 8px; }}
   .heatmap-container::-webkit-scrollbar {{ height: 6px; }}
@@ -7259,17 +8222,18 @@ pub fn generate_report(
   .heatmap-container::-webkit-scrollbar-thumb {{ background: var(--ed-scrollbar-thumb); border-radius: 3px; }}
   .heatmap-container::-webkit-scrollbar-thumb:hover {{ background: var(--ed-scrollbar-hover); }}
   table.heatmap {{ border-collapse: collapse; font-family: var(--ed-font-mono); font-size: 11px; }}
-  table.heatmap th {{ padding: 6px 10px; color: var(--ed-text-secondary); font-weight: 400; letter-spacing: 1px; border-bottom: 1px solid var(--ed-border); position: sticky; top: var(--sticky-offset, 0px); background: var(--ed-bg); z-index: 1; }}
+  table.agrid.heatmap th {{ padding: 6px 10px; color: var(--ed-text-secondary); font-weight: 300; letter-spacing: 1px; border-bottom: 1px solid var(--ed-border); position: sticky; top: var(--sticky-offset, 0px); background: var(--ed-bg); z-index: 1; }}
   /* One rule: every server-rendered table header renders uppercase, the
      agreement heatmaps' canonical case (Part 2 matrices and the outliers table
      included). Uppercasing words is right; uppercasing a symbol, a variable
      name or a unit corrupts it (σ_eq→Σ_EQ, dRA·cos(δ)→DRA·COS(Δ), ms→MS), so any
      header fragment carrying one is wrapped in the ONE no-transform span below
      ([`uhdr`] server-side, its `uhdr` twin client-side). */
-  table.heatmap th, .od-table th, table.agrid th, table.r1grid th, table.r2grid th, table.r3grid th {{ text-transform: uppercase; }}
+  /* S8 item 1: one family — every grid header (every variant) uppercases via the
+     shared table.agrid th rule below (folded in, not a second rule). */
   th .u {{ text-transform: none; letter-spacing: normal; }}
   table.heatmap th.dt-col {{ text-align: center; min-width: 70px; }}
-  table.heatmap td {{ padding: 5px 8px; text-align: center; border-bottom: 1px solid var(--ed-border-subtle); cursor: default; }}
+  table.agrid.heatmap td {{ padding: 5px 8px; text-align: center; border-bottom: 1px solid var(--ed-border-subtle); cursor: default; }}
   table.heatmap td.obj-name {{ text-align: left; color: var(--ed-text-primary); font-size: 11px; white-space: nowrap; padding-right: 16px; position: sticky; left: 0; background: var(--ed-bg); }}
   table.heatmap td.pop-tag {{ text-align: left; font-size: 11px; padding-right: 12px; }}
   table.heatmap td.cell {{ font-size: 11px; border-radius: 2px; }}
@@ -7279,28 +8243,36 @@ pub fn generate_report(
     color: var(--ed-text-muted);
   }}
   .pop-dot {{ display: inline-block; width: 6px; height: 6px; border-radius: 50%; margin-right: 4px; vertical-align: middle; }}
-  .chart-container {{ background: var(--ed-surface); border: 1px solid var(--ed-border); border-radius: var(--ed-radius-md); padding: 16px; margin-bottom: 24px; }}
+  /* S5 item 4: charts carry no card (no border, no inset fill, no padding). */
+  .chart-container {{ background: transparent; border: none; border-radius: 0; padding: 0; margin-bottom: 24px; }}
   .summary-grid {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 12px; margin-bottom: 24px; }}
   .summary-card {{ background: var(--ed-surface); border: 1px solid var(--ed-border); border-radius: var(--ed-radius-md); padding: 20px; }}
   .summary-card .value {{ font-family: var(--ed-font-display); font-weight: 700; font-size: 28px; color: var(--ed-text-primary); }}
-  .summary-card .label {{ font-family: var(--ed-font-mono); font-size: 11px; color: var(--ed-text-secondary); letter-spacing: 1px; text-transform: uppercase; margin-top: 4px; }}
+  .summary-card .label {{ font-family: var(--ed-font-mono); font-size: 10px; color: var(--ed-text-secondary); letter-spacing: 1.5px; text-transform: uppercase; margin-top: 4px; }}
+  /* S5 item 4: the A.1 run summary as one mono line of counts (no stat cards). */
+  .run-counts {{ font-family: var(--ed-font-mono); font-weight: 300; font-size: 11px; color: var(--ed-text-secondary); line-height: 1.9; }}
+  .run-counts .rc-k {{ color: var(--ed-text-muted); text-transform: uppercase; letter-spacing: 1.5px; font-size: 10px; margin-right: 6px; }}
   .legend {{ display: flex; gap: 16px; flex-wrap: wrap; margin-bottom: 16px; }}
   .legend-item {{ display: flex; align-items: center; gap: 4px; font-family: var(--ed-font-mono); font-size: 11px; color: var(--ed-text-secondary); }}
   .channel-toggle {{ display: inline-flex; flex-wrap: wrap; gap: 6px; margin: 8px 0 16px 0; font-family: var(--ed-font-mono); font-size: 11px; }}
   .channel-toggle button {{ background: var(--ed-surface); border: 1px solid var(--ed-border); border-radius: var(--ed-radius-sm); color: var(--ed-text-secondary); padding: 4px 10px; cursor: pointer; font-family: inherit; font-size: 11px; }}
   .channel-toggle button.active {{ color: var(--ed-text-primary); border-color: var(--ed-accent); background: var(--ed-surface-raised); }}
-  .od-table {{ font-family: var(--ed-font-mono); font-size: 11px; border-collapse: collapse; min-width: 100%; }}
-  .od-table th, .od-table td {{ padding: 6px 10px; border-bottom: 1px solid var(--ed-border); text-align: right; }}
-  .od-table th {{ color: var(--ed-text-secondary); font-weight: 400; letter-spacing: 1px; font-size: 11px; }}
-  .od-table td.obj {{ text-align: left; color: var(--ed-text-primary); }}
-  .od-table tr.diverged {{ background: rgba(208, 80, 64, 0.08); }}
+  /* S8 item 1: the two-column appendix / simple data tables as one `list`
+     variant of the grid family (object-list rows, right-aligned values). Its
+     own double-class selectors beat the agrid base, so the family base does not
+     clobber its padding; its header does not stick (short appendix tables). */
+  table.agrid.list {{ min-width: 100%; }}
+  .agrid.list th, .agrid.list td {{ padding: 6px 10px; border-bottom: 1px solid var(--ed-border); text-align: right; height: 24px; }}
+  .agrid.list th {{ color: var(--ed-text-secondary); font-weight: 300; letter-spacing: 1px; font-size: 11px; position: static; }}
+  .agrid.list td.obj {{ text-align: left; color: var(--ed-text-primary); }}
+  .agrid.list tr.diverged {{ background: rgba(208, 80, 64, 0.08); }}
 
   /* Convergence matrix — three states, three glyphs, three classes. The
      not-attempted hatch reuses the heatmap's `.cell.missing` fill so "we
      have no number here" looks the same everywhere in the report. */
   table.heatmap td.conv {{ font-size: 13px; line-height: 1.1; cursor: help; }}
   table.heatmap td.conv-ok {{ color: #3d9a6d; }}
-  table.heatmap td.conv-fail {{ color: #e06252; background: rgba(208, 80, 64, 0.10); }}
+  table.heatmap td.conv-fail {{ color: var(--ed-error-text); background: rgba(208, 80, 64, 0.10); }}
   table.heatmap td.conv-na {{
     color: var(--ed-text-muted);
     background: repeating-linear-gradient(45deg, #161c25, #161c25 4px, #1f2630 4px, #1f2630 8px);
@@ -7308,13 +8280,13 @@ pub fn generate_report(
   table.heatmap tr.conv-footer td {{ border-top: 1px solid var(--ed-border); padding-top: 8px; }}
   .conv-key {{ font-size: 13px; margin-right: 4px; }}
   .conv-key.conv-ok {{ color: #3d9a6d; }}
-  .conv-key.conv-fail {{ color: #e06252; }}
+  .conv-key.conv-fail {{ color: var(--ed-error-text); }}
   .conv-key.conv-na {{ color: var(--ed-text-muted); }}
 
   /* Capability pillar band (Overview) */
   .pillar-band {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(250px, 1fr)); gap: 12px; margin-top: 14px; }}
   .pillar {{ background: var(--ed-surface); border: 1px solid var(--ed-border); border-left-width: 3px; border-radius: var(--ed-radius-sm); padding: 14px 16px; display: flex; flex-direction: column; gap: 7px; }}
-  .pillar .pt {{ font-family: var(--ed-font-mono); font-size: 11px; letter-spacing: 2px; text-transform: uppercase; color: var(--ed-text-secondary); }}
+  .pillar .pt {{ font-family: var(--ed-font-mono); font-size: 10px; letter-spacing: 1.5px; text-transform: uppercase; color: var(--ed-text-secondary); }}
   .pillar .pc {{ font-family: var(--ed-font-display); font-weight: 700; font-size: 15px; color: var(--ed-text-primary); line-height: 1.35; }}
   .pillar .pp {{ font-family: var(--ed-font-mono); font-size: 11px; color: var(--ed-text-muted); line-height: 1.9; }}
   .pillar .pl {{ font-family: var(--ed-font-mono); font-size: 11px; margin-top: auto; }}
@@ -7338,7 +8310,7 @@ pub fn generate_report(
   .hero-cards {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(185px, 1fr)); gap: 12px; margin: 14px 0 6px; }}
   .hero-card {{ background: var(--ed-surface); border: 1px solid var(--ed-border); border-radius: var(--ed-radius-sm); padding: 16px 18px; }}
   .hero-card .hv {{ font-family: var(--ed-font-display); font-weight: 700; font-size: 30px; color: var(--ed-text-primary); line-height: 1.15; }}
-  .hero-card .hl {{ font-family: var(--ed-font-mono); font-size: 11px; color: var(--ed-text-secondary); letter-spacing: 1.5px; text-transform: uppercase; margin-bottom: 6px; }}
+  .hero-card .hl {{ font-family: var(--ed-font-mono); font-size: 10px; color: var(--ed-text-secondary); letter-spacing: 1.5px; text-transform: uppercase; margin-bottom: 6px; }}
   .hero-card .hs {{ font-size: 11px; color: var(--ed-text-muted); margin-top: 6px; }}
   .hero-badge {{ font-size: 13px; font-weight: 700; margin-right: 6px; }}
   .hero-badge.pass {{ color: #3d9a6d; }}
@@ -7353,11 +8325,14 @@ pub fn generate_report(
   }}
   /* ═══════ Redesign ═══════ */
   /* Masthead — no curated verdict strip, just what this run holds. */
-  .masthead {{ padding: 48px 60px 22px; max-width: 1600px; margin: 0 auto; border-bottom: 1px solid var(--ed-border); }}
-  .masthead .mh-eyebrow {{ font-family: var(--ed-font-mono); font-size: 11px; color: var(--ed-accent); letter-spacing: 2px; text-transform: uppercase; }}
-  .masthead h1 {{ font-family: var(--ed-font-display); font-weight: 800; font-size: 34px; letter-spacing: -0.5px; margin: 6px 0 10px; }}
-  .masthead h1 .mh-dim {{ color: rgba(232,232,236,0.38); }}
-  .mh-sub {{ font-family: var(--ed-font-mono); font-size: 12px; color: var(--ed-text-secondary); line-height: 1.7; max-width: 1000px; }}
+  /* S5 item 1: the masthead text starts on the content edge (rail 210 + the
+     section's 60px gutter), so masthead and every section share one left edge
+     at 1440 and 1920; the ≤1100px block below drops it back to the 20px gutter
+     when the rail hides. */
+  .masthead {{ padding: 48px 60px 22px 270px; max-width: 1600px; margin: 0 auto; border-bottom: 1px solid var(--ed-border); }}
+  .masthead .mh-eyebrow {{ font-family: var(--ed-font-mono); font-size: 10px; color: var(--ed-accent); letter-spacing: 1.5px; text-transform: uppercase; }}
+  .masthead h1 {{ font-family: var(--ed-font-display); font-weight: 700; font-size: 34px; letter-spacing: -0.5px; margin: 6px 0 10px; }}
+  .masthead h1 .mh-dim {{ color: var(--ed-text-muted); }}
   .mh-prov {{ font-family: var(--ed-font-mono); font-size: 11px; color: var(--ed-text-muted); line-height: 1.7; margin-top: 6px; }}
   .mh-link {{ color: var(--ed-accent); text-decoration: none; }}
   .mh-controls {{ display: flex; align-items: center; gap: 12px; flex-wrap: wrap; margin-top: 16px; font-family: var(--ed-font-mono); font-size: 13px; }}
@@ -7369,26 +8344,39 @@ pub fn generate_report(
   /* Layout — sticky left rail + single-scroll content column. */
   .layout-wrap {{ display: flex; gap: 0; max-width: 1600px; margin: 0 auto; align-items: flex-start; }}
   .rail {{ flex: 0 0 210px; position: sticky; top: 0; align-self: flex-start; max-height: 100vh; overflow-y: auto; padding: 24px 14px 24px 24px; font-family: var(--ed-font-mono); font-size: 11px; border-right: 1px solid var(--ed-border); }}
-  .rail .rail-part {{ color: var(--ed-text-muted); letter-spacing: 1px; text-transform: uppercase; font-size: 11px; margin: 16px 0 6px; }}
+  .rail .rail-part {{ color: var(--ed-text-muted); letter-spacing: 1.5px; text-transform: uppercase; font-size: 10px; margin: 16px 0 6px; }}
   .rail .rail-part:first-child {{ margin-top: 0; }}
-  .rail a {{ display: block; color: var(--ed-text-secondary); text-decoration: none; padding: 3px 8px; border-left: 2px solid transparent; line-height: 1.5; }}
+  .rail a {{ display: block; font-family: var(--ed-font-body); font-weight: 300; font-size: 13px; color: var(--ed-text-secondary); text-decoration: none; padding: 3px 8px; border-left: 2px solid transparent; line-height: 1.6; }}
   .rail a:hover {{ color: var(--ed-text-primary); }}
   .rail a.active {{ color: var(--ed-accent); border-left-color: var(--ed-accent); background: var(--ed-surface); }}
   .content {{ flex: 1 1 auto; min-width: 0; display: flex; flex-direction: column; }}
   .content .section {{ max-width: none; margin: 0; }}
-  /* Visual order: parts 1→4 in sequence, the cost section inside Part 1, the
-     STM cross-validation and six-arm study in Part 3 / appendix, the run
-     summary, external tools and provenance in the appendix, so the page
-     opens on Part 1. Reordered by flex `order` so no section div is
-     physically moved (and the scroll-spy still tracks). */
-  #part1 {{ order: 10; }} #part1-bar {{ order: 11; }} #s02 {{ order: 12; }} #s03 {{ order: 13; }} #s-t1-prop {{ order: 14; }} #s06 {{ order: 15; }} #s06b {{ order: 16; }} #s-t2-eph {{ order: 17; }} #s07 {{ order: 18; }} #s08b {{ order: 19; }} #s-t3-od {{ order: 20; }}
-  #part2 {{ order: 21; }} #s-ranking {{ order: 22; }} #s-timing {{ order: 23; }}
-  #part3 {{ order: 30; }} #s10 {{ order: 31; }} #s05 {{ order: 32; }} #s09b {{ order: 33; }}
-  #part4 {{ order: 40; }} #s12 {{ order: 41; }} #s15 {{ order: 42; }}
-  #appendix {{ order: 49; }} #s01 {{ order: 50; }} #s01b {{ order: 51; }} #s05c {{ order: 52; }} #s13 {{ order: 53; }}
+  /* S7 item 3: the content column emits in DOM == visual order — Part 1, Part 2
+     (2.1/2.2/2.3), Part 3, Part 4, then the appendix (run summary, external
+     tools, configurations, provenance). No flex `order` reorders any section, so
+     the DOM order is the visual order the reader and the scroll-spy both see. */
   @media (max-width: 1100px) {{ .rail {{ display: none; }} .masthead {{ padding: 32px 20px 18px; }} }}
 
-  .part-head {{ font-family: var(--ed-font-display); font-weight: 700; font-size: 13px; letter-spacing: 2px; text-transform: uppercase; color: var(--ed-accent); padding: 26px 60px 0; max-width: 1400px; margin: 0 auto; }}
+  /* S5 item 1: the Part head is a left-aligned stack — a mono eyebrow over a
+     Syne title — flush on the content edge (no centring, no max-width box), so
+     rail / masthead / content share one left edge at 1440 and 1920. */
+  .part-head {{ padding: 32px 60px 0; max-width: none; margin: 0; text-align: left; }}
+  .ph-eyebrow {{ display: block; font-family: var(--ed-font-mono); font-weight: 300; font-size: 10px; letter-spacing: 1.5px; text-transform: uppercase; color: var(--ed-text-muted); margin-bottom: 4px; }}
+  .ph-title {{ display: block; font-family: var(--ed-font-display); font-weight: 700; font-size: 28px; letter-spacing: -0.3px; color: var(--ed-text-primary); }}
+  /* S6 item 2: the Part 1 head facts — epoch, frames, force-model pair, sites —
+     stated once under the title in the eyebrow role. The per-fact label
+     (data-k) and the " · " separators are CSS, so only the terse values are DOM
+     text; values stay normal-case so the product name reads lowercase. */
+  .ph-facts {{ display: flex; flex-wrap: wrap; gap: 3px 16px; margin-top: 6px; font-family: var(--ed-font-mono); font-weight: 300; font-size: 10px; letter-spacing: 0.2px; color: var(--ed-text-secondary); }}
+  .ph-facts .phf {{ display: inline-flex; align-items: baseline; gap: 5px; }}
+  .ph-facts .phf::before {{ content: attr(data-k); color: var(--ed-text-muted); letter-spacing: 1px; text-transform: uppercase; }}
+  .ph-facts .phf-v + .phf-v::before {{ content: "· "; color: var(--ed-text-muted); }}
+  /* S6 item 1/3: one slot eyebrow (the single uppercase eyebrow role, matching
+     .ph-eyebrow's mono 300 10px 1.5px). The slot LETTER and its separator are a
+     CSS marker; only the slot name is DOM text. It is the scroll-spy anchor its
+     rail sub-entry targets. */
+  .slot-eyebrow {{ display: block; font-family: var(--ed-font-mono); font-weight: 300; font-size: 10px; letter-spacing: 1.5px; text-transform: uppercase; color: var(--ed-text-muted); margin: 22px 0 8px; }}
+  .slot-eyebrow::before {{ content: attr(data-slot) " · "; color: var(--ed-accent); }}
 
   /* ── Part 1 compare bar (owner pass 18: "make the comparison tool selection
      more obvious for section 1") ─────────────────────────────────────────────
@@ -7410,26 +8398,33 @@ pub fn generate_report(
   .part1-bar {{ position: sticky; top: 0; z-index: 30; background: var(--ed-surface-raised); border-bottom: 1px solid var(--ed-border); }}
   .part1-bar.p1b-released {{ position: static; }}
   .part1-bar.p1b-pinned {{ box-shadow: 0 2px 6px rgba(0, 0, 0, 0.18); }}
-  .p1b-inner {{ display: flex; align-items: center; gap: 12px; min-height: 40px; padding: 5px 60px; max-width: 1400px; margin: 0 auto; font-family: var(--ed-font-mono); font-size: 12px; }}
-  .part1-bar .p1b-label {{ color: var(--ed-text-muted); letter-spacing: 1px; text-transform: uppercase; font-size: 11px; }}
+  /* S5 item 1: the bar IS the Part 1 head line — the Part head stack on the
+     left, the Compare controls on the right, on one sticky line flush with the
+     content edge (no centring box). */
+  /* S8 item 3: the inner bar is a column — a top line (title + Compare on one
+     row that never wraps) over the facts as a full-width second row. */
+  .p1b-inner {{ display: flex; flex-direction: column; align-items: stretch; gap: 8px; padding: 18px 60px 14px; max-width: none; margin: 0; font-family: var(--ed-font-mono); font-size: 12px; }}
+  .p1b-topline {{ display: flex; align-items: center; justify-content: space-between; gap: 16px; min-height: 40px; flex-wrap: nowrap; }}
+  .p1b-topline .ph-head {{ flex: 1 1 auto; min-width: 0; }}
+  /* The two selects and the "vs" between them stay on one line at every width. */
+  .p1b-compare {{ display: flex; align-items: center; gap: 12px; flex-wrap: nowrap; white-space: nowrap; flex: 0 0 auto; }}
+  /* The facts own the full width of the bar's second row, so they never share a
+     line with the Compare selects. */
+  .p1b-inner > .ph-facts {{ margin-top: 0; }}
+  .part1-bar .p1b-label {{ color: var(--ed-text-muted); letter-spacing: 1.5px; text-transform: uppercase; font-size: 10px; }}
   .part1-bar .p1b-vs {{ color: var(--ed-text-muted); }}
   .part1-bar select {{ background: var(--ed-input-bg); color: var(--ed-accent); border: 1px solid var(--ed-input-border); border-radius: var(--ed-radius-sm); padding: 6px 12px; font-family: var(--ed-font-mono); font-size: 14px; font-weight: 700; cursor: pointer; }}
   .part1-bar select:focus-visible {{ outline: none; border-color: var(--ed-accent); box-shadow: 0 0 0 2px var(--ed-focus-ring); }}
   @media (max-width: 1100px) {{ .p1b-inner {{ padding-left: 20px; padding-right: 20px; }} }}
   /* A rail click / deep link to a Part 1 section must land below the pinned bar. */
-  #s02, #s03, #s-t1-prop, #s06, #s06b, #s-t2-eph, #s07, #s08b, #s-t3-od {{ scroll-margin-top: var(--bar-h); }}
-  /* One pair chip per Part 1 section title, naming the selected pair in the two
-     tools' colours; the same colour language as the compare-bar selects. Its
-     `pair-chip` class scopes its words as a chip (not title words) for the audit. */
-  .pair-chip {{ display: inline-flex; align-items: baseline; gap: 5px; margin-left: 10px; padding: 2px 9px; border: 1px solid var(--ed-border); border-radius: 999px; background: var(--ed-surface); font-family: var(--ed-font-mono); font-size: 11px; font-weight: 400; letter-spacing: 0.3px; text-transform: none; vertical-align: middle; }}
-  .pair-chip .pc-vs {{ color: var(--ed-text-muted); }}
+  #s02, #s06, #s08b, .spy-anchor {{ scroll-margin-top: var(--bar-h); }}
   /* Per-tool text colours as theme-aware tokens: a tool NAME shown as text (the
      compare-bar selects and the section-title pair chips) reads its --tool-<slug>
      token so it clears WCAG AA (>= 4.5:1) on the card/input surface in BOTH themes.
      The light values are darkened exactly as --ed-accent is. One source, below. */
 {tool_tokens_css}
 
-  .section-q {{ font-family: var(--ed-font-body); font-size: 14px; color: var(--ed-text-secondary); line-height: 1.6; max-width: 900px; margin-bottom: 14px; }}
+  .section-q {{ font-family: var(--ed-font-body); font-size: 13px; color: var(--ed-text-secondary); line-height: 1.6; max-width: 900px; margin-bottom: 14px; }}
   .disclosures {{ margin-top: 12px; font-family: var(--ed-font-mono); font-size: 11px; }}
   .more-tables {{ margin-top: 10px; }}
   .more-tables > summary {{ cursor: pointer; display: inline-block; font-family: var(--ed-font-mono); font-size: 11px; color: var(--ed-text-secondary); border: 1px solid var(--ed-input-border); border-radius: var(--ed-radius-sm); padding: 3px 10px; list-style: none; }}
@@ -7439,7 +8434,7 @@ pub fn generate_report(
   .more-tables > summary:hover {{ color: var(--ed-accent); border-color: var(--ed-accent); }}
   .more-tables[open] > summary {{ margin-bottom: 8px; }}
   .disclosures summary {{ color: var(--ed-accent); cursor: pointer; }}
-  .disclosures .disc-body {{ color: var(--ed-text-secondary); line-height: 1.7; max-width: 900px; margin-top: 8px; }}
+  .disclosures .disc-body {{ font-family: var(--ed-font-body); font-weight: 300; font-size: 13px; color: var(--ed-text-secondary); line-height: 1.6; max-width: 900px; margin-top: 8px; }}
   .refs {{ color: var(--ed-text-secondary); line-height: 1.6; max-width: 900px; }}
   .refs .ref-head {{ margin-bottom: 4px; color: var(--ed-accent); cursor: pointer; }}
   .refs .ref {{ margin-top: 3px; }}
@@ -7454,7 +8449,7 @@ pub fn generate_report(
   .grid-key .gk {{ display: inline-flex; align-items: center; gap: 5px; }}
   .grid-key .gk-sw {{ display: inline-block; width: 14px; height: 12px; border-radius: 2px; }}
   .grid-tool-head {{ font-family: var(--ed-font-display); font-weight: 700; font-size: 13px; color: var(--ed-accent); letter-spacing: 0.5px; margin: 20px 0 6px; }}
-  .grid-tool-note {{ font-family: var(--ed-font-mono); font-size: 12px; color: var(--ed-text-muted); margin: 2px 0 10px; }}
+  .grid-tool-note {{ font-family: var(--ed-font-body); font-weight: 300; font-size: 13px; line-height: 1.6; color: var(--ed-text-muted); margin: 2px 0 10px; }}
   .pair-notcompared {{ font-family: var(--ed-font-mono); font-size: 12px; color: var(--ed-text-secondary); padding: 10px 12px; margin: 4px 0 12px; border: 1px solid var(--ed-border); border-radius: var(--ed-radius-sm); background: var(--ed-hatch); }}
   .grid-scroll {{ overflow-x: auto; max-width: 100%; padding-bottom: 8px; }}
   /* H1/H2 tables reclaim the section's side padding so all 17 horizons fit
@@ -7501,12 +8496,12 @@ pub fn generate_report(
      the shared sticky-header rule, live for the families that reach the viewport:
      agreement (h1-prop/h2-eph), OD closeness and the Part 2 grids. table.heatmap th
      carries the same offset for uniformity, but a table wrapped in .heatmap-container
-     (e.g. the s07 outliers) scrolls inside that wrapper, so its header pins to the
+     (e.g. the §1.2A folded outliers) scrolls inside that wrapper, so its header pins to the
      wrapper, not below the bar — the offset is inert there. */
-  table.agrid th {{ padding: 5px 4px; color: var(--ed-text-secondary); font-weight: 400; letter-spacing: 0.3px; font-size: 11px; border-bottom: 1px solid var(--ed-border); position: sticky; top: var(--sticky-offset, 0px); background: var(--ed-bg); z-index: 2; }}
+  table.agrid th {{ padding: 5px 4px; color: var(--ed-text-secondary); font-weight: 300; letter-spacing: 0.3px; font-size: 11px; border-bottom: 1px solid var(--ed-border); position: sticky; top: var(--sticky-offset, 0px); background: var(--ed-bg); z-index: 2; text-transform: uppercase; }}
   table.agrid th.gdt {{ text-align: center; min-width: 40px; }}
   table.agrid th.fo-grp {{ text-align: center; border-left: 1px solid var(--ed-border); font-weight: 700; color: var(--ed-text-primary); }}
-  .rvruler {{ font-size: 9px; color: var(--ed-text-muted); font-weight: 400; margin-top: 1px; }}
+  .rvnote {{ font-size: 9px; color: var(--ed-text-muted); font-weight: 400; margin-top: 1px; }}
   table.agrid th.gt0h {{ color: var(--ed-text-muted); border-left: 3px solid var(--ed-border); }}
   table.agrid th.gobj {{ text-align: left; position: sticky; left: 0; z-index: 3; background: var(--ed-bg); }}
   table.agrid th.gworst {{ position: sticky; right: 0; background: var(--ed-bg); z-index: 3; text-align: left; min-width: 76px; }}
@@ -7520,7 +8515,13 @@ pub fn generate_report(
      not uppercased. */
   .agrid tr.gpophdr td.gpopname .pwarm {{ font-family: var(--ed-font-mono); font-weight: 400; font-size: 11px; letter-spacing: 0; text-transform: none; color: var(--ed-text-muted); }}
   .agrid tr.gpophdr td {{ border-top: 2px solid var(--ed-border); }}
+  /* S8 item 2: the 1.3A population header carries a converged/median summary cell
+     beside the population name, in the quieter mono reading style. */
+  .agrid tr.gpophdr td.gpop-sum {{ font-family: var(--ed-font-mono); font-weight: 400; font-size: 11px; letter-spacing: 0; text-transform: none; color: var(--ed-text-secondary); text-align: left; padding: 6px 10px; }}
   .agrid tr.gobjr td.gobjname2 {{ text-align: left; color: var(--ed-text-primary); font-size: 12px; padding: 3px 10px 3px 16px; position: sticky; left: 0; background: var(--ed-bg); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }}
+  /* S8 item 2: a failed fit's object name (1.3A optical row) keeps the error ink
+     even though it now carries the gobjname2 role. */
+  .agrid tr.gobjr td.gobjname2.od-fail-name {{ color: var(--ed-error-text); }}
   /* G1..G3 timing grids still use the block/tool row shape. */
   .agrid tr.gblock td.gblock-l {{ font-family: var(--ed-font-display); font-weight: 700; font-size: 12px; color: var(--ed-text-primary); text-transform: uppercase; letter-spacing: 0.5px; padding: 14px 12px 4px 8px; position: sticky; left: 0; background: var(--ed-bg); white-space: nowrap; }}
   .agrid tr.gblock td.gblock-fill {{ background: var(--ed-bg); border-bottom: 1px solid var(--ed-border); }}
@@ -7563,17 +8564,17 @@ pub fn generate_report(
   .odgrid td.oc.undef {{ background: rgba(139,145,152,0.14); }}
   .odgrid td.oc.undef .ocg {{ color: var(--ed-text-secondary); }}
   .odgrid td.oc.fail {{ background: rgba(212,85,58,0.14); }}
-  .odgrid td.oc.fail .ocg {{ color: #e0654a; font-weight: 700; }}
+  .odgrid td.oc.fail .ocg {{ color: var(--ed-error-text); font-weight: 700; }}
   .odgrid td.oc.rw::after {{ content: ""; position: absolute; top: 0; right: 0; border-width: 0 6px 6px 0; border-style: solid; border-color: transparent var(--ed-text-primary) transparent transparent; }}
   .odgrid td.oc.jplref {{ color: var(--ed-text-muted); font-size: 11px; background: var(--ed-hatch); }}
   .odgrid td.od-optonly {{ text-align: center; color: var(--ed-text-muted); font-size: 11px; background: var(--ed-hatch); }}
   .odgrid td.od-d {{ text-align: right; color: var(--ed-text-secondary); font-size: 11px; padding: 2px 8px; white-space: nowrap; }}
   .odgrid tr.odradar td {{ opacity: 0.85; }}
   .odgrid tr.odradar td.gtool {{ padding-left: 30px; color: var(--ed-text-muted); }}
-  .od-fail-name {{ color: #e0654a; }}
+  .od-fail-name {{ color: var(--ed-error-text); }}
   .od-fails {{ margin-top: 16px; font-family: var(--ed-font-mono); font-size: 12px; }}
-  .od-fails-h {{ color: #e0654a; letter-spacing: 1px; text-transform: uppercase; font-size: 12px; margin-bottom: 6px; }}
-  .od-fails-t td {{ padding: 3px 14px 3px 0; color: var(--ed-text-secondary); font-size: 11px; }}
+  .od-fails-h {{ color: var(--ed-error-text); letter-spacing: 1px; text-transform: uppercase; font-size: 12px; margin-bottom: 6px; }}
+  .agrid.odfails td {{ padding: 3px 14px 3px 0; color: var(--ed-text-secondary); font-size: 11px; }}
 
   /* H4 channel fidelity — four states. */
   table.fidgrid th.fid-h {{ text-align: center; min-width: 150px; font-size: 12px; }}
@@ -7650,7 +8651,7 @@ pub fn generate_report(
   .pw-select select {{ background: var(--ed-input-bg); color: var(--ed-text-primary); border: 1px solid var(--ed-input-border); border-radius: var(--ed-radius-sm); padding: 2px 6px; font-family: var(--ed-font-mono); font-size: 11px; }}
   .pw-grid-pair {{ display: flex; gap: 18px; flex-wrap: wrap; }}
   .pw-grid-one {{ flex: 1 1 320px; min-width: 0; }}
-  .pw-grid-cap {{ font-family: var(--ed-font-mono); font-size: 10px; color: var(--ed-text-muted); text-transform: uppercase; letter-spacing: 1px; margin: 4px 0; }}
+  .pw-grid-cap {{ font-family: var(--ed-font-mono); font-size: 10px; color: var(--ed-text-muted); text-transform: uppercase; letter-spacing: 1.5px; margin: 4px 0; }}
   .rv-chip {{ padding: 0 3px; border-radius: 2px; }}
   .panel-title.sub {{ font-size: 11px; opacity: 0.85; margin-top: 10px; }}
   .grid-key .gk-sw.rw {{ background: #22405a; position: relative; }}
@@ -7667,12 +8668,12 @@ pub fn generate_report(
     /* Accent and muted are raised to clear AA (4.5:1) as body text on the light
        page: #2f6a9e = 5.37:1, #616c77 = 5.04:1 against --ed-bg #f6f8fb. The dark
        theme's own accent/muted already pass and are unchanged. */
-    --ed-accent: #2f6a9e; --ed-accent-hover: #3d7ab8; --ed-accent-pressed: #24537c;
+    --ed-accent: #2d6da3; --ed-accent-hover: #3d7ab8; --ed-accent-pressed: #24537c;
     --ed-input-bg: #ffffff; --ed-input-border: #cdd7e1;
     --ed-scrollbar-thumb: #c3ccd8; --ed-scrollbar-hover: #a8b4c2;
     --ed-chart-grid: rgba(40,80,130,0.14);
   }}
-  :root.theme-light .masthead h1 .mh-dim {{ color: rgba(16,25,34,0.42); }}
+  :root.theme-light .masthead h1 .mh-dim {{ color: var(--ed-text-muted); }}
   /* Light-theme ladder backgrounds and ink are generated with the dark ones (see
      the {{ladder_css}} block above); no per-bin light overrides live here. */
   :root.theme-light .gc.mg::before {{ color: rgba(0,0,0,0.72); }}
@@ -7692,61 +8693,110 @@ pub fn generate_report(
 <div class="masthead">
   <div class="mh-eyebrow">Validation Report</div>
   <h1>EMPYREAN <span class="mh-dim">DYNAMICS</span></h1>
-  <div class="mh-sub" data-requires="empyrean" title="Rust safe-FFI channel under test. The comparison pair is set in the Part 1 compare bar and named on each Part 1 section chip; run counts and configuration are in the appendix run summary and provenance.">Rust channel under test.</div>
   <div class="mh-prov"><a href="#s13" class="mh-link" title="provenance &amp; references">provenance</a> &nbsp;·&nbsp; <a href="{dataset_file_name}" download class="mh-link" title="download dataset JSON">dataset</a></div>
   <div class="mh-controls">
     <label class="shownum"><input type="checkbox" id="show-numbers" checked> show numbers</label>
     <button id="theme-toggle" class="mh-toggle" title="Toggle light / dark theme" aria-label="Toggle light or dark theme">◐ theme</button>
-    <button id="sigma-toggle" class="mh-toggle" disabled style="opacity:0.4;cursor:not-allowed" title="σ view unavailable in this build: a coherent Mahalanobis view needs per-object σ at full precision in the key, worst column, summary line and every hover, which the agreement heatmap does not yet carry.">◎ σ view</button>
   </div>
 </div>
 
 <div class="layout-wrap">
 <nav class="rail" id="rail" aria-label="Contents">
-  <div class="rail-part">{part1_name}</div>
-  <a data-target="s02" href="#s02">1.1 Propagation</a>
-  <a data-target="s03" href="#s03">&nbsp;&nbsp;· error growth</a>
-  <a data-target="s-t1-prop" href="#s-t1-prop">&nbsp;&nbsp;· cost</a>
-  <a data-target="s06" href="#s06">1.2 Ephemeris</a>
-  <a data-target="s06b" href="#s06b">&nbsp;&nbsp;· error growth</a>
-  <a data-target="s-t2-eph" href="#s-t2-eph">&nbsp;&nbsp;· cost</a>
-  <a data-target="s07" href="#s07">&nbsp;&nbsp;· outliers</a>
-  <a data-target="s08b" href="#s08b">1.3 Orbit determination</a>
-  <a data-target="s-t3-od" href="#s-t3-od">&nbsp;&nbsp;· cost</a>
-  <div class="rail-part">{part2_name}</div>
-  <a data-target="s-ranking" href="#s-ranking">2.1 Side by side</a>
-  <a data-target="s-timing" href="#s-timing">2.2 Wall clock</a>
-  <div class="rail-part">{part3_name}</div>
-  <a data-target="s10" href="#s10">3.1 Channel fidelity</a>
-  <a data-target="s05" href="#s05">3.2 Derivatives</a>
-  <a data-target="s09b" href="#s09b">3.3 Non-grav recovery</a>
-  <div class="rail-part">{part4_name}</div>
-  <a data-target="s12" href="#s12">4.1 Consistency with JPL at epoch</a>
-  <a data-target="s15" href="#s15">4.2 Predictive power</a>
-  <div class="rail-part">{appendix_name}</div>
-  <a data-target="s01" href="#s01">Run summary</a>
-  <a data-target="s01b" href="#s01b">External tools</a>
-  <a data-target="s05c" href="#s05c">ASSIST configurations</a>
-  <a data-target="s13" href="#s13">Provenance</a>
-</nav>
+{rail_html}</nav>
 <main class="content">
 
-<div class="part-head" id="appendix">{appendix_name}</div>
+<div class="part1-bar" id="part1-bar">
+  <div class="p1b-inner">
+  <div class="p1b-topline">
+  <div class="ph-head">{part1_head}</div>
+  <div class="p1b-compare">
+  <span class="p1b-label">Compare</span>
+  <select id="tool1-select" aria-label="Tool"></select>
+  <span class="p1b-vs">vs</span>
+  <select id="tool2-select" aria-label="Reference"></select>
+  </div>
+  </div>
+  {part1_facts}
+  </div>
+</div>
+{part1_sections}
+<div class="section" id="overview-footer" hidden>
+  Methods, all six reference tools, per-axis detail and outliers &rarr; <b>Advanced</b> &middot; cross-channel fidelity, timing and covariance &rarr; <b>empyrean internals</b>.
+</div>
+
+<div class="part-head" id="part2" title="No figure combines tools and no cell compares two tools; each states a tool's own numbers against JPL.">{part2_head}</div>
+{part2_sections}
+<div class="part-head" id="part3">{part3_head}</div>
+<div class="section" id="s10">
+  <div class="section-num">3.1</div>
+  <div class="section-title" title="Channel fidelity — every distribution channel against empyrean-core">Channel fidelity</div>
+  {h4_fidelity_grid_html}
+  <div class="disclosures"><details><summary>{disc_summary}</summary><div class="disc-body">Each channel row pairs to its core row by (object, dt, force model, test type, observer, uncertainty arm). Prop/OD compared in Cartesian position (km; ULP ≤ 1e-10 km, floor 1 mm); ephemeris as angular separation (arcsec), RA wrapped modulo a turn so a 360° wrap is no defect (floor 1 µas, 1 mas). A cell is its population's worst state, never the majority; DIFF cells name objects. A channel absent this run is hatched "not run" — here <code>c</code>, so the C ABI is unvalidated. rust runs the full uncertainty grid; other channels only public-API arms (~half the counts). Every channel runs against empyrean-core, the validation reference; rust also appears in Parts 1&ndash;2 against JPL.</div></details></div>
+
+</div>
+
+<div class="section" id="s05" data-page="empyrean">
+  <div class="section-num">3.2</div>
+  <div class="section-title" title="Derivatives — first-order cross-validation">Derivatives</div>
+  <div class="panel-title">First-order cross-validation</div>
+  <div class="chart-container">
+    <div id="stm-agree-chart" style="height:{chart_h}px;"></div>
+  </div>
+  <div class="disclosures"><details><summary>{disc_summary}</summary><div class="disc-body">Relative Frobenius difference vs |dt| (log-y): empyrean's first-order partials against the corrected ASSIST variational partials over all first-order rows (median solid, 95th-percentile dashed), and against an ASSIST single-particle finite difference on a representative subset (measured step-size floor 1e-8, dotted). The two analytic methods agree to machine precision on the bulk; the tail is the self-perturber rows and deep encounters; the finite difference anchors both to truth at its own floor.</div></details></div>
+</div>
+
+<div class="section" id="s09b">
+  <div class="section-num">3.3</div>
+  <div class="section-title" title="Non-gravitational recovery — fitted A1/A2/A3 vs JPL">Non-gravitational recovery</div>
+  <div id="ng-empty" class="section-desc" style="display:none; color:#8b9198">No non-gravitational-recovery rows in this report. Run the OD subset against objects with a known SBDB non-grav signal to populate this section.</div>
+  <div id="ng-content">
+    <div class="panel-title" title="Fitted A1/A2/A3 vs JPL SBDB — empyrean's fit, with cross-channel agreement">Fitted A1/A2/A3 vs JPL SBDB</div>
+    <div class="heatmap-container">
+      <table class="agrid list" data-grid="list">
+        <thead><tr>
+          <th class="obj" style="text-align:left">Object</th>
+          <th title="{coeff_defs}">Coeff</th>
+          <th>Fitted <span class="u">± σ (AU/day²)</span></th>
+          <th>JPL SBDB <span class="u">(AU/day²)</span></th>
+          <th title="{verdict_rule}"><span class="u">z = (fit&minus;JPL)/σ</span></th>
+          <th title="rust, cli and python compared cell by cell on fit and verdict; a mark means they agree, otherwise the differing channels are named">channels</th>
+          <th title="the C ABI channel; absent this run, so the FFI non-grav block is unvalidated — hatched, counted, never dropped">c</th>
+        </tr></thead>
+        <tbody id="ng-overview"></tbody>
+      </table>
+    </div>
+  </div>
+  <div class="disclosures"><details><summary>{disc_summary}</summary><div class="disc-body">Objects with a non-zero JPL non-grav signal (Apophis, Bennu, the comets) are re-fit with <code>solve_for = StateAndNonGrav</code>; the fitted Marsden A1/A2/A3 and their 1σ (the (N=9) covariance diagonal) are compared to JPL. One row per (object, coefficient) states empyrean's fit; <b>PASS</b> when <code>|z| = |od_a − ic_a| / σ ≤ 3</code>. A <code>None</code> is a loud <b>FAIL</b>, not a blank — the (N=9) covariance was absent (silent fall-back to a state-only fit), the regression this section catches. The rust, cli and python channels collapse into one agreement column: a mark when they agree, otherwise the differing channel is named, so an FFI drop shows at once. The C ABI channel <code>c</code> is absent this run, so it is one hatched column — unvalidated, counted, never dropped.</div></details></div>
+</div>
+
+<div class="part-head" id="part4">{part4_head}</div>
+<div class="section" id="s12">
+  <div class="section-num">4.1</div>
+  <div class="section-title" title="Consistency with JPL at epoch — σ-equivalent 6-D distance">Consistency with JPL at epoch</div>
+  <div class="cov-panels">
+    <div class="chart-container"><div id="cov-chi2-panel" style="height:340px;"></div></div>
+    <div class="chart-container"><div id="cov-ratio-panel" style="height:340px;"></div></div>
+    <div class="chart-container"><div id="cov-cdf-panel" style="height:340px;"></div></div>
+  </div>
+  {covariance_realism_html}
+  <div class="disclosures"><details><summary>{disc_summary}</summary><div class="disc-body">A sigma-consistency test is not a coverage test: it shows consistency with JPL's stated covariance, not that either is correct. Every metric divides by an outlier-rejected formal covariance, the reference too; the measured post-selection effect is ~1.9–2.0× the formal 1σ, so part of the ~1.4 shortfall may be post-selection rather than a tight covariance, and tuning a threshold to a 0.94 median would tune toward an inflated sigma. Both pipelines sit below unity in reduced χ² under conservative Vereš-2017 weights — empyrean's 0.08 on Apophis reproduces the reference pipeline, visible only against JPL's 0.066 on the same object.</div></details></div>
+
+</div>
+
+<div class="section" id="s15">
+  <div class="section-num" title="Walk-forward predictive power: forward accuracy and covariance realism as the fit arc grows.">4.2</div>
+  <div class="section-title" title="Predictive power — forward accuracy and covariance realism as the fit arc grows">Predictive power</div>
+  {predictive_power_html}
+</div>
+
+<div class="part-head" id="appendix">{appendix_head}</div>
 
 <div class="section" id="s01">
   <div class="section-num">A.1</div>
   <div class="section-title" title="What this run holds">Run summary</div>
-  <div class="summary-grid">
-    <div class="summary-card"><div class="value">{n_objects}</div><div class="label">Objects</div></div>
-    <div class="summary-card"><div class="value">{n_populations}</div><div class="label">Populations</div></div>
-    <div class="summary-card"><div class="value">{n_dt}</div><div class="label">Time Offsets</div></div>
-    <div class="summary-card"><div class="value">{n_prop}</div><div class="label">Propagation Cases</div></div>
-    <div class="summary-card"><div class="value">{n_eph}</div><div class="label">Ephemeris Cases</div></div>
-    <div class="summary-card"><div class="value">{n_od}</div><div class="label">OD Cases</div></div>
-    <div class="summary-card"><div class="value">{n_channels}</div><div class="label">Channels</div></div>
-  </div>
+  <div class="grid-summary run-counts" title="by population — {pop_counts_line} · by channel — {channel_counts_line}">{n_objects} objects · {n_populations} populations · {n_dt} time offsets · {n_prop} propagation · {n_eph} ephemeris · {n_od} OD · {n_channels} channels</div>
   <div class="heatmap-container">
-  <table class="od-table" style="max-width:720px; margin-bottom:6px;">
+  <table class="agrid list" data-grid="list" style="max-width:720px; margin-bottom:6px;">
     <thead><tr><th style="text-align:left">Component</th><th style="text-align:left">Purpose</th><th>Version</th></tr></thead>
     <tbody>
       <tr><td style="text-align:left">hyperjet</td><td style="text-align:left">Automatic differentiation &mdash; forward-mode partials</td><td>1.13.0</td></tr>
@@ -7758,17 +8808,13 @@ pub fn generate_report(
     </tbody>
   </table>
   </div>
-  <div class="legend">
-{pop_legend}  </div>
-  <div class="legend">
-{channel_legend}  </div>
 </div>
 <div class="section" id="s01b">
   <div class="section-num">A.2</div>
   <div class="section-title" title="External reference tools — transparency">External tools</div>
   <div class="disclosures"><details><summary>{disc_summary}</summary><div class="disc-body">Every external comparison is driven by a runner script in <a href="https://github.com/Empyrean-Dynamics/empyrean-validation" target="_blank" rel="noopener">empyrean-validation</a> holding that tool's full invocation &mdash; settings, force model, weighting, rejection &mdash; so any panel number reproduces. The tools are external dependencies, not linked into empyrean: run independently, their JSON outputs merged at the comparison step.</div></details></div>
   <div class="heatmap-container">
-  <table class="od-table" style="margin-top:0.5em">
+  <table class="agrid list" data-grid="list" style="margin-top:0.5em">
     <thead><tr>
       <th style="text-align:left">Tool</th>
       <th style="text-align:left">Reference</th>
@@ -7781,7 +8827,7 @@ pub fn generate_report(
         <td><code>plan</code> step &mdash; queried, not a runner (SBDB + Horizons disk cache)</td>
       </tr>
       <tr>
-        <td><b title="Used for: N-body propagation; first-order partials via 6 variational particles (first order only).">ASSIST</b></td>
+        <td><b>ASSIST</b></td>
         <td>Holman et al. 2023 · REBOUND IAS15 · DE440</td>
         <td><a href="https://github.com/Empyrean-Dynamics/empyrean-validation/blob/main/runners/assist/run_assist.py" target="_blank" rel="noopener"><code>runners/assist/run_assist.py</code></a></td>
       </tr>
@@ -7791,7 +8837,7 @@ pub fn generate_report(
         <td><a href="https://github.com/Empyrean-Dynamics/empyrean-validation/blob/main/runners/layup/run_layup.py" target="_blank" rel="noopener"><code>runners/layup/run_layup.py</code></a></td>
       </tr>
       <tr>
-        <td><b title="Used for: orbit determination from ADES astrometry (post-fit RMS reference); its fitted orbit is then propagated by find_orb itself to the plan's epochs for propagation + sky-plane comparison (fit-then-propagate — unlike ASSIST / OpenOrb, which replay the plan's initial conditions, so these diffs include the fit-vs-JPL-orbit difference)">find_orb</b></td>
+        <td><b>find_orb</b></td>
         <td>Gray (Project Pluto) · MPC-grade OD</td>
         <td><a href="https://github.com/Empyrean-Dynamics/empyrean-validation/blob/main/runners/findorb/run_findorb.py" target="_blank" rel="noopener"><code>runners/findorb/run_findorb.py</code></a></td>
       </tr>
@@ -7805,197 +8851,13 @@ pub fn generate_report(
         <td>Granvik et al. · University of Helsinki (Fortran)</td>
         <td><a href="https://github.com/Empyrean-Dynamics/empyrean-validation/blob/main/runners/oorb/run_oorb.py" target="_blank" rel="noopener"><code>runners/oorb/run_oorb.py</code></a></td>
       </tr>
-      <tr style="opacity:0.55">
-        <td colspan="3" title="OrbFit: OrbFit Consortium / IAU MPC (CMC2003 rejection). kete: Dar Dahlen's personal project — independent Rust/Python NEO toolkit, originally Caltech IPAC / NEO Surveyor. jorbit: JAX autodiff propagator / OD. Runner scripts live under runners/; their JSON merges into the report when run."><small style="color:#8b9198"><b>Planned / opt-in:</b> OrbFit · kete · jorbit (not in this run)</small></td>
-      </tr>
+      {a2_absent_line}
     </tbody>
   </table>
   </div>
 </div>
 
-<div class="part-head" id="part1">{part1_name}</div>
-<div class="part1-bar" id="part1-bar">
-  <div class="p1b-inner">
-  <span class="p1b-label">Compare</span>
-  <select id="tool1-select" aria-label="Tool" style="color:var(--tool-empyrean)"></select>
-  <span class="p1b-vs">vs</span>
-  <select id="tool2-select" aria-label="Reference" style="color:var(--tool-jpl)"></select>
-  </div>
-</div>
-<div class="section" id="s02">
-  <div class="section-num">1.1A</div>
-  <div class="section-title" id="s02-title" title="Propagation — position agreement">Propagation{pair_chip}</div>
-  {h1_prop_grid_html}
-  <div class="disclosures"><details><summary>{disc_summary}</summary><div class="disc-body">Each cell is the absolute position offset in km between the selected tool and the reference at that horizon. The decade ladder's colour means the same everywhere and across runs. A cell the tool did not run, or an impactor horizon past impact (arc ends at impact), is hatched with the reason on hover &mdash; never dropped. The runaway wedge marks the off-scale top decade. Per-pair caveats, including any model-gap mark, live in that panel.</div></details></div>
-</div>
-
-<div class="section" id="s03" data-view="both">
-  <div class="section-num">1.1B</div>
-  <div class="section-title" title="Propagation — error growth by population">Error growth{pair_chip}</div>
-  <div class="chart-container">
-    <div id="growth-chart" style="height:{chart_h}px;"></div>
-  </div>
-  <div class="disclosures"><details><summary>{disc_summary}</summary><div class="disc-body">One line per population: median |tool &minus; reference| position offset (km) at each horizon, log y, driven by the pair selector. Where the selected tool omits a force term some objects need, a labelled dashed series traces them &mdash; a force-model gap, not an integrator one.</div></details></div>
-</div>
-
-<div class="section" id="s-t1-prop" data-view="both">
-  <div class="section-num">1.1C</div>
-  <div class="section-title" title="Propagation — cost per row">Cost{pair_chip}</div>
-  {t1_prop_timing_html}
-</div>
-
-<div class="section" id="s06">
-  <div class="section-num">1.2A</div>
-  <div class="section-title" id="s06-title" title="Ephemeris — sky-plane agreement">Ephemeris{pair_chip}</div>
-  {h2_eph_grid_html}
-  <div class="disclosures"><details><summary>{disc_summary}</summary><div class="disc-body">Each cell is the mean angular separation (mas) between the selected tool's and the reference's RA/Dec over the five sites. Decade ladder; 1 mas = the Gaia DR3 single-frame floor, at the D4/D5 boundary. A cell the tool did not run is hatched, never dropped. Unlike propagation, the t0 column is not degenerate: topocentric parallax at closest approach leaves a real separation at epoch.</div></details></div>
-</div>
-
-<div class="section" id="s06b" data-view="both">
-  <div class="section-num">1.2B</div>
-  <div class="section-title" title="Ephemeris — error growth by population">Error growth{pair_chip}</div>
-  <div class="channel-toggle" id="s06b-toggle">
-    <button class="active" data-mode="rust">Selected pair</button>
-    <button data-mode="all" data-requires="empyrean">empyrean channels</button>
-  </div>
-  <div class="chart-container">
-    <div id="eph-sep-chart" style="height:{chart_h}px;" title="Separation vs propagation offset, by population"></div>
-  </div>
-  <div class="disclosures"><details><summary>{disc_summary}</summary><div class="disc-body">One line per population: median |tool &minus; reference| angular separation (mas) at each horizon, log y, with the 25&ndash;75% band, driven by the pair selector. Dotted lines mark the 1 mas Gaia single-frame floor and the 100 mas typical CCD residual scale. With empyrean in the pair, the channels view overlays each distribution channel's own median.</div></details></div>
-</div>
-
-<div class="section" id="s07">
-  <div class="section-num">1.2D</div>
-  <div class="section-title" title="Ephemeris — RA/Dec offset outliers">Outliers{pair_chip}</div>
-  <div class="heatmap-container">
-    <table class="heatmap" style="min-width:100%" title="Outliers beyond the sky-plane grid"><thead><tr><th style="text-align:left">Object</th><th>Channel</th><th>dt</th><th>Observer</th><th><span class="u">dRA·cos(δ)</span></th><th><span class="u">dDec</span></th><th><span class="u">‖d‖</span></th></tr></thead>
-      <tbody id="eph-outliers"></tbody>
-    </table>
-  </div>
-</div>
-
-<div class="section" id="s-t2-eph" data-view="both">
-  <div class="section-num">1.2C</div>
-  <div class="section-title" title="Ephemeris — cost per row">Cost{pair_chip}</div>
-  {t2_eph_timing_html}
-</div>
-
-<div class="section" id="s08b">
-  <div class="section-num">1.3A</div>
-  <div class="section-title" id="s08b-title" title="Orbit determination — convergence &amp; closeness">Orbit determination{pair_chip}</div>
-{od_closeness_grid_html}
-  <div class="disclosures"><details><summary>{disc_summary}</summary><div class="disc-body">Fill = <code>σ_eq = √(Δᵀ(Σ_fit+Σ_ref)⁻¹Δ/6)</code>: the 6-DOF χ-equivalent Mahalanobis distance in Sun-centred ecliptic J2000 Keplerian elements at a common epoch; the canonical cell propagates the fit to the reference's published epoch. Shape carries convergence; anything not provably an attempt reads "not attempted", never failure. Reference covariance: radar + decades of debiased astrometry; ours optical-only, Vereš-2017 weights. Objects whose JPL solution used radar are not like-for-like — hatched, counted, out of statistics; the 1–3 band (outlier-rejected covariance) is not failure. Nine of 82 lack a finite metric: Σ_ref not positive-definite at epoch (Duende, four self-perturbers; no regularisation). Audited in §4.1.</div></details></div>
-</div>
-
-<div class="section" id="s-t3-od" data-view="both">
-  <div class="section-num">1.3B</div>
-  <div class="section-title" title="Orbit determination — cost per fit">Cost{pair_chip}</div>
-  {t3_od_timing_html}
-</div>
-
-<div class="section" id="overview-footer" hidden>
-  Methods, all six reference tools, per-axis detail and outliers &rarr; <b>Advanced</b> &middot; cross-channel fidelity, timing and covariance &rarr; <b>empyrean internals</b>.
-</div>
-
-<div class="part-head" id="part2" title="No figure combines tools and no cell compares two tools; each states a tool's own numbers against JPL.">{part2_name}</div>
-<div class="section" id="s-ranking">
-  <div class="section-num">2.1</div>
-  <div class="section-title" title="All tools, side by side — error growth, orbit determination, speed">Side by side</div>
-  {tool_ranking_html}
-  <div class="disclosures"><details><summary>{disc_summary}</summary><div class="disc-body">Each matrix states a tool's own numbers against JPL on the one decade ladder. Propagation and ephemeris cells: median and p90 offset from Horizons (km, mas). OD cell: fits converged of attempted, median σ-equivalent distance. Timing: p50 wall clock at its own boundary &mdash; integrate-only (ASSIST), whole-call (tool under test), per-fit (find_orb) &mdash; read down a row. A tool omitting the Marsden &Delta;T term and self-perturber forces the daggered objects need shows a force-model gap there (with-gap and excl-gap medians both). kete and jorbit emit timing only; find_orb is fit-then-propagate; OpenOrb, GRSS, OrbFit, layup have no rows and stay hatched.</div></details></div>
-</div>
-<div class="section" id="s-timing">
-  <div class="section-num">2.2</div>
-  <div class="section-title">Wall clock</div>
-  {part2_timing_html}
-</div>
-<div class="part-head" id="part3">{part3_name}</div>
-<div class="section" id="s10">
-  <div class="section-num">3.1A</div>
-  <div class="section-title" title="Channel fidelity — every distribution channel against empyrean-core">Channel fidelity</div>
-  {h4_fidelity_grid_html}
-  <div class="disclosures"><details><summary>{disc_summary}</summary><div class="disc-body">Each channel row pairs to its core row by (object, dt, force model, test type, observer, uncertainty arm). Prop/OD compared in Cartesian position (km; ULP ≤ 1e-10 km, floor 1 mm); ephemeris as angular separation (arcsec), RA wrapped modulo a turn so a 360° wrap is no defect (floor 1 µas, 1 mas). A cell is its population's worst state, never the majority; DIFF cells name objects. A channel absent this run is hatched "not run" — here <code>c</code>, so the C ABI is unvalidated. rust runs the full uncertainty grid; other channels only public-API arms (~half the counts).</div></details></div>
-
-</div>
-
-<div class="section" id="s05" data-page="empyrean">
-  <div class="section-num">3.2A</div>
-  <div class="section-title" title="Derivatives — first-order cross-validation">Derivatives</div>
-  <div class="panel-title">First-order cross-validation</div>
-  <div class="chart-container">
-    <div id="stm-agree-chart" style="height:{chart_h}px;"></div>
-  </div>
-  <div class="disclosures"><details><summary>{disc_summary}</summary><div class="disc-body">Relative Frobenius difference vs |dt| (log-y): empyrean's first-order partials against the corrected ASSIST variational partials over all first-order rows (median solid, 95th-percentile dashed), and against an ASSIST single-particle finite difference on a representative subset (measured step-size floor 1e-8, dotted). The two analytic methods agree to machine precision on the bulk; the tail is the self-perturber rows and deep encounters; the finite difference anchors both to truth at its own floor.</div></details></div>
-</div>
-
-<div class="section" id="s09b">
-  <div class="section-num">3.3A</div>
-  <div class="section-title" title="Non-gravitational recovery — fitted A1/A2/A3 vs JPL">Non-gravitational recovery</div>
-  <div id="ng-empty" class="section-desc" style="display:none; color:#8b9198">No non-gravitational-recovery rows in this report. Run the OD subset against objects with a known SBDB non-grav signal to populate this section.</div>
-  <div id="ng-content">
-    <div class="panel-title" title="Fitted A1/A2/A3 vs JPL SBDB — σ-consistency per channel">Fitted A1/A2/A3 vs JPL SBDB</div>
-    <div class="heatmap-container">
-      <table class="od-table">
-        <thead><tr>
-          <th class="obj" style="text-align:left">Object</th>
-          <th>Channel</th>
-          <th title="{coeff_defs}">Coeff</th>
-          <th>Fitted <span class="u">(AU/day²)</span></th>
-          <th>JPL SBDB <span class="u">(AU/day²)</span></th>
-          <th><span class="u">z = (fit&minus;JPL)/σ</span></th>
-          <th title="{verdict_rule}">Result</th>
-        </tr></thead>
-        <tbody id="ng-overview"></tbody>
-      </table>
-    </div>
-  </div>
-  <div class="disclosures"><details><summary>{disc_summary}</summary><div class="disc-body">Objects with a non-zero JPL non-grav signal (Apophis, Bennu, the comets) are re-fit with <code>solve_for = StateAndNonGrav</code>; the fitted Marsden A1/A2/A3 and their 1σ (the (N=9) covariance diagonal) are compared to JPL. <b>PASS</b> when <code>|z| = |od_a − ic_a| / σ ≤ 3</code> on every coefficient. A <code>None</code> is a loud <b>FAIL</b>, not a blank — the (N=9) covariance was absent (silent fall-back to a state-only fit), the regression this section catches. All four channels (rust/c/cli/python) run side by side, so an FFI drop of the block shows immediately.</div></details></div>
-</div>
-
-<div class="part-head" id="part4">{part4_name}</div>
-<div class="section" id="s12">
-  <div class="section-num">4.1A</div>
-  <div class="cov-panels">
-    <div class="chart-container"><div id="cov-chi2-panel" style="height:340px;"></div></div>
-    <div class="chart-container"><div id="cov-ratio-panel" style="height:340px;"></div></div>
-    <div class="chart-container"><div id="cov-cdf-panel" style="height:340px;"></div></div>
-  </div>
-  {covariance_realism_html}
-  <div class="disclosures"><details><summary>{disc_summary}</summary><div class="disc-body">A sigma-consistency test is not a coverage test: it shows consistency with JPL's stated covariance, not that either is correct. Every metric divides by an outlier-rejected formal covariance, the reference too; the measured post-selection effect is ~1.9–2.0× the formal 1σ, so part of the ~1.4 shortfall may be post-selection rather than a tight covariance, and tuning a threshold to a 0.94 median would tune toward an inflated sigma. Both pipelines sit below unity in reduced χ² under conservative Vereš-2017 weights — empyrean's 0.08 on Apophis reproduces the reference pipeline, visible only against JPL's 0.066 on the same object.</div></details></div>
-
-</div>
-
-<div class="section" id="s15">
-  <div class="section-num" title="Walk-forward predictive power: forward accuracy and covariance realism as the fit arc grows.">4.2</div>
-  {predictive_power_html}
-</div>
-
-<div class="section" id="s05c" data-page="empyrean">
-  <div class="section-num">A.3</div>
-  <div class="section-title" title="ASSIST configurations — six arms">ASSIST configurations</div>
-  <div class="panel-title" title="Resolved integrator settings, read back after attach">Resolved integrator settings</div>
-  <div class="heatmap-container"><div id="assist-arms-settings"></div></div>
-  <div class="disclosures"><details><summary>{disc_summary}</summary><div class="disc-body">The same objects and epochs under three ASSIST integrator configurations, each with the six variational particles off (state only) and on (first-order partials, N=6). <code>assist_default</code> = what <code>assist.Extras</code> attach leaves (IAS15 adaptive mode 1, 1e-9, min_dt 0, initial dt 0.001 d); <code>assist_layup</code> sets adaptive mode 2 (PRS controller) after attach, as Smithsonian/layup does; <code>assist_asteroid_institute</code> = adam-assist defaults (1e-6, min_dt 1e-9 d, mode 1, initial dt 1e-6 d), the config every earlier ASSIST number used. Each arm has a per-row wall clock cap; a row whose adaptive step collapses before the target epoch is a loud FAIL, counted below, never substituted.</div></details></div>
-  <div class="panel-title" title="Per-horizon median timing — integrate call only (ms)">Per-horizon median timing</div>
-  <div class="heatmap-container"><div id="assist-arms-timing"></div></div>
-  <div class="panel-title" title="Position agreement vs empyrean at 3 and 15 years, per configuration">Position agreement vs empyrean</div>
-  <div class="heatmap-container"><div id="assist-arms-pos"></div></div>
-  <div class="disclosures"><details><summary>{disc_summary}</summary><div class="disc-body">Median |empyrean &minus; ASSIST| in km at |dt| = 3 yr and 15 yr; the propagated position is independent of the variational particles, so this is per configuration. empyrean is its own <code>f64_detection_on</code> reference. Marsden &Delta;T objects are excluded from each median and counted separately (see &Delta;T exclusion); the all-rows median is in parentheses.</div></details></div>
-  <div class="panel-title" title="First-order agreement vs empyrean, per variational arm">First-order agreement vs empyrean</div>
-  <div class="heatmap-container"><div id="assist-arms-stm"></div></div>
-  <div class="disclosures"><details><summary>{disc_summary}</summary><div class="disc-body">Median relative Frobenius difference |emp &minus; ast|/|emp| between empyrean's first-order partials and each configuration's ASSIST variational partials, over all horizons.</div></details></div>
-  <div class="panel-title">empyrean barebones arms &mdash; ASSIST-matched settings</div>
-  <div class="heatmap-container">
-  <table class="od-table" style="font-size:11px;">
-    <thead><tr><th style="text-align:left">empyrean barebones arm</th><th style="text-align:left">Matched ASSIST config(s)</th><th>epsilon</th><th>initial step <span class="u">(d)</span></th><th>minimum step <span class="u">(d)</span></th><th style="text-align:left">adaptive mode</th></tr></thead>
-    <tbody>
-      <tr><td style="text-align:left"><code>*_assist_default_like</code></td><td style="text-align:left">assist_default, assist_layup</td><td>1e-9 (matched)</td><td>0.001 (matched)</td><td>0 (matched)</td><td style="text-align:left">no counterpart (GR15; floor tied to &epsilon;)</td></tr>
-      <tr><td style="text-align:left"><code>*_assist_asteroid_institute_like</code></td><td style="text-align:left">assist_asteroid_institute</td><td>1e-6 (matched)</td><td>1e-6 (matched)</td><td>1e-9 (matched)</td><td style="text-align:left">no counterpart (GR15; floor tied to &epsilon;)</td></tr>
-    </tbody>
-  </table>
-  </div>
-  <div class="disclosures"><details><summary>{disc_summary}</summary><div class="disc-body">empyrean's like-for-like timing arms use a force-model handle assembled once per object outside the timer (only the propagate call timed &mdash; the ASSIST integrate-call analogue), with event detection and dense output off, and villeneuve's integrator knobs matched to an ASSIST configuration. The mapping is exact where a knob exists on both sides, stated where not: villeneuve keeps GR15 (not IAS15); its encounter step-size floor ties to <code>epsilon</code> (&Delta;&theta; &prop; &epsilon;<sup>1/7</sup>), with no separate floor knob or adaptive-mode counterpart, so the layup ASSIST arms (differing from default only in the adaptive criterion) are compared against the default-like empyrean arm.</div></details></div>
-</div>
+{configurations_section}
 
 {provenance_footer_html}
 </main>
@@ -8019,6 +8881,10 @@ const PREDICT_DESCRIPTOR = PREDICT_DESCRIPTOR_JSON;
 const PW_PRIMARY = PW_PRIMARY_JSON;
 let predictWindows = null;   // installed only after the sidecar verifies
 const popColors = POP_COLORS_JSON;
+// S4 text-to-marks: the error-growth charts draw every population in ONE hue
+// (the 13-hue population palette is gone); a line is read from its direct
+// end-label and the hover names the focused line.
+const POP_HUE = '#5b9bd5';
 const channelColors = CHANNEL_COLORS_JSON;
 const AU_KM = 149597870.700;
 // Objects whose JPL solution carries a Marsden non-gravitational time-delay
@@ -8290,20 +9156,9 @@ function showPairPanels() {{
 }}
 onToolChange(showPairPanels);
 
-// The one pair-update path for the Part 1 section chips (its Rust twin
-// pair_chip_html server-renders the default pair). Each chip names the selected
-// pair in the two tools' colours; the section-title hovers stay pair-neutral now
-// that the chip carries the pair.
-function updatePairTitles() {{
-    document.querySelectorAll('.pair-chip').forEach(chip => {{
-        chip.dataset.tool = TOOL1;
-        chip.dataset.ref = TOOL2;
-        const t = chip.querySelector('.pc-t'), r = chip.querySelector('.pc-r');
-        if (t) {{ t.textContent = toolLabel(TOOL1); t.style.color = toolTextColor(TOOL1); }}
-        if (r) {{ r.textContent = toolLabel(TOOL2); r.style.color = toolTextColor(TOOL2); }}
-    }});
-}}
-onToolChange(updatePairTitles);
+// The compared pair is stated by the sticky Compare bar's two selects (each in
+// its tool colour); the section titles carry no pair chip, so there is no
+// per-title pair text to repaint on a pair change.
 
 // Every method disclosure starts closed on load, overriding any state a
 // browser may restore from its back/forward cache.
@@ -8349,12 +9204,6 @@ function assertPairInvariant(where) {{
     if (!REF_OPTS.includes(TOOL2)) problems.push('reference "' + TOOL2 + '" is not a Reference option');
     if (s1 && s1.value !== TOOL1) problems.push('Tool select shows "' + s1.value + '" but TOOL1="' + TOOL1 + '"');
     if (s2 && s2.value !== TOOL2) problems.push('Reference select shows "' + s2.value + '" but TOOL2="' + TOOL2 + '"');
-    // Every Part 1 chip is the reader's on-screen record of the compared pair, so
-    // each must name the current selection.
-    document.querySelectorAll('.pair-chip').forEach(chip => {{
-        if (chip.dataset.tool !== TOOL1 || chip.dataset.ref !== TOOL2)
-            problems.push('chip names ' + chip.dataset.tool + '/' + chip.dataset.ref + ' not ' + TOOL1 + '/' + TOOL2);
-    }});
     if (problems.length) console.error('[pair invariant] ' + where + ': ' + problems.join('; '));
 }}
 
@@ -8444,7 +9293,9 @@ function wirePageNav() {{
                 }}
             }});
         }}, {{ rootMargin: '-10% 0px -80% 0px', threshold: 0 }});
-        document.querySelectorAll('.section[id]').forEach(s => obs.observe(s));
+        // S6: observe the Part 1 slot anchors (A·B·C) as well as the sections,
+        // so the generated rail sub-entries light up as the reader scrolls.
+        document.querySelectorAll('.section[id], .spy-anchor[id]').forEach(s => obs.observe(s));
     }}
     links.forEach(a => {{
         a.onclick = (ev) => {{
@@ -8467,14 +9318,14 @@ function wirePageNav() {{
         root.classList.toggle('theme-light');
         rethemeCharts();
     }});
-    // σ view: DISABLED. A coherent Mahalanobis view has to switch the key, the
+    // σ view: NOT SHIPPED. A coherent Mahalanobis view has to switch the key, the
     // worst column, the summary line and every hover to σ together with the
     // cells; the agreement heatmap carries only a one-decimal σ span and a bin
     // per cell, not the per-object σ those elements need, and rebuilding it from
     // the dataset is out of scope for this pass. Rather than ship the half-built
     // view the reviewer flagged (nearly every cell reading "0.0σ" in the lowest
-    // tint under a metre key), the control stays disabled with the reason on
-    // hover; the frozen protected markup (data-sbin / cn-sig) is left untouched.
+    // tint under a metre key), the masthead carries no σ-view control until the
+    // view works; the frozen protected markup (data-sbin / cn-sig) is left untouched.
 }}
 
 // The Part 1 compare bar is pinned to the viewport top only while the reader is
@@ -8487,9 +9338,11 @@ function wirePageNav() {{
 // mid-page settles into the right pinned/released state with no layout shift.
 function wireCompareBar() {{
     const bar = document.getElementById('part1-bar');
-    const p1 = document.getElementById('part1');
+    // S5 item 1: the bar IS the Part 1 head, so the pin test reads the bar's own
+    // top (there is no separate #part1 head element any more).
+    const p1 = bar;
     const p2 = document.getElementById('part2');
-    if (!bar || !p1 || !p2) return;
+    if (!bar || !p2) return;
     const root = document.documentElement;
     let queued = false;
     function measure() {{ root.style.setProperty('--bar-h', bar.offsetHeight + 'px'); }}
@@ -8568,9 +9421,8 @@ const LEGEND_H = {{ orientation: 'h', y: 1.14 }};
 // ghost-grey, and the legend sits below the plot so it never overprints the
 // title in a narrow panel.
 function covTitle(text) {{ return {{ text, font: {{ size: 11, color: themeVar('--ed-text-secondary') }}, x: 0.02 }}; }}
-const COV_LEGEND = {{ ...baseLayout.legend, orientation: 'h', y: -0.18, yanchor: 'top', x: 0 }};
 function ax(title, type) {{
-    const a = {{ title: {{ text: title, font: {{ size: 10 }} }}, gridcolor: themeVar('--ed-border'), zerolinecolor: themeVar('--ed-border'), color: themeVar('--ed-text-muted') }};
+    const a = {{ title: {{ text: title, font: {{ size: 10 }} }}, gridcolor: themeVar('--ed-border'), zerolinecolor: themeVar('--ed-border'), color: themeVar('--ed-text-muted'), exponentformat: 'power' }};
     if (type) a.type = type;
     return a;
 }}
@@ -8623,9 +9475,10 @@ function empTitleText(el) {{
 // one (the covariance panels do) — read from `layout`, never `_fullLayout`,
 // which Plotly fills with its "Click to enter…" placeholder — else the nearest
 // heading above the chart in document order (a panel title if one precedes it,
-// else the section title), pair chip stripped. Pair: appended only for a pair
-// chart, detected by a pair chip in the chart's section — `#part1` is a sibling
-// part-head, never an ancestor, so ancestry cannot detect a Part 1 chart.
+// else the section title). Pair: appended only for a pair chart, detected by a
+// Part 1 section number ("1." prefix) — every Part 1 chart compares the pair the
+// sticky Compare bar's selects name (TOOL1/TOOL2). `#part1` is a sibling part-head,
+// never an ancestor, so ancestry cannot detect a Part 1 chart.
 function empChartIdentity(gd) {{
     const sec = gd.closest ? gd.closest('.section') : null;
     let num = '';
@@ -8642,7 +9495,7 @@ function empChartIdentity(gd) {{
         title = empTitleText(chosen);
     }}
     let pair = '';
-    if (sec && sec.querySelector('.pair-chip')) {{
+    if (sec && num.indexOf('1.') === 0) {{
         try {{ pair = toolLabel(TOOL1) + ' vs ' + toolLabel(TOOL2); }} catch (e) {{ pair = ''; }}
     }} else if (gd && gd.id === 'pw-timeline-chart') {{
         // The 4.2F walk timeline is per-object, not per-pair: its variant is the
@@ -8700,12 +9553,14 @@ function empExportPng(gd) {{
         .catch(e => {{ console.error('branded export failed', e); }})
         .finally(() => Plotly.relayout(gd, restore));
 }}
+// S5 item 4: the modebar carries ONE button — the branded PNG export
+// (empExportPng). `modeBarButtons` is an explicit single-group list, so no
+// default zoom / pan / autoscale tools are added back.
 const PLOTLY_CONFIG = {{
     responsive: true,
     displayModeBar: true,
     displaylogo: false,
-    modeBarButtonsToRemove: ['toImage', 'select2d', 'lasso2d', 'zoomIn2d', 'zoomOut2d', 'autoScale2d', 'toggleSpikelines', 'hoverClosestCartesian', 'hoverCompareCartesian'],
-    modeBarButtonsToAdd: [{{ name: 'downloadPng', title: 'Download PNG', icon: Plotly.Icons.camera, click: empExportPng }}],
+    modeBarButtons: [[{{ name: 'downloadPng', title: 'Download PNG', icon: Plotly.Icons.camera, click: empExportPng }}]],
 }};
 
 // ─────────── boot: everything that reads the fetched dataset ───────────
@@ -8792,6 +9647,7 @@ function drawGrowthChart(elId, opts) {{
     const val = opts.valFn;
     const dts = uniq(opts.base.map(r => r.dt_days)).sort((a, b) => a - b);
     const traces = [];
+    const popLabels = [];
     for (const pop of opts.pops) {{
         const rows = opts.base.filter(r => r.population === pop);
         // A log axis cannot show an exact zero (tool and reference share the
@@ -8816,26 +9672,42 @@ function drawGrowthChart(elId, opts) {{
         }}
         closeSeg();
         if (!ys.some(v => v != null)) continue;
-        const color = popColors[pop] || '#888';
+        // One hue for every population (the 13-hue palette is gone); the direct
+        // end-label names the line, the hover focuses it.
+        const color = POP_HUE;
         // The population's 25-75 percent band under its median line.
         traces.push({{ x: bandX, y: bandY,
-            fill: 'toself', fillcolor: color + '22', line: {{ color: 'rgba(0,0,0,0)' }},
+            fill: 'toself', fillcolor: color + '14', line: {{ color: 'rgba(0,0,0,0)' }},
             hoverinfo: 'skip', showlegend: false, legendgroup: pop, name: pop }});
-        traces.push({{ x: xs, y: ys, mode: 'lines+markers', line: {{ color, width: 2 }}, marker: {{ size: MARKER }}, name: pop, legendgroup: pop, hovertemplate: `${{pop}} median<br>dt: %{{x}}d<br>%{{y:${{opts.fmt}}}} ${{opts.unit}}<extra></extra>` }});
+        traces.push({{ x: xs, y: ys, mode: 'lines+markers', line: {{ color, width: 1.5 }}, marker: {{ size: MARKER }}, opacity: 0.85, name: pop, legendgroup: pop, showlegend: false, hovertemplate: `${{pop}} median<br>dt: %{{x}}d<br>%{{y:${{opts.fmt}}}} ${{opts.unit}}<extra></extra>` }});
+        // The line's direct end-label, at its last drawn point, in population order.
+        {{ let li = ys.length - 1; while (li >= 0 && ys[li] == null) li--; if (li >= 0) popLabels.push({{ x: xs[li], y: ys[li], text: pop }}); }}
     }}
     if (opts.extra) {{ for (const t of opts.extra(dts)) traces.push(t); }}
+    const refAnnos = [];
     if (opts.refLines) {{
         const xMin = dts[0], xMax = dts[dts.length - 1];
         for (const [y, label] of opts.refLines) {{
-            traces.push({{ x: [xMin, xMax], y: [y, y], mode: 'lines', line: {{ color: '#5b9bd540', width: 1, dash: 'dot' }}, name: label, showlegend: true }});
+            traces.push({{ x: [xMin, xMax], y: [y, y], mode: 'lines', line: {{ color: '#5b9bd540', width: 1, dash: 'dot' }}, name: label, showlegend: false, hoverinfo: 'skip' }});
+            // Gaia / CCD reference: a y-axis annotation, not a legend entry.
+            refAnnos.push({{ x: 0, xref: 'paper', xanchor: 'left', y: Math.log10(y), yref: 'y', yanchor: 'bottom', text: label, showarrow: false, font: {{ size: 9, color: themeVar('--ed-text-muted') }}, bgcolor: 'rgba(0,0,0,0)' }});
         }}
     }}
+    // Direct labels at the right end of every line, in population order.
+    // S5 item 3: dodge the direct end labels vertically where lines converge.
+    // Work in log space (the y axis is log): sort top-down and push any pair
+    // closer than MINSEP apart, so no two labels overlap at a crossing.
+    const MINSEP = 0.16;
+    const dodged = popLabels.map(p => ({{ x: p.x, ly: Math.log10(p.y), text: p.text }})).sort((a, b) => b.ly - a.ly);
+    for (let i = 1; i < dodged.length; i++) {{ if (dodged[i - 1].ly - dodged[i].ly < MINSEP) dodged[i].ly = dodged[i - 1].ly - MINSEP; }}
+    const labelAnnos = dodged.map(p => ({{ x: p.x, xref: 'x', xanchor: 'left', xshift: 5, y: p.ly, yref: 'y', yanchor: 'middle', text: p.text, showarrow: false, font: {{ size: 9, color: POP_HUE }}, bgcolor: 'rgba(0,0,0,0)' }}));
     Plotly.react(elId, traces, {{
         ...baseLayout,
+        margin: {{ ...baseLayout.margin, r: 92 }},
         xaxis: ax('dt (days from epoch)'),
         yaxis: ax(`|${{toolLabel(TOOL1)}} − ${{toolLabel(TOOL2)}}| ${{opts.quantity}} (${{opts.unit}})`, 'log'),
-        showlegend: true,
-        legend: {{ ...baseLayout.legend, ...LEGEND_H }},
+        showlegend: false,
+        annotations: labelAnnos.concat(refAnnos),
     }}, PLOTLY_CONFIG);
 }}
 // Propagation error growth (#growth-chart) through the shared drawer. Its extra
@@ -8864,7 +9736,7 @@ function redrawGrowthProp() {{
 onToolChange(redrawGrowthProp);
 
 function fmtErrorKm(km) {{
-    if (km == null) return '---';
+    if (km == null) return '—';
     if (km < 0.001) return (km * 1e6).toFixed(1) + ' mm';
     if (km < 1.0) return (km * 1000.0).toFixed(1) + ' m';
     if (km < 1000.0) return km.toFixed(2) + ' km';
@@ -8928,10 +9800,10 @@ if (assistResults.length > 0) {{
             const med = dts.map(d => Math.max(quant(byDt.get(d), 0.5), FLOOR));
             const p95 = dts.map(d => Math.max(quant(byDt.get(d), 0.95), FLOOR));
             const nrows = dts.map(d => byDt.get(d).length);
-            traces.push({{ x: dts, y: med, mode: 'lines+markers', name: 'empyrean vs ASSIST variational (median)',
+            traces.push({{ x: dts, y: med, mode: 'lines+markers', name: 'ASSIST variational',
                 line: {{ color: '#5b9bd5', width: 2 }}, marker: {{ color: '#5b9bd5', size: MARKER }}, text: nrows,
                 hovertemplate: '|dt| %{{x}}d<br>median ‖Φ_emp−Φ_ast‖/‖Φ_emp‖ %{{y:.2e}}<br>%{{text}} rows<extra></extra>' }});
-            traces.push({{ x: dts, y: p95, mode: 'lines', name: 'empyrean vs ASSIST variational (p95)',
+            traces.push({{ x: dts, y: p95, mode: 'lines', name: 'p95',
                 line: {{ color: '#5b9bd5', width: 1.5, dash: 'dash' }},
                 hovertemplate: '|dt| %{{x}}d<br>p95 %{{y:.2e}}<extra></extra>' }});
         }}
@@ -8951,7 +9823,7 @@ if (assistResults.length > 0) {{
             dts.forEach(d => allDts.add(d));
             const med = dts.map(d => Math.max(quant(byDt.get(d), 0.5), FLOOR));
             const nrows = dts.map(d => byDt.get(d).length);
-            if (dts.length) traces.push({{ x: dts, y: med, mode: 'lines+markers', name: 'empyrean vs finite difference (subset)',
+            if (dts.length) traces.push({{ x: dts, y: med, mode: 'lines+markers', name: 'finite difference',
                 line: {{ color: '#e8a040', width: 2 }}, marker: {{ color: '#e8a040', size: MARKER, symbol: 'diamond' }}, text: nrows,
                 hovertemplate: '|dt| %{{x}}d<br>median ‖Φ_emp−Φ_FD‖/‖Φ_FD‖ %{{y:.2e}}<br>%{{text}} bodies<extra></extra>' }});
         }}
@@ -8961,111 +9833,28 @@ if (assistResults.length > 0) {{
             return;
         }}
         const dtsAll = Array.from(allDts).sort((a, b) => a - b);
-        traces.push({{ x: dtsAll, y: dtsAll.map(() => FD_FLOOR), mode: 'lines', name: 'finite-difference floor (~1e-8)',
+        traces.push({{ x: dtsAll, y: dtsAll.map(() => FD_FLOOR), mode: 'lines', name: 'FD floor',
             line: {{ color: '#8b9198', width: 1.5, dash: 'dot' }}, hoverinfo: 'skip' }});
+        // S5 item 3: no Plotly legend — each series carries a direct end label at
+        // its last finite point, in the one shared key style.
+        const d3Annos = traces.map(t => {{
+            const xs = t.x, ys = t.y; let i = xs.length - 1;
+            while (i >= 0 && (ys[i] == null || !isFinite(ys[i]) || ys[i] <= 0)) i--;
+            return i >= 0 ? {{ x: xs[i], y: Math.log10(ys[i]), xref: 'x', yref: 'y', xanchor: 'left', xshift: 6, yanchor: 'middle', text: t.name, showarrow: false, font: {{ size: 9, color: (t.line && t.line.color) || '#8b9198' }} }} : null;
+        }}).filter(Boolean);
         Plotly.react(el, traces, {{
             ...baseLayout,
+            margin: {{ ...baseLayout.margin, r: 118 }},
             xaxis: ax('|dt| (days from epoch)'),
             yaxis: ax('rel. Frobenius difference (log)', 'log'),
-            showlegend: true,
-            legend: {{ ...baseLayout.legend, ...LEGEND_H }},
+            showlegend: false,
+            annotations: d3Annos,
         }}, PLOTLY_CONFIG);
     }})();
 }}
 
-// ─────────── Section 01c: ASSIST six-arm configuration comparison ───────────
-// Reads the standalone per-arm ASSIST rows (channel="assist") appended by
-// merge-external. Three configurations × variational off/on; per-horizon median
-// timing, per-configuration position agreement vs Empyrean at 15 yr, and
-// per-variational-arm STM agreement. Capped (FAIL) rows carry a null
-// assist_time_ms and are reported as a count, never a substituted number.
-(function buildAssistArms() {{
-    const arows = results.filter(r => r.channel === 'assist' && r.test_type === 'propagation');
-    if (!arows.length) return;
-    const s = document.getElementById('s05c');
-    if (s) s.style.display = '';
-    const byArm = {{}};
-    for (const r of arows) {{ (byArm[r.propagation_uncertainty] = byArm[r.propagation_uncertainty] || []).push(r); }}
-    const med = xs => {{ const v = xs.filter(x => x != null && isFinite(x)).sort((a, b) => a - b); return v.length ? v[Math.floor((v.length - 1) / 2)] : null; }};
-    const configs = [
-        ['assist_default', 'assist_default_variational_off', 'assist_default_variational_on', 'ASSIST default (mode 1, ε=1e-9)'],
-        ['assist_layup', 'assist_layup_variational_off', 'assist_layup_variational_on', 'ASSIST layup (mode 2, ε=1e-9)'],
-        ['assist_asteroid_institute', 'assist_asteroid_institute_variational_off', 'assist_asteroid_institute_variational_on', 'ASSIST asteroid-institute (mode 1, ε=1e-6)'],
-    ];
-    const H = [[365, '1 yr'], [1095, '3 yr'], [5475, '15 yr']];
-    const atH = (arm, h) => med((byArm[arm] || []).filter(r => Math.abs(Math.abs(r.dt_days) - h) < 1).map(r => r.assist_time_ms));
-    const cappedOf = arm => (byArm[arm] || []).filter(r => r.assist_time_ms == null).length;
-    // Timing table.
-    let t = '<table class="od-table" style="font-size:11px;"><thead><tr><th style="text-align:left">Arm</th>';
-    for (const [, lab] of H) t += `<th>${{lab}}</th>`;
-    t += '<th>capped</th></tr></thead><tbody>';
-    for (const [, off, on, lab] of configs) {{
-        for (const [arm, sub] of [[off, 'f64'], [on, 'variational']]) {{
-            t += `<tr><td style="text-align:left">${{lab.split(' (')[0]}} <span style="color:var(--ed-text-muted)">${{sub}}</span></td>`;
-            for (const [h] of H) {{ const m = atH(arm, h); t += `<td>${{m == null ? '—' : m.toFixed(2) + ' ms'}}</td>`; }}
-            const c = cappedOf(arm); t += `<td>${{c ? '<b style=\"color:#c0504d\">' + c + '</b>' : '0'}}</td></tr>`;
-        }}
-    }}
-    t += '</tbody></table>';
-    const te = document.getElementById('assist-arms-timing'); if (te) te.innerHTML = t;
-    // Position agreement per configuration at 3 yr and 15 yr (variational-off
-    // row). Rows for objects carrying a Marsden ΔT term are excluded from each
-    // median — ASSIST models no ΔT, so its position for those objects is not
-    // comparable to empyrean's (which applies it) — and counted separately; the
-    // all-rows median is shown alongside so the shift is visible, and the
-    // excluded rows stay in the data, marked, never dropped.
-    const POSH = [[1095, '3 yr'], [5475, '15 yr']];
-    let p = '<table class="od-table" style="font-size:11px;"><thead><tr><th style="text-align:left">Configuration</th>';
-    for (const [, hl] of POSH) p += `<th>median |emp − ast| @ ${{hl}}<br/><small style="font-weight:300; opacity:0.6">${{uhdr('ΔT')}}-excluded (all rows)</small></th>`;
-    p += '<th>rows</th><th>' + uhdr('ΔT excl') + '</th></tr></thead><tbody>';
-    let posExcl = 0;
-    for (const [, off, , lab] of configs) {{
-        p += `<tr><td style="text-align:left">${{lab}}</td>`;
-        let kept15 = 0, excl15 = 0;
-        for (const [H] of POSH) {{
-            const rr = (byArm[off] || []).filter(r => Math.abs(Math.abs(r.dt_days) - H) < 1 && r.emp_vs_assist_km != null);
-            const kept = rr.filter(r => !isDtObject(r.object));
-            const mk = med(kept.map(r => r.emp_vs_assist_km));
-            const ma = med(rr.map(r => r.emp_vs_assist_km));
-            if (H === 5475) {{ kept15 = kept.length; excl15 = rr.length - kept.length; }}
-            posExcl += rr.length - kept.length;
-            p += `<td>${{mk == null ? '—' : fmtErrorKm(mk)}} <small style="opacity:0.6">(${{ma == null ? '—' : fmtErrorKm(ma)}})</small></td>`;
-        }}
-        p += `<td>${{kept15}}</td><td>${{excl15 ? '<b>' + excl15 + '</b>' : '0'}}</td></tr>`;
-    }}
-    p += '</tbody></table>';
-    if (posExcl > 0) {{
-        const dtNames = [...DT_OBJECTS.keys()].join(', ');
-        p += `<div class="disclosures" style="margin-top:6px"><details><summary>ΔT exclusion</summary><div class="disc-body" style="font-size:10px">ASSIST does not model the non-gravitational delay ΔT these solutions carry, so its positions are not comparable; empyrean applies it. The ΔT-bearing objects (${{dtNames}}) are excluded from every median above and counted at right (ΔT excl) — kept in the data, marked, never dropped. The all-rows median is in parentheses.</div></details></div>`;
-    }}
-    const pe = document.getElementById('assist-arms-pos'); if (pe) pe.innerHTML = p;
-    // STM agreement per variational arm (relative Frobenius, all horizons).
-    const relTo = (a, ref) => {{
-        if (!Array.isArray(a) || !Array.isArray(ref)) return null;
-        let dn = 0, en = 0;
-        for (let i = 0; i < 6; i++) for (let j = 0; j < 6; j++) {{ const d = a[i][j] - ref[i][j]; dn += d * d; en += ref[i][j] * ref[i][j]; }}
-        return en > 0 ? Math.sqrt(dn) / Math.sqrt(en) : null;
-    }};
-    let m2 = '<table class="od-table" style="font-size:11px;"><thead><tr><th style="text-align:left">Configuration (variational)</th><th>' + uhdr('median ‖Φ_emp − Φ_ast‖/‖Φ_emp‖') + '</th><th>rows</th></tr></thead><tbody>';
-    for (const [, , on, lab] of configs) {{
-        const rels = (byArm[on] || []).filter(r => Math.abs(r.dt_days) > 0 && Array.isArray(r.assist_stm) && Array.isArray(r.emp_stm))
-            .map(r => relTo(r.assist_stm, r.emp_stm)).filter(v => v != null && isFinite(v));
-        const m = med(rels);
-        m2 += `<tr><td style="text-align:left">${{lab}}</td><td>${{m == null ? '—' : m.toExponential(2)}}</td><td>${{rels.length}}</td></tr>`;
-    }}
-    m2 += '</tbody></table>';
-    const me = document.getElementById('assist-arms-stm'); if (me) me.innerHTML = m2;
-    // Resolved settings per configuration, from a non-capped row's notes (the
-    // runner read them off the simulation AFTER attach + config).
-    let ss = '<table class="od-table" style="font-size:11px;"><thead><tr><th style="text-align:left">Configuration</th><th style="text-align:left">Resolved settings (read after attach)</th></tr></thead><tbody>';
-    for (const [cfg, off] of configs) {{
-        const r = (byArm[off] || []).find(x => x.notes && x.notes.indexOf('config=') >= 0);
-        const note = r ? r.notes.slice(r.notes.indexOf('config=')) : '—';
-        ss += `<tr><td style="text-align:left">${{cfg}}</td><td style="text-align:left"><code>${{note}}</code></td></tr>`;
-    }}
-    ss += '</tbody></table>';
-    const se = document.getElementById('assist-arms-settings'); if (se) se.innerHTML = ss;
-}})();
+// S5a: the ASSIST six-arm section is now server-rendered as the
+// "Configurations" appendix (A.3); see render_configurations_section().
 
 // ─────────── Section 06: Ephemeris angular separation ───────────
 // Ephemeris rows carrying the pairwise offsets: core has Empyrean's d_ra/d_dec
@@ -9214,6 +10003,11 @@ if (ephResults.length > 0) {{
         tr.innerHTML = `<td colspan="7" style="text-align:left; color:#5b9bd5">No rows beyond ±${{SCATTER_CLIP_MAS}} mas on this pair.</td>`;
         outBody.appendChild(tr);
     }}
+    // Summary-line runaway count (S3 item 4): write the deduped number of rows
+    // this fold lists into the selected pair's §1.2A summary line, so the count
+    // and the itemised list come from the same source and cannot disagree.
+    const rwn = document.querySelector(`.pair-panels[data-section="h2-eph"] .pair-panel[data-tool="${{TOOL1}}"][data-ref="${{TOOL2}}"] .rwn`);
+    if (rwn) rwn.textContent = seenOut.size + ' runaway';
     }}
     buildEphScatter();
     onToolChange(() => buildEphScatter());
@@ -9224,117 +10018,123 @@ if (ephResults.length > 0) {{
 // their 1σ (√ of the 9×9 state+A1/A2/A3 covariance diagonal). The σ are
 // `None` (not 0, not NaN) when the StateAndNonGrav fit did not actually
 // recover non-grav — the loud-failure case this section exists to catch.
-// We render one sub-row per coefficient (A1/A2/A3) whose JPL reference is
-// non-zero, per channel, with a |z| ≤ 3 σ-consistency PASS/FAIL.
+// S3 item 3: one row per (object, coefficient) stating empyrean's (rust) fit;
+// the rust/cli/python channels collapse into one cell-by-cell agreement column
+// and the absent C ABI channel `c` is one hatched column (not a hatched row per
+// object × coefficient), so an FFI drop still shows at once.
 const ngResults = results.filter(r => r.test_type === 'non_grav_recovery');
 if (ngResults.length === 0) {{
     document.getElementById('ng-empty').style.display = '';
     document.getElementById('ng-content').style.display = 'none';
 }} else {{
     document.getElementById('ng-empty').style.display = 'none';
-    // Group by object, then channel — so every object shows all four
-    // distribution channels side by side and a per-channel marshaling
-    // drop of the fitted non-grav block is visible as a row of FAILs.
+    // Group by object, then channel.
     const byObjNg = {{}};
     for (const r of ngResults) {{
         if (!byObjNg[r.object]) byObjNg[r.object] = {{}};
         byObjNg[r.object][r.channel] = r;
     }}
     const ngObjects = Object.keys(byObjNg).sort((a, b) => a.localeCompare(b));
-    // Stable channel order so the four channels always read the same way.
     const NG_CHANNELS = ['rust', 'c', 'cli', 'python'];
     const overview = document.getElementById('ng-overview');
     // Compact scientific formatter for AU/day² values, which run ~1e-14.
     const fmtNg = (v) => (v == null || !isFinite(v)) ? null : v.toExponential(3);
-    // Cells read only A1/A2/A3; radial/transverse/normal are defined once on the
-    // Coeff column-header hover (NG_COEFF_DEFS), not repeated per row.
     const COEFFS = [
         {{ key: 'a1', label: 'A1' }},
         {{ key: 'a2', label: 'A2' }},
         {{ key: 'a3', label: 'A3' }},
     ];
+    // A channel row has a usable non-grav fit for this coefficient when both the
+    // fitted value and its σ are finite (a None/NaN σ is the loud fall-back).
+    const ngFitOk = (r, key) => r != null && r['od_' + key] != null && isFinite(r['od_' + key]) && r['od_' + key + '_sigma'] != null && isFinite(r['od_' + key + '_sigma']);
+    const ngPass = (r, key, ic) => {{
+        if (!ngFitOk(r, key)) return 'fail';
+        if (ic == null || ic === 0) return 'na';
+        return Math.abs((r['od_' + key] - ic) / r['od_' + key + '_sigma']) <= 3 ? 'pass' : 'fail';
+    }};
+    // A channel's comparable signature for a coefficient: the fitted value to
+    // displayed precision plus the verdict, or `absent`/`fail` — two channels
+    // agree iff their signatures match.
+    const ngSig = (r, key, ic) => {{
+        if (r == null) return 'absent';
+        if (!ngFitOk(r, key)) return 'fail';
+        return fmtNg(r['od_' + key]) + '|' + ngPass(r, key, ic);
+    }};
     for (const obj of ngObjects) {{
         const row = byObjNg[obj];
-        // Determine which coefficients have a non-zero JPL reference on
-        // ANY channel (the reference is identical across channels, but be
-        // defensive). Only those participate in the PASS/FAIL verdict.
         const refRow = NG_CHANNELS.map(ch => row[ch]).find(r => r) || {{}};
         const activeCoeffs = COEFFS.filter(c => {{
             const ic = refRow['ic_' + c.key];
             return ic != null && ic !== 0;
         }});
-        // Fallback: if no reference coefficient is non-zero (shouldn't
-        // happen for objects the runner tagged non_grav_recovery), still
-        // show all three so the row isn't silently empty.
         const coeffs = activeCoeffs.length > 0 ? activeCoeffs : COEFFS;
-        // First column spans every (channel × coeff) sub-row for this object.
-        const totalSubRows = NG_CHANNELS.length * coeffs.length;
         let firstCellEmitted = false;
-        for (let ci = 0; ci < NG_CHANNELS.length; ci++) {{
-            const ch = NG_CHANNELS[ci];
-            const r = row[ch];
-            for (let ki = 0; ki < coeffs.length; ki++) {{
-                const c = coeffs[ki];
-                const tr = document.createElement('tr');
-                // Faint separator between channels for scanability.
-                if (ki === 0 && ci > 0) tr.style.borderTop = '1px solid #1a2332';
-                let cells = '';
-                // Object cell — rowspan across the whole object block.
-                if (!firstCellEmitted) {{
-                    cells += `<td class="obj" rowspan="${{totalSubRows}}" style="vertical-align:top">${{obj}}</td>`;
-                    firstCellEmitted = true;
-                }}
-                // Channel cell — rowspan across this channel's coefficients.
-                if (ki === 0) {{
-                    const cColor = channelColors[ch] || '#888';
-                    cells += `<td rowspan="${{coeffs.length}}" style="vertical-align:top; text-align:left; color:${{cColor}}">${{ch}}</td>`;
-                }}
-                cells += `<td style="text-align:left">${{c.label}}</td>`;
-                if (!r) {{
-                    // Channel produced no non_grav_recovery row at all —
-                    // the entire fitted block is missing for this channel.
-                    cells += `<td class="hatch" colspan="4" title="no non-grav row emitted for this channel"></td>`;
-                    tr.innerHTML = cells;
-                    overview.appendChild(tr);
-                    continue;
-                }}
-                const fit = r['od_' + c.key];
-                const sig = r['od_' + c.key + '_sigma'];
-                const ic = r['ic_' + c.key];
-                const jplCell = (ic != null) ? fmtNg(ic) : '—';
-                // Loud-failure rule: a None (or non-finite) fit or σ means
-                // the StateAndNonGrav fit did not recover non-grav — render
-                // it explicitly in red, never as a blank or a zero.
-                const fitOk = fit != null && isFinite(fit) && sig != null && isFinite(sig);
-                if (!fitOk) {{
-                    cells += `<td class="hatch" colspan="3" title="no non-grav covariance — fell back to state-only"></td>`;
-                    cells += `<td style="color:#e06252; font-weight:600" title="fail · no non-grav covariance (fell back to state-only)">✕</td>`;
-                    tr.innerHTML = cells;
-                    overview.appendChild(tr);
-                    continue;
-                }}
-                const fitStr = `${{fmtNg(fit)}} <span style="color:#8b9198">± ${{fmtNg(sig)}}</span>`;
-                cells += `<td style="text-align:left">${{fitStr}}</td>`;
-                cells += `<td style="text-align:left">${{jplCell}}</td>`;
-                // σ-consistency z; only meaningful when JPL reference is
-                // non-zero (otherwise there is nothing to be consistent with).
-                if (ic == null || ic === 0) {{
-                    cells += `<td style="color:#8b9198">—</td>`;
-                    // n/a is the page's one hatched state; the word + reason ride the hover.
-                    cells += `<td class="hatch" title="n/a · no non-zero JPL reference for this coefficient to test against"></td>`;
-                }} else {{
-                    const z = (fit - ic) / sig;
-                    const zAbs = Math.abs(z);
-                    const pass = zAbs <= 3;
-                    const zColor = pass ? '#3d9a6d' : '#e06252';
-                    cells += `<td style="color:${{zColor}}">${{z >= 0 ? '+' : '−'}}${{zAbs.toFixed(2)}}σ</td>`;
-                    // Verdict reuses the OD grid's glyph vocabulary (· pass, ✕ fail);
-                    // the word and |z| rule ride the cell hover, colour as before.
-                    cells += `<td style="color:${{zColor}}; font-weight:600" title="${{pass ? 'pass · |z| ≤ 3σ' : 'fail · |z| > 3σ'}}">${{pass ? '·' : '✕'}}</td>`;
-                }}
-                tr.innerHTML = cells;
-                overview.appendChild(tr);
+        for (const c of coeffs) {{
+            const key = c.key;
+            const ic = refRow['ic_' + key];
+            const rust = row['rust'];
+            const jplCell = (ic != null) ? fmtNg(ic) : '—';
+            const tr = document.createElement('tr');
+            let cells = '';
+            if (!firstCellEmitted) {{
+                cells += `<td class="obj" rowspan="${{coeffs.length}}" style="vertical-align:top">${{obj}}</td>`;
+                firstCellEmitted = true;
             }}
+            cells += `<td style="text-align:left">${{c.label}}</td>`;
+            // Fitted ± σ and z from the rust reference (empyrean's own fit).
+            let fittedCell, zCell;
+            if (rust == null) {{
+                fittedCell = `<td class="hatch" title="rust (the engine) emitted no non-grav row for this object — a regression"></td>`;
+                zCell = `<td class="hatch" title="no rust fit to test"></td>`;
+            }} else if (!ngFitOk(rust, key)) {{
+                // Loud fall-back: a None σ means the fit did not recover non-grav.
+                fittedCell = `<td style="color:#e06252; font-weight:600" title="fail · no non-grav covariance (fell back to state-only)">✕</td>`;
+                zCell = `<td style="color:#e06252; font-weight:600" title="fail · no non-grav covariance (fell back to state-only)">✕</td>`;
+            }} else {{
+                const fit = rust['od_' + key], sig = rust['od_' + key + '_sigma'];
+                fittedCell = `<td style="text-align:left">${{fmtNg(fit)}} <span style="color:#8b9198">± ${{fmtNg(sig)}}</span></td>`;
+                if (ic == null || ic === 0) {{
+                    zCell = `<td class="hatch" title="n/a · no non-zero JPL reference for this coefficient to test against"></td>`;
+                }} else {{
+                    const z = (fit - ic) / sig, zAbs = Math.abs(z), pass = zAbs <= 3;
+                    const zColor = pass ? '#3d9a6d' : '#e06252';
+                    zCell = `<td style="color:${{zColor}}; font-weight:600" title="${{pass ? 'pass · |z| ≤ 3σ' : 'fail · |z| > 3σ'}}">${{z >= 0 ? '+' : '−'}}${{zAbs.toFixed(2)}}σ</td>`;
+                }}
+            }}
+            cells += fittedCell;
+            cells += `<td style="text-align:left">${{jplCell}}</td>`;
+            cells += zCell;
+            // channels: rust/cli/python collapse — a mark when they agree, else
+            // the differing channel named (absent counts as a difference).
+            let channelsCell;
+            if (rust == null) {{
+                channelsCell = `<td class="hatch" title="rust absent — no reference to agree against"></td>`;
+            }} else {{
+                const refSig = ngSig(rust, key, ic);
+                const diffs = [];
+                for (const ch of ['cli', 'python']) {{
+                    const r2 = row[ch];
+                    if (r2 == null) {{ diffs.push(ch + ' absent'); continue; }}
+                    if (ngSig(r2, key, ic) !== refSig) diffs.push(ch);
+                }}
+                channelsCell = diffs.length === 0
+                    ? `<td style="color:#3d9a6d" title="rust, cli, python agree on fit and verdict">·</td>`
+                    : `<td style="color:#e06252" title="differ from rust: ${{diffs.join(', ')}}">${{diffs.join(', ')}}</td>`;
+            }}
+            cells += channelsCell;
+            // c (C ABI): one hatched column when absent; otherwise its agreement.
+            const cRow = row['c'];
+            let cCell;
+            if (cRow == null) {{
+                cCell = `<td class="hatch" title="c (C ABI) emitted no non-grav row this run — the FFI block is unvalidated"></td>`;
+            }} else if (rust != null && ngSig(cRow, key, ic) === ngSig(rust, key, ic)) {{
+                cCell = `<td style="color:#3d9a6d" title="c agrees with rust">·</td>`;
+            }} else {{
+                cCell = `<td style="color:#e06252" title="c differs from rust">&ne;</td>`;
+            }}
+            cells += cCell;
+            tr.innerHTML = cells;
+            overview.appendChild(tr);
         }}
     }}
 }}
@@ -9364,12 +10164,20 @@ function buildCovariancePanels() {{
     objs1.forEach((o, i) => {{ t1.push({{ x: [i, i], y: [empChi[o], jplChi[o]], mode: 'lines', line: {{ color: '#3a4453', width: 1 }}, hoverinfo: 'skip', showlegend: false }}); }});
     t1.push({{ x: objs1.map((o, i) => i), y: objs1.map(o => empChi[o]), mode: 'markers', marker: {{ color: '#5b9bd5', size: 6 }}, name: 'empyrean', text: objs1, hovertemplate: '%{{text}}<br>empyrean χ²ᵣ %{{y:.3f}}<extra></extra>' }});
     t1.push({{ x: objs1.map((o, i) => i), y: objs1.map(o => jplChi[o]), mode: 'markers', marker: {{ color: '#d05080', size: 6, symbol: 'diamond' }}, name: 'JPL', text: objs1, hovertemplate: '%{{text}}<br>JPL χ²ᵣ %{{y:.3f}}<extra></extra>' }});
-    Plotly.react('cov-chi2-panel', t1, {{ ...baseLayout, title: covTitle('1 · reduced χ² — empyrean paired to JPL'), margin: {{ l: 46, r: 8, t: 28, b: 58 }}, xaxis: {{ ...ax('object (sorted by empyrean)'), showticklabels: false }}, yaxis: ax('χ²ᵣ', 'log'), shapes: [{{ type: 'line', x0: -0.5, x1: Math.max(objs1.length - 0.5, 0.5), y0: 1, y1: 1, line: {{ color: '#8b9198', dash: 'dash', width: 1 }} }}], legend: COV_LEGEND }}, PLOTLY_CONFIG);
+    // S5 item 3: no Plotly legend — the two marker series carry a direct label.
+    const chiLast = objs1.length - 1;
+    const chiAnnos = chiLast >= 0 ? [
+        {{ x: chiLast, y: Math.log10(empChi[objs1[chiLast]]), xref: 'x', yref: 'y', xanchor: 'left', xshift: 6, yanchor: 'middle', text: 'empyrean', showarrow: false, font: {{ size: 9, color: '#5b9bd5' }} }},
+        {{ x: chiLast, y: Math.log10(jplChi[objs1[chiLast]]), xref: 'x', yref: 'y', xanchor: 'left', xshift: 6, yanchor: 'middle', text: 'JPL', showarrow: false, font: {{ size: 9, color: '#d05080' }} }},
+    ] : [];
+    Plotly.react('cov-chi2-panel', t1, {{ ...baseLayout, title: covTitle('1 · reduced χ² — empyrean paired to JPL'), margin: {{ l: 46, r: 72, t: 28, b: 58 }}, xaxis: {{ ...ax('object (sorted by empyrean)'), showticklabels: false }}, yaxis: ax('χ²ᵣ', 'log'), shapes: [{{ type: 'line', x0: -0.5, x1: Math.max(objs1.length - 0.5, 0.5), y0: 1, y1: 1, line: {{ color: '#8b9198', dash: 'dash', width: 1 }} }}], showlegend: false, annotations: chiAnnos }}, PLOTLY_CONFIG);
     // Panel 2 — σ ratio vs observed arc, coloured by population.
     const byPop = {{}};
     for (const c of recs) {{ if (radarExcluded.has(c.object)) continue; const rr = c.sigma_fit[0] / c.sigma_ref[0]; const a = arc[c.object]; if (!isFinite(rr) || a == null) continue; const p = popOf[c.object] || '?'; (byPop[p] = byPop[p] || []).push([a, rr, c.object]); }}
     const t2 = [];
-    for (const p in byPop) {{ const pts = byPop[p]; t2.push({{ x: pts.map(q => q[0]), y: pts.map(q => q[1]), mode: 'markers', marker: {{ color: popColors[p] || '#888', size: 7 }}, name: p, text: pts.map(q => q[2]), hovertemplate: '%{{text}} (' + p + ')<br>arc %{{x}} d<br>σ ratio %{{y:.2f}}<extra></extra>' }}); }}
+    // S5 item 3: the σ-ratio scatter is ONE hue (the 13-hue population palette is
+    // gone); the population is read from the hover, which focuses the point.
+    for (const p in byPop) {{ const pts = byPop[p]; t2.push({{ x: pts.map(q => q[0]), y: pts.map(q => q[1]), mode: 'markers', marker: {{ color: POP_HUE, size: 7 }}, name: p, text: pts.map(q => q[2]), hovertemplate: '%{{text}} (' + p + ')<br>arc %{{x}} d<br>σ ratio %{{y:.2f}}<extra></extra>' }}); }}
     const allArc = recs.map(c => arc[c.object]).filter(a => a != null);
     const amin = allArc.length ? Math.min(...allArc) : 1, amax = allArc.length ? Math.max(...allArc) : 1e5;
     Plotly.react('cov-ratio-panel', t2, {{ ...baseLayout, title: covTitle('2 · σ_emp(a) / σ_JPL(a) vs observed arc'), margin: {{ l: 46, r: 8, t: 28, b: 36 }}, xaxis: ax('observed arc (days)', 'log'), yaxis: ax('σ ratio (a element)', 'log'), shapes: [{{ type: 'line', x0: amin, x1: amax, y0: 1, y1: 1, line: {{ color: '#8b9198', dash: 'dash', width: 1 }} }}], showlegend: false }}, PLOTLY_CONFIG);
@@ -9379,10 +10187,14 @@ function buildCovariancePanels() {{
     const obsY = sig.map((v, i) => (i + 1) / n);
     const ex = [], ey = [];
     for (let lt = -1.1; lt <= 3.1; lt += 0.05) {{ const t = Math.pow(10, lt); ex.push(t); ey.push(1 - Math.exp(-3 * t * t) * (1 + 3 * t * t + 4.5 * t * t * t * t)); }}
+    // S5 item 3: no Plotly legend — each CDF line carries a direct end label.
+    const cdfAnnos = [];
+    if (ex.length) cdfAnnos.push({{ x: Math.log10(ex[ex.length - 1]), y: ey[ey.length - 1], xref: 'x', yref: 'y', xanchor: 'right', yanchor: 'bottom', text: 'expected', showarrow: false, font: {{ size: 9, color: '#8b9198' }} }});
+    if (sig.length) cdfAnnos.push({{ x: Math.log10(sig[sig.length - 1]), y: obsY[obsY.length - 1], xref: 'x', yref: 'y', xanchor: 'left', xshift: 6, yanchor: 'top', text: `observed (n=${{n}})`, showarrow: false, font: {{ size: 9, color: '#5b9bd5' }} }});
     Plotly.react('cov-cdf-panel', [
         {{ x: ex, y: ey, mode: 'lines', line: {{ color: '#8b9198', width: 2 }}, name: 'expected χ(6)/√6' }},
         {{ x: sig, y: obsY, mode: 'lines', line: {{ color: '#5b9bd5', width: 2 }}, name: `observed (n=${{n}})` }},
-    ], {{ ...baseLayout, title: covTitle('3 · σ_eq empirical CDF vs expected'), margin: {{ l: 46, r: 8, t: 28, b: 64 }}, xaxis: ax('σ_eq', 'log'), yaxis: ax('cumulative fraction'), legend: COV_LEGEND }}, PLOTLY_CONFIG);
+    ], {{ ...baseLayout, title: covTitle('3 · σ_eq empirical CDF vs expected'), margin: {{ l: 46, r: 88, t: 28, b: 64 }}, xaxis: ax('σ_eq', 'log'), yaxis: ax('cumulative fraction'), showlegend: false, annotations: cdfAnnos }}, PLOTLY_CONFIG);
 }}
 try {{ buildCovariancePanels(); }} catch (e) {{ console.error('buildCovariancePanels failed', e); }}
 // Charts follow whatever pair is selected at boot time, and every later change.
@@ -9399,8 +10211,7 @@ markEmptyDatasetContainers();
 // Containers that need the dataset carry a marked "dataset not loaded" state until
 // then; the server-rendered heatmaps, OD grid, timing panels and Part 2 do not.
 const DATASET_PENDING_IDS = ['growth-chart', 'eph-sep-chart', 'stm-agree-chart',
-    'cov-chi2-panel', 'cov-ratio-panel', 'cov-cdf-panel', 'ng-overview',
-    'assist-arms-timing', 'assist-arms-pos', 'assist-arms-stm', 'assist-arms-settings'];
+    'cov-chi2-panel', 'cov-ratio-panel', 'cov-cdf-panel', 'ng-overview'];
 const DATASET_PENDING_TBODY_IDS = ['eph-outliers'];
 const DATASET_PENDING_STYLE = 'padding:18px;text-align:center;color:#8b9198;font-size:12px;font-style:italic;border:1px dashed #3a4453;border-radius:4px;background:repeating-linear-gradient(45deg,transparent,transparent 6px,rgba(139,145,152,0.06) 6px,rgba(139,145,152,0.06) 12px);';
 function markDatasetPending(label) {{
@@ -9638,15 +10449,26 @@ function drawWalkTimeline(object) {{
         return;
     }}
     const x = tl.arc_days;
+    const cAcc = themeVar('--ed-accent'), cSep = themeVar('--ed-text-secondary');
     const traces = [
-        {{ x, y: tl.med_d2_norm, name: 'realism d²n', mode: 'lines+markers', marker: {{ size: MARKER }}, line: {{ color: themeVar('--ed-accent') }}, connectgaps: false, yaxis: 'y' }},
-        {{ x, y: tl.med_sep_arcsec, name: 'sep (arcsec)', mode: 'lines+markers', marker: {{ size: MARKER }}, line: {{ color: themeVar('--ed-text-secondary') }}, connectgaps: false, yaxis: 'y2' }},
+        {{ x, y: tl.med_d2_norm, name: 'realism d²n', mode: 'lines+markers', marker: {{ size: MARKER }}, line: {{ color: cAcc }}, connectgaps: false, yaxis: 'y' }},
+        {{ x, y: tl.med_sep_arcsec, name: 'sep (arcsec)', mode: 'lines+markers', marker: {{ size: MARKER }}, line: {{ color: cSep }}, connectgaps: false, yaxis: 'y2' }},
     ];
+    // S8 item 4: the last Plotly legend is gone — each line is named directly at
+    // its own end (both axes are log, so annotation data coords are log10), so the
+    // dual-axis chart reads without a legend key.
+    const lastFinite = ys => {{ for (let i = ys.length - 1; i >= 0; i--) {{ const v = ys[i]; if (v != null && isFinite(v) && v > 0 && x[i] > 0) return i; }} return -1; }};
+    const annos = [];
+    const iA = lastFinite(tl.med_d2_norm);
+    if (iA >= 0) annos.push({{ x: Math.log10(x[iA]), xref: 'x', y: Math.log10(tl.med_d2_norm[iA]), yref: 'y', text: 'realism d²n', showarrow: false, xanchor: 'right', yanchor: 'bottom', font: {{ color: cAcc, size: 11 }} }});
+    const iB = lastFinite(tl.med_sep_arcsec);
+    if (iB >= 0) annos.push({{ x: Math.log10(x[iB]), xref: 'x', y: Math.log10(tl.med_sep_arcsec[iB]), yref: 'y2', text: 'sep (arcsec)', showarrow: false, xanchor: 'right', yanchor: 'top', font: {{ color: cSep, size: 11 }} }});
     const layout = {{ ...baseLayout,
         xaxis: ax('fit arc (days)', 'log'),
         yaxis: {{ ...ax('realism d²n', 'log') }},
         yaxis2: {{ ...ax('sep (arcsec)', 'log'), overlaying: 'y', side: 'right' }},
-        legend: LEGEND_H,
+        showlegend: false,
+        annotations: annos,
         shapes: [
             {{ type: 'line', xref: 'paper', x0: 0, x1: 1, yref: 'y', y0: PW_BAND_50, y1: PW_BAND_50, line: {{ color: themeVar('--ed-border'), dash: 'dot' }} }},
             {{ type: 'line', xref: 'paper', x0: 0, x1: 1, yref: 'y', y0: PW_BAND_95, y1: PW_BAND_95, line: {{ color: themeVar('--ed-border'), dash: 'dot' }} }},
@@ -9680,12 +10502,15 @@ loadPredict();
         coeff_defs = NG_COEFF_DEFS,
         verdict_rule = NG_VERDICT_RULE,
         chart_h = FULL_CHART_HEIGHT_PX,
-        pair_chip = pair_chip_html(),
-        part1_name = PART_NAME_1,
-        part2_name = PART_NAME_2,
-        part3_name = PART_NAME_3,
-        part4_name = PART_NAME_4,
-        appendix_name = PART_NAME_APPENDIX,
+        rail_html = rail_html,
+        part1_head = part1_head,
+        part1_facts = part1_facts,
+        part1_sections = part1_sections,
+        part2_sections = part2_sections,
+        part2_head = part_head_inner(PART_NAME_2),
+        part3_head = part_head_inner(PART_NAME_3) + &part3_scope_html(results),
+        part4_head = part_head_inner(PART_NAME_4),
+        appendix_head = part_head_inner(PART_NAME_APPENDIX),
         dataset_file_name = data_file_name,
         n_prop = n_prop,
         n_eph = n_eph,
@@ -9694,20 +10519,14 @@ loadPredict();
         n_channels = n_channels,
         n_populations = n_populations,
         n_dt = n_dt,
-        pop_legend = pop_legend,
-        channel_legend = channel_legend,
-        h1_prop_grid_html = h1_prop_grid_html,
-        h2_eph_grid_html = h2_eph_grid_html,
-        od_closeness_grid_html = od_closeness_grid_html,
+        pop_counts_line = pop_counts_line,
+        channel_counts_line = channel_counts_line,
+        a2_absent_line = a2_absent_line,
         h4_fidelity_grid_html = h4_fidelity_grid_html,
-        tool_ranking_html = tool_ranking_html,
         covariance_realism_html = covariance_realism_html,
         predictive_power_html = predictive_power_html,
-        t1_prop_timing_html = t1_prop_timing_html,
-        t2_eph_timing_html = t2_eph_timing_html,
-        t3_od_timing_html = t3_od_timing_html,
-        part2_timing_html = part2_timing_html,
         provenance_footer_html = provenance_footer_html,
+        configurations_section = configurations_section,
         empyrean_version = empyrean_version,
     );
 
@@ -10525,7 +11344,18 @@ mod tests {
 
     #[test]
     fn text_diet_references_and_dt_caveat_collapsed() {
-        let html = render_synthetic_html();
+        // One ASSIST arm so the Configurations appendix renders its subsection
+        // (whose Method fold now carries the ΔT caveat); plus a plain row.
+        let mut rows = vec![
+            synthetic_rust_prop_row("Apophis", 0.0),
+            synthetic_rust_prop_row("Bennu", 0.0),
+        ];
+        let mut a = synthetic_rust_prop_row("Apophis", 0.0);
+        a.channel = "assist".into();
+        a.propagation_uncertainty = Some("assist_default_variational_off".into());
+        a.notes = "config=assist_default integrator=ias15 epsilon=0.000000001 min_dt=0 adaptive_mode=global initial_dt=0.001 (assist 1.2.3 rebound 4.6.0)".into();
+        rows.push(a);
+        let html = render_rows(&rows);
         // The provenance reference list moved into a collapsed <details> so its
         // seven citations leave the default view while staying cited.
         let sum = "<details><summary class=\"ref-head\"><b>References</b></summary>";
@@ -10547,17 +11377,21 @@ mod tests {
             "no citation may sit outside the collapsed references disclosure"
         );
 
-        // The ASSIST ΔT-exclusion caveat is injected by script; it must be built
-        // inside a collapsed disclosure body, never as a free-standing paragraph.
+        // S5a: the ΔT caveat is now one clause of the ASSIST subsection's single
+        // collapsed Method fold (the per-configuration agreement panels are
+        // gone); it must sit inside a disclosure body, never free-standing.
+        let caveat = "ASSIST models no Marsden &Delta;T term";
+        let c = html
+            .find(caveat)
+            .expect("the ΔT caveat must be present in the ASSIST Method fold");
         assert!(
-            html.contains("<summary>ΔT exclusion</summary>"),
-            "the ΔT-exclusion caveat must sit under a collapsed disclosure"
-        );
-        let caveat = "ASSIST does not model the non-gravitational delay";
-        let c = html.find(caveat).expect("ΔT caveat text must be present");
-        assert!(
-            html[..c].rfind("disc-body").is_some_and(|d| c - d < 140),
+            html[..c].rfind("disc-body").is_some_and(|d| c - d < 200),
             "the ΔT caveat text must be inside a disclosure body"
+        );
+        // Able to fail: the pre-S5a free-standing "ΔT exclusion" panel is gone.
+        assert!(
+            !html.contains("<summary>ΔT exclusion</summary>"),
+            "the pre-S5a ΔT-exclusion disclosure must be gone"
         );
     }
 
@@ -10674,11 +11508,8 @@ mod tests {
             "id=\"s01\"",
             "id=\"s01b\"",
             "id=\"s02\"",
-            "id=\"s03\"",
             "id=\"s05\"",
             "id=\"s06\"",
-            "id=\"s06b\"",
-            "id=\"s07\"",
             "id=\"s08b\"",
             "id=\"s09b\"",
             "id=\"s10\"",
@@ -10687,10 +11518,23 @@ mod tests {
         ] {
             assert!(html.contains(anchor), "missing section anchor: {anchor}");
         }
-        // The cut sections must be gone.
-        for gone in ["id=\"s04\"", "id=\"s08\"", "id=\"s09\"", "id=\"s11\""] {
+        // The cut sections must be gone. s07 (1.2D Outliers) folded into §1.2A as
+        // the `outliers` disclosure in S3 — its standalone section and rail entry
+        // are gone, so the fold must carry the table instead.
+        for gone in [
+            "id=\"s04\"",
+            "id=\"s08\"",
+            "id=\"s09\"",
+            "id=\"s11\"",
+            "id=\"s07\"",
+        ] {
             assert!(!html.contains(gone), "cut section still present: {gone}");
         }
+        assert!(
+            html.contains("<summary class=\"more-sum\">outliers</summary>")
+                && html.contains("<tbody id=\"eph-outliers\">"),
+            "the outliers table must fold into §1.2A, not vanish with s07"
+        );
 
         // (5) the client verifies the fetched dataset with a complete, loud ladder
         // before it renders a single chart: byte length, then FNV-1a-32 hash, then
@@ -10842,13 +11686,15 @@ mod tests {
             "expected exactly one .hatch CSS definition, found {hatch_defs}"
         );
 
-        // Scope to the propagation section (s02 → s03).
+        // S6: scope to the propagation section's A slot (s02 head → the B slot
+        // anchor s02-b), so the count is the A grid's pair-panels only, not the C
+        // cost panels that now share the merged section.
         let s02 = html.find("id=\"s02\"").expect("propagation section");
-        let s03 = html[s02..]
-            .find("id=\"s03\"")
+        let s02b = html[s02..]
+            .find("id=\"s02-b\"")
             .map(|e| s02 + e)
             .unwrap_or(html.len());
-        let sec = &html[s02..s03];
+        let sec = &html[s02..s02b];
 
         // The default pair (empyrean vs JPL) is the single visible panel; the
         // other legal pairs are hidden panels the selector reveals, including a
@@ -10986,17 +11832,27 @@ mod tests {
     /// "optical" or "+ radar". Splitting on the object keeps the assertion
     /// from matching another object's cells.
     fn od_arc_row(html: &str, object: &str, kind: &str) -> String {
-        let obj_at = html
-            .find(&format!(">{object}"))
+        // S8 item 2: one row per arc — the object name is the optical row's first
+        // cell (gobjname2); the radar arc is an indented sub-row below it.
+        let name_at = html
+            .find(&format!(">{object}</td>"))
             .unwrap_or_else(|| panic!("no grid row for {object:?}"));
-        let rest = &html[obj_at..];
-        let cell = format!("class=\"gtool\">{kind}</td>");
-        let c_at = rest
-            .find(&cell)
-            .unwrap_or_else(|| panic!("{object:?} has no {kind:?} arc row"));
-        let r2 = &rest[c_at..];
-        let end = r2.find("</tr>").expect("unterminated arc row");
-        r2[..end].to_string()
+        if kind == "optical" {
+            let tr_start = html[..name_at].rfind("<tr").expect("optical row opens");
+            let end = html[tr_start..]
+                .find("</tr>")
+                .expect("unterminated optical row");
+            html[tr_start..tr_start + end].to_string()
+        } else {
+            let rest = &html[name_at..];
+            let cell = format!("class=\"gtool\">{kind}</td>");
+            let c_at = rest
+                .find(&cell)
+                .unwrap_or_else(|| panic!("{object:?} has no {kind:?} arc row"));
+            let r2 = &rest[c_at..];
+            let end = r2.find("</tr>").expect("unterminated arc row");
+            r2[..end].to_string()
+        }
     }
 
     #[test]
@@ -11254,15 +12110,18 @@ mod tests {
         // Apophis carries two comparison records, the other radar objects one each,
         // so records (4) and objects (3) diverge in the fixture. Only Ceres (no
         // radar) feeds the statistics: σ_eq 1.50, n 1/1, ≤3σ 1. The VISIBLE count
-        // is objects (radar_counts.len(), matching §4.1) in the numbers-only idiom;
-        // the HOVER title carries the words and the per-record tally.
+        // is objects (radar_counts.len(), matching §4.1) in the numbers-only idiom.
         assert!(
             summary.contains("σ_eq 1.50 · n 1/1 · ≤3σ 1 · 3 radar excluded"),
             "visible summary must state the excluded OBJECT count (3): {summary}"
         );
+        // S4 text-to-marks: the summary line keeps numbers only; its words-naming-
+        // the-numbers hover is removed. The radar-exclusion rationale rides §1.3A's
+        // Method fold now, not this hover — fails on the old structure, which
+        // carried "3 objects … 4 records, both epoch sources" in the title.
         assert!(
-            open_tag.contains("3 objects") && open_tag.contains("4 records, both epoch sources"),
-            "hover title must state the excluded RECORD count (4): {open_tag}"
+            !open_tag.contains("title="),
+            "the summary line carries no hover title (numbers only): {open_tag:?}"
         );
         // Lock the divergence: had the visible count regressed to the record tally
         // it would read "4 radar excluded" — objects and records differ here
@@ -11341,8 +12200,8 @@ mod tests {
         }
 
         // The visible (empyrean) panel carries every object once as an optical
-        // row, with the radar arc as a sub-row — the row structure is uniform
-        // per panel.
+        // row (the object name IS the row — S8 item 2, no separate name row), with
+        // the radar arc as a sub-row — the row structure is uniform per panel.
         let emp_panel = {
             let start = html
                 .find("data-tool=\"empyrean\"")
@@ -11351,15 +12210,126 @@ mod tests {
             let end = rest.find("data-tool=\"findorb\"").unwrap_or(rest.len());
             &rest[..end]
         };
+        // One object row per object (name in the row), no separate name row.
         assert_eq!(
-            emp_panel.matches("class=\"gtool\">optical</td>").count(),
+            emp_panel
+                .matches("class=\"gobjr odrow\"><td class=\"gobjname2")
+                .count(),
             2,
-            "the empyrean panel must have one optical row per object (Apophis, Bennu)"
+            "the empyrean panel must have one object (optical) row per object (Apophis, Bennu)"
         );
         assert_eq!(
             emp_panel.matches("class=\"gtool\">+ radar</td>").count(),
             1,
             "the empyrean panel must carry the one radar arc as a sub-row"
+        );
+        // The separate, colspanned name row is gone.
+        assert!(
+            !emp_panel.contains("class=\"gobjrow\""),
+            "S8 item 2: no separate object-name row survives"
+        );
+    }
+
+    #[test]
+    fn s8_od_grid_is_one_row_per_arc_and_panels_stay_row_for_row_aligned() {
+        // S8 item 2: the OD A-grid renders the object name IN the row (no separate
+        // name row), population headers as every other grid (gpophdr), + radar
+        // sub-rows only where they exist, and every tool's panel keeps the exact
+        // same row sequence so the Tool/Reference selector swaps panels row-for-row.
+        let mut ap = conv_od_row("Apophis", "rust", "orbit_determination");
+        ap.od_converged = Some(true);
+        let mut ap_r = conv_od_row("Apophis", "rust", "orbit_determination_radar");
+        ap_r.od_converged = Some(true);
+        let mut bennu = conv_od_row("Bennu", "rust", "orbit_determination");
+        bennu.od_converged = Some(true);
+        let mut ap_core = conv_od_row("Apophis", "core", "orbit_determination");
+        ap_core.findorb_rms_residual = Some(0.3);
+        ap_core.findorb_n_obs_used = Some(500);
+        let html = build_od_closeness_grid(
+            &[ap, ap_r, bennu, ap_core],
+            &[sbdb_cmp("Apophis", 1.2), sbdb_cmp("Bennu", 2.0)],
+        );
+        // Population headers use the shared gpophdr/gpopname form, not gblock.
+        assert!(
+            html.contains("class=\"gpophdr\"><td class=\"gpopname\"")
+                && !html.contains("class=\"gblock\">"),
+            "1.3A population headers must use the shared gpophdr form"
+        );
+        // The object name is the optical row's first cell.
+        assert!(
+            html.contains("class=\"gobjr odrow\"><td class=\"gobjname2\">Apophis</td>"),
+            "the object name is rendered in the optical row, not a separate name row"
+        );
+        // Row-for-row alignment: the empyrean and find_orb panels emit the SAME
+        // sequence of row classes, so the selector can swap them without shifting
+        // layout. Extract each panel's row-class sequence and compare.
+        let panel_rows = |tool: &str| -> Vec<String> {
+            let s = html
+                .find(&format!("data-tool=\"{tool}\""))
+                .unwrap_or_else(|| panic!("{tool} panel"));
+            let rest = &html[s..];
+            let e = rest[1..]
+                .find("data-tool=\"")
+                .map(|x| x + 1)
+                .unwrap_or(rest.len());
+            let panel = &rest[..e];
+            panel
+                .match_indices("<tr class=\"")
+                .map(|(i, _)| {
+                    let tail = &panel[i + "<tr class=\"".len()..];
+                    tail[..tail.find('"').unwrap()].to_string()
+                })
+                .collect()
+        };
+        assert_eq!(
+            panel_rows("empyrean"),
+            panel_rows("findorb"),
+            "every tool's OD panel must emit the identical row sequence (row-for-row alignment)"
+        );
+        // + radar sub-rows only where the arc exists (Apophis has one, Bennu none).
+        assert_eq!(
+            panel_rows("empyrean")
+                .iter()
+                .filter(|c| c.contains("odradar"))
+                .count(),
+            1,
+            "a + radar sub-row appears only for the object that has a radar arc"
+        );
+    }
+
+    #[test]
+    fn s8_od_grid_speaks_one_null_token() {
+        // S8 item 1: the 1.3A OD grid uses one null token (—) for every "no value"
+        // state — the undefined metric (Σ_ref not SPD), converged-with-no-record,
+        // and a missing σ_eq all read as —, with the reason on the cell hover. The
+        // old distinct ? / · / n/d glyphs are gone. Fails on the old structure.
+        let mut iris = conv_od_row("Iris", "rust", "orbit_determination");
+        iris.od_converged = Some(true);
+        let mut nocov = conv_od_row("Nysa", "rust", "orbit_determination");
+        nocov.od_converged = Some(true);
+        let html = build_od_closeness_grid(
+            &[iris, nocov],
+            &[sbdb_cmp("Iris", f64::NAN)], // Iris: record present but Σ_ref non-SPD; Nysa: no record
+        );
+        // No legacy null glyph survives in the OD grid cells or its key.
+        for legacy in [">?</span>", ">·</span>", ">n/d<"] {
+            assert!(
+                !html.contains(legacy),
+                "a legacy null glyph survives: {legacy}"
+            );
+        }
+        // The undefined-metric cell shows — and carries its reason on hover.
+        let iris_row = od_arc_row(&html, "Iris", "optical");
+        assert!(
+            iris_row.contains("conv undef")
+                && iris_row.contains("Σ_ref not SPD")
+                && iris_row.contains(">—</span>"),
+            "the undefined-metric cell is the one null token with its reason on hover: {iris_row}"
+        );
+        // The key explains the one null token (—), with the reason deferred to hover.
+        assert!(
+            html.contains("no closeness number"),
+            "the key explains the one null token"
         );
     }
 
@@ -11758,24 +12728,29 @@ mod tests {
         let out = dir.path().join("report.html");
         generate_report(&timing_fixture(), &[], &out, None, None).unwrap();
         let html = std::fs::read_to_string(&out).unwrap();
-        let order = |id: &str| -> u32 {
-            let rule = format!("#{id} {{ order: ");
-            let at = html
-                .find(&rule)
-                .unwrap_or_else(|| panic!("no flex order rule for #{id}"));
-            let rest = &html[at + rule.len()..];
-            rest[..rest.find(';').unwrap()].parse().unwrap()
+        // S7 item 3: DOM order == visual order — no flex `order` reorders the
+        // column, so byte position IS the on-page order. The page opens on Part 1
+        // and the appendix (run summary first) follows Part 4.
+        let at = |id: &str| -> usize {
+            html.find(&format!("id=\"{id}\""))
+                .unwrap_or_else(|| panic!("missing #{id}"))
         };
-        let first = ["part1", "part2", "part3", "part4", "appendix", "s01", "s13"]
-            .into_iter()
-            .min_by_key(|id| order(id))
-            .unwrap();
-        assert_eq!(first, "part1", "the page must open on Part 1");
         assert!(
-            order("s01") > order("appendix"),
-            "run summary not in appendix"
+            !html.contains("{ order:"),
+            "no flex order rule may survive: DOM order must be the visual order"
         );
-        assert!(order("s01") < order("s01b") && order("s01b") < order("s13"));
+        assert!(
+            at("part1-bar") < at("part2") && at("part2") < at("part4"),
+            "the page opens on Part 1; Part 2 precedes Part 4"
+        );
+        assert!(
+            at("part4") < at("appendix"),
+            "the appendix follows Part 4, not precedes Part 1"
+        );
+        assert!(
+            at("appendix") < at("s01") && at("s01") < at("s01b") && at("s01b") < at("s13"),
+            "run summary (A.1) opens the appendix, then external tools and provenance"
+        );
     }
 
     #[test]
@@ -11784,53 +12759,53 @@ mod tests {
         let out = dir.path().join("report.html");
         generate_report(&timing_fixture(), &[], &out, None, None).unwrap();
         let html = std::fs::read_to_string(&out).unwrap();
-        let start = html.find("id=\"s-ranking\"").expect("Part 2 section");
-        let end = html[start..].find("id=\"s-timing\"").unwrap() + start;
+        // S7: Part 2 is the three sections between the part2 and part3 heads.
+        let start = html.find("id=\"part2\"").expect("Part 2 head");
+        let end = html[start..].find("id=\"part3\"").unwrap() + start;
         let part2 = &html[start..end];
+        // Every hatched grid cell carries its reason on hover; its visible text is
+        // empty or one of the canonical hatch phrases, never a free sentence.
+        let canonical = [
+            "",
+            HATCH_NOT_IN_RUN,
+            HATCH_NOT_TIMED,
+            HATCH_NOT_COMPARED,
+            HATCH_NO_RECORD,
+            HATCH_NOT_ATTEMPTED,
+        ];
         let mut hatched = 0;
-        for cell in part2.split("<td class=\"r1c hatch\"").skip(1) {
+        for cell in part2.split("<td class=\"gc hatch\"").skip(1) {
             let (open, rest) = cell.split_once('>').expect("open tag");
             let text = &rest[..rest.find("</td>").expect("cell end")];
             assert!(
-                open.contains("title=\""),
+                open.contains("title=\"") && !open.contains("title=\"\""),
                 "hatched cell without a reason: {open}"
             );
             assert!(
-                !open.contains("title=\"\""),
-                "hatched cell with an empty reason"
-            );
-            assert!(
-                text.is_empty(),
-                "hatched cell prints its reason as words: {text:?}"
+                canonical.contains(&text),
+                "hatched cell shows non-canonical text: {text:?}"
             );
             hatched += 1;
         }
         assert!(
-            hatched >= 10,
-            "expected the kete, jorbit, JPL and absent-tool hatches, found {hatched}"
+            hatched >= 4,
+            "expected the untimed and absent-tool grid hatches, found {hatched}"
         );
-        for words in [
-            ">timing only<",
-            ">reference<",
-            ">not in this run<",
-            ">runs no fit<",
-        ] {
-            assert!(
-                !part2.contains(words),
-                "visible hatch label survived: {words}"
-            );
-        }
-        // The by-object-and-fitter matrix states a fit's state with the OD
-        // grid's glyphs, never as a word, and every glyph carries its reason.
+        // The by-object-and-fitter matrix (2.3 A) states a fit's state with a
+        // glyph, never as a word, and every glyph carries its reason.
         for words in [">fit<", ">conv<", ">n/d<"] {
             assert!(!part2.contains(words), "state written as a word: {words}");
         }
-        let fitter = &part2[part2.find("r3grid").expect("by object and fitter")..];
+        let fitter = &part2[part2
+            .find("By object and fitter")
+            .expect("2.3 by object and fitter table")..];
         let mut glyphs = 0;
         for cell in fitter.split("<td class=\"r1c\"").skip(1) {
             let (open, rest) = cell.split_once('>').expect("open tag");
             let text = &rest[..rest.find("</td>").expect("cell end")];
-            if ["·", "?", "✕"].contains(&text) {
+            // S8 item 1: a fit with no closeness number reads as the one null token
+            // (—); a failed fit keeps ✕. Both still carry their reason on hover.
+            if ["—", "✕"].contains(&text) {
                 assert!(
                     open.contains("title=\""),
                     "state glyph {text} without a reason"
@@ -11839,7 +12814,7 @@ mod tests {
             }
         }
         assert!(
-            glyphs >= 2,
+            glyphs >= 1,
             "expected state glyphs in the fitter matrix, found {glyphs}"
         );
     }
@@ -11861,11 +12836,17 @@ mod tests {
         let out = dir.path().join("report.html");
         generate_report(&timing_fixture(), &[], &out, None, None).unwrap();
         let html = std::fs::read_to_string(&out).unwrap();
+        // S7: the rail names 2.1 by its axis (Propagation), never a "side by
+        // side" ranking label.
         let rail = html
-            .find("data-target=\"s-ranking\"")
+            .find("data-target=\"s-prop\"")
             .expect("rail entry for section 2.1");
         let entry = &html[rail..rail + html[rail..].find("</a>").unwrap()];
-        assert!(entry.ends_with("2.1 Side by side"), "rail entry: {entry}");
+        assert!(entry.ends_with("2.1 Propagation"), "rail entry: {entry}");
+        assert!(
+            !html.contains("Side by side"),
+            "the ranking-flavoured 2.1 label is gone"
+        );
     }
 
     #[test]
@@ -11984,7 +12965,14 @@ mod tests {
         let html = std::fs::read_to_string(&out).unwrap();
 
         let p2 = html.find("id=\"part2\"").expect("part2 anchor");
-        for id in ["g1-prop-time", "g2-eph-time", "g3-od-time", "s-timing"] {
+        for id in [
+            "g1-prop-time",
+            "g2-eph-time",
+            "g3-od-time",
+            "s-prop",
+            "s-eph",
+            "s-od",
+        ] {
             let at = html
                 .find(&format!("id=\"{id}\""))
                 .unwrap_or_else(|| panic!("missing {id}"));
@@ -12161,14 +13149,14 @@ mod tests {
         );
         assert!(
             html.contains(
-                "grid-scroll grid-sticky\"><table class=\"agrid fidgrid\" id=\"g1-prop-time\""
+                "grid-scroll grid-sticky\"><table class=\"agrid fidgrid\" data-grid=\"fidelity\" id=\"g1-prop-time\""
             ),
             "per-object timing grid wrapper must carry the sticky marker"
         );
         // Precision: the wide per-object fidelity grid shares the fidgrid class but
         // must keep the plain wrapper (it scrolls horizontally, never pins).
         assert!(
-            html.contains("grid-scroll\"><table class=\"agrid fidgrid\"><thead><tr><th class=\"gobj\" rowspan=\"2\">object</th>"),
+            html.contains("grid-scroll\"><table class=\"agrid fidgrid\" data-grid=\"fidelity\"><thead><tr><th class=\"gobj\" rowspan=\"2\">object</th>"),
             "wide fidelity grid must keep the plain grid-scroll wrapper"
         );
         // Rule side: the ≥1360px overflow-drop rule must target the marker, or the
@@ -12253,7 +13241,12 @@ mod tests {
 
         // G3: the per-object empyrean cell shows the same rust-only median, so
         // T1 and G3 agree instead of disagreeing across a silent pool.
-        let grids = build_timing_grids(&rows, emp_eph_channel(&rows), emp_od_channel(&rows));
+        let grids = build_timing_grid_axis(
+            &rows,
+            "orbit_determination",
+            emp_eph_channel(&rows),
+            emp_od_channel(&rows),
+        );
         let g3_at = grids.find("id=\"g3-od-time\"").expect("G3 OD grid");
         let g3_row = timing_row_slice(&grids[g3_at..], "Apophis");
         assert!(
@@ -12416,7 +13409,9 @@ mod tests {
         let s05c = at("id=\"s05c\"");
         let s09b = at("id=\"s09b\"");
         let s10 = at("id=\"s10\"");
-        let part1 = at("id=\"part1\"");
+        // S5 item 1: the Part 1 head is the sticky Compare bar (#part1-bar);
+        // there is no separate #part1 element any more.
+        let part1 = at("id=\"part1-bar\"");
         let part2 = at("id=\"part2\"");
         // The Part 1 block ends at the Part 2 head; all three relocated sections
         // now sit after it, none inside the Part 1 DOM block.
@@ -12480,19 +13475,11 @@ mod tests {
     }
 
     #[test]
-    fn compare_bar_carries_the_only_selects_and_every_part_one_title_a_pair_chip() {
+    fn compare_bar_carries_the_only_selects_and_states_the_pair() {
         let html = render_rows(&pair_test_rows());
         let at = |needle: &str| {
             html.find(needle)
                 .unwrap_or_else(|| panic!("missing {needle}"))
-        };
-        let order = |id: &str| -> u32 {
-            let rule = format!("#{id} {{ order: ");
-            let a = html
-                .find(&rule)
-                .unwrap_or_else(|| panic!("no flex order rule for #{id}"));
-            let rest = &html[a + rule.len()..];
-            rest[..rest.find(';').unwrap()].parse().unwrap()
         };
 
         // Exactly one Tool select and one Reference select, both inside the bar.
@@ -12506,22 +13493,29 @@ mod tests {
             1,
             "exactly one Reference select on the page"
         );
+        // S5 item 1: the bar IS the Part 1 head line — it runs from its open tag
+        // to the first Part 1 section — and carries both selects plus the Part 1
+        // head (eyebrow + title) on one sticky line.
         let bar_open = at("<div class=\"part1-bar\" id=\"part1-bar\">");
-        let bar = &html[bar_open..bar_open + html[bar_open..].find("</div>").unwrap()];
+        let bar = &html[bar_open..at("<div class=\"section\" id=\"s02\">")];
         assert!(
             bar.contains("id=\"tool1-select\"") && bar.contains("id=\"tool2-select\""),
             "both selects must live inside the compare bar"
         );
         assert!(
             bar.contains(">Compare<") && bar.contains(">vs<"),
-            "the only visible words in the bar are Compare and vs"
+            "the bar names the Compare controls"
+        );
+        assert!(
+            bar.contains("class=\"ph-eyebrow\"") && bar.contains("class=\"ph-title\""),
+            "the bar carries the Part 1 head (eyebrow + title) on the same line"
         );
 
-        // The bar sits between the Part 1 head and the first Part 1 section, both
-        // in flex order and in the DOM (rail order == visual order preserved).
+        // S7: DOM order == visual order — the bar sits (by byte position) ahead of
+        // the first Part 1 section, no flex `order` reorders it.
         assert!(
-            order("part1") < order("part1-bar") && order("part1-bar") < order("s02"),
-            "the bar's flex order sits between #part1 and the first Part 1 section"
+            bar_open < at("<div class=\"section\" id=\"s02\">"),
+            "the bar sits ahead of the first Part 1 section in DOM order"
         );
 
         // The masthead carries neither select nor the removed comparing caption.
@@ -12535,25 +13529,17 @@ mod tests {
             "the masthead comparing caption is gone"
         );
 
-        // Exactly one chip per Part 1 section title, none outside Part 1; the
-        // server render names the default pair with its data attributes.
+        // The pair chips are gone (S4 text-to-marks): the sticky Compare bar
+        // states the pair (its two tool-coloured selects + Compare / vs), so no
+        // section title carries a pair-chip element and none survives anywhere on
+        // the page — fails the moment a chip is re-introduced. (The defensive
+        // empTitleText still names the 'pair-chip' class in JS, which is why this
+        // keys on the chip MARKUP, not the bare string.)
         assert!(
-            html.contains("<span class=\"pair-chip\" data-tool=\"empyrean\" data-ref=\"jpl\">"),
-            "the chip server-renders the default pair with data-tool/data-ref"
-        );
-        let part1 = at("id=\"part1\"");
-        let part2 = at("id=\"part2\"");
-        let mut chips = 0;
-        for (i, _) in html.match_indices("class=\"pair-chip\"") {
-            assert!(
-                part1 < i && i < part2,
-                "a pair chip fell outside the Part 1 DOM block at byte {i}"
-            );
-            chips += 1;
-        }
-        assert_eq!(
-            chips, 9,
-            "one chip on each of the nine Part 1 section titles, none elsewhere"
+            !html.contains("class=\"pair-chip\"")
+                && !html.contains("class=\"pc-t\"")
+                && !html.contains("class=\"pc-vs\""),
+            "no pair-chip element survives anywhere — the Compare bar states the pair"
         );
 
         // The shared sticky-header rule threads the --sticky-offset custom
@@ -12574,8 +13560,8 @@ mod tests {
             "Part 1 sections carry a scroll-margin equal to the bar height"
         );
 
-        // The three agreement hovers keep their description but drop the pair
-        // (the chip now names it).
+        // The three agreement hovers keep their description but name no pair
+        // (the Compare bar states it).
         let s02t = at("id=\"s02-title\"");
         let s02_title_attr = &html[s02t..s02t + html[s02t..].find('>').unwrap()];
         assert!(
@@ -12622,24 +13608,17 @@ mod tests {
             !html.contains("#tool-selector"),
             "the dead #tool-selector rules are deleted"
         );
-        // Finding 2: tool NAMES render from --tool-<slug> tokens, not inline hex.
+        // S5 item 5: the tool CATEGORICAL colours are gone from the Compare bar —
+        // the two selects carry no per-tool inline hue (names only) and read the
+        // one shared accent instead.
         assert!(
-            html.contains("<span class=\"pc-t\" style=\"color:var(--tool-empyrean)\">")
-                && html.contains("<span class=\"pc-r\" style=\"color:var(--tool-jpl)\">"),
-            "the default pair chip colours its tool names from tokens"
+            html.contains("id=\"tool1-select\" aria-label=\"Tool\"></select>")
+                && html.contains("id=\"tool2-select\" aria-label=\"Reference\"></select>"),
+            "the compare-bar selects carry no per-tool inline colour (names only)"
         );
         assert!(
-            html.contains(
-                "id=\"tool1-select\" aria-label=\"Tool\" style=\"color:var(--tool-empyrean)\""
-            ) && html.contains(
-                "id=\"tool2-select\" aria-label=\"Reference\" style=\"color:var(--tool-jpl)\""
-            ),
-            "the compare-bar selects colour their tool names from tokens"
-        );
-        assert!(
-            !html.contains("class=\"pc-t\" style=\"color:#")
-                && !html.contains("class=\"pc-r\" style=\"color:#"),
-            "no chip tool name carries an inline hex colour"
+            html.contains(".part1-bar select {") && html.contains("color: var(--ed-accent)"),
+            "the compare-bar selects read the one shared accent, not a per-tool hue"
         );
         // Finding 6: loadDataset re-runs the anchor scroll after boot so a deep
         // link settles onto its target once the dataset has rendered.
@@ -12649,6 +13628,134 @@ mod tests {
             ),
             "loadDataset re-runs the deep-link scroll after boot"
         );
+    }
+
+    #[test]
+    fn s8_part_one_bar_keeps_selects_on_one_line_and_facts_on_a_second_row() {
+        // S8 item 3: the two Compare selects stay on ONE line with "vs" between
+        // them; the four facts render as a full-width second row of the bar.
+        // Fails on the pre-S8 structure (facts nested inside .ph-head, no
+        // .p1b-topline, a wrapping .p1b-compare, a row .p1b-inner).
+        let html = render_rows(&pair_test_rows());
+        let bar_open = html
+            .find("<div class=\"part1-bar\" id=\"part1-bar\">")
+            .expect("part1-bar");
+        let bar = &html[bar_open..html.find("<div class=\"section\" id=\"s02\">").unwrap()];
+        // 1. A top line wraps the head and the Compare controls on one row.
+        let topline = bar.find("class=\"p1b-topline\"").expect("p1b-topline row");
+        let facts = bar.find("class=\"ph-facts\"").expect("ph-facts row");
+        let compare = bar.find("class=\"p1b-compare\"").expect("p1b-compare");
+        // 2. The facts are a SEPARATE row after the top line (not inside .ph-head,
+        //    so they clear the Compare controls entirely).
+        assert!(
+            topline < compare && compare < facts,
+            "the facts render after the top line's Compare controls, as the second row"
+        );
+        let ph_head = bar.find("class=\"ph-head\"").expect("ph-head");
+        assert!(
+            ph_head < facts && facts > compare,
+            "the facts are a sibling second row, not nested inside the head/title line"
+        );
+        // 3. The inner bar is a column; the top line and the Compare controls both
+        //    refuse to wrap, so the two selects and "vs" never break onto two lines.
+        let css = |sel: &str| {
+            let i = html
+                .find(sel)
+                .unwrap_or_else(|| panic!("missing css {sel}"));
+            html[i..i + html[i..].find('}').unwrap()].to_string()
+        };
+        assert!(
+            css(".p1b-inner {").contains("flex-direction: column"),
+            "the inner bar stacks the top line over the facts row"
+        );
+        assert!(
+            css(".p1b-topline {").contains("flex-wrap: nowrap"),
+            "the top line (title + Compare) never wraps"
+        );
+        let comp = css(".p1b-compare {");
+        assert!(
+            comp.contains("flex-wrap: nowrap") && comp.contains("white-space: nowrap"),
+            "the two selects and vs stay on one line: {comp}"
+        );
+    }
+
+    #[test]
+    fn s8_walk_timeline_labels_its_lines_directly_not_with_a_legend() {
+        // S8 item 4: the last Plotly legend (the 4.2 dual-axis walk timeline) is
+        // replaced by a direct label at each line's end. Fails on the old
+        // structure (drawWalkTimeline carried `legend: LEGEND_H`).
+        let rows = vec![synthetic_rust_prop_row("Apophis", 0.0)];
+        let agg = synthetic_predict_aggregates("snap");
+        let dir = tempfile::tempdir().unwrap();
+        let out = dir.path().join("report.html");
+        generate_report(&rows, &[], &out, None, Some(&agg)).unwrap();
+        let html = std::fs::read_to_string(&out).unwrap();
+        let f = html
+            .find("function drawWalkTimeline(")
+            .expect("drawWalkTimeline");
+        // The function body up to the next top-level function declaration (or the
+        // end of the script if it is the last one). LEGEND_H is only used before
+        // this function, so extending to the end keeps the negative check sound.
+        let rel = html[f..].find("\nfunction ").unwrap_or(html.len() - f);
+        let body = &html[f..f + rel];
+        assert!(
+            body.contains("showlegend: false"),
+            "the walk timeline disables the Plotly legend"
+        );
+        assert!(
+            !body.contains("legend: LEGEND_H"),
+            "the walk timeline no longer carries a legend entry"
+        );
+        assert!(
+            body.contains("text: 'realism d²n', showarrow: false")
+                && body.contains("text: 'sep (arcsec)', showarrow: false"),
+            "each line is named directly at its own end"
+        );
+    }
+
+    #[test]
+    fn s8_every_table_belongs_to_the_one_agrid_family_with_a_role() {
+        // S8 item 1: every rendered table is one grid family (`agrid` + a variant
+        // or the `list` style); no legacy standalone family (`od-table`,
+        // `heatmap`, `od-fails-t`) survives, and the grids the audit protects
+        // carry a `data-grid` role so the checks key on the role, not the class.
+        // Fails on the pre-S8 structure (bare od-table / heatmap / od-fails-t).
+        let rows = pair_test_rows();
+        let agg = synthetic_predict_aggregates("snap");
+        let dir = tempfile::tempdir().unwrap();
+        let out = dir.path().join("report.html");
+        generate_report(&rows, &[], &out, None, Some(&agg)).unwrap();
+        let html = std::fs::read_to_string(&out).unwrap();
+        let mut n_tables = 0usize;
+        let mut idx = 0usize;
+        while let Some(rel) = html[idx..].find("<table") {
+            let start = idx + rel;
+            let end = start + html[start..].find('>').expect("the table tag closes");
+            let tag = &html[start..=end];
+            n_tables += 1;
+            assert!(
+                tag.contains("class=\"agrid"),
+                "every table is in the agrid family: {tag}"
+            );
+            assert!(
+                !tag.contains("class=\"od-table")
+                    && !tag.contains("class=\"heatmap\"")
+                    && !tag.contains("class=\"od-fails-t"),
+                "no legacy standalone table class survives: {tag}"
+            );
+            idx = end + 1;
+        }
+        assert!(
+            n_tables >= 8,
+            "the render carries the family's tables, got {n_tables}"
+        );
+        for role in [
+            "data-grid=\"agreement\"",
+            "data-grid=\"predict\"",
+            "data-grid=\"list\"",
+        ] {
+            assert!(html.contains(role), "the render carries the {role} grids");
+        }
     }
 
     /// sRGB → linear per WCAG 2.x.
@@ -12749,9 +13856,11 @@ mod tests {
             "empyrean/assist panel must not name find_orb"
         );
         // The static Section-1 disclosure body is pair-neutral (names no tool).
+        // S6: the merged 1.1 section runs from s02 to the merged 1.2 section s06;
+        // its first disc-body is the one ▸Method fold (the A/B methods merged).
         let s02 = html.find("id=\"s02\"").expect("s02");
-        let s03 = html[s02..].find("id=\"s03\"").map(|e| s02 + e).unwrap();
-        let sec = &html[s02..s03];
+        let s06 = html[s02..].find("id=\"s06\"").map(|e| s02 + e).unwrap();
+        let sec = &html[s02..s06];
         let db = sec.find("class=\"disc-body\">").expect("s02 disclosure");
         let disc = &sec[db..sec[db..].find("</div>").map(|e| db + e).unwrap()];
         assert!(
@@ -12826,70 +13935,65 @@ mod tests {
     }
 
     #[test]
-    fn ephemeris_error_growth_is_its_own_section_after_the_heatmap() {
-        // A1: the ephemeris error-growth chart is a first-class section (s06b),
-        // the sibling of the propagation one (s03): its own anchor, the
-        // eph-sep-chart moved into it, a rail entry, and a flex-order slot
-        // directly under the 1.2 heatmap and before the ephemeris cost.
+    fn s6_ephemeris_growth_and_cost_live_inside_the_merged_1_2_section() {
+        // S6: 1.1/1.2/1.3 are each ONE .section with the fixed slots. The former
+        // standalone error-growth (s03/s06b) and cost (s-t1-prop/s-t2-eph/s-t3-od)
+        // sections are gone; their content lives in the B and C slots of the
+        // merged section. The eph-sep-chart and its pair/channels toggle sit
+        // inside the merged 1.2 section (s06), between the B and C slot anchors.
         let dir = tempfile::tempdir().unwrap();
         let out = dir.path().join("report.html");
         generate_report(&timing_fixture(), &[], &out, None, None).unwrap();
         let html = std::fs::read_to_string(&out).unwrap();
 
-        // The eph-sep-chart lives inside the new s06b section, not the s06
-        // heatmap section it used to be buried in.
-        let s06b = html
-            .find("id=\"s06b\"")
-            .expect("ephemeris growth section s06b");
-        let eph_chart = html.find("id=\"eph-sep-chart\"").expect("eph-sep-chart");
-        assert!(eph_chart > s06b, "the eph-sep-chart must sit inside s06b");
+        // The old split sections no longer exist as section anchors.
+        for gone in [
+            "id=\"s03\"",
+            "id=\"s-t1-prop\"",
+            "id=\"s06b\"",
+            "id=\"s-t2-eph\"",
+            "id=\"s-t3-od\"",
+            "id=\"s07\"",
+        ] {
+            assert!(!html.contains(gone), "the old split section {gone} is gone");
+        }
 
-        // A rail entry names it (the scroll-spy tracks any rail a[data-target]).
-        let rail = html.find("data-target=\"s06b\"").expect("s06b rail entry");
-        let entry = &html[rail..rail + html[rail..].find("</a>").unwrap()];
-        assert!(entry.contains("error growth"), "s06b rail entry: {entry}");
-
-        // The pair/channels toggle moved into s06b, so its id names that section;
-        // the stale s06-toggle carryover from the old section must be gone.
+        // The merged 1.2 section runs from s06 to the merged 1.3 section s08b and
+        // carries the B eyebrow, the eph-sep-chart (with its toggle) and the C
+        // eyebrow, in that order.
+        let s06 = html.find("id=\"s06\"").expect("merged 1.2 section s06");
+        let s08b = html[s06..].find("id=\"s08b\"").map(|e| s06 + e).unwrap();
+        let sec = &html[s06..s08b];
+        let b_eye = sec.find("id=\"s06-b\"").expect("1.2 B slot anchor");
+        let toggle = sec
+            .find("id=\"s06b-toggle\"")
+            .expect("pair/channels toggle");
+        let chart = sec.find("id=\"eph-sep-chart\"").expect("eph-sep-chart");
+        let c_eye = sec.find("id=\"s06-c\"").expect("1.2 C slot anchor");
         assert!(
-            html.contains("id=\"s06b-toggle\""),
-            "the toggle id must name its section (s06b)"
+            b_eye < toggle && toggle < chart && chart < c_eye,
+            "the toggle + eph-sep-chart sit in the B slot, before C"
         );
-        assert!(
-            !html.contains("s06-toggle"),
-            "the stale s06-toggle id must be gone"
-        );
+        // The toggle id is unchanged; no stale carryover.
+        assert!(!html.contains("s06-toggle\""), "no stale s06-toggle id");
 
-        // Flex order: heatmap (s06) < error growth (s06b) < cost (s-t2-eph) <
-        // outliers (s07); the extra outliers table comes last on the axis.
-        let order = |id: &str| -> u32 {
-            let rule = format!("#{id} {{ order: ");
-            let at = html
-                .find(&rule)
-                .unwrap_or_else(|| panic!("no order rule for #{id}"));
-            let rest = &html[at + rule.len()..];
-            rest[..rest.find(';').unwrap()].parse().unwrap()
+        // S7: DOM order == visual order — the three merged sections run after the
+        // bar in order by byte position (no flex `order`).
+        let at = |id: &str| -> usize {
+            html.find(&format!("id=\"{id}\""))
+                .unwrap_or_else(|| panic!("no section {id}"))
         };
-        assert!(
-            order("s06") < order("s06b"),
-            "eph growth must follow the heatmap"
-        );
-        assert!(
-            order("s06b") < order("s-t2-eph"),
-            "eph growth must precede its cost"
-        );
-        assert!(
-            order("s-t2-eph") < order("s07"),
-            "the outliers table comes last on the axis"
-        );
+        assert!(at("part1-bar") < at("s02"), "bar precedes 1.1");
+        assert!(at("s02") < at("s06"), "1.1 precedes 1.2");
+        assert!(at("s06") < at("s08b"), "1.2 precedes 1.3");
     }
 
     #[test]
-    fn part_one_section_letters_are_sequential_per_axis() {
-        // A1: within each Part-1 axis the section letters run A, B, C, … with no
-        // gaps and the same role at the same letter (heatmap A, error growth B,
-        // cost C), except OD, which has no growth chart, so its cost follows the
-        // grid directly at B.
+    fn s6_part_one_is_three_sections_numbered_1_1_1_2_1_3_with_abc_slots() {
+        // S6 item 1/3: Part 1 is exactly three .section elements, numbered
+        // 1.1/1.2/1.3 (the lone-letter scheme is gone), each with the three slot
+        // anchors A·B·C; nothing between the bar and the Part 2 head is another
+        // section.
         let dir = tempfile::tempdir().unwrap();
         let out = dir.path().join("report.html");
         generate_report(&timing_fixture(), &[], &out, None, None).unwrap();
@@ -12903,18 +14007,190 @@ mod tests {
             let e = html[n..].find("</div>").map(|e| n + e).unwrap();
             html[n..e].to_string()
         };
-        // Propagation axis: A heatmap, B growth, C cost.
-        assert_eq!(num("s02"), "1.1A");
-        assert_eq!(num("s03"), "1.1B");
-        assert_eq!(num("s-t1-prop"), "1.1C");
-        // Ephemeris axis: A heatmap, B growth, C cost, D outliers (extra last).
-        assert_eq!(num("s06"), "1.2A");
-        assert_eq!(num("s06b"), "1.2B");
-        assert_eq!(num("s-t2-eph"), "1.2C");
-        assert_eq!(num("s07"), "1.2D");
-        // OD axis: A grid, B cost (no growth chart between them).
-        assert_eq!(num("s08b"), "1.3A");
-        assert_eq!(num("s-t3-od"), "1.3B");
+        assert_eq!(num("s02"), "1.1");
+        assert_eq!(num("s06"), "1.2");
+        assert_eq!(num("s08b"), "1.3");
+        // The lone-letter Part-1 numbering is gone.
+        for gone in [
+            "1.1A", "1.1B", "1.1C", "1.2A", "1.2B", "1.2C", "1.3A", "1.3B",
+        ] {
+            assert!(
+                !html.contains(&format!("section-num\">{gone}<")),
+                "the lone-letter number {gone} is gone from Part 1 titles"
+            );
+        }
+        // Each merged section carries its three slot anchors A·B·C.
+        for sec in ["s02", "s06", "s08b"] {
+            for slot in ["a", "b", "c"] {
+                assert!(
+                    html.contains(&format!("id=\"{sec}-{slot}\"")),
+                    "{sec} must carry the {slot} slot anchor"
+                );
+            }
+        }
+        // Exactly three Part-1 sections (the bar..Part 2 window holds only them).
+        let bar = html.find("id=\"part1-bar\"").expect("part1-bar");
+        let p2 = html[bar..]
+            .find("id=\"part2\"")
+            .map(|e| bar + e)
+            .expect("part2 head");
+        let window = &html[bar..p2];
+        // Three real merged sections; the hidden legacy overview-footer .section
+        // is not a Part-1 content section.
+        let n = window.matches("<div class=\"section\" id=").count()
+            - window.matches("id=\"overview-footer\"").count();
+        assert_eq!(n, 3, "Part 1 holds exactly three content .section elements");
+    }
+
+    #[test]
+    fn s6_part_one_head_states_the_four_facts_once() {
+        // S6 item 2: the Part 1 head line states, once, epoch (MJD TDB + UTC),
+        // the frame per metric, the force-model pair, and the observing sites —
+        // read from the rows, in the eyebrow role under the title.
+        let dir = tempfile::tempdir().unwrap();
+        let out = dir.path().join("report.html");
+        generate_report(&timing_fixture(), &[], &out, None, None).unwrap();
+        let html = std::fs::read_to_string(&out).unwrap();
+        let bar = html.find("id=\"part1-bar\"").expect("part1-bar");
+        let p2 = html[bar..].find("id=\"part2\"").map(|e| bar + e).unwrap();
+        let head = &html[bar..p2];
+        let facts = head.find("class=\"ph-facts\"").expect("ph-facts");
+        let facts = &head[facts..];
+        // All four facts are present in the eyebrow role, each in its own chip.
+        for k in ["epoch", "frames", "force", "sites"] {
+            assert!(
+                facts.contains(&format!("data-k=\"{k}\"")),
+                "the head states the {k} fact"
+            );
+        }
+        // The epoch fact carries both MJD TDB and a UTC date, from the rows (the
+        // fixture's 61000.0 IC epoch); the frame-per-metric and the force pair
+        // are stated with their reference.
+        assert!(
+            facts.contains("MJD 61000.0 TDB") && facts.contains(" UTC"),
+            "the epoch fact states MJD TDB and UTC"
+        );
+        assert!(facts.contains("ICRF/J2000"), "a per-metric frame is stated");
+        assert!(
+            facts.contains("DE441"),
+            "the reference force model is stated"
+        );
+    }
+
+    #[test]
+    fn s6_part_one_rail_is_generated_from_the_section_tree() {
+        // S6 item 3: the rail is generated from the same tree — one entry per
+        // section plus A·B·C sub-entries that scroll to the slot anchors; the old
+        // · error growth / · cost / · outliers entries are gone.
+        let dir = tempfile::tempdir().unwrap();
+        let out = dir.path().join("report.html");
+        generate_report(&timing_fixture(), &[], &out, None, None).unwrap();
+        let html = std::fs::read_to_string(&out).unwrap();
+        let rail_at = html.find("<nav class=\"rail\"").expect("rail");
+        let rail_end = html[rail_at..].find("</nav>").map(|e| rail_at + e).unwrap();
+        let rail = &html[rail_at..rail_end];
+        for (sec, num, title) in [
+            ("s02", "1.1", "Propagation"),
+            ("s06", "1.2", "Ephemeris"),
+            ("s08b", "1.3", "Orbit determination"),
+        ] {
+            assert!(
+                rail.contains(&format!(
+                    "data-target=\"{sec}\" href=\"#{sec}\">{num} {title}</a>"
+                )),
+                "rail names {num} {title}"
+            );
+            for slot in ["a", "b", "c"] {
+                assert!(
+                    rail.contains(&format!(
+                        "data-target=\"{sec}-{slot}\" href=\"#{sec}-{slot}\""
+                    )),
+                    "rail sub-entry scrolls to {sec}-{slot}"
+                );
+            }
+        }
+        // The old standalone per-axis sub-entries (`&nbsp;&nbsp;· error growth`,
+        // `· cost`, `· outliers`) are gone; the new sub-entries read `A · by
+        // object` etc. (so "· cost" legitimately appears inside `C · cost`).
+        assert!(
+            !rail.contains("· error growth")
+                && !rail.contains(">&nbsp;&nbsp;· cost<")
+                && !rail.contains("· outliers"),
+            "the old per-axis rail sub-entries are gone"
+        );
+    }
+
+    #[test]
+    fn s6_one_method_fold_per_merged_part_one_section() {
+        // S6 item 1: one ▸Method fold per section (the A/B methods merged); 1.2
+        // also keeps the ▸outliers itemised runaway list.
+        let dir = tempfile::tempdir().unwrap();
+        let out = dir.path().join("report.html");
+        generate_report(&timing_fixture(), &[], &out, None, None).unwrap();
+        let html = std::fs::read_to_string(&out).unwrap();
+        let count_methods = |a: &str, b: &str| -> usize {
+            let lo = html.find(a).unwrap();
+            let hi = html[lo..].find(b).map(|e| lo + e).unwrap();
+            html[lo..hi].matches("<summary>Method</summary>").count()
+        };
+        assert_eq!(
+            count_methods("id=\"s02\"", "id=\"s06\""),
+            1,
+            "1.1 has one Method"
+        );
+        assert_eq!(
+            count_methods("id=\"s06\"", "id=\"s08b\""),
+            1,
+            "1.2 has one Method"
+        );
+        assert_eq!(
+            count_methods("id=\"s08b\"", "id=\"overview-footer\""),
+            1,
+            "1.3 has one Method"
+        );
+        // 1.2 keeps the itemised runaway list under its fold.
+        let s06 = html.find("id=\"s06\"").unwrap();
+        let s08b = html[s06..].find("id=\"s08b\"").map(|e| s06 + e).unwrap();
+        let sec = &html[s06..s08b];
+        assert!(
+            sec.contains("<summary class=\"more-sum\">outliers</summary>")
+                && sec.contains("<tbody id=\"eph-outliers\">"),
+            "1.2 keeps the itemised ▸outliers runaway list"
+        );
+    }
+
+    #[test]
+    fn s6_od_grid_drops_the_empty_dr_epoch_column_and_gains_a_fit_quality_marginal() {
+        // S6 item 1 (1.3): the all-"—" Δr@epoch column is gone from the OD grid,
+        // and 1.3's B slot is a fit-quality population marginal with named
+        // not-measured states (never blanks).
+        let (rows, cmp) = radar_scenario();
+        let dir = tempfile::tempdir().unwrap();
+        let out = dir.path().join("report.html");
+        generate_report(&rows, &cmp, &out, None, None).unwrap();
+        let html = std::fs::read_to_string(&out).unwrap();
+        assert!(
+            !html.contains("Δr @epoch") && !html.contains("not in the sidecar schema yet"),
+            "the empty Δr@epoch column is gone from the OD grid"
+        );
+        // The 1.3 B slot (s08b-b) holds the fit-quality marginal with the named
+        // not-measured states.
+        let b_at = html.find("id=\"s08b-b\"").expect("1.3 B slot anchor");
+        let c_at = html[b_at..]
+            .find("id=\"s08b-c\"")
+            .map(|e| b_at + e)
+            .unwrap();
+        let b = &html[b_at..c_at];
+        assert!(
+            b.contains("not measured"),
+            "the fit-quality marginal names its not-measured states"
+        );
+        for header in ["n_obs", "RMS", "σ_eq"] {
+            assert!(
+                b.contains(header),
+                "the fit-quality marginal shows {header}"
+            );
+        }
     }
 
     #[test]
@@ -13034,17 +14310,17 @@ mod tests {
             html.contains("'title.font.color': themeVar('--ed-text-secondary')"),
             "rethemeCharts must re-colour panel titles on a theme flip"
         );
-        // The legend is placed below the plot (one shared definition) so it cannot
-        // overprint the top title band of the two legended panels.
+        // S5 item 3: the covariance panels carry NO Plotly legend — the shared
+        // COV_LEGEND placement is gone and each panel names its series with direct
+        // end labels / a chip annotation instead.
         assert_eq!(
-            html.matches("const COV_LEGEND =").count(),
-            1,
-            "one shared covariance-legend placement"
+            html.matches("COV_LEGEND").count(),
+            0,
+            "the shared covariance legend must be gone (direct labels replace it)"
         );
-        assert_eq!(
-            html.matches("legend: COV_LEGEND").count(),
-            2,
-            "the two legended covariance panels share the bottom-placed legend"
+        assert!(
+            html.contains("const chiAnnos =") && html.contains("const cdfAnnos ="),
+            "the chi² and CDF panels must build direct-label annotations"
         );
     }
 
@@ -13198,26 +14474,39 @@ mod tests {
     }
 
     #[test]
-    fn export_identity_keys_off_the_pair_chip_not_part1_ancestry() {
+    fn export_identity_keys_the_pair_off_the_compare_bar_selects() {
         let html = render_rows(&pair_test_rows());
         // The old identity gated the pair on DOM ancestry (gd.closest('#part1')),
-        // but #part1 is a sibling part-head, never an ancestor of a chart, so the
-        // pair was never appended and the filename pair slot was always 'none'.
+        // but the Part 1 head is a sibling of the charts, never an ancestor, so
+        // the pair was never appended. S5 item 1: the head is now the sticky
+        // Compare bar (#part1-bar), still a sibling — so ancestry still cannot be
+        // the gate and the num-prefix gate below is what fires.
         assert!(
             !html.contains("closest('#part1')"),
             "the export identity must not gate the pair on #part1 ancestry"
         );
         assert!(
-            html.contains("<div class=\"part-head\" id=\"part1\">"),
-            "#part1 is a sibling part-head label, not a wrapper, which is why ancestry failed"
+            html.contains("<div class=\"part1-bar\" id=\"part1-bar\">"),
+            "the Part 1 head is the sticky Compare bar, a sibling of the charts, not a wrapper"
         );
-        // The pair is now gated on a pair chip inside the chart's own section.
+        // S4: the pair chips are gone, so the pair can no longer be detected by a
+        // chip in the chart's section. It is now gated on the Part 1 section
+        // number ("1." prefix) and reads the pair the sticky Compare bar's selects
+        // name (TOOL1/TOOL2) — never a pair chip.
         assert!(
-            html.contains("sec.querySelector('.pair-chip')"),
-            "the pair must be detected by a pair chip in the chart's section"
+            !html.contains("sec.querySelector('.pair-chip')"),
+            "the pair gate must not key off a pair chip (chips removed in S4)"
         );
-        // Each Part 1 client chart sits in the SAME section as a pair chip, so the
-        // gate fires for exactly those charts.
+        assert!(
+            html.contains("num.indexOf('1.') === 0"),
+            "the pair is gated on the Part 1 section number prefix"
+        );
+        assert!(
+            html.contains("pair = toolLabel(TOOL1) + ' vs ' + toolLabel(TOOL2)"),
+            "the pair string comes from the Compare bar's TOOL1/TOOL2 selection"
+        );
+        // Each Part 1 client chart sits in a section whose number starts "1.", so
+        // the num-prefix gate fires for exactly those charts.
         for id in ["growth-chart", "eph-sep-chart"] {
             let at = html
                 .find(&format!("id=\"{id}\""))
@@ -13226,17 +14515,10 @@ mod tests {
                 .rfind("<div class=\"section\"")
                 .expect("the chart's section open tag");
             assert!(
-                html[sec_open..at].contains("pair-chip"),
-                "#{id}'s section must carry a pair chip so the export pair gate fires"
+                html[sec_open..at].contains("<div class=\"section-num\">1."),
+                "#{id}'s section number must start \"1.\" so the export pair gate fires"
             );
         }
-        // The title text strips the pair chip, so Part 1 titles are not glued (no
-        // "Error growthempyrean vs JPL").
-        assert!(
-            html.contains("function empTitleText(")
-                && html.contains("classList.contains('pair-chip')"),
-            "empTitleText must remove the pair chip from a heading's text"
-        );
     }
 
     #[test]
@@ -13265,6 +14547,135 @@ mod tests {
         assert!(
             html.contains("[num, title, pair].filter(Boolean).join(' · ')"),
             "the caption must join number, title and pair with an explicit separator"
+        );
+    }
+
+    #[test]
+    fn s4_item1_header_sentences_become_a_units_key_line() {
+        // S4 item 1 / S7: the former single "By tool and axis" matrix becomes one
+        // per-axis readout, each stating its units on one short key line; the <th>
+        // carry no header sentence. Fails on the old structure (one matrix with
+        // "km · mas vs JPL · σ_eq · ms" and an .r1sub header sentence).
+        let html = render_rows(&pair_test_rows());
+        assert!(
+            html.contains("<div class=\"grid-summary\">km</div>")
+                && html.contains("<div class=\"grid-summary\">mas</div>")
+                && html.contains("<div class=\"grid-summary\"><span class=\"u\">σ_eq</span></div>"),
+            "each Part-2 section states its axis units on its own readout key line"
+        );
+        // The comparison reference rides the (uncounted) readout table header.
+        assert!(
+            html.contains("<th>propagation vs JPL</th>")
+                && html.contains("<th>ephemeris vs JPL</th>")
+                && html.contains("<th>orbit determination vs JPL</th>"),
+            "the readout table header names the JPL comparison"
+        );
+        assert!(
+            !html.contains("By tool and axis") && !html.contains("km · mas vs JPL · σ_eq · ms"),
+            "the single combined by-tool-and-axis matrix is gone"
+        );
+        // Scope the header-sentence check to Part 2 (r1sub is a legitimate class
+        // in the Part 4.2 ruler elsewhere).
+        let p2s = html.find("id=\"part2\"").unwrap();
+        let p2e = html[p2s..].find("id=\"part3\"").map(|i| p2s + i).unwrap();
+        let part2 = &html[p2s..p2e];
+        assert!(
+            !part2.contains("r1sub") && !part2.contains("p50 · p90 · km"),
+            "the readout <th> carry no header sentence — only the quantity name"
+        );
+        // The stat descriptors the sentence carried stay reachable in the Method folds.
+        assert!(
+            html.contains("median and p90 offset from Horizons")
+                && html.contains("p50 wall clock at its own boundary"),
+            "p50/p90/boundary descriptors remain in the Part-2 Method folds"
+        );
+    }
+
+    #[test]
+    fn s4_item3_panel_captions_and_summary_hovers_move_to_the_fold() {
+        // S4 item 3: the 4.2 panel-title captions and the 1.3A/3.1/4.1 summary-line
+        // hovers lose their title text; the content rides the Method fold.
+        let rows = vec![synthetic_rust_prop_row("Apophis", 0.0)];
+        let agg = synthetic_predict_aggregates("snap");
+        let dir = tempfile::tempdir().unwrap();
+        let out = dir.path().join("report.html");
+        generate_report(&rows, &[], &out, None, Some(&agg)).unwrap();
+        let html = std::fs::read_to_string(&out).unwrap();
+        // The 4.2 panel titles carry no hover caption (fails on the old structure).
+        assert!(
+            html.contains("<div class=\"panel-title\">Coverage</div>")
+                && html.contains("<div class=\"panel-title\">Surfaces</div>"),
+            "the 4.2 panel titles carry no hover caption"
+        );
+        assert!(
+            !html.contains("How often the next observations land inside the predicted"),
+            "the Coverage panel caption is gone from the hover"
+        );
+        // The Surfaces provenance (snapshot) moved into its Method fold.
+        assert!(
+            html.contains("snapshot snap"),
+            "the Surfaces provenance rides its Method fold, not the panel-title hover"
+        );
+
+        // The 3.1 summary-line hover is gone; its content rides the fold.
+        let h2 = render_rows(&pair_test_rows());
+        assert!(
+            !h2.contains("Each counted channel reproduces empyrean-core to"),
+            "the 3.1 summary-line hover caption is removed"
+        );
+        assert!(
+            h2.contains("Every channel runs against empyrean-core, the validation reference"),
+            "the 3.1 caption moved into the channel-fidelity Method fold"
+        );
+    }
+
+    #[test]
+    fn s4_item4_sigma_view_control_and_boundary_chips_are_gone() {
+        // S4 item 4: the disabled σ-view control + tooltip are removed until the
+        // view works, and the A/B/C boundary chips are gone (the boundary names
+        // ride the group labels / §2.1 fold). Fails on the old structure.
+        let html = render_rows(&pair_test_rows());
+        assert!(
+            !html.contains("id=\"sigma-toggle\"") && !html.contains("◎ σ view"),
+            "the disabled σ-view button and its tooltip are removed"
+        );
+        assert!(
+            !html.contains("class=\"tbchip\""),
+            "no A/B/C boundary chip survives on any timing header"
+        );
+        // The boundary names stay visible in the Part 2 timing group labels.
+        assert!(
+            html.contains("propagation · integrate only")
+                && html.contains("orbit determination · per fit"),
+            "the boundary names stay in the timing group labels"
+        );
+    }
+
+    #[test]
+    fn s4_item2_growth_charts_use_one_hue_and_direct_labels() {
+        // S4 item 2: the 1.1B / 1.2B 13-entry population legends become direct
+        // end-labels in population order, one hue per chart; the Gaia/CCD refs
+        // move to y-axis annotations. Fails on the old structure (popColors[pop]
+        // per line, a 13-entry legend, Gaia/CCD as legend entries).
+        let html = render_rows(&pair_test_rows());
+        assert!(
+            html.contains("const POP_HUE =") && html.contains("const color = POP_HUE;"),
+            "the error-growth lines draw in one hue, not the 13-hue population palette"
+        );
+        assert!(
+            html.contains("popLabels.push(")
+                && html.contains("const dodged = popLabels.map(")
+                && html.contains("const labelAnnos = dodged.map("),
+            "each line carries a direct, vertically-dodged end-label built in population order"
+        );
+        assert!(
+            html.contains("annotations: labelAnnos.concat(refAnnos)"),
+            "the labels and the Gaia/CCD references ride annotations, not a legend"
+        );
+        // The Gaia/CCD reference lines are no longer legend entries.
+        assert!(
+            !html.contains("name: label, showlegend: true"),
+            "the Gaia/CCD reference lines carry no legend entry (they are annotated)"
         );
     }
 
@@ -13436,10 +14847,53 @@ mod tests {
                 "the per-row coeff sub-label {sub} must be gone"
             );
         }
-        // Verdict reuses the OD grid's glyph vocabulary; PASS/FAIL words are gone.
+        // S3 item 3: one row per (object, coefficient). The per-channel `Channel`
+        // column and the separate `Result` verdict column are gone from the §3.3
+        // table (scoped, since the §1.2A outliers fold has its own Channel column);
+        // the rust, cli and python channels collapse into one agreement column and
+        // the absent C ABI channel `c` is one hatched column.
+        let ng = {
+            let s = html.find("id=\"s09b\"").expect("3.3 non-grav section");
+            let e = html[s..]
+                .find("id=\"part4\"")
+                .map(|i| s + i)
+                .unwrap_or(html.len());
+            &html[s..e]
+        };
         assert!(
-            html.contains("pass ? '·' : '✕'"),
-            "verdict must render · (pass) / ✕ (fail), the OD grid glyphs"
+            !ng.contains(">Channel</th>"),
+            "the §3.3 per-channel Channel column must be gone"
+        );
+        assert!(
+            !ng.contains("Result</th>") && !html.contains("pass ? '·' : '✕'"),
+            "the separate Result glyph column must be gone (z carries the verdict)"
+        );
+        assert!(
+            html.contains(">channels</th>") && html.contains(">c</th>"),
+            "the new columns are the channels-agreement column and the c column"
+        );
+        // The rust/cli/python agreement collapses: a mark when they agree, else
+        // the differing channel named.
+        assert!(
+            html.contains("rust, cli, python agree on fit and verdict")
+                && html.contains("differ from rust:"),
+            "the agreement column must collapse rust/cli/python with a named-difference fallback"
+        );
+        // The absent c channel is one hatched column, not a hatched row.
+        assert!(
+            html.contains("c (C ABI) emitted no non-grav row this run"),
+            "the absent c channel must be one hatched column with its reason"
+        );
+        // One row per (object, coefficient): the object cell spans coeffs.length,
+        // never the old channels × coeffs count.
+        assert!(
+            html.contains("rowspan=\"${coeffs.length}\"") && !html.contains("const totalSubRows"),
+            "the object cell must span one row per coefficient, not per channel × coefficient"
+        );
+        // The z cell still carries the pass/fail verdict on its colour and hover.
+        assert!(
+            html.contains("pass · |z| ≤ 3σ") && html.contains("fail · |z| > 3σ"),
+            "the z cell must carry the |z| ≤ 3 verdict on its hover"
         );
         for word in ["'PASS'", "'FAIL'", ">FAIL</td>", ">PASS</td>"] {
             assert!(
@@ -13447,11 +14901,6 @@ mod tests {
                 "a verdict word {word} still renders as a cell"
             );
         }
-        // The Result header carries the rule on its hover.
-        assert!(
-            html.contains("Result</th>") && html.contains("✕ fail"),
-            "Result header must carry the |z| rule on its hover"
-        );
     }
 
     #[test]
@@ -13463,7 +14912,10 @@ mod tests {
             ("Run summary", "What this run holds"),
             ("External tools", "External reference tools — transparency"),
             ("Provenance", "Reproducibility — provenance for this run"),
-            ("ASSIST configurations", "ASSIST configurations — six arms"),
+            (
+                "Configurations",
+                "Configuration of each external reference tool in this run",
+            ),
         ] {
             assert!(
                 html.contains(&format!(">{title}</div>")),
@@ -13479,7 +14931,7 @@ mod tests {
             "Run summary",
             "External tools",
             "Provenance",
-            "ASSIST configurations",
+            "Configurations",
         ] {
             assert!(
                 html.contains(&format!(">{label}</a>")),
@@ -13493,12 +14945,129 @@ mod tests {
             "External reference tools &mdash; transparency",
             "Reproducibility &mdash; Provenance",
             "&mdash; six arms",
+            ">ASSIST configurations</div>",
             "Provenance — frame, ephemeris, force model, references",
             "Methodology &middot; ASSIST arms",
         ] {
             assert!(
                 !html.contains(gone),
                 "old appendix text still present: {gone}"
+            );
+        }
+    }
+
+    /// S5a: the appendix "ASSIST configurations" (s05c) is now "Configurations"
+    /// with one subsection per EXTERNAL tool that has rows in the run; empyrean
+    /// is not a subsection and a tool with no rows emits nothing. Fails on the
+    /// pre-S5a structure (the old title and the per-configuration agreement
+    /// panels).
+    #[test]
+    fn configurations_appendix_has_one_subsection_per_external_tool_with_rows() {
+        let note = |cfg: &str| -> String {
+            match cfg {
+                "assist_default" => "config=assist_default integrator=ias15 epsilon=0.000000001 min_dt=0 adaptive_mode=global initial_dt=0.001 (assist 1.2.3 rebound 4.6.0)".to_string(),
+                "assist_layup" => "config=assist_layup integrator=ias15 epsilon=0.000000001 min_dt=0 adaptive_mode=prs23 initial_dt=0.001 (assist 1.2.3 rebound 4.6.0)".to_string(),
+                _ => "config=assist_asteroid_institute integrator=ias15 epsilon=0.000001 min_dt=0.000000001 adaptive_mode=global initial_dt=0.000001 (assist 1.2.3 rebound 4.6.0)".to_string(),
+            }
+        };
+        let mut rows = Vec::new();
+        for (cfg, var) in [
+            ("assist_default", "off"),
+            ("assist_default", "on"),
+            ("assist_layup", "off"),
+            ("assist_layup", "on"),
+            ("assist_asteroid_institute", "off"),
+            ("assist_asteroid_institute", "on"),
+        ] {
+            let mut r = synthetic_rust_prop_row("Apophis", 0.0);
+            r.channel = "assist".into();
+            r.propagation_uncertainty = Some(format!("{cfg}_variational_{var}"));
+            r.notes = note(cfg);
+            rows.push(r);
+        }
+        // find_orb: present (a propagation-comparison field), no config recorded.
+        let mut fo = synthetic_rust_prop_row("Apophis", 0.0);
+        fo.findorb_vs_horizons_km = Some(1.5);
+        rows.push(fo);
+        // kete + jorbit: timing only, on core rows.
+        let mut k = synthetic_rust_prop_row("Apophis", 0.0);
+        k.channel = "core".into();
+        k.kete_time_ms = Some(5.0);
+        rows.push(k);
+        let mut j = synthetic_rust_prop_row("Apophis", 0.0);
+        j.channel = "core".into();
+        j.jorbit_time_ms = Some(6.0);
+        rows.push(j);
+
+        let html = render_rows(&rows);
+
+        // Title, hover and rail all read "Configurations"; the old name is gone.
+        assert!(
+            html.contains(">Configurations</div>")
+                && html.contains(
+                    "title=\"Configuration of each external reference tool in this run\""
+                ),
+            "the appendix title and hover must read Configurations"
+        );
+        assert!(
+            html.contains(">Configurations</a>"),
+            "the rail entry must read Configurations"
+        );
+        assert!(
+            !html.contains("ASSIST configurations"),
+            "the old 'ASSIST configurations' name must be gone"
+        );
+        // One subsection anchor per external tool WITH rows; none for tools with
+        // no rows this run; none for empyrean.
+        for present in ["s05c-assist", "s05c-findorb", "s05c-kete", "s05c-jorbit"] {
+            assert!(
+                html.contains(&format!("id=\"{present}\"")),
+                "a subsection must render for the present external tool {present}"
+            );
+        }
+        for absent in [
+            "s05c-layup",
+            "s05c-orbfit",
+            "s05c-grss",
+            "s05c-oorb",
+            "s05c-adamcore",
+            "s05c-empyrean",
+        ] {
+            assert!(
+                !html.contains(&format!("id=\"{absent}\"")),
+                "no subsection may render for {absent} (no rows / not external)"
+            );
+        }
+        // ASSIST head states the recorded version; the arm table carries the
+        // recorded settings read from the notes, nothing hand-typed.
+        assert!(
+            html.contains("ASSIST &middot; <code>1.2.3</code>"),
+            "the ASSIST subsection head must state the recorded version"
+        );
+        for recorded in ["prs23", "global", "0.000000001", "0.000001"] {
+            assert!(
+                html.contains(recorded),
+                "the ASSIST arm table must carry the recorded setting {recorded}"
+            );
+        }
+        // find_orb ran but recorded no configuration: unrecorded settings render
+        // as the one null token with "not recorded" on hover.
+        assert!(
+            html.contains("title=\"not recorded\""),
+            "an unrecorded setting must render the null token with a not-recorded hover"
+        );
+        // Able to fail on the pre-S5a structure: the per-configuration agreement
+        // panels and the JS mounts are gone.
+        for gone in [
+            ">Position agreement vs empyrean</div>",
+            ">First-order agreement vs empyrean</div>",
+            ">Resolved integrator settings</div>",
+            "id=\"assist-arms-settings\"",
+            "id=\"assist-arms-pos\"",
+        ] {
+            assert!(
+                !html.contains(gone),
+                "pre-S5a structure still present: {gone}"
             );
         }
     }
@@ -14104,11 +15673,22 @@ mod tests {
         );
         assert!(
             numeric_cells("Configuration arms</div>", "Per-object walk</div>") > 0,
-            "4.2C main-effects sub-matrix (now leading the arm section) must render at least one numeric row"
+            "4.2D main-effects table (arms + calibration merged in S3) must render at least one numeric row"
+        );
+        // The merged arms+calibration section carries the Calibration content (the
+        // 1σ/2σ columns and the log-score mark) without a separate Calibration
+        // panel-title, so the per-object walk is now bounded by the timeline.
+        assert!(
+            numeric_cells("Per-object walk</div>", "Walk timeline</div>") > 0,
+            "4.2E per-object matrix must render at least one numeric row"
         );
         assert!(
-            numeric_cells("Per-object walk</div>", "Calibration</div>") > 0,
-            "4.2E per-object matrix must render at least one numeric row"
+            !html.contains(">Calibration</div>"),
+            "Calibration folds into the merged Configuration arms section (S3 item 2)"
+        );
+        assert!(
+            html.contains(">log-score absent</div>"),
+            "the merged section keeps the log-score-absent mark"
         );
         // The full arm axis (4) exceeds the rust arm count (3); the surfaces
         // provenance (folded into the panel-title hover) states 4 arms, and the
@@ -14150,7 +15730,7 @@ mod tests {
             .find("class=\"grid-key\"")
             .expect("coverage key present");
         let grid_at = cov
-            .find("<table class=\"agrid pw-grid\">")
+            .find("<table class=\"agrid pw-grid\" data-grid=\"predict\">")
             .expect("coverage matrix present");
         assert!(
             key_at < grid_at,
@@ -14180,13 +15760,13 @@ mod tests {
             "the 1-dof expected triple must carry a visible label"
         );
 
-        // Finding 5 / v2-#6: the corner states the cell is the trust-off observed
-        // 2σ percent, computed on Σ_pred-dominated rows only (the one load-bearing
-        // scope caveat, now on the always-visible header beside trust-off, not
-        // only the hover and the collapsed method body), and the horizon in days.
+        // Finding 5 / v2-#6 (S4): the cell scope — trust-off observed 2σ percent on
+        // Σ_pred-dominated rows only, the tool ╲ dt layout and the day horizon — is
+        // the one load-bearing caveat. S4 moved it off the per-matrix corner header
+        // onto the always-visible scope key line under the Coverage summary.
         assert!(
             cov.contains("trust-off · σ_pred-only 2σ% · tool ╲ dt · days"),
-            "the corner must state trust-off, the σ_pred-only scope, the 2σ unit and the day horizon"
+            "the scope key must state trust-off, the σ_pred-only scope, the 2σ unit and the day horizon"
         );
         assert!(
             cov.contains("σ_pred-only"),
@@ -14194,9 +15774,15 @@ mod tests {
         );
 
         // Finding 6: the covariance arm rides visibly beside the tool group name.
+        // Vocabulary (S3 item 7): the group header reads the product name
+        // `empyrean`, not the `rust` channel slug, and the covariance arm renders
+        // as factor words (`EFCC · adaptive · per-obs · linear`) with the raw id
+        // on hover only.
         assert!(
-            cov.contains("<span class=\"pwarm\">efcc.adap.nonight</span>"),
-            "the rust coverage group header must name its covariance arm on the face"
+            cov.contains(
+                ">empyrean <span class=\"pwarm\" title=\"arm efcc.adap.nonight\">EFCC · adaptive · per-obs · linear</span>"
+            ),
+            "the coverage group header must name empyrean and render the arm as factor words with the id on hover"
         );
     }
 
@@ -14602,5 +16188,759 @@ mod tests {
             "a snapshot mismatch must be refused"
         );
         assert!(merge_predict_aggregates(vec![]).unwrap().is_none());
+    }
+
+    // The population order is one canonical switch (POPULATION_ORDER) applied to
+    // every grid. Guards the constant (it names exactly the 13 catalog
+    // populations, nested in Part-4 class order, no duplicate) and proves the
+    // switch is wired into the agreement-grid spine: objects fed worst-value
+    // first and out of population order still render their population blocks in
+    // POPULATION_ORDER. The render half can fail — revert prop_like_ordered_blocks
+    // to a worst-descending block sort and NEO/Comet flip.
+    #[test]
+    fn population_order_is_the_single_canonical_switch() {
+        use std::collections::{BTreeSet, HashMap};
+        // (1) The constant names exactly the catalog's populations, with no
+        // duplicate, and each maps to one of the six Part-4 classes.
+        let in_order: BTreeSet<&str> = POPULATION_ORDER.iter().copied().collect();
+        assert_eq!(
+            in_order.len(),
+            POPULATION_ORDER.len(),
+            "POPULATION_ORDER must not repeat a population"
+        );
+        let catalog_pops: BTreeSet<&str> = crate::catalog::all_objects()
+            .iter()
+            .map(|o| o.population)
+            .collect();
+        assert_eq!(
+            in_order, catalog_pops,
+            "POPULATION_ORDER must name exactly the catalog's populations"
+        );
+        for &p in &POPULATION_ORDER {
+            // Panics if a population is unmapped — the constant stays in sync
+            // with the six-class taxonomy.
+            let _ = crate::predict_schema::classes::from_population(p);
+        }
+        // population_rank is the identity on the slice; an unknown sorts last.
+        for (i, &p) in POPULATION_ORDER.iter().enumerate() {
+            assert_eq!(
+                population_rank(p),
+                i,
+                "population_rank must match the slice for {p}"
+            );
+        }
+        assert_eq!(
+            population_rank("not a population"),
+            POPULATION_ORDER.len(),
+            "an unmapped population must sort last"
+        );
+        // class_rank is non-decreasing along the slice (classes stay contiguous).
+        let mut last = 0usize;
+        for &p in &POPULATION_ORDER {
+            let r = class_rank(crate::predict_schema::classes::from_population(p));
+            assert!(
+                r >= last,
+                "class_rank must be non-decreasing along POPULATION_ORDER (contiguous classes)"
+            );
+            last = r;
+        }
+
+        // (2) The switch is wired into the agreement-grid spine. Under the old
+        // worst-descending policy Comet (worst 10 km) would sort ahead of NEO
+        // (worst 1 km); the canonical order must still place NEO first.
+        let objects = [("Comet obj", "Comet"), ("NEO obj", "NEO")];
+        let dts = [0i64, 30];
+        let mut vals: HashMap<(String, i64), f64> = HashMap::new();
+        vals.insert(("Comet obj".to_string(), 0), 10.0);
+        vals.insert(("Comet obj".to_string(), 30), 8.0);
+        vals.insert(("NEO obj".to_string(), 0), 1.0);
+        vals.insert(("NEO obj".to_string(), 30), 0.5);
+        let blocks = prop_like_ordered_blocks(&objects, &dts, &vals);
+        let order: Vec<&str> = blocks.iter().map(|(p, _)| *p).collect();
+        assert_eq!(
+            order,
+            vec!["NEO", "Comet"],
+            "the canonical order must place NEO before Comet despite Comet's larger worst value"
+        );
+    }
+
+    // ───────────────────── S3 de-duplication tests ─────────────────────
+    // One per S3 item; each fails on the pre-S3 structure.
+
+    #[test]
+    fn s3_item1_timing_grids_fold_behind_one_per_object_disclosure() {
+        let html = render_rows(&timing_fixture());
+        // S7: the propagation cost (per-row + by-population) and its per-object G1
+        // grid live in §2.1's C slot. Scope to §2.1 (s-prop .. s-eph).
+        let spos = html.find("id=\"s-prop\"").expect("2.1 Propagation section");
+        let send = html[spos..].find("id=\"s-eph\"").map(|i| spos + i).unwrap();
+        let after = &html[spos..send];
+        let perrow = after
+            .find(">Per row</div>")
+            .expect("the per-row table stays open");
+        // The C-slot per-object fold is the `per object` disclosure that follows
+        // the per-row table (the A slot is also a `per object` fold, before it).
+        let fold = perrow
+            + after[perrow..]
+                .find("<details class=\"more-tables\"><summary class=\"more-sum\">per object</summary>")
+                .expect("2.1 C per-object fold present");
+        let g1 = after.find("id=\"g1-prop-time\"").expect("G1 grid present");
+        assert!(
+            perrow < fold,
+            "the per-row (and by-population) cost tables stay open, before the fold"
+        );
+        assert!(
+            fold < g1,
+            "the per-object G1 grid folds behind one `per object` disclosure"
+        );
+    }
+
+    // ───────────────────── S7 Part-2 reshape tests ─────────────────────
+    // One per item; each fails on the pre-S7 (s-ranking / s-timing) structure.
+
+    #[test]
+    fn s7_part2_is_three_sections_with_slot_anchors() {
+        let html = render_rows(&timing_fixture());
+        // The old two-section split (s-ranking / s-timing) is gone.
+        assert!(
+            !html.contains("id=\"s-ranking\"") && !html.contains("id=\"s-timing\""),
+            "the old 2.1 Side-by-side / 2.2 Wall-clock split is gone"
+        );
+        // Three axis sections, each with the A · B · C slot anchors the renderer
+        // emits (the scroll-spy targets).
+        for (sec, title) in [
+            ("s-prop", "Propagation"),
+            ("s-eph", "Ephemeris"),
+            ("s-od", "Orbit determination"),
+        ] {
+            assert!(
+                html.contains(&format!("<div class=\"section\" id=\"{sec}\">")),
+                "missing Part-2 section {sec}"
+            );
+            for slot in ["a", "b", "c"] {
+                assert!(
+                    html.contains(&format!(
+                        "class=\"slot-eyebrow spy-anchor\" id=\"{sec}-{slot}\""
+                    )),
+                    "section {sec} missing slot anchor {sec}-{slot}"
+                );
+            }
+            // The section-title div for this section carries the axis name.
+            let tid = format!("id=\"{sec}-title\"");
+            let t = html
+                .find(&tid)
+                .unwrap_or_else(|| panic!("section {sec} has no title div"));
+            let close = html[t..].find("</div>").map(|i| t + i).unwrap();
+            assert!(
+                html[t..close].contains(title),
+                "section {sec} title div missing axis name {title}"
+            );
+        }
+    }
+
+    #[test]
+    fn s7_b_by_population_slot_exists_for_all_three_axes() {
+        let html = render_rows(&timing_fixture());
+        // Every axis section has a B · by population slot (today only propagation
+        // did); fails on the old structure where ephemeris/OD had no marginal.
+        for sec in ["s-prop", "s-eph", "s-od"] {
+            assert!(
+                html.contains(&format!("id=\"{sec}-b\"")),
+                "section {sec} missing its B · by population slot"
+            );
+        }
+        // The ephemeris B is a population × tool matrix (empyrean + find_orb).
+        let se = html.find("id=\"s-eph-b\"").unwrap();
+        let se_end = html[se..].find("id=\"s-eph-c\"").map(|i| se + i).unwrap();
+        let eph_b = &html[se..se_end];
+        assert!(
+            eph_b.contains("<th class=\"gobj\">population</th>")
+                && eph_b.contains("<th>empyrean</th>")
+                && eph_b.contains("<th>find_orb</th>"),
+            "the ephemeris B states each tool's separation by population"
+        );
+        // The OD B is a population × tool matrix (empyrean σ_eq + find_orb conv).
+        let so = html.find("id=\"s-od-b\"").unwrap();
+        let so_end = html[so..].find("id=\"s-od-c\"").map(|i| so + i).unwrap();
+        let od_b = &html[so..so_end];
+        assert!(
+            od_b.contains("empyrean <span class=\"u\">σ_eq</span>")
+                && od_b.contains(">find_orb conv.</th>"),
+            "the OD B states empyrean σ_eq and find_orb convergence by population"
+        );
+    }
+
+    #[test]
+    fn s7_parts_3_and_4_heads_have_titles_and_no_lone_letters() {
+        let html = render_rows(&timing_fixture());
+        // 4.1 and 4.2 now render an on-page title (today they render none).
+        assert!(
+            html.contains(">Consistency with JPL at epoch</div>"),
+            "4.1 renders its on-page title"
+        );
+        assert!(
+            html.contains(">Predictive power</div>"),
+            "4.2 renders its on-page title"
+        );
+        // The P.n section numbers carry no lone slot letter any more.
+        for n in ["3.1", "3.2", "3.3", "4.1"] {
+            assert!(
+                html.contains(&format!("<div class=\"section-num\">{n}</div>")),
+                "section number {n} present without a lone letter"
+            );
+        }
+        for lone in [">3.1A<", ">3.2A<", ">3.3A<", ">4.1A<"] {
+            assert!(
+                !html.contains(lone),
+                "lone-letter section number {lone} survived"
+            );
+        }
+    }
+
+    #[test]
+    fn s7_rail_is_generated_for_every_part() {
+        let rail = build_rail_html();
+        // A rail-part header for each of the five parts.
+        for p in [
+            PART_NAME_1,
+            PART_NAME_2,
+            PART_NAME_3,
+            PART_NAME_4,
+            PART_NAME_APPENDIX,
+        ] {
+            assert!(
+                rail.contains(&format!("<div class=\"rail-part\">{p}</div>")),
+                "rail missing part header {p}"
+            );
+        }
+        // Part 2 is three fixed-slot entries, each with its A · B · C sub-entries.
+        for sec in ["s-prop", "s-eph", "s-od"] {
+            assert!(
+                rail.contains(&format!("data-target=\"{sec}\"")),
+                "rail missing Part-2 section {sec}"
+            );
+            for slot in ["a", "b", "c"] {
+                assert!(
+                    rail.contains(&format!("data-target=\"{sec}-{slot}\"")),
+                    "rail missing {sec}-{slot} sub-entry"
+                );
+            }
+        }
+        // Parts 3–4 and the appendix are flat entries, in the tree order.
+        for sec in [
+            "s10", "s05", "s09b", "s12", "s15", "s01", "s01b", "s05c", "s13",
+        ] {
+            assert!(
+                rail.contains(&format!("data-target=\"{sec}\"")),
+                "rail missing entry {sec}"
+            );
+        }
+        // No pre-S7 ranking/timing rail entries.
+        assert!(
+            !rail.contains("s-ranking") && !rail.contains("s-timing"),
+            "the pre-S7 rail entries are gone"
+        );
+    }
+
+    #[test]
+    fn s7_dom_order_equals_visual_order() {
+        let html = render_rows(&timing_fixture());
+        // No flex `order` reorders the content column: byte position IS the order.
+        assert!(!html.contains("{ order:"), "no flex order rule may survive");
+        let at = |id: &str| -> usize {
+            html.find(&format!("id=\"{id}\""))
+                .unwrap_or_else(|| panic!("missing #{id}"))
+        };
+        let seq = [
+            "part1-bar",
+            "s-prop",
+            "s-eph",
+            "s-od",
+            "part3",
+            "s10",
+            "s05",
+            "s09b",
+            "part4",
+            "s12",
+            "s15",
+            "appendix",
+            "s01",
+            "s01b",
+            "s05c",
+            "s13",
+        ];
+        let mut prev = 0usize;
+        for id in seq {
+            let p = at(id);
+            assert!(p > prev, "#{id} is out of DOM/visual order");
+            prev = p;
+        }
+    }
+
+    #[test]
+    fn s3_item2_arms_and_calibration_merge_into_one_factor_level_table() {
+        let rows = vec![synthetic_rust_prop_row("Apophis", 0.0)];
+        let agg = synthetic_predict_aggregates("snap");
+        let dir = tempfile::tempdir().unwrap();
+        let out = dir.path().join("report.html");
+        generate_report(&rows, &[], &out, None, Some(&agg)).unwrap();
+        let html = std::fs::read_to_string(&out).unwrap();
+        // One merged section: no separate Calibration panel-title.
+        assert!(
+            html.contains(">Configuration arms</div>") && !html.contains(">Calibration</div>"),
+            "Configuration arms and Calibration merge into one section"
+        );
+        // One factor × level header carries realism AND 1σ/2σ coverage together.
+        let m = html
+            .find(">marginal realism</span>")
+            .expect("marginal realism column");
+        let hdr = &html[m..m + html[m..].find("</tr>").expect("header row end")];
+        assert!(
+            hdr.contains(">1σ obs</span>") && hdr.contains(">2σ obs</span>"),
+            "the merged factor-level header pairs marginal realism with 1σ/2σ coverage"
+        );
+        // One of each fold, and the log-score-absent mark stays.
+        assert_eq!(
+            html.matches("<summary>full factor grid</summary>").count(),
+            1,
+            "one full factor grid fold"
+        );
+        assert_eq!(
+            html.matches("<summary>full arm list</summary>").count(),
+            1,
+            "one full arm list fold"
+        );
+        assert!(
+            html.contains(">log-score absent</div>"),
+            "the log-score-absent mark stays"
+        );
+    }
+
+    #[test]
+    fn s3_item3_nongrav_one_row_per_coeff_with_agreement_and_c_hatched() {
+        let html = render_synthetic_html();
+        assert!(
+            html.contains("rowspan=\"${coeffs.length}\"") && !html.contains("const totalSubRows"),
+            "one row per (object, coefficient), not per channel × coefficient"
+        );
+        let ng = {
+            let s = html.find("id=\"s09b\"").expect("3.3 non-grav section");
+            let e = html[s..]
+                .find("id=\"part4\"")
+                .map(|i| s + i)
+                .unwrap_or(html.len());
+            &html[s..e]
+        };
+        assert!(
+            ng.contains(">channels</th>")
+                && ng.contains(">c</th>")
+                && !ng.contains(">Channel</th>"),
+            "rust/cli/python collapse to one agreement column; c is its own column"
+        );
+        assert!(
+            html.contains("c (C ABI) emitted no non-grav row this run"),
+            "the absent c channel is one hatched column with its reason"
+        );
+    }
+
+    #[test]
+    fn s3_item4_outliers_fold_into_1_2a_and_section_and_rail_are_gone() {
+        let html = render_rows(&pair_test_rows());
+        assert!(
+            !html.contains("id=\"s07\"") && !html.contains("data-target=\"s07\""),
+            "the standalone 1.2D Outliers section and its rail entry are gone"
+        );
+        // S6: the merged 1.2 section runs from s06 to the merged 1.3 section s08b.
+        let s06 = html.find("id=\"s06\"").expect("1.2 section");
+        let s06end = html[s06..].find("id=\"s08b\"").map(|i| s06 + i).unwrap();
+        let sec = &html[s06..s06end];
+        assert!(
+            sec.contains("<summary class=\"more-sum\">outliers</summary>")
+                && sec.contains("<tbody id=\"eph-outliers\">"),
+            "the outliers table folds into §1.2 as the `outliers` disclosure"
+        );
+        assert!(
+            sec.contains("class=\"rwn\"") && sec.contains("runaway</span>"),
+            "the §1.2A summary line gains the runaway count element (JS fills the number)"
+        );
+    }
+
+    #[test]
+    fn s3_item5_assist_capped_moves_into_2_2_n_and_a3_timing_table_gone() {
+        // Two timed ASSIST default rows plus one capped (null wall clock).
+        let mut rows = Vec::new();
+        for dt in [0.0_f64, 30.0, 60.0] {
+            let mut r = synthetic_rust_prop_row("Apophis", dt);
+            r.channel = "assist".into();
+            r.propagation_uncertainty = Some("assist_default_variational_off".into());
+            r.assist_time_ms = if dt == 60.0 { None } else { Some(6.0) };
+            r.emp_time_ms = None;
+            rows.push(r);
+        }
+        let html = render_rows(&rows);
+        assert!(
+            !html.contains(">Per-horizon median timing</div>")
+                && !html.contains("id=\"assist-arms-timing\""),
+            "the §A.3 per-horizon timing panel-title and its mount are removed"
+        );
+        assert!(
+            html.contains("(capped 1)"),
+            "the capped (loud-FAIL) count moves into §2.2's n column, so nothing is lost"
+        );
+    }
+
+    #[test]
+    fn s3_item6_sigma_eq_owned_by_1_3a_trimmed_from_2_1_and_4_1a() {
+        let (rows, cmp) = radar_scenario();
+        let dir = tempfile::tempdir().unwrap();
+        let out = dir.path().join("report.html");
+        generate_report(&rows, &cmp, &out, None, None).unwrap();
+        let html = std::fs::read_to_string(&out).unwrap();
+
+        // 2.1 "By object and fitter": the empyrean σ_eq column is dropped (1.3A
+        // owns it); the external fitter stays and the panel links to §1.3A.
+        let s2 = html
+            .find("By object and fitter")
+            .expect("2.1 by-object-and-fitter table");
+        let t2 = &html[s2..s2 + html[s2..].find("</table>").expect("2.1 table end")];
+        assert!(
+            t2.contains("<th>find_orb</th>") && !t2.contains("<th>empyrean</th>"),
+            "2.1 keeps the external fitter column and drops the duplicate empyrean σ_eq column"
+        );
+        assert!(
+            html[s2..].contains("href=\"#s08b\""),
+            "2.1 links to §1.3A for empyrean's per-object σ_eq"
+        );
+
+        // 4.1A "Complete per-object table": the duplicate σ_eq column is dropped;
+        // pathology, the paired χ²r, the σ ratio and the JPL arc stay.
+        let s4 = html
+            .find("Complete per-object table")
+            .expect("4.1A per-object table");
+        let t4 = &html[s4..s4 + html[s4..].find("</table>").expect("4.1A table end")];
+        assert!(
+            !t4.contains("<span class=\"u\">σ_eq</span>"),
+            "4.1A drops the duplicate per-object σ_eq column"
+        );
+        assert!(
+            t4.contains(">pathology</th>")
+                && t4.contains("χ²ᵣ emp / JPL")
+                && t4.contains("σ ratio (a)")
+                && t4.contains("arc (days)"),
+            "4.1A keeps pathology, the paired χ²r, the σ ratio and the JPL arc"
+        );
+    }
+
+    #[test]
+    fn s3_item7_coverage_group_header_names_empyrean_and_factor_words() {
+        let rows = vec![synthetic_rust_prop_row("Apophis", 0.0)];
+        let agg = synthetic_predict_aggregates("snap");
+        let dir = tempfile::tempdir().unwrap();
+        let out = dir.path().join("report.html");
+        generate_report(&rows, &[], &out, None, Some(&agg)).unwrap();
+        let html = std::fs::read_to_string(&out).unwrap();
+        assert!(
+            html.contains(">empyrean <span class=\"pwarm\" title=\"arm efcc.adap.nonight\">EFCC · adaptive · per-obs · linear</span>"),
+            "the 4.2 coverage group header reads empyrean + the arm as factor words"
+        );
+        assert!(
+            !html.contains("<span class=\"pwarm\">efcc.adap.nonight</span>"),
+            "the raw arm id no longer renders as the chip text (it rides the hover)"
+        );
+    }
+
+    // ── S5 (P4 remainder) ───────────────────────────────────────────────────
+
+    #[test]
+    fn s5_item1_part_heads_are_eyebrow_title_and_part1_carries_the_controls() {
+        let html = render_rows(&pair_test_rows());
+        // Part heads are a mono eyebrow over a Syne title (both classes present,
+        // split from "Part N · Title"). Fails on the old single-string head.
+        assert!(
+            html.contains("<span class=\"ph-eyebrow\">Part 1</span><span class=\"ph-title\">Reference agreement</span>"),
+            "the Part 1 head splits into a mono eyebrow + Syne title"
+        );
+        assert!(
+            html.contains("class=\"ph-eyebrow\">Part 2<")
+                && html.contains("class=\"ph-eyebrow\">Part 4<"),
+            "every Part head carries the eyebrow + title shape"
+        );
+        // The part-head is flush on the content edge — no centring box.
+        let ph = html.find(".part-head {").expect("part-head rule");
+        let rule = &html[ph..ph + html[ph..].find('}').unwrap()];
+        assert!(
+            rule.contains("max-width: none") && !rule.contains("1400px"),
+            "the Part head is left-aligned on the content edge, not a centred 1400px box: {rule}"
+        );
+        // The Compare controls ride the Part 1 head line: the sticky bar carries
+        // the head stack AND the two selects, and the separate #part1 head is gone.
+        assert!(
+            html.contains("<div class=\"part1-bar\" id=\"part1-bar\">")
+                && html.contains("<div class=\"ph-head\"><span class=\"ph-eyebrow\">Part 1</span>"),
+            "the sticky Compare bar is the Part 1 head line"
+        );
+        assert!(
+            !html.contains("\"part-head\" id=\"part1\">"),
+            "the separate #part1 part-head is merged into the sticky bar"
+        );
+    }
+
+    #[test]
+    fn s5_item2_one_null_token_in_the_error_formatter() {
+        let html = render_rows(&pair_test_rows());
+        // The km error formatter returns the one null token (—), not the legacy
+        // triple-hyphen variant. Fails on the old '---' return.
+        assert!(
+            html.contains("if (km == null) return '—';"),
+            "the error formatter returns the one null token"
+        );
+        assert!(
+            !html.contains("return '---'"),
+            "the legacy triple-hyphen null variant is gone"
+        );
+    }
+
+    #[test]
+    fn s5_item3_keys_collapse_to_chip_and_grid_key_no_plotly_legend() {
+        let html = render_rows(&pair_test_rows());
+        // The inline value chip carries its decade on a data attribute, so every
+        // chip shares one class signature — the `.lchip.gbN` form is gone.
+        assert!(
+            html.contains(".lchip[data-gb=\"1\"]") && html.contains(".lchip[data-gb=\"7\"]"),
+            "the ladder chip ink is keyed on data-gb, not a gbN class"
+        );
+        assert!(
+            !html.contains(".lchip.gb") && !html.contains("class=\"lchip gb"),
+            "no chip carries a gbN class any more"
+        );
+        // The rvruler mini-key is folded away (renamed off the key selector).
+        assert!(
+            html.contains(".rvnote {")
+                && !html.contains(".rvruler {")
+                && !html.contains("class=\"rvruler\""),
+            "the rvruler key component is gone"
+        );
+        // The remaining Plotly legends (3.2, 4.1) are gone in favour of direct
+        // labels — the shared COV_LEGEND placement no longer exists.
+        assert!(
+            !html.contains("COV_LEGEND"),
+            "the covariance-panel Plotly legend is gone (direct labels replace it)"
+        );
+        assert!(
+            html.contains("const chiAnnos =") && html.contains("const d3Annos ="),
+            "the chi² and derivatives panels build direct-label annotations"
+        );
+        // The growth end labels are vertically dodged where lines converge.
+        assert!(
+            html.contains("const dodged = popLabels.map(") && html.contains("MINSEP"),
+            "the growth direct labels are dodged"
+        );
+    }
+
+    #[test]
+    fn s5_item4_a1_mono_line_no_chart_cards_modebar_download_only() {
+        let html = render_rows(&pair_test_rows());
+        // A.1 is one mono line of counts — no stat cards, no dot legends.
+        assert!(
+            html.contains("class=\"grid-summary run-counts\"")
+                && html.contains(" objects · ")
+                && html.contains(" channels</div>"),
+            "A.1 renders a mono run-counts line (recognised as a summary line)"
+        );
+        assert!(
+            !html.contains("class=\"summary-card\"") && !html.contains("<div class=\"legend\">"),
+            "A.1 drops the seven stat cards and the two dot legends"
+        );
+        // The modebar carries only the one branded download button.
+        assert!(
+            html.contains("modeBarButtons: [[{ name: 'downloadPng'"),
+            "the modebar is a single-group list with only the download button"
+        );
+        assert!(
+            !html.contains("modeBarButtonsToRemove") && !html.contains("modeBarButtonsToAdd"),
+            "no default-tool add/remove lists survive"
+        );
+        // Every axis uses power exponents; charts carry no card (border + inset).
+        assert!(
+            html.contains("exponentformat: 'power'"),
+            "axes use power exponents"
+        );
+        let cc = html
+            .find(".chart-container {")
+            .expect("chart-container rule");
+        let rule = &html[cc..cc + html[cc..].find('}').unwrap()];
+        assert!(
+            rule.contains("border: none") && rule.contains("background: transparent"),
+            "charts carry no card (no border, no inset fill): {rule}"
+        );
+    }
+
+    #[test]
+    fn s5_item5_colours_kit_accent_and_unified_error_ink() {
+        let html = render_rows(&pair_test_rows());
+        // The light-theme text accent is the kit value #2d6da3.
+        assert!(
+            html.contains("--ed-accent: #2d6da3"),
+            "the light accent is the kit text-accent #2d6da3"
+        );
+        // The two freelanced error reds collapse to the one error token.
+        assert!(
+            !html.contains("#e0654a"),
+            "the second error red is unified onto the error token"
+        );
+        // The masthead dim ink reads a token, not a bespoke rgba.
+        assert!(
+            html.contains(".masthead h1 .mh-dim { color: var(--ed-text-muted); }")
+                && !html.contains("rgba(232,232,236,0.38)"),
+            "the dim masthead ink reads a token"
+        );
+        // The compare-bar tool categorical colours are gone (names only).
+        assert!(
+            !html.contains("style=\"color:var(--tool-empyrean)\""),
+            "the compare-bar selects carry no per-tool categorical colour"
+        );
+    }
+
+    #[test]
+    fn s5_item6_timing_key_line_and_a2_absent_line_is_data_driven() {
+        let dir = tempfile::tempdir().unwrap();
+        let out = dir.path().join("report.html");
+        generate_report(&timing_fixture(), &[], &out, None, None).unwrap();
+        let html = std::fs::read_to_string(&out).unwrap();
+        // The 2.2 timing tables carry ONE visible key line; the header-row hover
+        // sentence is gone from the speed matrix. Delta 9: the key line is a terse
+        // unit key, not a sentence (reading guidance moved to the Method fold).
+        assert!(
+            html.contains("<div class=\"grid-summary\">ms · p5 p50 p95 · n · by boundary</div>"),
+            "the speed matrix states its reading in one terse unit key line"
+        );
+        assert!(
+            html.contains("id=\"t1-speed-matrix\"><thead><tr><th class=\"gobj\">arm</th>"),
+            "the speed-matrix header row no longer carries a hover sentence"
+        );
+        // The A.2 "planned / opt-in" line is data-driven: the old static long
+        // hover naming all three tools is gone.
+        assert!(
+            !html.contains("OrbFit Consortium / IAU MPC (CMC2003 rejection)"),
+            "the A.2 planned line is computed from the run, not a static enumeration"
+        );
+    }
+
+    /// Delta 9 item 3: a key line (`.grid-summary`, or the readout unit key) names
+    /// units/axes in the terse `·` idiom and must never carry a sentence. A
+    /// "sentence" here is a period followed by whitespace and a capital (an
+    /// embedded sentence boundary), OR a run of prose — more than 8 words with no
+    /// `·` field separator. Readout SUMMARY lines (id `…-summary`) are exempt:
+    /// the brief budgets them at ≤25 words of numbers. Fails on the pre-delta
+    /// lines ("Wall clock … Read within a boundary." / "Median … read down a
+    /// column."); the self-checks below prove the detector can fail.
+    #[test]
+    fn delta9_key_lines_are_terse_not_sentences() {
+        fn visible(inner: &str) -> String {
+            let mut out = String::new();
+            let mut depth = 0i32;
+            for ch in inner.chars() {
+                match ch {
+                    '<' => depth += 1,
+                    '>' => depth = (depth - 1).max(0),
+                    _ if depth == 0 => out.push(ch),
+                    _ => {}
+                }
+            }
+            out.split_whitespace().collect::<Vec<_>>().join(" ")
+        }
+        fn alpha_words(s: &str) -> usize {
+            s.split_whitespace()
+                .filter(|w| w.chars().any(|c| c.is_ascii_alphabetic()))
+                .count()
+        }
+        fn period_then_capital(s: &str) -> bool {
+            let c: Vec<char> = s.chars().collect();
+            for i in 0..c.len() {
+                if c[i] == '.' {
+                    let mut j = i + 1;
+                    while j < c.len() && c[j].is_whitespace() {
+                        j += 1;
+                    }
+                    if j < c.len() && c[j].is_ascii_uppercase() {
+                        return true;
+                    }
+                }
+            }
+            false
+        }
+        fn is_sentence(s: &str) -> bool {
+            period_then_capital(s) || (!s.contains('·') && alpha_words(s) > 8)
+        }
+        // The detector proves it can fail — pre-delta sentences flag, terse keys
+        // and short numeric readouts do not.
+        assert!(is_sentence(
+            "Median propagation ms per population; read down a column."
+        ));
+        assert!(is_sentence(
+            "Wall clock (ms) per arm; p5 · p50 · p95 · n, grouped by boundary. Read within a boundary."
+        ));
+        assert!(!is_sentence("ms · p5 p50 p95 · n · by boundary"));
+        assert!(!is_sentence("median ms · by population"));
+        assert!(!is_sentence("km"));
+        assert!(!is_sentence("No walk-forward data in this report."));
+
+        let dir = tempfile::tempdir().unwrap();
+        let out = dir.path().join("report.html");
+        generate_report(&timing_fixture(), &[], &out, None, None).unwrap();
+        let html = std::fs::read_to_string(&out).unwrap();
+        // The key lines this delta governs are the Part 1 and Part 2 unit keys
+        // (the C·cost timing keys and the Part-2 readout keys km/mas/σ_eq); scan
+        // up to Part 3. Downstream parts carry ≤25-word numeric readout summaries
+        // (e.g. §4.1's "Median σ_eq … too tight.") that are not unit keys.
+        let scope_end = html.find("id=\"part3\"").unwrap_or(html.len());
+        for (attrs, inner) in elements_by_class(&html[..scope_end], "grid-summary") {
+            // Readout summary lines carry the section's numbers at the ≤25-word
+            // budget, not a unit key — exempt (id `…-summary`).
+            if attrs.contains("-summary\"") {
+                continue;
+            }
+            let text = visible(inner);
+            assert!(
+                !is_sentence(&text),
+                "grid-summary key line is a sentence: {text:?} (attrs {attrs:?})"
+            );
+        }
+    }
+
+    /// Delta 9 item 1: the masthead no longer states the channel under test. No
+    /// "RUST"/"Rust channel under test" (nor any "Rust") survives in the
+    /// masthead; the statement moved once to Part 3's scope line (eyebrow role).
+    #[test]
+    fn delta9_masthead_has_no_rust_channel_under_test() {
+        let dir = tempfile::tempdir().unwrap();
+        let out = dir.path().join("report.html");
+        generate_report(&timing_fixture(), &[], &out, None, None).unwrap();
+        let html = std::fs::read_to_string(&out).unwrap();
+        let mstart = html.find("<div class=\"masthead\">").expect("masthead");
+        let mend = mstart
+            + html[mstart..]
+                .find("<div class=\"layout-wrap\">")
+                .expect("masthead end");
+        let masthead = &html[mstart..mend];
+        assert!(
+            !masthead.contains("RUST"),
+            "masthead must not carry upper-case RUST: {masthead:?}"
+        );
+        assert!(
+            !masthead.contains("Rust channel under test"),
+            "the masthead 'Rust channel under test' subtitle is gone"
+        );
+        assert!(
+            !masthead.contains("Rust"),
+            "the masthead carries no 'Rust' at all: {masthead:?}"
+        );
+        // The statement moved once to Part 3's scope line.
+        let p3 = html.find("id=\"part3\"").expect("part3 head");
+        let p3win = &html[p3..(p3 + 800).min(html.len())];
+        assert!(
+            p3win.contains("data-k=\"channels\"") && p3win.contains("rust (under test)"),
+            "Part 3 states the channel under test once in its eyebrow scope line: {p3win:?}"
+        );
     }
 }
