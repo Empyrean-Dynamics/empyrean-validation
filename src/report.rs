@@ -9237,7 +9237,7 @@ pub fn generate_report(
     };
     // The empyrean distribution version the component table reports, defined once
     // here and reused by the branded-export attribution so the two cannot drift.
-    let empyrean_version = "0.10.0";
+    let empyrean_version = "0.11.0-rc.0";
     // The branded-export attribution, built once server-side. It is emitted only
     // into the client script (never as visible page text); the download handler
     // appends each chart's own section, title and selected pair at click time.
@@ -9488,7 +9488,7 @@ pub fn generate_report(
     // ── §13 Reproducibility footer — every detail a referee needs to
     // reproduce a number from this report. Static content for now;
     // version + git-hash fields hard-coded against the current pins
-    // (empyrean 0.10.0 / empyrean-core v0.10.2 / hyperjet 1.15). Per-row
+    // (empyrean 0.11.0-rc.0 / empyrean-core v0.11.0 / hyperjet 1.15.0). Per-row
     // run-time provenance (commit hash, kernel hash) is a follow-up.
     let provenance_footer_html = format!(
         r##"
@@ -10158,11 +10158,11 @@ pub fn generate_report(
     <thead><tr><th style="text-align:left">Component</th><th style="text-align:left">Purpose</th><th>Version</th></tr></thead>
     <tbody>
       <tr><td style="text-align:left">hyperjet</td><td style="text-align:left">Automatic differentiation &mdash; STMs / STTs</td><td>1.15.0</td></tr>
-      <tr><td style="text-align:left">empyrean-core</td><td style="text-align:left">Reference channel (<code>validate-core</code>)</td><td>0.10.2</td></tr>
+      <tr><td style="text-align:left">empyrean-core</td><td style="text-align:left">Reference channel (<code>validate-core</code>)</td><td>0.11.0</td></tr>
       <tr><td style="text-align:left">empyrean</td><td style="text-align:left">Distribution under test &mdash; Rust wrapper, C ABI, Python wheel, CLI</td><td>{empyrean_version}</td></tr>
-      <tr><td style="text-align:left">empyrean-py</td><td style="text-align:left">Python wheel</td><td>0.10.0</td></tr>
-      <tr><td style="text-align:left">empyrean-cli</td><td style="text-align:left">Command-line interface</td><td>0.10.0</td></tr>
-      <tr><td style="text-align:left">C ABI</td><td style="text-align:left"><code>EMPYREAN_ABI_VERSION</code> &mdash; equality-checked at load</td><td>1000</td></tr>
+      <tr><td style="text-align:left">empyrean-py</td><td style="text-align:left">Python wheel</td><td>0.11.0-rc.0</td></tr>
+      <tr><td style="text-align:left">empyrean-cli</td><td style="text-align:left">Command-line interface</td><td>0.11.0-rc.0</td></tr>
+      <tr><td style="text-align:left">C ABI</td><td style="text-align:left"><code>EMPYREAN_ABI_VERSION</code> &mdash; equality-checked at load</td><td>1100</td></tr>
     </tbody>
   </table>
   </div>
