@@ -1,0 +1,83 @@
+name: Validation finding
+description: empyrean disagrees with another tool or a published reference at a level you do not consider acceptable.
+title: "[validation]: "
+labels: ["validation", "needs-triage"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thank you. We triage validation findings the same week. Our own
+        comparisons against other tools are published at
+        https://validation.empyrean-dynamics.com and produced by this
+        repository; a finding that extends or contradicts them is exactly what
+        we want to see. To discuss a comparison before it is a finding, start a
+        [discussion](https://github.com/Empyrean-Dynamics/empyrean/discussions/categories/q-a)
+        tagged validation.
+
+  - type: input
+    id: object
+    attributes:
+      label: Object
+      description: Designation or name, and the orbit solution or epoch you started from.
+      placeholder: "99942 Apophis, JPL solution 216, epoch 2461000.5 TDB"
+    validations:
+      required: true
+
+  - type: dropdown
+    id: quantity
+    attributes:
+      label: Quantity compared
+      options:
+        - State vector or orbital elements at an epoch
+        - Close approach time or distance
+        - Impact probability or B-plane coordinates
+        - Ephemeris (RA, Dec, rates, magnitudes)
+        - Orbit determination solution or residuals
+        - Covariance or uncertainty product
+        - Other
+    validations:
+      required: true
+
+  - type: dropdown
+    id: reference
+    attributes:
+      label: Reference
+      options:
+        - JPL Horizons
+        - JPL SBDB, CNEOS Sentry or Scout
+        - ESA NEOCC
+        - ASSIST
+        - find_orb
+        - OpenOrb
+        - GRSS
+        - jorbit
+        - Published paper or table
+        - Other
+    validations:
+      required: true
+
+  - type: textarea
+    id: comparison
+    attributes:
+      label: The disagreement
+      description: The empyrean value, the reference value, their difference, and why you consider it unacceptable (expected numerical agreement, quoted uncertainty, time span).
+    validations:
+      required: true
+
+  - type: textarea
+    id: reproducer
+    attributes:
+      label: How to reproduce both numbers
+      description: The empyrean call (Python, Rust, CLI or C ABI) and how the reference value was obtained, so we can run both.
+      render: shell
+    validations:
+      required: true
+
+  - type: textarea
+    id: version
+    attributes:
+      label: Version output
+      description: "`empyrean --version` or the Python version string; include the kernel set if you changed it."
+      render: text
+    validations:
+      required: true

@@ -1,0 +1,11 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Question or general discussion
+    url: https://github.com/Empyrean-Dynamics/empyrean/discussions/categories/q-a
+    about: The central discussion board for everything Empyrean. Start there to discuss a comparison before it is a finding; tag it validation.
+  - name: Published validation results
+    url: https://validation.empyrean-dynamics.com
+    about: Our comparisons against other tools and references, per object, per quantity and per tool.
+  - name: Bug in empyrean itself
+    url: https://github.com/Empyrean-Dynamics/empyrean/issues/new/choose
+    about: A crash or an API defect that is not a numerical disagreement belongs in the empyrean repository.
