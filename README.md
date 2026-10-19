@@ -5,7 +5,7 @@ Cross-channel and external-reference validation for the empyrean astrodynamics s
 
 <a href="https://github.com/Empyrean-Dynamics/empyrean-validation/actions/workflows/rust.yml"><img src="https://github.com/Empyrean-Dynamics/empyrean-validation/actions/workflows/rust.yml/badge.svg" alt="CI"></a>
 <a href="https://github.com/Empyrean-Dynamics/empyrean-validation/actions/workflows/validation.yml"><img src="https://github.com/Empyrean-Dynamics/empyrean-validation/actions/workflows/validation.yml/badge.svg" alt="Validation Suite"></a>
-<a href="https://github.com/Empyrean-Dynamics/empyrean/releases/tag/v0.10.0-rc.0"><img src="https://img.shields.io/badge/validates-empyrean%200.10.0--rc.0-1a1a2e?style=flat-square" alt="validates empyrean 0.10.0-rc.0"></a>
+<a href="https://github.com/Empyrean-Dynamics/empyrean/releases/tag/v0.11.0-rc.0"><img src="https://img.shields.io/badge/validates-empyrean%200.11.0--rc.0-1a1a2e?style=flat-square" alt="validates empyrean 0.11.0-rc.0"></a>
 <br>
 <a href="LICENSE"><img src="https://img.shields.io/badge/license-BSD--3--Clause-blue.svg?style=flat-square" alt="License"></a>
 <a href="https://doi.org/10.5281/zenodo.21315119"><img src="https://zenodo.org/badge/1225313390.svg" alt="DOI"></a>
@@ -146,13 +146,13 @@ building from, and revert them before committing.
 
 ### What the current pins validate
 
-The committed manifests pin **empyrean `0.10.0-rc.0`** (crates.io and
-PyPI) and **hyperjet `1.13.0`**, against the **empyrean-core `0.10.1`**
+The committed manifests pin **empyrean `0.11.0-rc.0`** (crates.io and
+PyPI) and **hyperjet `1.15.0`**, against the **empyrean-core `0.11.0`**
 reference channel. Two things about that generation change how a run is
 set up:
 
 - **The C ABI is distribution-versioned and the load handshake is an
-  equality check** — `EMPYREAN_ABI_VERSION` is `1000`. The C-channel
+  equality check** — `EMPYREAN_ABI_VERSION` is `1100`. The C-channel
   runner now asserts it at startup against the loaded `libempyrean` and
   refuses to run on a mismatch, because the versions encode struct
   layout: a stale library is not a degraded run but a reinterpretation of
