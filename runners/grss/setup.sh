@@ -20,12 +20,20 @@
 #
 # 2. KERNELS. `import grss` calls grss.utils.initialize(), which shells out to
 #    the package's own get_kernels.py — and that pulls the FULL kernel set,
-#    4.4 GB, including DE441 (3.3 GB) and the long-span SB441-N16 (646 MB).
-#    The validation grid spans ~2005-2040, entirely inside DE440's 1550-2650
-#    coverage, so this script fetches only the DE440-case set (~235 MB):
+#    4.4 GB, including DE441 (3.3 GB) and the long-span SB441-N16 (646 MB),
+#    from dated NAIF file names that move. The validation grid spans
+#    ~2005-2040, entirely inside DE440's 1550-2650 coverage, so this script
+#    stages only the DE440-case set (~235 MB) under GRSS's own names:
 #
 #        de440.bsp  sb441-n16s.bsp  earth_{latest,historic,predict}.bpc
 #        moon_pa_de440.bpc  pck00011.tpc
+#
+#    The planetary ephemeris and the Earth/Moon orientation kernels come from
+#    the registered kernel set every empyrean repo pins (synced into DATA_DIR
+#    by the suite; CI restores it before this script runs) — the same files
+#    the engine reads, never a second download of a moving name. Only the two
+#    files the set does not carry, the short-span SB441-N16 and pck00011.tpc,
+#    are fetched, from stable undated addresses.
 #
 #    run_grss.py passes `--de-kernel 440` to match and STAMPS the kernel
 #    version into every row's `source_version`, so the report always records
@@ -117,39 +125,68 @@ fi
 echo "grss package: $GRSS_PKG"
 
 # ── 2. SPICE kernels ───────────────────────────────────────
-# Fetched here, deliberately, instead of letting `import grss` shell out to
-# get_kernels.py — see the header. Downloads are atomic (temp file, then
-# rename) and size-verified against the server's Content-Length on every
-# invocation, cache hit or miss, so a truncated kernel can never be silently
-# reused by a fit. Mirrors the fixture-fetch discipline in
-# scripts/fetch-fixtures.sh.
+# Staged here, deliberately, instead of letting `import grss` shell out to
+# get_kernels.py — see the header.
 NAIF="https://naif.jpl.nasa.gov/pub/naif/generic_kernels"
 SSD="https://ssd.jpl.nasa.gov/ftp"
-
-KERNELS=(
-    "$NAIF/pck/earth_latest_high_prec.bpc|earth_latest.bpc"
-    "$NAIF/pck/earth_620120_250826.bpc|earth_historic.bpc"
-    "$NAIF/pck/earth_2025_250826_2125_predict.bpc|earth_predict.bpc"
-    "$NAIF/pck/moon_pa_de440_200625.bpc|moon_pa_de440.bpc"
-    "$NAIF/pck/pck00011.tpc|pck00011.tpc"
-)
-if [ "$GRSS_DE_KERNEL" = "441" ]; then
-    KERNELS+=(
-        "$SSD/eph/planets/bsp/de441.bsp|de441.bsp"
-        "$SSD/eph/small_bodies/asteroids_de441/sb441-n16.bsp|sb441-n16.bsp"
-    )
-else
-    KERNELS+=(
-        "$SSD/eph/planets/bsp/de440.bsp|de440.bsp"
-        "$SSD/xfr/sb441-n16s.bsp|sb441-n16s.bsp"
-    )
-fi
 
 KDIR="$GRSS_PKG/kernels"
 mkdir -p "$KDIR"
 
+# ── 2a. From the registered kernel set ─────────────────────
+# DATA_DIR is the synced set (the Makefile passes its DATA_DIR; the suite's
+# default is ~/.empyrean/data). Each file is matched by the pattern its NAIF
+# name follows across set versions and must match exactly once; a missing or
+# ambiguous file is a hard stop with the set named, never a download.
+DATA_DIR="${DATA_DIR:-$HOME/.empyrean/data}"
+if [ ! -d "$DATA_DIR" ]; then
+    echo "ERROR: DATA_DIR=$DATA_DIR does not exist." >&2
+    echo "       GRSS stages its planetary and orientation kernels from the registered" >&2
+    echo "       kernel set the suite syncs there; sync it first (the CI prep job does)." >&2
+    exit 1
+fi
+stage_from_set() {  # stage_from_set <pattern> <grss name>
+    local pattern="$1" name="$2"
+    local matches=()
+    while IFS= read -r f; do matches+=("$f"); done < <(find "$DATA_DIR" -maxdepth 1 -name "$pattern" -type f | sort)
+    if [ "${#matches[@]}" -ne 1 ] || [ ! -s "${matches[0]}" ]; then
+        echo "ERROR: expected exactly one non-empty '$pattern' in the registered kernel set at" >&2
+        echo "       $DATA_DIR; found ${#matches[@]}. GRSS never downloads what the set carries." >&2
+        exit 1
+    fi
+    local src="${matches[0]}" dest="$KDIR/$name"
+    if [ -f "$dest" ] && cmp -s "$src" "$dest"; then
+        printf '  ok       %-22s %s (set)\n' "$name" "$(basename "$src")"
+    else
+        printf '  staging  %-22s %s (set)\n' "$name" "$(basename "$src")"
+        cp -f "$src" "$dest.part" && mv "$dest.part" "$dest"
+    fi
+}
 echo
 echo "──── SPICE kernels (DE$GRSS_DE_KERNEL case) → $KDIR ────"
+stage_from_set "earth_latest_high_prec.bpc"   "earth_latest.bpc"
+stage_from_set "earth_620120_*.bpc"           "earth_historic.bpc"
+stage_from_set "earth_*_predict.bpc"          "earth_predict.bpc"
+stage_from_set "moon_pa_de440_*.bpc"          "moon_pa_de440.bpc"
+if [ "$GRSS_DE_KERNEL" = "441" ]; then
+    stage_from_set "sb441-n16.bsp" "sb441-n16.bsp"
+else
+    stage_from_set "de440.bsp" "de440.bsp"
+fi
+
+# ── 2b. The two files the set does not carry ──────────────
+# Stable, undated addresses. Downloads are atomic (temp file, then rename)
+# and size-verified against the server's Content-Length on every invocation,
+# cache hit or miss, so a truncated kernel can never be silently reused.
+KERNELS=(
+    "$NAIF/pck/pck00011.tpc|pck00011.tpc"
+)
+if [ "$GRSS_DE_KERNEL" = "441" ]; then
+    KERNELS+=( "$SSD/eph/planets/bsp/de441.bsp|de441.bsp" )
+else
+    KERNELS+=( "$SSD/xfr/sb441-n16s.bsp|sb441-n16s.bsp" )
+fi
+
 for entry in "${KERNELS[@]}"; do
     url="${entry%%|*}"
     name="${entry##*|}"

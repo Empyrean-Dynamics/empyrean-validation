@@ -197,7 +197,9 @@ env:
   # Shared cache keys — every job restores by these exact keys so the
   # downloads/builds `prep` populates fan out warm. Bump a version suffix
   # when the underlying artifact set changes.
-  DATA_CACHE_KEY: empyrean-data-v2
+  # The registered kernel set every empyrean repo pins (lang/workflow/gcp-project.md).
+  EMPYREAN_DATASET: kernels-full-2026-10-13
+  EMPYREAN_OFFLINE: "1"
   JPL_CACHE_KEY: empyrean-api-cache-v1
 
 jobs:
@@ -254,6 +256,9 @@ jobs:
     needs: precheck
     if: needs.precheck.outputs.empyrean-available == 'true'
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write          # Workload Identity Federation, read-only kernel bucket
     timeout-minutes: 90
     outputs:
       # The per-object fan-out matrix, generated from the catalog.
@@ -284,7 +289,9 @@ jobs:
         with:
           gh-pat: ${{ secrets.GH_PAT }}
           python-version: ${{ env.PYTHON_VERSION }}
-          data-cache-key: ${{ env.DATA_CACHE_KEY }}
+          dataset: ${{ env.EMPYREAN_DATASET }}
+          workload-identity-provider: ${{ vars.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service-account: ${{ vars.GCP_DATA_READER_SA }}
           jpl-cache-key: ${{ env.JPL_CACHE_KEY }}
           role: writer
           install-python-tooling: "true"
@@ -362,7 +369,7 @@ jobs:
         with:
           gh-pat: ${{ secrets.GH_PAT }}
           python-version: ${{ env.PYTHON_VERSION }}
-          data-cache-key: ${{ env.DATA_CACHE_KEY }}
+          dataset: ${{ env.EMPYREAN_DATASET }}
           jpl-cache-key: ${{ env.JPL_CACHE_KEY }}
           role: reader
       # `build-reference`, not `build`: only the rust runner, the harness CLI and
@@ -552,7 +559,7 @@ jobs:
         uses: actions/cache/restore@v4
         with:
           path: data
-          key: ${{ env.DATA_CACHE_KEY }}
+          key: empyrean-data-${{ env.EMPYREAN_DATASET }}
       - name: Restore JPL API responses
         uses: actions/cache/restore@v4
         with:
@@ -691,7 +698,7 @@ jobs:
         uses: actions/cache/restore@v4
         with:
           path: data
-          key: ${{ env.DATA_CACHE_KEY }}
+          key: empyrean-data-${{ env.EMPYREAN_DATASET }}
       - name: Restore JPL API responses
         uses: actions/cache/restore@v4
         with:
@@ -1021,6 +1028,11 @@ jobs:
           gcloud storage cp results/od_validation.json         ${{ env.GCS_BUCKET }}/latest/od_validation.json
           gcloud storage cp results/validation_report.html     ${{ env.GCS_BUCKET }}/latest/validation_report.html
           gcloud storage cp results/validation_report.data.json ${{ env.GCS_BUCKET }}/latest/validation_report.data.json
+          # The predictive-power timelines (Part 4.2) travel as a second sidecar the
+          # page fetches beside itself; absent when the run carried no walk aggregate.
+          if [ -f results/validation_report.predict.json ]; then
+            gcloud storage cp results/validation_report.predict.json "${{ env.GCS_BUCKET }}/latest/validation_report.predict.json"
+          fi
           gcloud storage cp results/validation_summary.json    ${{ env.GCS_BUCKET }}/latest/validation_summary.json
           for ch in rust python c cli core assist findorb oorb kete jorbit layup orbfit; do
             f="results/validation_${ch}.json"
@@ -1031,6 +1043,11 @@ jobs:
           gcloud storage cp results/od_validation.json         ${{ env.GCS_BUCKET }}/archive/${TIMESTAMP}/od_validation.json
           gcloud storage cp results/validation_report.html     ${{ env.GCS_BUCKET }}/archive/${TIMESTAMP}/validation_report.html
           gcloud storage cp results/validation_report.data.json ${{ env.GCS_BUCKET }}/archive/${TIMESTAMP}/validation_report.data.json
+          # The predictive-power timelines (Part 4.2) travel as a second sidecar the
+          # page fetches beside itself; absent when the run carried no walk aggregate.
+          if [ -f results/validation_report.predict.json ]; then
+            gcloud storage cp results/validation_report.predict.json "${{ env.GCS_BUCKET }}/archive/${TIMESTAMP}/validation_report.predict.json"
+          fi
           gcloud storage cp results/validation_summary.json    ${{ env.GCS_BUCKET }}/archive/${TIMESTAMP}/validation_summary.json
           for ch in rust python c cli core assist findorb oorb kete jorbit layup orbfit; do
             f="results/validation_${ch}.json"

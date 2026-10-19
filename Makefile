@@ -939,7 +939,12 @@ run-assist: $(PLAN) check-plan $(ASSIST_PY)
 # produced a green leg that ran no comparator at all. Fail with the fix
 # instead; the matrix's fail-fast:false keeps the other comparators alive and
 # reduce then omits find_orb honestly.
+# fo asserts without ~/.find_orb (miscell.cpp); a cached build restores the
+# binary but not $HOME, so the config dir is installed here when missing.
 run-findorb: $(ASSIST_PY) check-plan fixtures
+	@test -f "$(HOME)/.find_orb/cospar.txt" || { \
+	    echo "──── Installing find_orb config directory (cached build) ───"; \
+	    cd $(EMP_VAL_RUNNERS)/findorb && ./setup.sh --config-only; }
 	@test -x "$(FO_BIN)" || { \
 	    echo "ERROR: find_orb binary not built: $(FO_BIN)"; \
 	    echo "       Build it with: make setup-findorb"; \
@@ -1048,7 +1053,7 @@ GRSS_PY := $(GRSS_VENV)/bin/python
 setup-grss: $(GRSS_PY)
 $(GRSS_PY):
 	@echo "──── Setting up grss venv + SPICE kernels ──────────────"
-	@cd $(EMP_VAL_RUNNERS)/grss && ./setup.sh
+	@cd $(EMP_VAL_RUNNERS)/grss && DATA_DIR="$(DATA_DIR)" ./setup.sh
 
 run-grss: $(GRSS_OUT)
 # Same rule as find_orb / layup: the venv is an optional BUILD, but a missing
