@@ -15,6 +15,14 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+# `--config-only` installs the config directory for an already-built binary
+# (a cached build on a fresh runner has none) and must be consumed before the
+# optional install prefix, which is the first positional argument.
+CONFIG_ONLY=0
+if [ "${1:-}" = "--config-only" ]; then
+    CONFIG_ONLY=1
+    shift
+fi
 PREFIX="${1:-$SCRIPT_DIR/install}"
 BUILD_DIR="$SCRIPT_DIR/build"
 NPROC="$(nproc 2>/dev/null || sysctl -n hw.ncpu 2>/dev/null || echo 4)"
@@ -153,7 +161,7 @@ build_findorb() {
     return 0
 }
 
-if [ "${1:-}" = "--config-only" ]; then
+if [ "$CONFIG_ONLY" = 1 ]; then
     if [ ! -x "$PREFIX/bin/fo" ] || [ ! -d "$BUILD_DIR/find_orb" ]; then
         echo "ERROR: --config-only needs the built binary ($PREFIX/bin/fo) and the" >&2
         echo "       source tree ($BUILD_DIR/find_orb); run ./setup.sh without flags first." >&2
