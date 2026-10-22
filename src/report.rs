@@ -521,9 +521,35 @@ struct ChannelRollup {
     max_d_lt_diff_s: f64,
     n_passing: usize,
     n_total_compared: usize,
+    /// Pairs where the reference and this channel both refused the same
+    /// orbit-determination fit (an identical refusal is parity, so these
+    /// count toward `n_passing`). See [`od_delivery`] (empyrean-57o6n).
+    n_refused_identically: usize,
+    /// Pairs where one side delivered an orbit the other refused — a real
+    /// divergence, NOT counted toward `n_passing`. Each is named in
+    /// `refusal_mismatches`.
+    n_refusal_mismatch: usize,
+    /// One record per refusal mismatch, for the gate to name (object, test
+    /// type, method, which side delivered).
+    refusal_mismatches: Vec<RefusalMismatch>,
     p50_time_ms: f64,
     p50_rust_time_ms: f64,
     p50_speed_ratio: f64,
+}
+
+/// A pair where the reference and the channel disagreed on whether the orbit
+/// was delivered: one side delivered, the other refused. Carried per channel
+/// so the summary JSON names it and `ci-check` can print it (empyrean-57o6n).
+#[derive(Debug, Clone)]
+struct RefusalMismatch {
+    object: String,
+    test_type: String,
+    /// The uncertainty method the row was run under (prefix, e.g.
+    /// `second_order`), or the raw tag when it is outside the vocabulary.
+    method: String,
+    /// `"reference"` or `"channel"` — the side that delivered the orbit the
+    /// other refused.
+    delivered_side: &'static str,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -551,6 +577,13 @@ struct TestTypeRollup {
     n_converged: usize,
     n_compared: usize,
     n_bit_identical: usize,
+    /// Of this test type's compared pairs, how many were an identical refusal
+    /// (both sides declined to deliver). Counted toward `n_passing`
+    /// (empyrean-57o6n).
+    n_refused_identically: usize,
+    /// Of this test type's compared pairs, how many were a refusal mismatch
+    /// (one side delivered, the other refused). NOT counted toward passing.
+    n_refusal_mismatch: usize,
     p50_dr_km: f64,
     p95_dr_km: f64,
     p99_dr_km: f64,
@@ -592,6 +625,69 @@ fn vec_dr_km(a: &Option<[f64; 3]>, b: &Option<[f64; 3]>) -> Option<f64> {
 /// error-growth views — surfacing only in the dedicated timing panels.
 fn is_timing_only_uncertainty(mode: Option<&str>) -> bool {
     mode.map(|m| m.contains("detection_off")).unwrap_or(false)
+}
+
+/// Whether an orbit-determination fit row delivered an orbit, refused one, or
+/// carries no fit at all.
+///
+/// The per-orbit outcome channel is the sole delivery discriminator: a fit the
+/// engine declined (second order / sigma point / Monte Carlo under the
+/// per-method plan — no honest implementation on `determine_object`) stays one
+/// row with a refusal recorded, never a dropped row. When both the reference
+/// and a channel refuse the same fit, that is parity, not a miss
+/// (empyrean-57o6n).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Delivery {
+    /// The engine delivered an orbit for this row.
+    Delivered,
+    /// The engine refused to deliver an orbit (by design or by failure).
+    NotDelivered,
+    /// The row is not an orbit-determination fit (propagation / ephemeris),
+    /// so delivery does not apply — such a row is compared by its metrics.
+    NotApplicable,
+}
+
+/// Classify a row's orbit delivery — the single authority behind both the
+/// channel summary's refusal tallies and the mismatches `ci-check` names.
+///
+/// `orbit_delivered` / `orbit_status` are the per-orbit outcome fields the rust,
+/// python, c and cli channels fill; the core channel carries neither and reports
+/// `od_converged` instead, so that is the fallback. A row that carries no
+/// delivery signal at all (propagation / ephemeris) is [`Delivery::NotApplicable`].
+fn od_delivery(r: &ValidationResult) -> Delivery {
+    // The per-orbit outcome channel, when present, is definitive.
+    if let Some(delivered) = r.orbit_delivered {
+        return if delivered {
+            Delivery::Delivered
+        } else {
+            Delivery::NotDelivered
+        };
+    }
+    if let Some(status) = r.orbit_status.as_deref() {
+        return if status == DELIVERED_STATUS {
+            Delivery::Delivered
+        } else {
+            Delivery::NotDelivered
+        };
+    }
+    // Core channel: no delivery fields, so read the convergence flag. `None`
+    // means the row has no fit (propagation / ephemeris).
+    match r.od_converged {
+        Some(true) => Delivery::Delivered,
+        Some(false) => Delivery::NotDelivered,
+        None => Delivery::NotApplicable,
+    }
+}
+
+/// The uncertainty method a row ran under, named the way the report names it
+/// (reusing [`method_label`]): the human label for the row's
+/// `propagation_uncertainty` tag, or `—` when the row carries no method.
+fn refused_method_name(r: &ValidationResult) -> String {
+    r.propagation_uncertainty
+        .as_deref()
+        .map(method_label)
+        .unwrap_or("—")
+        .to_string()
 }
 
 fn rollup_channels(results: &[ValidationResult]) -> Vec<ChannelRollup> {
@@ -647,6 +743,15 @@ fn rollup_channels(results: &[ValidationResult]) -> Vec<ChannelRollup> {
         let mut max_d_lt = 0.0f64;
         let mut n_passing = 0;
         let mut n_compared = 0;
+        // Refusal parity (empyrean-57o6n): an orbit-determination pair where
+        // both the reference and this channel refused the same fit is parity
+        // (counts as passing); a pair where one side delivered and the other
+        // refused is a divergence that is named, not passed.
+        let mut n_refused_identically = 0;
+        let mut n_refusal_mismatch = 0;
+        let mut refusal_mismatches: Vec<RefusalMismatch> = Vec::new();
+        let mut by_tt_refused_identically: BTreeMap<String, usize> = BTreeMap::new();
+        let mut by_tt_refusal_mismatch: BTreeMap<String, usize> = BTreeMap::new();
         let mut channel_times: Vec<f64> = Vec::new();
         let mut core_match_times: Vec<f64> = Vec::new();
         // A position-vector-only `dr_km` stream was historically tracked
@@ -756,6 +861,50 @@ fn rollup_channels(results: &[ValidationResult]) -> Vec<ChannelRollup> {
                     n_passing += 1;
                     *by_tt_bit_identical.entry(r.test_type.clone()).or_default() += 1;
                 }
+            } else {
+                // No metric was comparable between the two rows. For an
+                // orbit-determination fit this is the refusal case: the fidelity
+                // metrics are read off a delivered orbit, so a refused fit (no
+                // emp_pos, no residuals) carries none. Classify both sides'
+                // delivery (empyrean-57o6n). Both refusing is parity and counts
+                // as passing; one side delivering while the other refused is a
+                // real divergence that is named, not passed. A row that is not a
+                // fit on either side (NotApplicable) leaves the counts untouched,
+                // exactly as before.
+                match (od_delivery(core_r), od_delivery(r)) {
+                    (Delivery::NotDelivered, Delivery::NotDelivered) => {
+                        n_passing += 1;
+                        n_refused_identically += 1;
+                        *by_tt_refused_identically
+                            .entry(r.test_type.clone())
+                            .or_default() += 1;
+                    }
+                    (Delivery::Delivered, Delivery::NotDelivered) => {
+                        n_refusal_mismatch += 1;
+                        *by_tt_refusal_mismatch
+                            .entry(r.test_type.clone())
+                            .or_default() += 1;
+                        refusal_mismatches.push(RefusalMismatch {
+                            object: r.object.clone(),
+                            test_type: r.test_type.clone(),
+                            method: refused_method_name(r),
+                            delivered_side: "reference",
+                        });
+                    }
+                    (Delivery::NotDelivered, Delivery::Delivered) => {
+                        n_refusal_mismatch += 1;
+                        *by_tt_refusal_mismatch
+                            .entry(r.test_type.clone())
+                            .or_default() += 1;
+                        refusal_mismatches.push(RefusalMismatch {
+                            object: r.object.clone(),
+                            test_type: r.test_type.clone(),
+                            method: refused_method_name(r),
+                            delivered_side: "channel",
+                        });
+                    }
+                    _ => {}
+                }
             }
 
             if let (Some(t), Some(rt)) = (r.emp_time_ms, core_r.emp_time_ms)
@@ -798,6 +947,8 @@ fn rollup_channels(results: &[ValidationResult]) -> Vec<ChannelRollup> {
                     n_converged: by_tt_converged.get(tt).copied().unwrap_or(0),
                     n_compared: n_compared_tt,
                     n_bit_identical,
+                    n_refused_identically: by_tt_refused_identically.get(tt).copied().unwrap_or(0),
+                    n_refusal_mismatch: by_tt_refusal_mismatch.get(tt).copied().unwrap_or(0),
                     p50_dr_km: p50,
                     p95_dr_km: p95,
                     p99_dr_km: p99,
@@ -818,6 +969,9 @@ fn rollup_channels(results: &[ValidationResult]) -> Vec<ChannelRollup> {
             max_d_lt_diff_s: max_d_lt,
             n_passing,
             n_total_compared: n_compared,
+            n_refused_identically,
+            n_refusal_mismatch,
+            refusal_mismatches,
             p50_time_ms: {
                 if channel == "core" {
                     let mut all_rust: Vec<f64> = rows
@@ -961,6 +1115,8 @@ fn write_summary(
                             "n_converged": x.n_converged,
                             "n_compared": x.n_compared,
                             "n_bit_identical": x.n_bit_identical,
+                            "n_refused_identically": x.n_refused_identically,
+                            "n_refusal_mismatch": x.n_refusal_mismatch,
                             "p50_dr_km": nan_or(x.p50_dr_km),
                             "p95_dr_km": nan_or(x.p95_dr_km),
                             "p99_dr_km": nan_or(x.p99_dr_km),
@@ -975,6 +1131,18 @@ fn write_summary(
                 "n_rows": r.n_rows,
                 "n_passing": r.n_passing,
                 "n_total_compared": r.n_total_compared,
+                "n_refused_identically": r.n_refused_identically,
+                "n_refusal_mismatch": r.n_refusal_mismatch,
+                "refusal_mismatches": r
+                    .refusal_mismatches
+                    .iter()
+                    .map(|m| serde_json::json!({
+                        "object": m.object,
+                        "test_type": m.test_type,
+                        "method": m.method,
+                        "delivered_side": m.delivered_side,
+                    }))
+                    .collect::<Vec<_>>(),
                 "max_dr_km": r.max_dr_km,
                 "max_sep_diff_arcsec": r.max_sep_diff_arcsec,
                 "max_d_ra_diff_arcsec": r.max_d_ra_diff_arcsec,
@@ -9329,7 +9497,26 @@ pub fn generate_report(
     let h1_prop_grid_html = build_prop_agreement_grid(results);
     let h2_eph_grid_html = build_eph_agreement_grid(results);
     let od_closeness_grid_html = build_od_closeness_grid(results, orbit_comparisons);
-    let h4_fidelity_grid_html = build_channel_fidelity_grid(results);
+    let mut h4_fidelity_grid_html = build_channel_fidelity_grid(results);
+    // Named figure (empyrean-57o6n): identical orbit-determination refusals —
+    // where the reference and a replay channel both decline the same fit by
+    // design — are parity, not misses, and are counted as passing. Surface the
+    // tally beside the fidelity grid, read from the same rollup the summary JSON
+    // and `ci-check` read so all three carry one spelling. Appended only when
+    // the run holds such refusals, so a report with none is unchanged.
+    {
+        let fidelity_channels = ["rust", "python", "cli", "c"];
+        let n_refused: usize = rollups
+            .iter()
+            .filter(|r| fidelity_channels.contains(&r.channel.as_str()))
+            .map(|r| r.n_refused_identically)
+            .sum();
+        if n_refused > 0 {
+            h4_fidelity_grid_html.push_str(&format!(
+                "<div class=\"grid-summary\" title=\"An orbit-determination fit the reference and the channel both refuse by design (second order / sigma point / Monte Carlo have no honest implementation on determine_object) is an identical refusal — parity, counted as passing, never a miss.\">{n_refused} identical OD refusals across replay channels counted as parity</div>"
+        ));
+        }
+    }
     let method_matrix_html = build_method_matrix_html(results);
     let method_outcome_html = build_method_outcome_html(results);
     let covariance_realism_html = build_covariance_realism_html(results, orbit_comparisons);
@@ -12876,6 +13063,153 @@ mod tests {
         r.layup_converged = Some(true);
         r.timestamp = "2026-04-29T00:00:00Z".to_string();
         r
+    }
+
+    // ── Refusal parity (empyrean-57o6n) ───────────────────────────────────
+    //
+    // An orbit-determination fit refused under its uncertainty method
+    // (second order / sigma point / Monte Carlo — no honest implementation on
+    // `determine_object`) delivers no orbit, so it carries none of the fidelity
+    // metrics. When the reference and a channel both refuse the same fit, that
+    // is parity; the summary must count it as passing rather than leave the
+    // gate's 100% forever unreachable.
+
+    /// A minimal orbit-determination row keyed so a core reference row and a
+    /// channel row pair up in [`rollup_channels`]. Delivery fields are left
+    /// unset — each test sets the refused / delivered state it needs.
+    fn parity_od_row(channel: &str, method_tag: &str) -> ValidationResult {
+        let mut r = ValidationResult::empty();
+        r.object = "Chiron".to_string();
+        r.population = "Centaur".to_string();
+        r.epoch_mjd_tdb = 61000.0;
+        r.t_mjd_tdb = 61000.0;
+        r.dt_days = 0.0;
+        r.force_model = "standard".to_string();
+        r.test_type = "orbit_determination".to_string();
+        r.observer = None;
+        r.propagation_uncertainty = Some(method_tag.to_string());
+        r.channel = channel.to_string();
+        r.timestamp = "2026-04-29T00:00:00Z".to_string();
+        r
+    }
+
+    fn rollup_for<'a>(rollups: &'a [ChannelRollup], channel: &str) -> &'a ChannelRollup {
+        rollups
+            .iter()
+            .find(|r| r.channel == channel)
+            .unwrap_or_else(|| panic!("channel {channel} present in rollup"))
+    }
+
+    // (a) Both sides refuse → the pair is parity: it counts as passing and
+    // increments n_refused_identically.
+    #[test]
+    fn refusal_parity_both_refused_counts_as_passing() {
+        let mut core = parity_od_row("core", "second_order_detection_on");
+        core.od_converged = Some(false); // core-style refusal, no delivery fields
+        let mut py = parity_od_row("python", "second_order_detection_on");
+        py.orbit_delivered = Some(false);
+        py.orbit_status = Some("failed: SecondOrder has no honest implementation".to_string());
+
+        let rollups = rollup_channels(&[core, py]);
+        let py_r = rollup_for(&rollups, "python");
+        assert_eq!(py_r.n_total_compared, 1);
+        assert_eq!(py_r.n_refused_identically, 1);
+        assert_eq!(py_r.n_refusal_mismatch, 0);
+        assert_eq!(py_r.n_passing, 1, "an identical refusal is parity");
+        assert!(py_r.refusal_mismatches.is_empty());
+        assert_eq!(
+            py_r.by_test_type["orbit_determination"].n_refused_identically,
+            1
+        );
+    }
+
+    // (b) Reference refused, channel delivered → not passing, a named mismatch
+    // with the channel as the delivering side.
+    #[test]
+    fn refusal_parity_reference_refused_channel_delivered_is_mismatch() {
+        let mut core = parity_od_row("core", "second_order_detection_on");
+        core.od_converged = Some(false);
+        let mut py = parity_od_row("python", "second_order_detection_on");
+        py.orbit_delivered = Some(true);
+        py.orbit_status = Some("delivered".to_string());
+        // A delivered orbit carries a position, but the refused reference has
+        // none, so no metric is comparable — the refusal path classifies it.
+        py.emp_pos_au = Some([1.0, 0.0, 0.0]);
+
+        let rollups = rollup_channels(&[core, py]);
+        let py_r = rollup_for(&rollups, "python");
+        assert_eq!(py_r.n_total_compared, 1);
+        assert_eq!(py_r.n_refused_identically, 0);
+        assert_eq!(py_r.n_refusal_mismatch, 1);
+        assert_eq!(py_r.n_passing, 0, "a one-sided delivery is not parity");
+        assert_eq!(py_r.refusal_mismatches.len(), 1);
+        let m = &py_r.refusal_mismatches[0];
+        assert_eq!(m.delivered_side, "channel");
+        assert_eq!(m.method, "second order");
+        assert_eq!(m.object, "Chiron");
+        assert_eq!(m.test_type, "orbit_determination");
+        assert_eq!(
+            py_r.by_test_type["orbit_determination"].n_refusal_mismatch,
+            1
+        );
+    }
+
+    // (c) Channel refused, reference delivered → not passing, a named mismatch
+    // with the reference as the delivering side.
+    #[test]
+    fn refusal_parity_reference_delivered_channel_refused_is_mismatch() {
+        let mut core = parity_od_row("core", "second_order_detection_on");
+        core.od_converged = Some(true); // a converged core fit is a delivery
+        core.emp_pos_au = Some([1.0, 0.0, 0.0]);
+        let mut py = parity_od_row("python", "second_order_detection_on");
+        py.orbit_delivered = Some(false);
+        py.orbit_status = Some("failed: SecondOrder has no honest implementation".to_string());
+
+        let rollups = rollup_channels(&[core, py]);
+        let py_r = rollup_for(&rollups, "python");
+        assert_eq!(py_r.n_refusal_mismatch, 1);
+        assert_eq!(py_r.n_refused_identically, 0);
+        assert_eq!(py_r.n_passing, 0);
+        assert_eq!(py_r.refusal_mismatches[0].delivered_side, "reference");
+    }
+
+    // (d) A core-style refusal (od_converged false, no delivery fields) is
+    // classified as not-delivered, so the core self-comparison is an identical
+    // refusal rather than an uncounted row.
+    #[test]
+    fn refusal_parity_core_style_od_converged_false_is_a_refusal() {
+        let mut core = parity_od_row("core", "monte_carlo_detection_on");
+        core.od_converged = Some(false);
+        assert_eq!(core.orbit_delivered, None, "core carries no delivery flag");
+        assert_eq!(core.orbit_status, None, "core carries no delivery status");
+
+        let rollups = rollup_channels(&[core]);
+        let core_r = rollup_for(&rollups, "core");
+        assert_eq!(core_r.n_total_compared, 1);
+        assert_eq!(core_r.n_refused_identically, 1);
+        assert_eq!(core_r.n_passing, 1);
+    }
+
+    // (e) A pair compared by a real metric is untouched by the refusal
+    // classification: no refusals are tallied and the metric decides passing.
+    #[test]
+    fn refusal_parity_leaves_metric_rows_unchanged() {
+        let mut core = synthetic_rust_prop_row("Apophis", 0.0);
+        core.channel = "core".to_string();
+        core.emp_pos_au = Some([1.0, 0.0, 0.0]);
+        let mut py = synthetic_rust_prop_row("Apophis", 0.0);
+        py.channel = "python".to_string();
+        py.emp_pos_au = Some([1.0, 0.0, 0.0]); // bit-identical to core
+
+        let rollups = rollup_channels(&[core, py]);
+        let py_r = rollup_for(&rollups, "python");
+        assert_eq!(py_r.n_total_compared, 1);
+        assert_eq!(py_r.n_passing, 1);
+        assert_eq!(py_r.n_refused_identically, 0);
+        assert_eq!(py_r.n_refusal_mismatch, 0);
+        assert!(py_r.refusal_mismatches.is_empty());
+        assert_eq!(py_r.by_test_type["propagation"].n_bit_identical, 1);
+        assert_eq!(py_r.by_test_type["propagation"].n_refused_identically, 0);
     }
 
     #[test]

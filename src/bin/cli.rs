@@ -2158,12 +2158,32 @@ fn ci_check_failures(
 
         let passing = ch["n_passing"].as_u64().unwrap_or(0);
         let total = ch["n_total_compared"].as_u64().unwrap_or(0);
+        // Identical orbit-determination refusals — both sides refuse the same
+        // fit by design — are parity, already folded into n_passing by the
+        // summary. Surface the count so the gate's pass line reads honestly
+        // (empyrean-57o6n).
+        let refused = ch["n_refused_identically"].as_u64().unwrap_or(0);
         if total == 0 {
             failures.push(format!("{want}: no rows compared"));
         } else if passing < total {
             failures.push(format!(
-                "{want}: {passing}/{total} rows passed at 1e-10 (expected 100%)"
+                "{want}: {passing}/{total} rows passed at 1e-10 \
+                 ({refused} refused identically) (expected 100%)"
             ));
+            // Name every refusal mismatch so a red is actionable: one side
+            // delivered an orbit the other refused.
+            if let Some(mismatches) = ch["refusal_mismatches"].as_array() {
+                for m in mismatches {
+                    let obj = m["object"].as_str().unwrap_or("?");
+                    let tt = m["test_type"].as_str().unwrap_or("?");
+                    let method = m["method"].as_str().unwrap_or("?");
+                    let side = m["delivered_side"].as_str().unwrap_or("?");
+                    failures.push(format!(
+                        "{want}: refusal mismatch — {obj} / {tt} / {method}: \
+                         {side} delivered, the other refused"
+                    ));
+                }
+            }
         }
 
         // Unscoped per-axis floors apply to every strict channel. Scoped
@@ -2305,6 +2325,23 @@ fn ci_check(args: CiCheckArgs) -> Result<(), Box<dyn std::error::Error>> {
     let failures = ci_check_failures(channels, &args.strict_channels, &min_rows, &args.summary);
 
     if failures.is_empty() {
+        // One pass line per strict channel, carrying the refused-identically
+        // count beside the passed count so the gate's green reads the same
+        // spelling the summary and report carry (empyrean-57o6n).
+        for want in &args.strict_channels {
+            if let Some(ch) = channels
+                .iter()
+                .find(|c| c["channel"].as_str() == Some(want.as_str()))
+            {
+                let passing = ch["n_passing"].as_u64().unwrap_or(0);
+                let total = ch["n_total_compared"].as_u64().unwrap_or(0);
+                let refused = ch["n_refused_identically"].as_u64().unwrap_or(0);
+                eprintln!(
+                    "ci-check: {want}: {passing}/{total} rows passed at 1e-10 \
+                     ({refused} refused identically)"
+                );
+            }
+        }
         eprintln!(
             "ci-check: all strict channels [{}] passed binding fidelity at 1e-10",
             args.strict_channels.join(", ")
