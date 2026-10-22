@@ -193,6 +193,9 @@ env:
   # sibling dispatch) validates the complete catalog; pass a comma-separated
   # subset via workflow_dispatch `objects` for a quick targeted run.
   OBJECTS: ${{ inputs.objects || '' }}
+  # Object chunks per channel leg (scripts/channel-chunks.py); capped at the
+  # object count, so a subset dispatch fans out no wider than its objects.
+  CHANNEL_CHUNKS: "10"
   TIER: ${{ inputs.tier || 'standard' }}
   # Shared cache keys — every job restores by these exact keys so the
   # downloads/builds `prep` populates fan out warm. Bump a version suffix
@@ -263,6 +266,9 @@ jobs:
     outputs:
       # The per-object fan-out matrix, generated from the catalog.
       objects: ${{ steps.objects.outputs.objects }}
+      # The same objects dealt into chunks for the channel legs, and how many.
+      chunks: ${{ steps.objects.outputs.chunks }}
+      chunk_count: ${{ steps.objects.outputs.chunk_count }}
     steps:
       - name: Log trigger source
         run: |
@@ -329,6 +335,11 @@ jobs:
           test "$count" -gt 0 || { echo "ERROR: matrix is empty — no objects to validate." >&2; exit 1; }
           echo "objects=$matrix" >> "$GITHUB_OUTPUT"
           echo "Fanning out $count per-object reference legs."
+          chunks="$(python3 scripts/channel-chunks.py split --objects results/objects.json --count "${CHANNEL_CHUNKS}")"
+          chunk_count="$(python3 -c 'import json,sys;print(len(json.loads(sys.argv[1])))' "$chunks")"
+          echo "chunks=$chunks" >> "$GITHUB_OUTPUT"
+          echo "chunk_count=$chunk_count" >> "$GITHUB_OUTPUT"
+          echo "Fanning out 4 channels x $chunk_count object chunks."
 
   # ── reference (per-object matrix) ───────────────────────────────────
   # One leg per catalog object. Each restores the caches prep warmed, rebuilds
@@ -500,18 +511,22 @@ jobs:
   # in prep (it seeds the plan), so this job replays the prebuilt plan
   # through the wheel, the C ABI, the CLI, and empyrean-core direct.
   empyrean:
-    name: Empyrean channel — ${{ matrix.channel }}
-    needs: assemble
+    name: Empyrean channel — ${{ matrix.channel }} · ${{ matrix.chunk.id }}
+    needs: [prep, assemble]
     runs-on: ubuntu-latest
-    # One leg per channel. The per-method plan replays every uncertainty
-    # method on every channel, so a single sequential job no longer fits any
-    # budget (run 169, 2026-10-19: the python channel alone was still running
-    # at the 120-minute limit). Each leg builds only what its channel links.
+    # One leg per channel per object chunk. The per-method plan replays every
+    # uncertainty method on every channel; a single leg per channel does not
+    # fit either (run 171, 2026-10-22: python and core were each still
+    # replaying at 240 minutes), so the channel job fans out over the chunks
+    # prep dealt from the same object matrix the reference legs use. Each leg
+    # builds only what its channel links and uploads one chunk file; reduce
+    # concatenates the chunks per channel before the merge.
     timeout-minutes: 240
     strategy:
       fail-fast: false
       matrix:
         channel: [python, c, cli, core]
+        chunk: ${{ fromJson(needs.prep.outputs.chunks) }}
     steps:
       - name: Checkout empyrean-validation (default)
         uses: actions/checkout@v4
@@ -629,24 +644,30 @@ jobs:
         env:
           DATA_DIR: ${{ env.EMPYREAN_DATA_DIR }}
         run: |
+          # The c and cli drivers run under the wheel's virtualenv (the
+          # Makefile's WHEEL_VENV python), so those legs build the wheel too.
           case "${{ matrix.channel }}" in
             python) make build-empyrean-c build-wheel ;;
-            c)      make build-empyrean-c build-c ;;
-            cli)    make build-empyrean-c build-cli ;;
+            c)      make build-empyrean-c build-wheel build-c ;;
+            cli)    make build-empyrean-c build-wheel build-cli ;;
             core)   make build-core ;;
             *)      echo "unknown channel ${{ matrix.channel }}" >&2; exit 1 ;;
           esac
       - name: Replay plan — ${{ matrix.channel }}
         working-directory: empyrean-validation
         env:
+          OBJECTS: ${{ matrix.chunk.objects }}
           DATA_DIR: ${{ env.EMPYREAN_DATA_DIR }}
-        run: make run-${{ matrix.channel }} PLAN_PREBUILT=1 OBJECTS="${OBJECTS}" TIERS="${TIER}"
+        run: |
+          make run-${{ matrix.channel }} PLAN_PREBUILT=1 OBJECTS="${OBJECTS}" TIERS="${TIER}"
+          mv results/validation_${{ matrix.channel }}.json \
+             results/validation_${{ matrix.channel }}.chunk${{ matrix.chunk.id }}.json
 
-      - name: Upload ${{ matrix.channel }} channel output
+      - name: Upload ${{ matrix.channel }} chunk ${{ matrix.chunk.id }}
         uses: actions/upload-artifact@v4
         with:
-          name: channel-${{ matrix.channel }}
-          path: empyrean-validation/results/validation_${{ matrix.channel }}.json
+          name: channel-${{ matrix.channel }}-${{ matrix.chunk.id }}
+          path: empyrean-validation/results/validation_${{ matrix.channel }}.chunk${{ matrix.chunk.id }}.json
           retention-days: 30
           if-no-files-found: error
 
@@ -836,7 +857,7 @@ jobs:
   # reported success. `make lint-workflows` catches exactly that mismatch.
   reduce:
     name: Reduce — merge + report + publish
-    needs: [assemble, empyrean, external]
+    needs: [prep, assemble, empyrean, external]
     if: always() && needs.assemble.result == 'success' && needs.empyrean.result == 'success'
     runs-on: ubuntu-latest
     timeout-minutes: 45
@@ -902,6 +923,18 @@ jobs:
       - name: List staged channels
         working-directory: empyrean-validation
         run: ls -la results/
+
+      # Each channel arrives as one file per object chunk; put it back
+      # together before the merge, refusing a short channel.
+      - name: Assemble channel chunks
+        working-directory: empyrean-validation
+        run: |
+          for ch in python c cli core; do
+            python3 scripts/channel-chunks.py concat \
+              --out "results/validation_${ch}.json" \
+              --expect "${{ needs.prep.outputs.chunk_count }}" \
+              results/validation_${ch}.chunk*.json
+          done
 
       # reduce builds only the harness, then folds in whichever external
       # channels are present (skipping any that a failed leg left absent).
