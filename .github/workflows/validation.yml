@@ -500,10 +500,18 @@ jobs:
   # in prep (it seeds the plan), so this job replays the prebuilt plan
   # through the wheel, the C ABI, the CLI, and empyrean-core direct.
   empyrean:
-    name: Empyrean channels — python/c/cli/core
+    name: Empyrean channel — ${{ matrix.channel }}
     needs: assemble
     runs-on: ubuntu-latest
-    timeout-minutes: 120
+    # One leg per channel. The per-method plan replays every uncertainty
+    # method on every channel, so a single sequential job no longer fits any
+    # budget (run 169, 2026-10-19: the python channel alone was still running
+    # at the 120-minute limit). Each leg builds only what its channel links.
+    timeout-minutes: 240
+    strategy:
+      fail-fast: false
+      matrix:
+        channel: [python, c, cli, core]
     steps:
       - name: Checkout empyrean-validation (default)
         uses: actions/checkout@v4
@@ -620,22 +628,25 @@ jobs:
         working-directory: empyrean-validation
         env:
           DATA_DIR: ${{ env.EMPYREAN_DATA_DIR }}
-        run: make build-empyrean-c build-c build-cli build-wheel build-core
-      - name: Replay plan — python / c / cli / core
+        run: |
+          case "${{ matrix.channel }}" in
+            python) make build-empyrean-c build-wheel ;;
+            c)      make build-empyrean-c build-c ;;
+            cli)    make build-empyrean-c build-cli ;;
+            core)   make build-core ;;
+            *)      echo "unknown channel ${{ matrix.channel }}" >&2; exit 1 ;;
+          esac
+      - name: Replay plan — ${{ matrix.channel }}
         working-directory: empyrean-validation
         env:
           DATA_DIR: ${{ env.EMPYREAN_DATA_DIR }}
-        run: make run-python run-c run-cli run-core PLAN_PREBUILT=1 OBJECTS="${OBJECTS}" TIERS="${TIER}"
+        run: make run-${{ matrix.channel }} PLAN_PREBUILT=1 OBJECTS="${OBJECTS}" TIERS="${TIER}"
 
-      - name: Upload empyrean channel outputs
+      - name: Upload ${{ matrix.channel }} channel output
         uses: actions/upload-artifact@v4
         with:
-          name: channels-empyrean
-          path: |
-            empyrean-validation/results/validation_python.json
-            empyrean-validation/results/validation_c.json
-            empyrean-validation/results/validation_cli.json
-            empyrean-validation/results/validation_core.json
+          name: channel-${{ matrix.channel }}
+          path: empyrean-validation/results/validation_${{ matrix.channel }}.json
           retention-days: 30
           if-no-files-found: error
 
@@ -652,7 +663,10 @@ jobs:
     name: External — ${{ matrix.tool }}
     needs: assemble
     runs-on: ubuntu-latest
-    timeout-minutes: 180
+    # Budget from the measured pace (run 169, 2026-10-19): the longest green
+    # leg was jorbit at 73 min; orbfit, back to one fit per object, is about
+    # 80 min at its 1.6 min/fit.
+    timeout-minutes: 240
     strategy:
       fail-fast: false
       matrix:

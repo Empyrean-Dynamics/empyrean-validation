@@ -610,6 +610,29 @@ def _default_psv_dir() -> Path:
     return Path(__file__).resolve().parents[2] / "fixtures" / "psv"
 
 
+def select_od_rows(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """One orbit-determination row per object: the plan's untagged fit.
+
+    The per-method plan carries one `orbit_determination` row per uncertainty
+    method per object (seven or eight rows an object) so the engine channels
+    can produce every method's products. OrbFit fits one orbit per object;
+    replaying every method row re-ran the same fit seven times (354 fits for
+    50 objects — run 169 reached 115 in three hours). The untagged row
+    (`propagation_uncertainty` null) is the canonical fit the external
+    references compare against; an object without one falls back to its first
+    OD row, in plan order, so no object is dropped.
+    """
+    by_object: Dict[str, List[Dict[str, Any]]] = {}
+    for r in rows:
+        if r.get("test_type") == "orbit_determination":
+            by_object.setdefault(str(r.get("object", "")), []).append(r)
+    selected: List[Dict[str, Any]] = []
+    for rows_for_object in by_object.values():
+        untagged = [r for r in rows_for_object if r.get("propagation_uncertainty") is None]
+        selected.append(untagged[0] if untagged else rows_for_object[0])
+    return selected
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(
         description="Replay validation-plan OD rows through OrbFit (neofit2.x).",
@@ -665,7 +688,7 @@ def main() -> int:
     for r in rows:
         rows_by_object.setdefault(r.get("object", ""), []).append(r)
 
-    od_rows = [r for r in rows if r.get("test_type") == "orbit_determination"]
+    od_rows = select_od_rows(rows)
     if args.only:
         want = {s.strip() for s in args.only.split(",") if s.strip()}
         od_rows = [r for r in od_rows if r.get("object") in want]
