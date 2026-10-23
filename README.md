@@ -20,6 +20,10 @@ empyrean-validation answers one question continuously: **does every way of
 reaching the empyrean physics produce the same numbers, and do those numbers
 agree with independent implementations and JPL references?**
 
+The live answer is the report, regenerated on every release:
+<https://validation.empyrean-dynamics.com/latest/validation_report.html>.
+Cite that URL, not the bare domain, which lists the bucket.
+
 It replays one canonical test plan — a curated catalog of 43 solar-system
 objects (NEAs including impactors and temporarily-captured objects, comets,
 Trojans, KBOs, interstellar objects) with per-object time grids — through
