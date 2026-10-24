@@ -55,6 +55,25 @@ outputs:
 runs:
   using: composite
   steps:
+    # The c, python and cli channels build the distribution (header, dylib,
+    # wheel) from the empyrean sibling checkout below, so that checkout must be
+    # the exact release the manifests pin (runners/rust/Cargo.toml → crates.io),
+    # not the floating default branch — which moves ahead to an unreleased rc
+    # and makes `check-engine-version` refuse the run. Read the pin here (the
+    # suite checkout lives at empyrean-validation/ in every caller) and pin the
+    # empyrean checkout to its tag.
+    - name: Resolve the pinned distribution version
+      id: pinned-engine
+      shell: bash
+      run: |
+        version="$(sed -n 's/^empyrean = "=\(.*\)"/\1/p' empyrean-validation/runners/rust/Cargo.toml)"
+        if [ -z "$version" ]; then
+          echo "ERROR: could not read the pinned empyrean version from empyrean-validation/runners/rust/Cargo.toml." >&2
+          exit 1
+        fi
+        echo "version=$version" >> "$GITHUB_OUTPUT"
+        echo "Pinned distribution: v$version"
+
     # ── Sibling-checkout layout ────────────────────────────────
     # The Makefile resolves every sibling from `..` of the
     # empyrean-validation checkout, so each repo MUST sit alongside it.
@@ -69,6 +88,10 @@ runs:
         repository: Empyrean-Dynamics/empyrean
         path: empyrean
         token: ${{ inputs.gh-pat }}
+        # Pin to the released tag the manifests resolve to (see above), not the
+        # default branch. The other siblings stay on their default branch; the
+        # core channel's pin is a separate follow-up.
+        ref: v${{ steps.pinned-engine.outputs.version }}
     - name: Checkout empyrean-core (sibling)
       uses: actions/checkout@v4
       with:
