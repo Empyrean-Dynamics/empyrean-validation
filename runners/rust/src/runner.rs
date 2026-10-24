@@ -695,6 +695,13 @@ fn build_uncertainty_axes(
 }
 
 /// Run propagation + ephemeris validation against Horizons reference.
+///
+/// The IC + reference inputs are read from the pinned snapshot on disk
+/// (`sbdb_cache_dir`, `horizons_cache_dir`), with the JPL/MPC hosts sealed in
+/// CI. A query that misses the snapshot is a gap in the pinned inputs, not a
+/// transient outage: this returns [`Err`] naming the object, the product and
+/// the lookup key (see [`empyrean_validation::inputs`]) rather than skipping
+/// the object, so a short reference can never look complete.
 pub fn run_propagation_validation(
     ctx: &Context,
     objs: &[&ValidationObject],
@@ -702,7 +709,9 @@ pub fn run_propagation_validation(
     horizons_cache_dir: &std::path::Path,
     sbdb_cache_dir: &std::path::Path,
     num_threads: Option<usize>,
-) -> Vec<ValidationResult> {
+) -> Result<Vec<ValidationResult>, String> {
+    use empyrean_validation::inputs::{InputProduct, ephemeris_key, missing_input, vectors_key};
+
     let timestamp = chrono::Utc::now().to_rfc3339();
     let channel = "rust".to_string();
     // Provenance: the exact empyrean engine (empyrean-core / villeneuve /
@@ -747,19 +756,31 @@ pub fn run_propagation_validation(
         let sbdb = match empyrean::query_sbdb(&[obj.sbdb_query], Some(sbdb_cache_dir)) {
             Ok(b) if !b.orbits.is_empty() => b,
             Ok(_) => {
-                eprintln!("  {}: SKIP (SBDB: empty result)", obj.name);
-                continue;
+                return Err(missing_input(
+                    obj.name,
+                    InputProduct::Sbdb,
+                    obj.sbdb_query,
+                    sbdb_cache_dir,
+                    "SBDB query returned no orbits",
+                ));
             }
             Err(e) => {
-                eprintln!("  {}: SKIP (SBDB: {e})", obj.name);
-                continue;
+                return Err(missing_input(
+                    obj.name,
+                    InputProduct::Sbdb,
+                    obj.sbdb_query,
+                    sbdb_cache_dir,
+                    &e.to_string(),
+                ));
             }
         };
         let epoch = match sbdb.orbits[0].state.epoch.mjd_tdb() {
             Ok(t) => t,
             Err(e) => {
-                eprintln!("  {}: SKIP (SBDB epoch: {e})", obj.name);
-                continue;
+                return Err(format!(
+                    "{}: SBDB record in the pinned snapshot has an unreadable epoch: {e}",
+                    obj.name
+                ));
             }
         };
 
@@ -770,8 +791,13 @@ pub fn run_propagation_validation(
         ) {
             Ok(h) => h,
             Err(e) => {
-                eprintln!("  {}: SKIP (Horizons IC: {e})", obj.name);
-                continue;
+                return Err(missing_input(
+                    obj.name,
+                    InputProduct::HorizonsVectors,
+                    &vectors_key(obj.horizons_command, epoch),
+                    horizons_cache_dir,
+                    &e.to_string(),
+                ));
             }
         };
 
@@ -818,7 +844,13 @@ pub fn run_propagation_validation(
                     horizons_vectors.insert(dt as i64, h);
                 }
                 Err(e) => {
-                    eprintln!("  {}: dt={dt:+.0}d Horizons SKIP ({e})", obj.name);
+                    return Err(missing_input(
+                        obj.name,
+                        InputProduct::HorizonsVectors,
+                        &vectors_key(obj.horizons_command, target),
+                        horizons_cache_dir,
+                        &e.to_string(),
+                    ));
                 }
             }
         }
@@ -840,16 +872,22 @@ pub fn run_propagation_validation(
                             .insert((obs_code, dt as i64), r.into_iter().next().unwrap());
                     }
                     Ok(_) => {
-                        eprintln!(
-                            "  {}: {obs_code} dt={dt:+.0}d ephemeris SKIP (empty)",
-                            obj.name
-                        );
+                        return Err(missing_input(
+                            obj.name,
+                            InputProduct::HorizonsEphemeris,
+                            &ephemeris_key(obj.horizons_command, obs_code, target),
+                            horizons_cache_dir,
+                            "ephemeris query returned no records",
+                        ));
                     }
                     Err(e) => {
-                        eprintln!(
-                            "  {}: {obs_code} dt={dt:+.0}d ephemeris SKIP ({e})",
-                            obj.name
-                        );
+                        return Err(missing_input(
+                            obj.name,
+                            InputProduct::HorizonsEphemeris,
+                            &ephemeris_key(obj.horizons_command, obs_code, target),
+                            horizons_cache_dir,
+                            &e.to_string(),
+                        ));
                     }
                 }
             }
@@ -1648,7 +1686,7 @@ pub fn run_propagation_validation(
             .collect()
     });
 
-    all_results.into_iter().flatten().collect()
+    Ok(all_results.into_iter().flatten().collect())
 }
 
 /// Result of [`run_od_validation`] — the existing per-row metric records
@@ -2482,7 +2520,9 @@ pub fn run_od_validation(
     max_iterations: u32,
     tier: ForceModelTier,
     sbdb_cache_dir: Option<&std::path::Path>,
-) -> OdValidationOutput {
+) -> Result<OdValidationOutput, String> {
+    use empyrean_validation::inputs::{InputProduct, missing_input};
+
     let timestamp = chrono::Utc::now().to_rfc3339();
     let channel = "rust".to_string();
     // Provenance: the exact empyrean engine (empyrean-core / villeneuve /
@@ -2537,7 +2577,7 @@ pub fn run_od_validation(
                 Ok(o) => o,
                 Err(e) => {
                     eprintln!("  {}: OD SKIP ({e})", obj.name);
-                    return (Vec::new(), Vec::new(), Vec::new());
+                    return Ok((Vec::new(), Vec::new(), Vec::new()));
                 }
             };
             // Fit configuration. Hoisted above both OD passes because it
@@ -2605,7 +2645,7 @@ pub fn run_od_validation(
                         .collect::<Vec<_>>()
                         .join(", ")
                 )));
-                return (results, captured_orbits, orbit_comparisons);
+                return Ok((results, captured_orbits, orbit_comparisons));
             };
 
             let psv = match std::fs::read_to_string(path) {
@@ -2616,7 +2656,7 @@ pub fn run_od_validation(
                         obj.name
                     );
                     results.push(fixture_failure(format!("read PSV {}: {e}", path.display())));
-                    return (results, captured_orbits, orbit_comparisons);
+                    return Ok((results, captured_orbits, orbit_comparisons));
                 }
             };
 
@@ -2631,7 +2671,7 @@ pub fn run_od_validation(
                         "parse PSV {}: {e}",
                         path.display()
                     )));
-                    return (results, captured_orbits, orbit_comparisons);
+                    return Ok((results, captured_orbits, orbit_comparisons));
                 }
             };
 
@@ -2646,7 +2686,7 @@ pub fn run_od_validation(
                 ));
                 row.n_obs_used = Some(0);
                 results.push(row);
-                return (results, captured_orbits, orbit_comparisons);
+                return Ok((results, captured_orbits, orbit_comparisons));
             }
 
             let n_obs = observations.len();
@@ -2685,7 +2725,7 @@ pub fn run_od_validation(
                     row.od_iterations = Some(max_iterations);
                     row.emp_time_ms = Some(ms_fail);
                     results.push(row);
-                    return (results, captured_orbits, orbit_comparisons);
+                    return Ok((results, captured_orbits, orbit_comparisons));
                 }
             };
             let ms = t0.elapsed().as_secs_f64() * 1000.0;
@@ -2765,12 +2805,24 @@ pub fn run_od_validation(
                         (Some(sbdb_state), captured, Some(sbdb_ng))
                     }
                     Ok(_) => {
+                        // A present SBDB record with no published orbit is
+                        // expected — short-arc impactors have no JPL solution
+                        // to compare against — so this stays a non-fatal
+                        // absence of the comparison, not a snapshot miss.
                         eprintln!("  {}: SBDB returned empty batch", obj.name);
                         (None, None, None)
                     }
                     Err(e) => {
-                        eprintln!("  {}: SBDB SKIP ({e})", obj.name);
-                        (None, None, None)
+                        // A failed query under the sealed snapshot means the
+                        // SBDB response is missing from the pinned inputs:
+                        // fatal, not a dropped comparison.
+                        return Err(missing_input(
+                            obj.name,
+                            InputProduct::Sbdb,
+                            obj.sbdb_query,
+                            sbdb_cache_dir.unwrap_or_else(|| std::path::Path::new("<unset>")),
+                            &e.to_string(),
+                        ));
                     }
                 };
 
@@ -3307,9 +3359,9 @@ pub fn run_od_validation(
                 }
             }
 
-            (results, captured_orbits, orbit_comparisons)
+            Ok((results, captured_orbits, orbit_comparisons))
         })
-        .collect();
+        .collect::<Result<Vec<_>, String>>()?;
 
     // Flatten per-object triples back into the function-level accumulators.
     // Input order is preserved by `.par_iter().map().collect()` (Rayon's
@@ -3323,11 +3375,11 @@ pub fn run_od_validation(
         orbit_comparisons.extend(p);
     }
 
-    OdValidationOutput {
+    Ok(OdValidationOutput {
         results,
         captured_orbits,
         orbit_comparisons,
-    }
+    })
 }
 
 /// Propagate a native CoordinateState (any representation) to

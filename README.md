@@ -102,9 +102,11 @@ make report           # render the unified HTML report
 ```
 
 Channel repos sit as siblings of this checkout (`../empyrean`,
-`../empyrean-core`, …); `make plan` regenerates the canonical plan from
-SBDB / Horizons. `cargo test` covers the schema, comparison kernel, and
-report rendering.
+`../empyrean-core`, …); `make plan` regenerates the canonical plan from the
+pinned inputs snapshot — the SBDB, Horizons, and MPC products are minted once
+into an immutable snapshot (`fixtures/manifest.json`) and read offline, never
+queried live (see `fixtures/README.md`). `cargo test` covers the schema,
+comparison kernel, and report rendering.
 
 Want to benchmark another implementation against the same plan? See
 [Add a runner](runners/README.md#add-a-runner) — external runners are

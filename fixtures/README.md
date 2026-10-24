@@ -1,91 +1,139 @@
-# Fixtures — the snapshot contract
+# Validation inputs — the snapshot contract
 
-The ADES PSV astrometry that the OD channels fit (`psv/`, `psv-radar/`) is
-**not stored in git**. It lives in an immutable, content-addressed GCS
-snapshot, and the tracked `manifest.json` in this directory pins it
-bit-exactly — so a git SHA still identifies its exact validation inputs, and
-the validation-of-record contract survives the data leaving the repository.
+Every JPL and MPC product the suite reads is **not stored in git**. All of it —
+SBDB records, Horizons state vectors and ephemerides, and the ADES PSV
+astrometry the OD channels fit — lives in one immutable, content-addressed
+snapshot in the suite's own public-read bucket (`gs://empyrean-validation`,
+under `inputs/<snapshot_id>/`, beside the published `latest/` and `archive/`
+reports), and the tracked `manifest.json` in this directory pins it bit-exactly.
+So a git SHA still identifies the exact validation inputs, and the
+validation-of-record contract survives the data leaving the repository.
+
+The snapshot is minted once by a manual action and consumed offline: the
+validation workflow never queries JPL or the MPC. SBDB solutions move, and with
+them the Horizons epochs the whole plan hangs on, so pinning the responses is
+what makes a run reproducible rather than merely repeatable.
+
+## The four products
 
 ```
-manifest.json      tracked   pins the snapshot: id, base URL, per-file
-                             {path, sha256, bytes, data_rows}
-psv/*.psv          fetched   optical OD fixtures     (see psv/README.md)
-psv-radar/*.psv    fetched   radar-augmented variant (see psv-radar/README.md)
-psv*/README.md     tracked   per-directory documentation
+sbdb/<query>.json          one SBDB response per catalog object (orbit,
+                           covariance, non-grav + physical parameters)
+horizons/<file>.json       Horizons state vectors (the IC at the SBDB epoch,
+                           one per dt of each object's grid, and the Sun's
+                           barycentric state at every target epoch) and
+                           Horizons observer ephemerides (RA/Dec, light-time
+                           corrected) per observer per dt
+psv/<name>.psv             optical OD astrometry, ADES 2017 PSV
+psv-radar/<name>.psv       optical + <radar> table for the radar objects
+MANIFEST.json              per-file manifest (fetched beside the data; not
+                           tracked), verified against the pin before any file
+                           is trusted
 ```
+
+`sbdb/` and `horizons/` files are the engine's own disk-cache files, named by
+the engine's sanitized lookup key; the suite treats them as opaque bytes. The
+plan builder, the reference runner, the ASSIST runner and `merge-external` all
+read these four directories and nothing else — `CACHE_DIR` defaults to this
+`fixtures/` tree, so a developer's `~/.empyrean/cache` is no longer consulted.
+`fixtures/windows.json` (the local, never-regenerated walk manifest) and these
+READMEs are not part of the snapshot and are never touched by the fetch.
 
 ## Fetching
 
 ```sh
-make fixtures            # or directly: scripts/fetch-fixtures.sh
+make fixtures                  # python3 scripts/inputs.py fetch --pin … --prune
+make fixtures INPUTS_OFFLINE=1 # verify the on-disk snapshot without the bucket
 ```
 
-Plain HTTPS via `curl` from
+`scripts/inputs.py fetch` materializes whatever is missing or stale (atomic
+temp-file-then-rename, never a partial write), verifies **every** file's sha256
+against the manifest on **every** invocation — cache hit or miss — prunes any
+file inside the four product directories that the manifest does not list, and
+exits nonzero naming each offending path with its expected and actual hash.
+Nothing downstream runs a fit or a fetch unless it exits 0. `INPUTS_OFFLINE=1`
+does the same verification pass without touching the network: it is the CI
+reader path, where a missing or stale file is a hard failure.
 
+The bucket is public-read — this is public MPC astrometry and public JPL data —
+so readers fetch over plain HTTPS with no credential of any kind
+(`scripts/inputs.py fetch` uses `urllib`, never `gcloud`). Only the mint
+*writes* the snapshot, with the suite's existing CI identity; the upload is the
+one operation that uses `gcloud storage`.
+
+## The pin — `manifest.json`
+
+```json
+{"schema": 1, "snapshot_id": "<UTC date>-<12 hex>",
+ "bucket": "gs://empyrean-validation/inputs", "tree_hash": "<64 hex>",
+ "files_total": 0, "products": {"psv": 0, "psv-radar": 0, "horizons": 0, "sbdb": 0},
+ "partial": false, "minted_utc": "<iso>", "minted_by": "<mint run url>"}
 ```
-https://storage.googleapis.com/empyrean-validation/fixtures/<snapshot_id>/<path>
-```
 
-The objects are public-read — MPC astrometry is public data — so readers
-(local checkouts, CI, forks, external-matrix legs with no secrets) need no
-gcloud and no credential of any kind. `gcloud` is used only by the snapshot
-*upload* (`scripts/upload-fixture-snapshot.sh`).
+- `snapshot_id` — `<UTC date>-<12 hex>`, the hex being the leading 12 characters
+  of the sha256 over one line per file, `"<path>\t<sha256>\n"`, sorted by path.
+  Content-addressed: any change to any file, or to the set of files, is a new
+  id.
+- `tree_hash` — the full 64-hex digest of those same lines. Before any file is
+  trusted, the fetch recomputes it from the downloaded per-file manifest and
+  requires it to equal the manifest's own `tree_hash` and the pin's.
+- `bucket`, `files_total`, per-product counts, `minted_utc`, `minted_by` — the
+  small, reviewable summary; the per-file manifest lives beside the data in the
+  bucket.
 
-How that public read is conferred depends on the bucket's access-control
-mode, and the upload script resolves it *before* transferring a byte:
-`empyrean-validation` has uniform bucket-level access enabled, so per-object
-ACLs are inert and visibility comes from the bucket-wide
-`allUsers → roles/storage.objectViewer` IAM binding; on a bucket without UBLA
-the script grants a per-object ACL scoped to the snapshot prefix instead. It
-refuses to upload into a bucket where neither path yields a public read
-(including `public_access_prevention=enforced`), rather than minting a
-permanent snapshot nobody outside the project could fetch.
+A placeholder pin (`snapshot_id: "PENDING-FIRST-MINT"`, empty `tree_hash`) is
+refused loudly by the fetch, which is the intended state until the first mint
+fills it in.
 
-The fetch script verifies **every** file's sha256 against the manifest on
-**every** invocation — cache hit or miss — re-fetches anything missing or
-stale (atomic temp-file-then-rename, never a partial write), fails loudly
-naming each offending path with its expected/actual hash, and additionally
-rejects any `*.psv` on disk that the manifest does not list (the runners glob
-these directories, so an unlisted file would be silently fitted). Nothing
-downstream runs fits unless it exits 0. Every fixture-consuming Makefile
-target depends on it.
+## Roles in CI
 
-## The manifest
+The inputs snapshot follows the same cache discipline as the kernel set:
 
-- `snapshot_id` — `<UTC date>-<12 hex>`, where the hex is the leading 12
-  characters of the sha256 over the UTF-8 bytes of one line per file,
-  `"<path>\t<sha256>\n"`, sorted by `path`. Content-addressed: any change to
-  any file (or to the set of files) produces a new id.
-- `base_url` — `https://storage.googleapis.com/empyrean-validation/fixtures`.
-- `files[]` — per file: `path` (relative to this directory), `sha256`,
-  `bytes`, and `data_rows` (ADES PSV data lines: total lines minus
-  `#`-prefixed comment/version lines minus the pipe-header line(s); the
-  radar-augmented files carry two headers — optical table + `<radar>` table).
+- **prep** is the sole fetcher: it reads the pinned snapshot once over plain
+  HTTPS (no credential) and saves it to the actions cache under
+  `inputs-<snapshot_id>`, so the fan-out legs do not each hit the bucket.
+- **every other job** restores that exact key and refuses to run on a miss,
+  with no credential, then re-verifies the snapshot offline. The external
+  comparator legs therefore keep carrying no secret and no identity.
+
+## Only ever from there — the seal
+
+The suite reading its inputs only from the snapshot is enforced, not assumed.
+Immediately before its run step, every suite job points the JPL and MPC hosts
+(`ssd.jpl.nasa.gov`, `ssd-api.jpl.nasa.gov`, `data.minorplanetcenter.net`,
+`minorplanetcenter.net`, `www.minorplanetcenter.net`) at `127.0.0.1` and proves
+the override took (`scripts/seal-upstream.sh`). A client that would have reached
+one of these then fails at the socket, naming the host, instead of silently
+fetching an input the git SHA does not pin. Any snapshot miss in the plan
+builder, the reference runner, `merge-external` or the ASSIST runner is an
+error that fails the leg — naming the object, the product and the lookup key —
+not a skip that quietly shrinks the reference. Publishing the report to Google
+Cloud Storage is deliberately not sealed.
 
 ## Immutability and refresh
 
-Snapshots are **never overwritten**. `scripts/upload-fixture-snapshot.sh`
-refuses to run if anything already exists under its destination prefix, and
-requires `--yes` after echoing its full plan.
+Snapshots are **never overwritten**: a `snapshot_id` is content-addressed, and
+the mint refuses to upload into a prefix that already holds anything, so a
+refresh always writes a new prefix and an existing one is left untouched.
 
-A fixture refresh (new astrometry, new objects) mints a **new** snapshot:
-regenerate the manifest from the updated working tree (new content → new
-`snapshot_id`), upload the new prefix, and land the manifest change in a
-reviewed PR. The PR diff *is* the data diff, hash by hash. Refresh tooling is
-tracked as empyrean-svgl.
+A refresh (moved SBDB solutions, new objects, refreshed astrometry) mints a
+**new** snapshot and adopts it in a reviewed PR:
+
+1. Dispatch the manual "Mint validation inputs" action on `main`.
+2. Read its summary artifact — per-product counts, SBDB epoch moves, PSV row
+   deltas against the pinned snapshot.
+3. Open the bump PR: it changes only this `manifest.json`, with the mint's
+   `inputs.py diff <pinned> <new>` output in the description. The PR's own
+   validation run is the acceptance test.
+4. Merge; the next full run on `main` publishes the report built on the new
+   snapshot.
+
+Each new snapshot is a new content-addressed id, so the PR diff *is* the data
+diff. Old snapshots stay in the bucket as history; a tag pins its snapshot.
 
 ## Old releases
 
-The fixtures were tracked in git until this contract landed. **History is
-untouched**: every tag from the in-git era still carries its fixtures in the
-checkout itself and needs no fetch step. Tags from this contract onward pin
-their inputs through `manifest.json` instead.
-
-## CI
-
-Every fixture-consuming job restores an `actions/cache` entry keyed
-`fixtures-<snapshot_id>`, then runs the fetch script **unconditionally** — on
-a cache hit it is a pure verify, so a poisoned or truncated cache fails the
-job instead of reaching a fit — and saves the cache only on a miss, after a
-fully verified fetch. This mirrors the kernel-cache poison discipline in
-`.github/workflows/validation.yml`.
+The inputs were tracked in git, then carried in a public bucket, before this
+contract. **History is untouched**: tags from the in-git era carry their
+fixtures in the checkout, and tags from the public-bucket era fetch from it.
+Tags from this contract onward pin their inputs through `manifest.json`.

@@ -27,7 +27,15 @@
 #
 # Override defaults:
 #   make all OBJECTS="Apophis,Bennu" TIERS="standard"
-#   make all DATA_DIR=/custom/data CACHE_DIR=/custom/cache
+#   make all DATA_DIR=/custom/data
+#
+# The JPL and MPC inputs (SBDB, Horizons vectors + ephemerides, ADES PSVs)
+# are NOT fetched live: `fixtures/manifest.json` pins one immutable snapshot
+# minted by the manual mint-inputs workflow, and `make fixtures` materializes
+# and sha256-verifies it under `fixtures/` (CACHE_DIR defaults there). Every
+# consumer — the plan builder, the reference runner, ASSIST, merge-external —
+# reads that snapshot and nothing else; a developer's ~/.empyrean/cache is no
+# longer consulted. See fixtures/README.md for the contract.
 #
 # CI entrypoint: `make setup all` from a fresh clone (with sibling
 # repos checked out as above).
@@ -52,16 +60,25 @@ TIERS ?= standard
 # isolated matrix legs that never build or run the rust reference themselves.
 PLAN_PREBUILT ?=
 DATA_DIR ?= $(HOME)/.empyrean/data
-CACHE_DIR ?= $(HOME)/.empyrean/cache
+# The JPL cache (SBDB + Horizons) is the pinned inputs snapshot on disk, not a
+# developer's personal cache: every consumer reads fixtures/{sbdb,horizons} and
+# nothing else, so a cache miss fails loudly instead of silently fetching.
+CACHE_DIR ?= $(ROOT)/fixtures
 RESULTS_DIR := $(ROOT)/results
 FIXTURES_PSV := $(ROOT)/fixtures/psv
 # Radar-augmented fixtures (optical + ADES <radar> table) for the objects with
 # radar astrometry; drives the find_orb radar-OD reference pass.
 FIXTURES_PSV_RADAR := $(ROOT)/fixtures/psv-radar
-# The fixture DATA is not in git: fixtures/manifest.json (tracked) pins an
-# immutable public-read GCS snapshot, and the fetch script materializes +
-# verifies it. See fixtures/README.md for the contract.
-FETCH_FIXTURES := $(ROOT)/scripts/fetch-fixtures.sh
+# The inputs snapshot (SBDB, Horizons, ADES PSVs) is not in git:
+# fixtures/manifest.json (tracked) pins one immutable snapshot in the suite's
+# public validation bucket (gs://empyrean-validation/inputs/<id>/), and
+# scripts/inputs.py materializes + sha256-verifies it over plain HTTPS (no
+# credential). See fixtures/README.md for the contract.
+# INPUTS_OFFLINE=1 verifies the on-disk snapshot without touching the network
+# — the reader path in CI, where prep is the sole fetcher.
+INPUTS_PIN := $(ROOT)/fixtures/manifest.json
+INPUTS_TOOL := python3 $(ROOT)/scripts/inputs.py
+INPUTS_OFFLINE ?=
 
 # Per-channel runners (rust / python / c / cli) live in this repo's
 # runners/ directory alongside the external-reference runners. They
@@ -222,19 +239,26 @@ all: build run report
 
 # ── Fixtures ───────────────────────────────────────────────
 # Every OD channel reads $(FIXTURES_PSV); the find_orb radar pass reads
-# $(FIXTURES_PSV_RADAR). The data lives in an immutable public-read GCS
-# snapshot pinned bit-exactly by fixtures/manifest.json (tracked); the
-# fetch script downloads whatever is missing/stale over plain HTTPS and
-# verifies EVERY file's sha256 on EVERY invocation — so no target below
-# can ever fit a partial, stale, or contaminated set, and it exits
-# nonzero naming each offending file when it cannot deliver that.
+# $(FIXTURES_PSV_RADAR); the plan builder and reference runner read
+# $(CACHE_DIR)/{sbdb,horizons}. All four product directories are one
+# immutable snapshot pinned bit-exactly by fixtures/manifest.json (tracked),
+# in the suite's public validation bucket. `scripts/inputs.py fetch`
+# materializes whatever is missing/stale over plain HTTPS (atomic
+# temp-then-rename, no credential), verifies EVERY file's sha256 on EVERY
+# invocation, prunes any snapshot-shaped file (*.psv, *.json in the product
+# dirs) the manifest does not list, and exits nonzero
+# naming each offending file — so no target below can ever fit a partial,
+# stale, or contaminated set. INPUTS_OFFLINE=1 does the verify pass without the
+# network: the CI reader path, where prep is the sole fetcher. Files outside
+# the four product dirs (fixtures/windows.json,
+# fixtures/README.md) are never touched.
 #
 # Phony on purpose: the verify must run every time. Order-only
 # (`| fixtures`) on the file targets: the guard must run before them, but
 # a phony prerequisite must never mark a completed multi-hour channel
 # output as out of date.
 fixtures:
-	@$(FETCH_FIXTURES)
+	@$(INPUTS_TOOL) fetch --pin $(INPUTS_PIN) --dest $(ROOT)/fixtures --prune $(if $(INPUTS_OFFLINE),--offline,)
 
 # Back-compat alias — CI steps and muscle memory both know this name.
 check-fixtures: fixtures

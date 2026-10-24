@@ -73,33 +73,40 @@ jobs:
           rustflags: ""
 
       # The harness tests read the OD fixture set (catalog.rs pins
-      # RADAR_FIXTURE_OBJECTS against the files on disk), which is not in
-      # git: fixtures/manifest.json pins an immutable public-read GCS
-      # snapshot. Same restore → always-verify fetch → save-on-miss poison
-      # discipline as .github/workflows/validation.yml: the fetch script
-      # verifies every sha256 even on a cache hit, so a poisoned cache
-      # fails here rather than reaching a test.
-      - name: Read fixture snapshot id
-        id: fixtures-key
+      # RADAR_FIXTURE_OBJECTS against the files on disk), which is not in git:
+      # fixtures/manifest.json pins one immutable snapshot in the suite's
+      # public validation bucket. Restore → always-verify fetch → save-on-miss
+      # poison discipline: `make fixtures` fetches over plain HTTPS and verifies
+      # every sha256 even on a cache hit, so a poisoned cache fails here rather
+      # than reaching a test. Public-read, no credential — this job, like
+      # build-lint, runs on any clone including fork PRs.
+      - name: Read inputs snapshot id
+        id: inputs-id
         run: python3 -c "import json; print('id=' + json.load(open('fixtures/manifest.json'))['snapshot_id'])" >> "$GITHUB_OUTPUT"
-      - name: Restore OD fixtures
-        id: cache-fixtures
+      - name: Restore inputs snapshot
+        id: cache-inputs
         uses: actions/cache/restore@v4
         with:
           path: |
-            fixtures/psv/*.psv
-            fixtures/psv-radar/*.psv
-          key: fixtures-${{ steps.fixtures-key.outputs.id }}
-      - name: Fetch + verify OD fixtures
-        run: ./scripts/fetch-fixtures.sh
-      - name: Save OD fixtures
-        if: steps.cache-fixtures.outputs.cache-hit != 'true'
+            fixtures/psv
+            fixtures/psv-radar
+            fixtures/horizons
+            fixtures/sbdb
+            fixtures/MANIFEST.json
+          key: inputs-${{ steps.inputs-id.outputs.id }}
+      - name: Fetch + verify the pinned inputs snapshot
+        run: make fixtures
+      - name: Save inputs snapshot
+        if: steps.cache-inputs.outputs.cache-hit != 'true'
         uses: actions/cache/save@v4
         with:
           path: |
-            fixtures/psv/*.psv
-            fixtures/psv-radar/*.psv
-          key: fixtures-${{ steps.fixtures-key.outputs.id }}
+            fixtures/psv
+            fixtures/psv-radar
+            fixtures/horizons
+            fixtures/sbdb
+            fixtures/MANIFEST.json
+          key: inputs-${{ steps.inputs-id.outputs.id }}
 
       - name: Unit tests
         run: cargo test --verbose

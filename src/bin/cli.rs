@@ -39,6 +39,7 @@ use empyrean_validation::{
     catalog::{
         RADAR_FIXTURE_OBJECTS, ValidationObject, all_objects, filter_by_name, filter_by_population,
     },
+    inputs::{InputProduct, missing_input},
     plan::{PlanConfig, build_plan},
     report::{SUMMARY_TEST_TYPES, generate_report},
     schema::{OrbitComparison, ValidationResult, channels, test_types},
@@ -170,8 +171,9 @@ struct PlanArgs {
     /// f64-no-cov only.
     #[arg(long, default_value_t = true)]
     uncertainty_axis: bool,
-    /// Disk-cache directory for SBDB / Horizons queries.
-    #[arg(long, default_value = "~/.empyrean/cache")]
+    /// Pinned inputs snapshot directory for SBDB / Horizons (the suite reads
+    /// this and nothing else; CI sets it via the Makefile's CACHE_DIR).
+    #[arg(long, default_value = "fixtures")]
     cache_dir: PathBuf,
 }
 
@@ -557,7 +559,7 @@ fn plan(args: PlanArgs) -> Result<(), Box<dyn std::error::Error>> {
         uncertainty_axis: args.uncertainty_axis,
     };
 
-    let plan = build_plan(&selected, &config, &sbdb_cache_dir, &horizons_cache_dir);
+    let plan = build_plan(&selected, &config, &sbdb_cache_dir, &horizons_cache_dir)?;
 
     if let Some(parent) = args.output.parent() {
         std::fs::create_dir_all(parent)?;
@@ -1695,13 +1697,38 @@ struct SbdbOdRef {
 /// Read `{sbdb_cache_dir}/{sbdb_query with spaces→underscores}.json` and
 /// extract the JPL fit quality from `response.orbit`. Returns `None` if the
 /// cache file is absent or has no orbit block (the object is simply skipped).
-fn read_sbdb_od_ref(sbdb_cache_dir: &std::path::Path, sbdb_query: &str) -> Option<SbdbOdRef> {
+/// Read JPL's SBDB OD reference for `sbdb_query` from the pinned snapshot.
+///
+/// The SBDB response lives in the sealed inputs snapshot, so the file's
+/// ABSENCE is a gap in the pinned inputs — fatal ([`Err`]), naming the key and
+/// the directory — not a silently dropped OD reference as it used to be. A
+/// present response with no published orbit is a different, legitimate case
+/// (short-arc impactors have no JPL solution): that returns `Ok(None)` and the
+/// caller skips it without fabricating a reference.
+fn read_sbdb_od_ref(
+    sbdb_cache_dir: &std::path::Path,
+    sbdb_query: &str,
+) -> Result<Option<SbdbOdRef>, String> {
     let fname = format!("{}.json", sbdb_query.replace(' ', "_"));
-    let txt = std::fs::read_to_string(sbdb_cache_dir.join(fname)).ok()?;
-    let d: serde_json::Value = serde_json::from_str(&txt).ok()?;
+    let path = sbdb_cache_dir.join(fname);
+    let txt = std::fs::read_to_string(&path).map_err(|e| {
+        missing_input(
+            sbdb_query,
+            InputProduct::Sbdb,
+            sbdb_query,
+            sbdb_cache_dir,
+            &e.to_string(),
+        )
+    })?;
+    let d: serde_json::Value = serde_json::from_str(&txt).map_err(|e| {
+        format!(
+            "{}: SBDB snapshot file is not valid JSON: {e}",
+            path.display()
+        )
+    })?;
     let o = &d["response"]["orbit"];
     if !o.is_object() {
-        return None;
+        return Ok(None);
     }
     let f64_of = |v: &serde_json::Value| {
         v.as_f64()
@@ -1718,7 +1745,7 @@ fn read_sbdb_od_ref(sbdb_cache_dir: &std::path::Path, sbdb_query: &str) -> Optio
             .or_else(|| v.as_str().and_then(|s| s.trim().parse().ok()))
     };
     let str_of = |v: &serde_json::Value| v.as_str().map(|s| s.to_string());
-    Some(SbdbOdRef {
+    Ok(Some(SbdbOdRef {
         rms: f64_of(&o["rms"]),
         n_obs_used: u32_of(&o["n_obs_used"]),
         n_del_obs_used: u32_of(&o["n_del_obs_used"]),
@@ -1728,7 +1755,7 @@ fn read_sbdb_od_ref(sbdb_cache_dir: &std::path::Path, sbdb_query: &str) -> Optio
         soln_date: str_of(&o["soln_date"]),
         pe_used: str_of(&o["pe_used"]),
         sb_used: str_of(&o["sb_used"]),
-    })
+    }))
 }
 
 /// Fold JPL's SBDB fit quality onto every OD row as the `ref_od_*` reference.
@@ -1753,10 +1780,16 @@ fn merge_jpl(
         let Some(&query) = query_of.get(r.object.as_str()) else {
             continue;
         };
-        let od = cache
-            .entry(query.to_string())
-            .or_insert_with(|| read_sbdb_od_ref(sbdb_cache_dir, query));
-        let Some(od) = od else { continue };
+        if !cache.contains_key(query) {
+            // `?` here fails the merge if the SBDB snapshot file is missing —
+            // the OD reference is no longer silently dropped. A present file
+            // with no orbit resolves to `None` and is skipped below.
+            let od = read_sbdb_od_ref(sbdb_cache_dir, query)?;
+            cache.insert(query.to_string(), od);
+        }
+        let Some(od) = cache.get(query).unwrap() else {
+            continue;
+        };
         r.ref_od_rms_normalized = od.rms;
         r.ref_od_reduced_chi2 = od.rms.map(|x| x * x);
         r.ref_od_n_obs_used = od.n_obs_used;
@@ -3215,17 +3248,54 @@ mod tests {
     }
 
     #[test]
-    fn merge_jpl_handles_space_in_query_and_skips_missing() {
-        // "2020 AV2" resolves to cache file "2020_AV2.json"; an object whose
-        // cache file is absent is silently skipped (no fabrication).
+    fn merge_jpl_handles_space_in_query() {
+        // "2020 AV2" resolves to cache file "2020_AV2.json".
         let dir = tempfile::tempdir().unwrap();
         write_sbdb(dir.path(), "2020 AV2", r#"{"rms":".5","n_obs_used":402}"#);
-        let mut rows = vec![od_row("2020 AV2"), od_row("Bennu")];
+        let mut rows = vec![od_row("2020 AV2")];
         let n = merge_jpl(&mut rows, dir.path()).unwrap();
         assert_eq!(n, 1);
         assert_eq!(rows[0].ref_od_n_obs_used, Some(402));
         assert_eq!(rows[0].ref_od_reduced_chi2, Some(0.25));
-        assert_eq!(rows[1].ref_od_n_obs_used, None); // no cache file for Bennu
+    }
+
+    #[test]
+    fn merge_jpl_errors_when_the_sbdb_snapshot_file_is_missing() {
+        // The inputs are sealed: an OD object whose SBDB file is absent from
+        // the snapshot is a gap in the pinned inputs, not a silently dropped
+        // reference. The merge fails, naming the key and the directory.
+        let dir = tempfile::tempdir().unwrap();
+        write_sbdb(dir.path(), "2020 AV2", r#"{"rms":".5","n_obs_used":402}"#);
+        let mut rows = vec![od_row("2020 AV2"), od_row("Bennu")];
+        let err = merge_jpl(&mut rows, dir.path()).unwrap_err().to_string();
+        assert!(err.contains("SBDB"), "names the product: {err}");
+        assert!(
+            err.contains("sealed"),
+            "states the inputs are sealed: {err}"
+        );
+        // The key is the catalog's sbdb_query for Bennu, not its display name.
+        let bennu_query = all_objects()
+            .into_iter()
+            .find(|o| o.name == "Bennu")
+            .unwrap()
+            .sbdb_query;
+        assert!(err.contains(bennu_query), "names the lookup key: {err}");
+    }
+
+    #[test]
+    fn merge_jpl_skips_an_object_whose_sbdb_record_has_no_orbit() {
+        // SBDB legitimately has no published orbit for short-arc impactors;
+        // the file is present but carries `orbit: null`. That is a real
+        // absence of a comparison, not a snapshot miss: skip it, do not error
+        // and do not fabricate a reference.
+        let dir = tempfile::tempdir().unwrap();
+        write_sbdb(dir.path(), "2020 AV2", r#"{"rms":".5","n_obs_used":402}"#);
+        write_sbdb(dir.path(), "Bennu", "null");
+        let mut rows = vec![od_row("2020 AV2"), od_row("Bennu")];
+        let n = merge_jpl(&mut rows, dir.path()).unwrap();
+        assert_eq!(n, 1, "only the object with a published orbit is merged");
+        assert_eq!(rows[0].ref_od_n_obs_used, Some(402));
+        assert_eq!(rows[1].ref_od_n_obs_used, None); // Bennu: no orbit, skipped
     }
 
     // ── Per-object CI fan-out: slugs and selection ──────────────────

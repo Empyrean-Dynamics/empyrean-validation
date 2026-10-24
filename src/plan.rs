@@ -6,14 +6,17 @@
 //! every `(object, dt)`, and emits a [`ValidationPlan`] (`Vec<ValidationResult>`
 //! with `channel = "plan"`) that every replay channel consumes.
 //!
-//! # Network behaviour
+//! # Inputs come from the pinned snapshot, never the network
 //!
 //! Both SBDB and Horizons queries go through the published `empyrean`
-//! crate's disk-cached JPL clients (`cache_dir`-keyed)
-//! — the first run hits the network and writes to disk; subsequent runs
-//! against the same cache are network-free. CI environments should
-//! commit the cache as a workflow artifact (or pull it from GCS) so the
-//! plan generation step is deterministic across runs.
+//! crate's disk-cached JPL clients (`cache_dir`-keyed), but the suite points
+//! `cache_dir` at the pinned inputs snapshot on disk (`fixtures/sbdb`,
+//! `fixtures/horizons`) and seals the JPL and MPC hosts, so the clients read
+//! the snapshot and never reach the network. A query that misses the snapshot
+//! is a gap in the pinned inputs, not a transient outage: [`build_plan`] fails
+//! the whole plan naming the object, the product and the lookup key (see
+//! [`crate::inputs`]) rather than dropping the object, so a short reference can
+//! never look complete.
 //!
 //! # Plan row shape
 //!
@@ -104,14 +107,17 @@ impl Default for PlanConfig {
 /// perturb itself whichever question the row asks — see
 /// [`self_perturber_naif_ids`].
 ///
-/// Network errors on individual objects are logged to stderr and skip
-/// that object — the plan continues with whatever objects responded.
+/// The inputs are read from the pinned snapshot (see the module docs): a
+/// query that misses it fails the whole plan with a named error ([`Err`]),
+/// rather than skipping the object, so the plan is either the full catalog or
+/// an explicit failure naming the missing input.
 pub fn build_plan(
     objects: &[&ValidationObject],
     config: &PlanConfig,
     sbdb_cache_dir: &std::path::Path,
     horizons_cache_dir: &std::path::Path,
-) -> ValidationPlan {
+) -> Result<ValidationPlan, String> {
+    use crate::inputs::{InputProduct, ephemeris_key, missing_input, vectors_key};
     let timestamp = chrono::Utc::now().to_rfc3339();
     let mut plan: ValidationPlan = Vec::new();
 
@@ -122,19 +128,34 @@ pub fn build_plan(
         let sbdb = match empyrean::query_sbdb(&[obj.sbdb_query], Some(sbdb_cache_dir)) {
             Ok(b) if !b.orbits.is_empty() => b,
             Ok(_) => {
-                eprintln!("  {}: SKIP (SBDB: empty result)", obj.name);
-                continue;
+                return Err(missing_input(
+                    obj.name,
+                    InputProduct::Sbdb,
+                    obj.sbdb_query,
+                    sbdb_cache_dir,
+                    "SBDB query returned no orbits",
+                ));
             }
             Err(e) => {
-                eprintln!("  {}: SKIP (SBDB: {e})", obj.name);
-                continue;
+                return Err(missing_input(
+                    obj.name,
+                    InputProduct::Sbdb,
+                    obj.sbdb_query,
+                    sbdb_cache_dir,
+                    &e.to_string(),
+                ));
             }
         };
         let epoch = match sbdb.orbits[0].state.epoch.mjd_tdb() {
             Ok(t) => t,
             Err(e) => {
-                eprintln!("  {}: SKIP (SBDB epoch: {e})", obj.name);
-                continue;
+                // The SBDB record is present but its epoch does not convert —
+                // a malformed pinned input, not a miss. Still fatal: dropping
+                // the object silently shrank the reference.
+                return Err(format!(
+                    "{}: SBDB record in the pinned snapshot has an unreadable epoch: {e}",
+                    obj.name
+                ));
             }
         };
 
@@ -146,8 +167,13 @@ pub fn build_plan(
         ) {
             Ok(h) => h,
             Err(e) => {
-                eprintln!("  {}: SKIP (Horizons IC: {e})", obj.name);
-                continue;
+                return Err(missing_input(
+                    obj.name,
+                    InputProduct::HorizonsVectors,
+                    &vectors_key(obj.horizons_command, epoch),
+                    horizons_cache_dir,
+                    &e.to_string(),
+                ));
             }
         };
 
@@ -199,7 +225,13 @@ pub fn build_plan(
                     horizons_vectors.insert(dt as i64, h);
                 }
                 Err(e) => {
-                    eprintln!("  {}: dt={dt:+.0}d Horizons SKIP ({e})", obj.name);
+                    return Err(missing_input(
+                        obj.name,
+                        InputProduct::HorizonsVectors,
+                        &vectors_key(obj.horizons_command, target),
+                        horizons_cache_dir,
+                        &e.to_string(),
+                    ));
                 }
             }
             match empyrean::query_horizons_vectors("10", target, Some(horizons_cache_dir)) {
@@ -207,7 +239,13 @@ pub fn build_plan(
                     sun_vectors.insert(dt as i64, h);
                 }
                 Err(e) => {
-                    eprintln!("  {}: dt={dt:+.0}d Sun-vector SKIP ({e})", obj.name);
+                    return Err(missing_input(
+                        obj.name,
+                        InputProduct::HorizonsVectors,
+                        &vectors_key("10", target),
+                        horizons_cache_dir,
+                        &e.to_string(),
+                    ));
                 }
             }
         }
@@ -234,10 +272,22 @@ pub fn build_plan(
                         horizons_ephemeris.insert((obs, dt as i64), r.into_iter().next().unwrap());
                     }
                     Ok(_) => {
-                        eprintln!("  {}: {obs} dt={dt:+.0}d ephemeris SKIP (empty)", obj.name);
+                        return Err(missing_input(
+                            obj.name,
+                            InputProduct::HorizonsEphemeris,
+                            &ephemeris_key(obj.horizons_command, obs, target),
+                            horizons_cache_dir,
+                            "ephemeris query returned no records",
+                        ));
                     }
                     Err(e) => {
-                        eprintln!("  {}: {obs} dt={dt:+.0}d ephemeris SKIP ({e})", obj.name);
+                        return Err(missing_input(
+                            obj.name,
+                            InputProduct::HorizonsEphemeris,
+                            &ephemeris_key(obj.horizons_command, obs, target),
+                            horizons_cache_dir,
+                            &e.to_string(),
+                        ));
                     }
                 }
             }
@@ -325,7 +375,7 @@ pub fn build_plan(
     }
 
     eprintln!("Plan: {} rows", plan.len());
-    plan
+    Ok(plan)
 }
 
 /// The uncertainty **methods** the plan emits for one object.

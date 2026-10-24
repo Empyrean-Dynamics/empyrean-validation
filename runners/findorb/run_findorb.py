@@ -25,16 +25,13 @@ import argparse
 import json
 import os
 import pathlib
-import re
 import shutil
 import subprocess
 import sys
 import tempfile
 import time
-import urllib.parse
-import urllib.request
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, Optional
 
 # Local: ADES radar table -> MPC 80-column R/r records. find_orb reads 80-column
 # radar natively but cannot parse the ADES <radar> table at all.
@@ -130,62 +127,6 @@ def resolve_source_version() -> str:
         return f"find_orb unknown ({reason})"
     sha = proc.stdout.strip()
     return f"find_orb {sha}" if sha else "find_orb unknown (empty git sha)"
-
-
-# ── MPC Observation Fetching ────────────────────────────
-
-
-def fetch_mpc_observations(designation: str) -> Optional[str]:
-    """Fetch observations from MPC API and return as ADES PSV string.
-
-    The MPC API returns JSON which we convert to ADES PSV format
-    for consumption by both empyrean and find_orb.
-    """
-    url = f"https://data.minorplanetcenter.net/api/get-obs?designation={urllib.parse.quote(designation)}&return_type=json"
-    try:
-        req = urllib.request.Request(url, headers={"Accept": "application/json"})
-        with urllib.request.urlopen(req, timeout=30) as resp:
-            data = json.loads(resp.read())
-    except Exception as e:
-        print(f"  MPC fetch failed: {e}")
-        return None
-
-    if not data:
-        return None
-
-    # Convert MPC JSON to ADES PSV
-    lines = ["# version=2017"]
-    lines.append("permID|trkSub|mode|stn|obsTime|ra|dec|rmsRA|rmsDec|astCat|mag|band")
-
-    for obs in data:
-        perm_id = obs.get("number", "")
-        trk_sub = obs.get("trksub", obs.get("provid", ""))
-        mode = obs.get("mode", "CCD")
-        stn = obs.get("stn", "")
-        obs_time = obs.get("obstime", obs.get("jd_obs", ""))
-        ra = obs.get("ra", "")
-        dec = obs.get("dec", "")
-        rms_ra = obs.get("rmsRA", "")
-        rms_dec = obs.get("rmsDec", "")
-        ast_cat = obs.get("catalog", "")
-        mag = obs.get("mag", "")
-        band = obs.get("band", "")
-
-        # Skip if missing essential fields
-        if not stn or not obs_time or not ra or not dec:
-            continue
-
-        fields = [
-            str(perm_id), str(trk_sub), str(mode), str(stn),
-            str(obs_time), str(ra), str(dec), str(rms_ra), str(rms_dec),
-            str(ast_cat), str(mag), str(band),
-        ]
-        lines.append("|".join(fields))
-
-    if len(lines) <= 2:
-        return None
-
-    return "\n".join(lines) + "\n"
 
 
 # ── find_orb Execution ──────────────────────────────────
@@ -472,45 +413,6 @@ def run_findorb(
         return None
     finally:
         shutil.rmtree(tmp_dir, ignore_errors=True)
-
-
-# ── SBDB Fetch (for comparison) ─────────────────────────
-
-
-def fetch_sbdb_elements(designation: str) -> Optional[Dict[str, Any]]:
-    """Fetch SBDB orbital elements for comparison."""
-    url = f"https://ssd-api.jpl.nasa.gov/sbdb.api?sstr={urllib.parse.quote(designation)}&phys-par=true&cov=true"
-    try:
-        with urllib.request.urlopen(url, timeout=15) as resp:
-            data = json.loads(resp.read())
-    except Exception:
-        return None
-
-    orbit = data.get("orbit", {})
-    elements = orbit.get("elements", [])
-
-    result = {}
-    for elem in elements:
-        name = elem.get("name", "")
-        value = elem.get("value")
-        sigma = elem.get("sigma")
-        if value is not None:
-            try:
-                result[name] = float(value)
-            except (ValueError, TypeError):
-                result[name] = value
-        if sigma is not None:
-            try:
-                result[f"{name}_sigma"] = float(sigma)
-            except (ValueError, TypeError):
-                pass
-
-    # Get covariance if available
-    cov_data = orbit.get("covariance", {})
-    if cov_data:
-        result["sbdb_covariance"] = cov_data
-
-    return result if result else None
 
 
 # ── Main ────────────────────────────────────────────────
