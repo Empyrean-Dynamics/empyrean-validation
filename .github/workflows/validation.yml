@@ -358,7 +358,10 @@ jobs:
     name: Reference — ${{ matrix.object.name }}
     needs: prep
     runs-on: ubuntu-latest
-    timeout-minutes: 90
+    # The heaviest object (2020 CD3, a minimoon with Monte Carlo rows) took 37,
+    # 51 and then more than 90 minutes on three runs of the same code: runner
+    # variance, not a regression. Budget from the measured spread.
+    timeout-minutes: 180
     strategy:
       fail-fast: false
       # 25 rather than all 50 is free here, and deliberate. Wall-clock is set by
