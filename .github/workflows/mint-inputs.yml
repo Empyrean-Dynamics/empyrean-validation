@@ -1,0 +1,387 @@
+name: Mint validation inputs
+
+# The ONE workflow allowed to reach JPL and the MPC. It mints a validation
+# inputs snapshot by running a single online reference pass against an EMPTY
+# cache, merging the engine's own disk-cache files (horizons/, sbdb/) with the
+# ADES PSV astrometry (psv/, psv-radar/) into one tree, and uploading it,
+# immutable and content-addressed, to gs://empyrean-data/validation/<id>/.
+# Every other validation workflow reads that snapshot offline.
+#
+# EMPYREAN_OFFLINE="1" below gates the KERNEL manager only; the JPL Horizons /
+# SBDB and MPC query clients are NOT gated by it, which is precisely why this
+# workflow can and does fetch them live. There is no seal step here.
+#
+# Design: lang/design/validation-inputs-snapshot.md (sections "Minting" and
+# "Writer identity"). Shapes mirror validation.yml's prep/reference/assemble.
+
+on:
+  workflow_dispatch:
+    inputs:
+      objects:
+        description: "Comma-separated catalog names for a PARTIAL (rehearsal) snapshot; empty = the full catalog."
+        type: string
+        required: false
+        default: ""
+      psv_source:
+        description: "pinned = the pinned snapshot's PSVs (needs the new-format pin); legacy-public = the old public PSV snapshot (first mint only)."
+        type: choice
+        options:
+          - pinned
+          - legacy-public
+        default: pinned
+      upload:
+        description: "Upload the minted snapshot to the bucket (off = mint + report only)."
+        type: boolean
+        default: true
+
+# One mint at a time: a snapshot prefix is immutable and two concurrent mints
+# of the same tree would race on the refuse-if-exists check.
+concurrency: mint-inputs
+
+permissions:
+  contents: read
+  id-token: write
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_NET_GIT_FETCH_WITH_CLI: true
+  PYTHON_VERSION: "3.12"
+  # The registered kernel set every empyrean repo pins (lang/workflow/gcp-project.md).
+  EMPYREAN_DATASET: kernels-full-2026-10-13
+  EMPYREAN_DATA_DIR: ${{ github.workspace }}/data
+  # Kernels only (see the header): the JPL/MPC query clients are not gated by it.
+  EMPYREAN_OFFLINE: "1"
+  OBJECTS: ${{ inputs.objects }}
+  # The mint fetches everything the suite reads from JPL, which is the standard
+  # tier's set; there is no tier input because a snapshot is tier-complete.
+  TIER: standard
+  BUCKET: gs://empyrean-data/validation
+
+jobs:
+  # ── prep ───────────────────────────────────────────────────────────
+  # Build the engine + harness and warm the shared caches ONCE, then emit the
+  # per-object matrix from the catalog. The sole writer of the kernel cache the
+  # fan-out legs restore (same contract as validation.yml's prep).
+  prep:
+    name: Prep — build + object matrix
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+    timeout-minutes: 90
+    outputs:
+      objects: ${{ steps.objects.outputs.objects }}
+    steps:
+      - name: Checkout empyrean-validation (default)
+        uses: actions/checkout@v4
+        with:
+          path: empyrean-validation
+      - name: Engine setup (writer — populates the shared caches)
+        uses: ./empyrean-validation/.github/actions/engine-setup
+        with:
+          gh-pat: ${{ secrets.GH_PAT }}
+          python-version: ${{ env.PYTHON_VERSION }}
+          dataset: ${{ env.EMPYREAN_DATASET }}
+          # engine-setup on main still requires this input; the mint keeps no JPL
+          # cache, so the key is inert. The consumption PR removes the input and
+          # this line with it.
+          jpl-cache-key: mint-unused
+          workload-identity-provider: ${{ vars.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service-account: ${{ vars.GCP_DATA_READER_SA }}
+          role: writer
+          install-python-tooling: "true"
+      - name: Build engine + harness binaries
+        working-directory: empyrean-validation
+        env:
+          DATA_DIR: ${{ env.EMPYREAN_DATA_DIR }}
+        run: make build
+      - name: Emit per-object matrix
+        id: objects
+        working-directory: empyrean-validation
+        run: |
+          # Read the matrix from the FILE the target writes, never from make's
+          # stdout (its recipe banners there break fromJson), exactly as
+          # validation.yml does.
+          make list-objects OBJECTS="${OBJECTS}"
+          matrix="$(cat results/objects.json)"
+          count="$(python3 -c 'import json;print(len(json.load(open("results/objects.json"))))')"
+          test "$count" -gt 0 || { echo "ERROR: matrix is empty — no objects to mint." >&2; exit 1; }
+          echo "objects=$matrix" >> "$GITHUB_OUTPUT"
+          echo "Minting inputs for $count object(s)."
+
+  # ── mint (per-object matrix) ────────────────────────────────────────
+  # One leg per catalog object. Each runs the reference prop+eph + OD pass with
+  # an EMPTY cache directory, so every SBDB/Horizons response is fetched live
+  # and written in the engine's own disk-cache format. The snapshot is, by
+  # construction, the set of responses one reference pass consumed.
+  mint:
+    name: Mint — ${{ matrix.object.name }}
+    needs: prep
+    runs-on: ubuntu-latest
+    # 2020 CD3's auto-cascade row can take up to 3 h on a hosted VM.
+    timeout-minutes: 360
+    strategy:
+      fail-fast: false
+      max-parallel: 25
+      matrix:
+        object: ${{ fromJson(needs.prep.outputs.objects) }}
+    steps:
+      - name: Checkout empyrean-validation (default)
+        uses: actions/checkout@v4
+        with:
+          path: empyrean-validation
+      - name: Engine setup (reader — restores prep's caches)
+        uses: ./empyrean-validation/.github/actions/engine-setup
+        with:
+          gh-pat: ${{ secrets.GH_PAT }}
+          python-version: ${{ env.PYTHON_VERSION }}
+          dataset: ${{ env.EMPYREAN_DATASET }}
+          jpl-cache-key: mint-unused
+          role: reader
+      - name: Build reference prerequisites (warm)
+        working-directory: empyrean-validation
+        env:
+          DATA_DIR: ${{ env.EMPYREAN_DATA_DIR }}
+        run: make build-reference
+      - name: Reference shard — ${{ matrix.object.name }} (live JPL/MPC into an empty cache)
+        working-directory: empyrean-validation
+        env:
+          DATA_DIR: ${{ env.EMPYREAN_DATA_DIR }}
+        run: |
+          # CACHE_DIR starts empty; the Makefile passes it to the runner as
+          # --cache-dir, which writes horizons/ + sbdb/ under it (Makefile ~L655).
+          make shard-reference \
+            OBJECT="${{ matrix.object.name }}" \
+            SLUG="${{ matrix.object.slug }}" \
+            TIERS="${TIER}" \
+            CACHE_DIR="$GITHUB_WORKSPACE/mint/cache"
+      - name: Upload input shard (engine cache files)
+        uses: actions/upload-artifact@v4
+        with:
+          name: inputs-shard-${{ matrix.object.slug }}
+          path: mint/cache
+          retention-days: 7
+          if-no-files-found: error
+      - name: Upload reference shard (free health check)
+        uses: actions/upload-artifact@v4
+        with:
+          name: reference-shard-${{ matrix.object.slug }}
+          path: empyrean-validation/results/shards/${{ matrix.object.slug }}/
+          retention-days: 7
+          if-no-files-found: error
+
+  # ── assemble ────────────────────────────────────────────────────────
+  # Merge the input shards into one tree, add the plan-only keys online, attach
+  # the PSV products, build the manifest + pin, and upload the immutable
+  # snapshot. A partial result is never uploaded as a full snapshot.
+  assemble:
+    name: Assemble — merge, plan, manifest, upload
+    needs: [prep, mint]
+    if: always()
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+    timeout-minutes: 60
+    steps:
+      - name: Require every mint leg to have succeeded
+        if: needs.mint.result != 'success'
+        run: |
+          echo "ERROR: a mint leg did not succeed (needs.mint.result=${{ needs.mint.result }})." >&2
+          echo "       A partial result is never uploaded as a full snapshot — re-run the failed object(s)." >&2
+          exit 1
+      - name: Checkout empyrean-validation (default)
+        uses: actions/checkout@v4
+        with:
+          path: empyrean-validation
+      - name: Engine setup (reader — restores prep's caches)
+        uses: ./empyrean-validation/.github/actions/engine-setup
+        with:
+          gh-pat: ${{ secrets.GH_PAT }}
+          python-version: ${{ env.PYTHON_VERSION }}
+          dataset: ${{ env.EMPYREAN_DATASET }}
+          jpl-cache-key: mint-unused
+          role: reader
+      - name: Build harness binary
+        working-directory: empyrean-validation
+        env:
+          DATA_DIR: ${{ env.EMPYREAN_DATA_DIR }}
+        run: make build-empyrean-validation
+      - name: Download input shards
+        uses: actions/download-artifact@v4
+        with:
+          pattern: inputs-shard-*
+          path: shards-in
+      - name: Merge input shards into one tree (byte-identical collision check)
+        run: |
+          python3 - "$GITHUB_WORKSPACE/shards-in" "$GITHUB_WORKSPACE/mint/tree" <<'PY'
+          import pathlib, shutil, sys
+          src_root, tree = pathlib.Path(sys.argv[1]), pathlib.Path(sys.argv[2])
+          products = ("horizons", "sbdb")
+          collisions, copied = [], 0
+          for shard in sorted(p for p in src_root.iterdir() if p.is_dir()):
+              for product in products:
+                  d = shard / product
+                  if not d.is_dir():
+                      continue
+                  for f in sorted(p for p in d.rglob("*") if p.is_file()):
+                      rel = f.relative_to(shard)
+                      dst = tree / rel
+                      if dst.exists():
+                          if f.read_bytes() != dst.read_bytes():
+                              collisions.append(f"{rel}: differs between {shard.name} and an earlier shard")
+                          continue
+                      dst.parent.mkdir(parents=True, exist_ok=True)
+                      shutil.copy2(f, dst)
+                      copied += 1
+          if collisions:
+              for c in collisions:
+                  print("ERROR: " + c, file=sys.stderr)
+              sys.exit(1)
+          print(f"merged {copied} input file(s) into {tree}")
+          PY
+      - name: Build the plan against the merged tree (online — fetch the Sun-state keys)
+        working-directory: empyrean-validation
+        env:
+          DATA_DIR: ${{ env.EMPYREAN_DATA_DIR }}
+        run: |
+          # `empyrean-validation plan` (build_plan) issues every query the suite
+          # can issue — including the Sun's barycentric state at each target epoch
+          # (Horizons command "10"), which the reference legs never fetch. Running
+          # it AFTER the shard merge, with --cache-dir pointed at the merged tree,
+          # means the per-object SBDB/Horizons keys are cache hits in the shards
+          # and only the Sun keys are fetched live into the tree. The plan JSON
+          # itself is a throwaway; the cache side effect is the point.
+          if [ -n "${OBJECTS}" ]; then
+            ./target/release/empyrean-validation plan \
+              --cache-dir "$GITHUB_WORKSPACE/mint/tree" \
+              --tiers "${TIER}" \
+              --output "$RUNNER_TEMP/plan-from-scratch.json" \
+              --only "${OBJECTS}"
+          else
+            ./target/release/empyrean-validation plan \
+              --cache-dir "$GITHUB_WORKSPACE/mint/tree" \
+              --tiers "${TIER}" \
+              --output "$RUNNER_TEMP/plan-from-scratch.json"
+          fi
+      # The data bucket is private; fetching the pinned PSVs and uploading both
+      # need the writer identity (objectCreator + objectViewer). It must come
+      # BEFORE the pinned fetch below.
+      - name: Require the writer identity
+        if: (inputs.psv_source == 'pinned' || inputs.upload) && vars.GCP_DATA_WRITER_SA == ''
+        run: |
+          echo "ERROR: GCP_DATA_WRITER_SA is empty — the mint cannot fetch the pinned snapshot or upload." >&2
+          echo "       Set the repository variable (lang/workflow/gcp-project.md, 'Writer identity')." >&2
+          exit 1
+      - name: Authenticate to the data bucket (writer)
+        if: inputs.psv_source == 'pinned' || inputs.upload
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ vars.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ vars.GCP_DATA_WRITER_SA }}
+      - name: PSV products (pinned)
+        if: inputs.psv_source == 'pinned'
+        working-directory: empyrean-validation
+        run: |
+          # Fetch the pinned snapshot (needs the NEW-format pin) and copy only
+          # its PSV products into the tree; horizons/ + sbdb/ for THIS mint come
+          # from the live reference pass above.
+          python3 scripts/inputs.py fetch --pin fixtures/manifest.json --dest "$RUNNER_TEMP/psv-src"
+          cp -R "$RUNNER_TEMP/psv-src/psv" "$GITHUB_WORKSPACE/mint/tree/psv"
+          cp -R "$RUNNER_TEMP/psv-src/psv-radar" "$GITHUB_WORKSPACE/mint/tree/psv-radar"
+      - name: PSV products (legacy-public — first mint only)
+        if: inputs.psv_source == 'legacy-public'
+        working-directory: empyrean-validation
+        run: |
+          # First mint only, before the repo pins a snapshot in the new format:
+          # copy the PSVs from the old public snapshot over plain HTTPS.
+          make fixtures
+          cp -R fixtures/psv "$GITHUB_WORKSPACE/mint/tree/psv"
+          cp -R fixtures/psv-radar "$GITHUB_WORKSPACE/mint/tree/psv-radar"
+      - name: Build provenance
+        working-directory: empyrean-validation
+        env:
+          PSV_SOURCE: ${{ inputs.psv_source }}
+        run: |
+          python3 - > "$GITHUB_WORKSPACE/mint/provenance.json" <<'PY'
+          import json, os, tomllib
+          cargo = tomllib.load(open("runners/rust/Cargo.toml", "rb"))
+          dep = cargo.get("dependencies", {}).get("empyrean")
+          ver = dep if isinstance(dep, str) else (dep or {}).get("version")
+          if not ver:
+              raise SystemExit("ERROR: no empyrean dependency version in runners/rust/Cargo.toml.")
+          ver = ver.lstrip("=")
+          # The pinned snapshot id, or the old public one, tags the PSV origin.
+          old_id = "unknown"
+          try:
+              old_id = json.load(open("fixtures/manifest.json"))["snapshot_id"]
+          except Exception:
+              pass
+          source = os.environ["PSV_SOURCE"]
+          psv_source = f"pinned:{old_id}" if source == "pinned" else f"legacy-public:{old_id}"
+          prov = {
+              "catalog_commit": os.environ["GITHUB_SHA"],
+              "distribution_version": ver,
+              "workflow_run": f"{os.environ['GITHUB_SERVER_URL']}/{os.environ['GITHUB_REPOSITORY']}/actions/runs/{os.environ['GITHUB_RUN_ID']}",
+              "endpoints": [
+                  "https://ssd-api.jpl.nasa.gov/sbdb.api",
+                  "https://ssd.jpl.nasa.gov/api/horizons.api",
+              ],
+              "psv_source": psv_source,
+              "curation": {"psv": "set of record, unchanged"},
+          }
+          print(json.dumps(prov, indent=2))
+          PY
+          cat "$GITHUB_WORKSPACE/mint/provenance.json"
+      - name: Manifest + summary + pin
+        working-directory: empyrean-validation
+        run: |
+          TREE="$GITHUB_WORKSPACE/mint/tree"
+          partial=""; allow=""
+          # A subset dispatch is a partial snapshot, named as such; the pin
+          # refuses a partial one for a full run.
+          if [ -n "${OBJECTS}" ]; then partial="--partial"; allow="--allow-partial"; fi
+          run_url="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+          sid="$(python3 scripts/inputs.py manifest --tree "$TREE" --provenance "$GITHUB_WORKSPACE/mint/provenance.json" $partial)"
+          echo "SNAPSHOT_ID=$sid" >> "$GITHUB_ENV"
+          python3 scripts/inputs.py summary --tree "$TREE" > "$GITHUB_WORKSPACE/mint/summary.txt"
+          python3 scripts/inputs.py pin --manifest "$TREE/MANIFEST.json" \
+            --out "$GITHUB_WORKSPACE/mint/pin.json" --minted-by "$run_url" $allow
+      - name: Diff against the pinned snapshot
+        if: inputs.psv_source == 'pinned'
+        working-directory: empyrean-validation
+        run: |
+          python3 scripts/inputs.py diff "$RUNNER_TEMP/psv-src/MANIFEST.json" \
+            "$GITHUB_WORKSPACE/mint/tree/MANIFEST.json" | tee "$GITHUB_WORKSPACE/mint/diff.txt"
+      - name: Upload snapshot to the bucket
+        if: inputs.upload
+        working-directory: empyrean-validation
+        run: python3 scripts/inputs.py upload --tree "$GITHUB_WORKSPACE/mint/tree" --yes
+      - name: Stage mint report
+        run: |
+          mkdir -p "$GITHUB_WORKSPACE/mint/report"
+          cp "$GITHUB_WORKSPACE/mint/tree/MANIFEST.json" "$GITHUB_WORKSPACE/mint/report/"
+          cp "$GITHUB_WORKSPACE/mint/summary.txt" "$GITHUB_WORKSPACE/mint/report/"
+          cp "$GITHUB_WORKSPACE/mint/pin.json" "$GITHUB_WORKSPACE/mint/report/"
+          if [ -f "$GITHUB_WORKSPACE/mint/diff.txt" ]; then
+            cp "$GITHUB_WORKSPACE/mint/diff.txt" "$GITHUB_WORKSPACE/mint/report/"
+          fi
+      - name: Upload mint report
+        uses: actions/upload-artifact@v4
+        with:
+          name: mint-report
+          path: mint/report/
+          if-no-files-found: error
+      - name: Job summary
+        run: |
+          {
+            echo "## Minted snapshot \`${SNAPSHOT_ID}\`"
+            echo ""
+            echo "- Bucket: \`${BUCKET}/${SNAPSHOT_ID}/\`"
+            echo "- Uploaded: ${{ inputs.upload }}"
+            echo "- PSV source: ${{ inputs.psv_source }}"
+            echo ""
+            echo '```'
+            cat "$GITHUB_WORKSPACE/mint/summary.txt"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
