@@ -89,12 +89,16 @@ jobs:
           workload-identity-provider: ${{ vars.GCP_WORKLOAD_IDENTITY_PROVIDER }}
           service-account: ${{ vars.GCP_DATA_READER_SA }}
           role: writer
-          install-python-tooling: "true"
-      - name: Build engine + harness binaries
+      - name: Build the reference runner + harness
         working-directory: empyrean-validation
         env:
           DATA_DIR: ${{ env.EMPYREAN_DATA_DIR }}
-        run: make build
+        # The mint links the checksum-pinned crates.io engine, never the sibling
+        # checkout, so it needs neither the C dylib (build-empyrean-c, which runs
+        # check-engine-version against the sibling) nor the wheel. build-rust and
+        # build-empyrean-validation are the only binaries list-objects and
+        # shard-reference use.
+        run: make build-rust build-empyrean-validation
       - name: Emit per-object matrix
         id: objects
         working-directory: empyrean-validation
@@ -138,11 +142,13 @@ jobs:
           dataset: ${{ env.EMPYREAN_DATASET }}
           jpl-cache-key: mint-unused
           role: reader
-      - name: Build reference prerequisites (warm)
+      - name: Build the reference runner + harness (warm)
         working-directory: empyrean-validation
         env:
           DATA_DIR: ${{ env.EMPYREAN_DATA_DIR }}
-        run: make build-reference
+        # Not build-reference: that pulls in build-empyrean-c (the sibling dylib +
+        # check-engine-version), which the mint's reference runner never links.
+        run: make build-rust build-empyrean-validation
       - name: Reference shard — ${{ matrix.object.name }} (live JPL/MPC into an empty cache)
         working-directory: empyrean-validation
         env:
