@@ -4,8 +4,9 @@ name: Mint validation inputs
 # inputs snapshot by running a single online reference pass against an EMPTY
 # cache, merging the engine's own disk-cache files (horizons/, sbdb/) with the
 # ADES PSV astrometry (psv/, psv-radar/) into one tree, and uploading it,
-# immutable and content-addressed, to gs://empyrean-data/validation/<id>/.
-# Every other validation workflow reads that snapshot offline.
+# immutable and content-addressed, to gs://empyrean-validation/inputs/<id>/
+# (public-read, beside latest/ and archive/). Every other validation workflow
+# reads that snapshot offline over plain HTTPS.
 #
 # EMPYREAN_OFFLINE="1" below gates the KERNEL manager only; the JPL Horizons /
 # SBDB and MPC query clients are NOT gated by it, which is precisely why this
@@ -55,7 +56,7 @@ env:
   # The mint fetches everything the suite reads from JPL, which is the standard
   # tier's set; there is no tier input because a snapshot is tier-complete.
   TIER: standard
-  BUCKET: gs://empyrean-data/validation
+  BUCKET: gs://empyrean-validation/inputs
 
 jobs:
   # ── prep ───────────────────────────────────────────────────────────
@@ -270,40 +271,39 @@ jobs:
               --tiers "${TIER}" \
               --output "$RUNNER_TEMP/plan-from-scratch.json"
           fi
-      # The data bucket is private; fetching the pinned PSVs and uploading both
-      # need the writer identity (objectCreator + objectViewer). It must come
-      # BEFORE the pinned fetch below.
-      - name: Require the writer identity
-        if: (inputs.psv_source == 'pinned' || inputs.upload) && vars.GCP_DATA_WRITER_SA == ''
-        run: |
-          echo "ERROR: GCP_DATA_WRITER_SA is empty — the mint cannot fetch the pinned snapshot or upload." >&2
-          echo "       Set the repository variable (lang/workflow/gcp-project.md, 'Writer identity')." >&2
-          exit 1
-      - name: Authenticate to the data bucket (writer)
-        if: inputs.psv_source == 'pinned' || inputs.upload
+      # The snapshot prefix is written with the suite's CI identity (empyrean-ci
+      # already holds objectAdmin on gs://empyrean-validation) — the same
+      # identity and the same auth block validation.yml's publish step uses. No
+      # new service account or Actions variable. Reads below need no auth: the
+      # bucket is public. Authenticate unconditionally so `upload` has it.
+      - name: Authenticate to Google Cloud (writer — publishes the snapshot)
         uses: google-github-actions/auth@v2
         with:
-          workload_identity_provider: ${{ vars.GCP_WORKLOAD_IDENTITY_PROVIDER }}
-          service_account: ${{ vars.GCP_DATA_WRITER_SA }}
+          workload_identity_provider: "projects/786706985139/locations/global/workloadIdentityPools/github-pool/providers/github-provider"
+          service_account: "empyrean-ci@empyrean-dynamics.iam.gserviceaccount.com"
       - name: PSV products (pinned)
         if: inputs.psv_source == 'pinned'
         working-directory: empyrean-validation
         run: |
-          # Fetch the pinned snapshot (needs the NEW-format pin) and copy only
-          # its PSV products into the tree; horizons/ + sbdb/ for THIS mint come
-          # from the live reference pass above.
+          # The snapshot bucket is public-read, so inputs.py fetch needs no auth.
+          # Fetch the pinned snapshot (new-format pin) and copy only its *.psv
+          # into the tree; horizons/ + sbdb/ for THIS mint come from the live
+          # reference pass above.
           python3 scripts/inputs.py fetch --pin fixtures/manifest.json --dest "$RUNNER_TEMP/psv-src"
-          cp -R "$RUNNER_TEMP/psv-src/psv" "$GITHUB_WORKSPACE/mint/tree/psv"
-          cp -R "$RUNNER_TEMP/psv-src/psv-radar" "$GITHUB_WORKSPACE/mint/tree/psv-radar"
+          mkdir -p "$GITHUB_WORKSPACE/mint/tree/psv" "$GITHUB_WORKSPACE/mint/tree/psv-radar"
+          cp "$RUNNER_TEMP/psv-src/psv/"*.psv "$GITHUB_WORKSPACE/mint/tree/psv/"
+          cp "$RUNNER_TEMP/psv-src/psv-radar/"*.psv "$GITHUB_WORKSPACE/mint/tree/psv-radar/"
       - name: PSV products (legacy-public — first mint only)
         if: inputs.psv_source == 'legacy-public'
         working-directory: empyrean-validation
         run: |
           # First mint only, before the repo pins a snapshot in the new format:
-          # copy the PSVs from the old public snapshot over plain HTTPS.
+          # copy the PSVs from the old public snapshot over plain HTTPS. Only the
+          # *.psv files are products — never the tracked psv/README.md.
           make fixtures
-          cp -R fixtures/psv "$GITHUB_WORKSPACE/mint/tree/psv"
-          cp -R fixtures/psv-radar "$GITHUB_WORKSPACE/mint/tree/psv-radar"
+          mkdir -p "$GITHUB_WORKSPACE/mint/tree/psv" "$GITHUB_WORKSPACE/mint/tree/psv-radar"
+          cp fixtures/psv/*.psv "$GITHUB_WORKSPACE/mint/tree/psv/"
+          cp fixtures/psv-radar/*.psv "$GITHUB_WORKSPACE/mint/tree/psv-radar/"
       - name: Build provenance
         working-directory: empyrean-validation
         env:
@@ -380,10 +380,12 @@ jobs:
           if-no-files-found: error
       - name: Job summary
         run: |
+          pub="https://storage.googleapis.com/${BUCKET#gs://}"
           {
             echo "## Minted snapshot \`${SNAPSHOT_ID}\`"
             echo ""
-            echo "- Bucket: \`${BUCKET}/${SNAPSHOT_ID}/\`"
+            echo "- Bucket (gs): \`${BUCKET}/${SNAPSHOT_ID}/\`"
+            echo "- Public URL: ${pub}/${SNAPSHOT_ID}/"
             echo "- Uploaded: ${{ inputs.upload }}"
             echo "- PSV source: ${{ inputs.psv_source }}"
             echo ""
