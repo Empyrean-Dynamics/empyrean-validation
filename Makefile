@@ -680,27 +680,25 @@ assemble-reference: $(EMP_VAL_BIN)
 
 # Mint a validation inputs snapshot LOCALLY into a scratch tree, no upload:
 # the one online path (.github/workflows/mint-inputs.yml) by hand, minus the
-# bucket, the pin, and the provenance CI records. The reference `run` pass
-# executes against an EMPTY cache dir, so every SBDB and Horizons response is
-# fetched LIVE and written in the engine's own disk-cache format under
-# MINT_DIR/tree/{horizons,sbdb}; the pinned PSVs are attached from the fixtures
-# tree; scripts/inputs.py writes the manifest and prints the summary. OBJECTS=
-# mints a partial tree, named as such in its manifest. Developers mint locally;
-# `make fixtures` fetches the pinned snapshot instead. This reaches JPL and the
-# MPC — run it deliberately.
+# bucket, the pin, and the provenance CI records. Query-only: the harness
+# `plan` subcommand runs against an EMPTY cache dir, so every SBDB and Horizons
+# response (vectors, observer ephemerides, Sun states) is fetched LIVE and
+# written in the engine's own disk-cache format under MINT_DIR/tree/{horizons,
+# sbdb} — it fetches, it does not propagate. The pinned PSVs are attached from
+# the fixtures tree; scripts/inputs.py writes the manifest and prints the
+# summary. OBJECTS= mints a partial tree, named as such in its manifest.
+# Developers mint locally; `make fixtures` fetches the pinned snapshot instead.
+# This reaches JPL and the MPC — run it deliberately.
 MINT_DIR ?= $(ROOT)/mint
-mint-inputs: $(RUST_BIN) $(EMP_VAL_BIN) | fixtures
-	@echo "──── Mint (local): reference pass into $(MINT_DIR)/tree [live JPL/MPC] ──"
+mint-inputs: $(EMP_VAL_BIN) | fixtures
+	@echo "──── Mint (local, query-only): plan fetches JPL/MPC into $(MINT_DIR)/tree ──"
 	@rm -rf $(MINT_DIR)
 	@mkdir -p $(MINT_DIR)/tree
-	@$(DYLD) $(RUST_BIN) run $(ONLY_FLAG) --tiers $(TIERS) \
-	    --data-dir $(DATA_DIR) --cache-dir $(MINT_DIR)/tree \
-	    --output $(MINT_DIR)/validation_rust_propeph.json
-	@echo "──── Mint (local): plan — fetch the Sun-state keys (Horizons '10') into the tree ──"
 	@$(DYLD) $(EMP_VAL_BIN) plan $(ONLY_FLAG) --tiers $(TIERS) \
 	    --cache-dir $(MINT_DIR)/tree --output $(MINT_DIR)/plan-from-scratch.json
-	@cp -R $(FIXTURES_PSV) $(MINT_DIR)/tree/psv
-	@cp -R $(FIXTURES_PSV_RADAR) $(MINT_DIR)/tree/psv-radar
+	@mkdir -p $(MINT_DIR)/tree/psv $(MINT_DIR)/tree/psv-radar
+	@cp $(FIXTURES_PSV)/*.psv $(MINT_DIR)/tree/psv/
+	@cp $(FIXTURES_PSV_RADAR)/*.psv $(MINT_DIR)/tree/psv-radar/
 	@printf '%s' '{"catalog_commit":"local","distribution_version":"local","workflow_run":"local","endpoints":["https://ssd-api.jpl.nasa.gov/sbdb.api","https://ssd.jpl.nasa.gov/api/horizons.api"],"psv_source":"local:fixtures","curation":{"psv":"set of record, unchanged"}}' > $(MINT_DIR)/provenance.json
 	@python3 $(ROOT)/scripts/inputs.py manifest --tree $(MINT_DIR)/tree --provenance $(MINT_DIR)/provenance.json $(if $(OBJECTS),--partial,)
 	@python3 $(ROOT)/scripts/inputs.py summary --tree $(MINT_DIR)/tree

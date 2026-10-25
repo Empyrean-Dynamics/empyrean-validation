@@ -1,9 +1,10 @@
 name: Mint validation inputs
 
 # The ONE workflow allowed to reach JPL and the MPC. It mints a validation
-# inputs snapshot by running a single online reference pass against an EMPTY
-# cache, merging the engine's own disk-cache files (horizons/, sbdb/) with the
-# ADES PSV astrometry (psv/, psv-radar/) into one tree, and uploading it,
+# inputs snapshot by running the harness `plan` subcommand (query-only — it
+# fetches, it does not propagate) per object against an EMPTY cache, merging the
+# engine's own disk-cache files (horizons/, sbdb/) with the ADES PSV astrometry
+# (psv/, psv-radar/) into one tree, and uploading it,
 # immutable and content-addressed, to gs://empyrean-validation/inputs/<id>/
 # (public-read, beside latest/ and archive/). Every other validation workflow
 # reads that snapshot offline over plain HTTPS.
@@ -94,12 +95,12 @@ jobs:
         working-directory: empyrean-validation
         env:
           DATA_DIR: ${{ env.EMPYREAN_DATA_DIR }}
-        # The mint links the checksum-pinned crates.io engine, never the sibling
-        # checkout, so it needs neither the C dylib (build-empyrean-c, which runs
-        # check-engine-version against the sibling) nor the wheel. build-rust and
-        # build-empyrean-validation are the only binaries list-objects and
-        # shard-reference use.
-        run: make build-rust build-empyrean-validation
+        # The mint is query-only: the harness binary (list-objects here, the plan
+        # builder in the legs) links the checksum-pinned crates.io engine, never
+        # the sibling checkout, so neither the C dylib (build-empyrean-c, which
+        # runs check-engine-version against the sibling) nor the reference runner
+        # nor the wheel is built.
+        run: make build-empyrean-validation
       - name: Emit per-object matrix
         id: objects
         working-directory: empyrean-validation
@@ -115,16 +116,21 @@ jobs:
           echo "Minting inputs for $count object(s)."
 
   # ── mint (per-object matrix) ────────────────────────────────────────
-  # One leg per catalog object. Each runs the reference prop+eph + OD pass with
-  # an EMPTY cache directory, so every SBDB/Horizons response is fetched live
-  # and written in the engine's own disk-cache format. The snapshot is, by
-  # construction, the set of responses one reference pass consumed.
+  # One leg per catalog object. Each runs the harness `plan` subcommand against
+  # an EMPTY cache: plan issues exactly the suite's query set — SBDB, Horizons
+  # vectors, observer ephemerides, and the Sun's barycentric state — and writes
+  # them in the engine's own disk-cache format. No propagation, OD or
+  # uncertainty replay, so the mint fetches rather than computes. (Rehearsal run
+  # 40148288681 confirmed the key set: one object's plan produced 17 vectors +
+  # 17 Sun + 85 ephemerides, identical to the reference runner's set.)
   mint:
     name: Mint — ${{ matrix.object.name }}
     needs: prep
     runs-on: ubuntu-latest
-    # 2020 CD3's auto-cascade row can take up to 3 h on a hosted VM.
-    timeout-minutes: 360
+    # Queries only (SBDB + Horizons vectors / observer ephemerides / Sun state),
+    # no propagation, OD or uncertainty replay, so a leg is minutes; 60 is ample
+    # headroom for JPL response latency.
+    timeout-minutes: 60
     strategy:
       fail-fast: false
       max-parallel: 25
@@ -143,37 +149,37 @@ jobs:
           dataset: ${{ env.EMPYREAN_DATASET }}
           jpl-cache-key: mint-unused
           role: reader
-      - name: Build the reference runner + harness (warm)
+      - name: Build the harness
         working-directory: empyrean-validation
         env:
           DATA_DIR: ${{ env.EMPYREAN_DATA_DIR }}
-        # Not build-reference: that pulls in build-empyrean-c (the sibling dylib +
-        # check-engine-version), which the mint's reference runner never links.
-        run: make build-rust build-empyrean-validation
-      - name: Reference shard — ${{ matrix.object.name }} (live JPL/MPC into an empty cache)
+        # Query-only: the harness `plan` subcommand issues every query the suite
+        # makes (SBDB, Horizons vectors + observer ephemerides + the Sun's
+        # state), so the leg needs no runner and no build-empyrean-c. It links
+        # the checksum-pinned crates.io engine and reads the kernel set the
+        # reader engine-setup restored (EMPYREAN_DATA_DIR).
+        run: make build-empyrean-validation
+      - name: Mint inputs — ${{ matrix.object.name }} (query-only; live JPL/MPC into an empty cache)
         working-directory: empyrean-validation
         env:
           DATA_DIR: ${{ env.EMPYREAN_DATA_DIR }}
         run: |
-          # CACHE_DIR starts empty; the Makefile passes it to the runner as
-          # --cache-dir, which writes horizons/ + sbdb/ under it (Makefile ~L655).
-          make shard-reference \
-            OBJECT="${{ matrix.object.name }}" \
-            SLUG="${{ matrix.object.slug }}" \
-            TIERS="${TIER}" \
-            CACHE_DIR="$GITHUB_WORKSPACE/mint/cache"
+          # `plan` fetches every SBDB/Horizons response (vectors, observer
+          # ephemerides, and the Sun's barycentric state at each target epoch)
+          # live and writes them under --cache-dir in the engine's own disk-cache
+          # format (horizons/ + sbdb/). No propagation, OD or uncertainty replay:
+          # the cache IS the product; the plan JSON is a throwaway. --only takes
+          # a comma list, one name here, quoted because names carry spaces.
+          ./target/release/empyrean-validation plan \
+            --only "${{ matrix.object.name }}" \
+            --tiers "${TIER}" \
+            --cache-dir "$GITHUB_WORKSPACE/mint/cache" \
+            --output "$RUNNER_TEMP/plan-${{ matrix.object.slug }}.json"
       - name: Upload input shard (engine cache files)
         uses: actions/upload-artifact@v4
         with:
           name: inputs-shard-${{ matrix.object.slug }}
           path: mint/cache
-          retention-days: 7
-          if-no-files-found: error
-      - name: Upload reference shard (free health check)
-        uses: actions/upload-artifact@v4
-        with:
-          name: reference-shard-${{ matrix.object.slug }}
-          path: empyrean-validation/results/shards/${{ matrix.object.slug }}/
           retention-days: 7
           if-no-files-found: error
 
@@ -247,18 +253,17 @@ jobs:
               sys.exit(1)
           print(f"merged {copied} input file(s) into {tree}")
           PY
-      - name: Build the plan against the merged tree (online — fetch the Sun-state keys)
+      - name: Verify the plan builds from the merged tree (all cache hits)
         working-directory: empyrean-validation
         env:
           DATA_DIR: ${{ env.EMPYREAN_DATA_DIR }}
         run: |
-          # `empyrean-validation plan` (build_plan) issues every query the suite
-          # can issue — including the Sun's barycentric state at each target epoch
-          # (Horizons command "10"), which the reference legs never fetch. Running
-          # it AFTER the shard merge, with --cache-dir pointed at the merged tree,
-          # means the per-object SBDB/Horizons keys are cache hits in the shards
-          # and only the Sun keys are fetched live into the tree. The plan JSON
-          # itself is a throwaway; the cache side effect is the point.
+          # Every mint leg already ran `plan --only <object>`, so each shard
+          # carries that object's SBDB, Horizons vectors, observer ephemerides
+          # AND Sun states. Re-running `plan` over the full merged tree must now
+          # be ALL cache hits and fetch nothing new — a consistency check that
+          # the merged key set is exactly what a plan build reads. The plan JSON
+          # is a throwaway.
           if [ -n "${OBJECTS}" ]; then
             ./target/release/empyrean-validation plan \
               --cache-dir "$GITHUB_WORKSPACE/mint/tree" \
