@@ -5,7 +5,7 @@ One snapshot carries everything the validation suite reads from JPL and the
 MPC: the SBDB responses and Horizons vectors/ephemerides in the engine's own
 disk-cache format (`horizons/`, `sbdb/`), and the ADES PSV astrometry
 (`psv/`, `psv-radar/`). It lives, immutable and content-addressed, at
-`gs://empyrean-data/validation/<snapshot_id>/`, and the suite only ever reads
+`gs://empyrean-validation/inputs/<snapshot_id>/`, and the suite only ever reads
 it from there (design: lang/design/validation-inputs-snapshot.md).
 
 This tool is the mint PR's producer and the consumption PR's reader; both code
@@ -40,9 +40,13 @@ are listed one per line on stderr, each naming the path and the
 expected/actual value. Nothing is ever written partially: a temp file is
 written beside the target, verified, then `os.replace`d into place.
 
-gcloud: every bucket operation is `gcloud storage` (never curl); credentials
-are the caller's (WIF in CI, the owner locally). The binary is injectable for
-tests (a fake `gcloud` via INPUTS_GCLOUD_BIN, or a runner passed to the verb).
+Reads are public: the snapshot bucket (gs://empyrean-validation/inputs) is
+public-read, so `fetch` and its manifest resolution download over plain HTTPS
+with urllib — no credential, no gcloud — which is why the readers in CI carry
+no identity. Writes use `gcloud storage` (`upload` only): the writer
+authenticates as the suite's CI identity. Both sides are injectable for tests —
+the gcloud binary via INPUTS_GCLOUD_BIN or a runner passed to `upload`, and the
+HTTP reader as a callable (URL -> bytes) passed to `fetch`.
 """
 
 from __future__ import annotations
@@ -54,6 +58,11 @@ import os
 import re
 import subprocess
 import sys
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+from collections.abc import Callable
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -63,7 +72,11 @@ PSV_PRODUCTS = ("psv", "psv-radar")
 # acts only on files with this suffix directly inside the product directory;
 # a README.md, a dotfile, or a subdirectory is never extra and never pruned.
 PRODUCT_EXT = {"psv": ".psv", "psv-radar": ".psv", "horizons": ".json", "sbdb": ".json"}
-DEFAULT_BUCKET = "gs://empyrean-data/validation"
+DEFAULT_BUCKET = "gs://empyrean-validation/inputs"
+# The snapshot bucket is public-read; a gs:// URI maps to this HTTPS origin.
+PUBLIC_ORIGIN = "https://storage.googleapis.com/"
+HTTP_TIMEOUT = 30.0
+HTTP_RETRIES = 5
 SCHEMA = 1
 
 # A PSV header line is a `|`-joined line whose fields are all bare column-name
@@ -144,11 +157,57 @@ def load_json(path: Path) -> dict:
         raise ContentError(f"{path}: not valid JSON ({e})") from e
 
 
-# ── gcloud ───────────────────────────────────────────────────────────────────
+# ── public HTTPS reads ───────────────────────────────────────────────────────
+
+# A reader: URL -> bytes, raising HttpError on failure. Injectable for tests.
+HttpGet = Callable[[str], bytes]
+
+
+class HttpError(Exception):
+    """A failed HTTPS read of a public object. Carries the URL and, if any, the status."""
+
+    def __init__(self, url: str, status: int | None = None, reason: str = ""):
+        self.url = url
+        self.status = status
+        detail = f"HTTP {status}" if status is not None else "connection error"
+        super().__init__(f"{url}: {detail} {reason}".strip())
+
+
+def public_url(gs_uri: str) -> str:
+    """Map ``gs://<bucket>/<prefix>`` to its public ``https://storage.googleapis.com/...`` URL.
+
+    Each path segment is URL-quoted (names carry spaces and apostrophes); the
+    slashes between segments are preserved.
+    """
+    if not gs_uri.startswith("gs://"):
+        raise ContentError(f"not a gs:// URI: {gs_uri}")
+    return PUBLIC_ORIGIN + urllib.parse.quote(gs_uri[len("gs://"):], safe="/")
+
+
+def http_get_public(url: str, *, timeout: float = HTTP_TIMEOUT, retries: int = HTTP_RETRIES) -> bytes:
+    """GET a public URL. Retries 5xx and connection errors with backoff; a 404
+    (or any other 4xx) fails at once, naming the URL."""
+    last: HttpError | None = None
+    for attempt in range(retries):
+        try:
+            with urllib.request.urlopen(url, timeout=timeout) as resp:
+                return resp.read()
+        except urllib.error.HTTPError as e:
+            if not (500 <= e.code < 600):  # 404 and every other non-5xx: no retry
+                raise HttpError(url, e.code, e.reason) from e
+            last = HttpError(url, e.code, e.reason)
+        except (urllib.error.URLError, TimeoutError, OSError) as e:
+            last = HttpError(url, None, str(e))
+        if attempt < retries - 1:
+            time.sleep(min(2.0**attempt, 30.0))
+    raise last or HttpError(url, None, "exhausted retries")
+
+
+# ── gcloud (writer only) ─────────────────────────────────────────────────────
 
 
 class Gcloud:
-    """Thin `gcloud storage` wrapper. The binary is injectable for tests."""
+    """Thin `gcloud storage` wrapper for `upload`. The binary is injectable for tests."""
 
     def __init__(self, binary: str | None = None):
         self.binary = binary or os.environ.get("INPUTS_GCLOUD_BIN", "gcloud")
@@ -195,9 +254,13 @@ def _list_product_files(tree: Path, partial: bool) -> list[Path]:
         if not d.is_dir():
             errors.append(f"{d}: product directory is missing")
             continue
-        files = sorted(p for p in d.rglob("*") if p.is_file())
+        suffix = PRODUCT_EXT[product]
+        # Snapshot-shaped files only — *.psv / *.json directly in the product
+        # dir. A tracked README.md, a dotfile, or a subdirectory is never a
+        # product, matching the fetch extra/prune scope.
+        files = sorted(p for p in d.iterdir() if p.is_file() and p.name.endswith(suffix))
         if not files and not partial:
-            errors.append(f"{d}: product directory is empty (pass --partial for a partial snapshot)")
+            errors.append(f"{d}: no {suffix} product files (pass --partial for a partial snapshot)")
         out.extend(files)
     if errors:
         raise ContentError(errors)
@@ -270,7 +333,12 @@ def summary(tree: Path) -> str:
     lines.append(f"{'-' * 12}{'-' * 8:>8}{'-' * 16:>16}")
     for product in PRODUCTS:
         d = tree / product
-        files = [p for p in d.rglob("*") if p.is_file()] if d.is_dir() else []
+        suffix = PRODUCT_EXT[product]
+        files = (
+            [p for p in d.iterdir() if p.is_file() and p.name.endswith(suffix)]
+            if d.is_dir()
+            else []
+        )
         total = sum(p.stat().st_size for p in files)
         lines.append(f"{product:<12}{len(files):>8}{total:>16,}")
     lines.append("")
@@ -442,7 +510,7 @@ def _verified(path: Path, entry: dict) -> bool:
     return sha256_file(path) == entry["sha256"]
 
 
-def _resolve_manifest(pin: dict, dest: Path, base: str, offline: bool, gcloud: Gcloud) -> dict:
+def _resolve_manifest(pin: dict, dest: Path, base: str, offline: bool, http_get: HttpGet) -> dict:
     sid = pin["snapshot_id"]
     local = dest / "MANIFEST.json"
     if local.is_file():
@@ -453,28 +521,27 @@ def _resolve_manifest(pin: dict, dest: Path, base: str, offline: bool, gcloud: G
         raise ContentError(
             f"MANIFEST.json for {sid} is absent or does not match the pin, and --offline was given."
         )
-    tmp = local.with_name(local.name + f".part.{os.getpid()}")
-    dest.mkdir(parents=True, exist_ok=True)
-    gcloud.cp(f"{base}/MANIFEST.json", str(tmp))
+    url = f"{public_url(base)}/MANIFEST.json"
     try:
-        m = load_json(tmp)
-        recomputed = tree_hash(m.get("files", []))
-        errs = []
-        if recomputed != m.get("tree_hash"):
-            errs.append(
-                f"MANIFEST.json: tree_hash over files[] is {recomputed} "
-                f"but the manifest records {m.get('tree_hash')}"
-            )
-        if m.get("tree_hash") != pin["tree_hash"]:
-            errs.append(
-                f"MANIFEST.json: tree_hash {m.get('tree_hash')} does not match the pin's {pin['tree_hash']}"
-            )
-        if errs:
-            raise ContentError(errs)
-        os.replace(tmp, local)
-    finally:
-        if tmp.exists():
-            tmp.unlink()
+        raw = http_get(url)
+    except HttpError as e:
+        raise ContentError(str(e)) from e
+    m = json.loads(raw.decode("utf-8"))
+    recomputed = tree_hash(m.get("files", []))
+    errs = []
+    if recomputed != m.get("tree_hash"):
+        errs.append(
+            f"MANIFEST.json: tree_hash over files[] is {recomputed} "
+            f"but the manifest records {m.get('tree_hash')}"
+        )
+    if m.get("tree_hash") != pin["tree_hash"]:
+        errs.append(
+            f"MANIFEST.json: tree_hash {m.get('tree_hash')} does not match the pin's {pin['tree_hash']}"
+        )
+    if errs:
+        raise ContentError(errs)
+    dest.mkdir(parents=True, exist_ok=True)
+    atomic_write_json(local, m)
     return m
 
 
@@ -483,9 +550,10 @@ def fetch(
     dest: Path,
     prune: bool,
     offline: bool,
-    gcloud: Gcloud,
+    http_get: HttpGet | None = None,
     allow_partial: bool = False,
 ) -> int:
+    http_get = http_get or http_get_public
     pin = load_json(pin_path)
     if pin.get("partial") and not allow_partial:
         raise ContentError(
@@ -495,8 +563,9 @@ def fetch(
     dest = dest.resolve()
     sid = pin["snapshot_id"]
     base = f"{pin['bucket']}/{sid}"
+    base_url = public_url(base)
 
-    manifest = _resolve_manifest(pin, dest, base, offline, gcloud)
+    manifest = _resolve_manifest(pin, dest, base, offline, http_get)
     if manifest.get("partial") and not allow_partial:
         raise ContentError(f"snapshot {sid} is partial; refusing to fetch for a full run.")
 
@@ -510,14 +579,21 @@ def fetch(
         if offline:
             errors.append(f"{entry['path']}: missing or stale and --offline was given")
             continue
-        tmp = p.with_name(p.name + f".part.{os.getpid()}")
-        p.parent.mkdir(parents=True, exist_ok=True)
-        gcloud.cp(f"{base}/{entry['path']}", str(tmp))
-        actual = sha256_file(tmp)
+        url = f"{base_url}/{urllib.parse.quote(entry['path'], safe='/')}"
+        try:
+            data = http_get(url)
+        except HttpError as e:
+            errors.append(f"{entry['path']}: download failed — {e}")
+            continue
+        # Verify the bytes before anything touches the tree: on a mismatch no
+        # .part and no target are written, so a bad download leaves no trace.
+        actual = hashlib.sha256(data).hexdigest()
         if actual != entry["sha256"]:
-            tmp.unlink(missing_ok=True)
             errors.append(f"{entry['path']}: sha256 expected {entry['sha256']} actual {actual}")
             continue
+        p.parent.mkdir(parents=True, exist_ok=True)
+        tmp = p.with_name(p.name + f".part.{os.getpid()}")
+        tmp.write_bytes(data)
         os.replace(tmp, p)
         fetched += 1
 
@@ -558,7 +634,7 @@ def cmd_fetch(args: argparse.Namespace) -> int:
         Path(args.dest),
         args.prune,
         args.offline,
-        Gcloud(),
+        http_get_public,
         args.allow_partial,
     )
 

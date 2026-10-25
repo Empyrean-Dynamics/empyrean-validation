@@ -1,14 +1,16 @@
 """inputs.py: manifest/summary/diff/upload/pin/fetch, with a failing path per verb.
 
-gcloud is faked by a dir-backed bucket (FakeGcloud) so the upload/fetch online
-paths run with no network and no credential; the offline path invokes no
-gcloud at all.
+Writes (`upload`) go through a dir-backed fake gcloud (FakeGcloud). Reads
+(`fetch`) go through a dir-backed fake HTTP reader (FakeHttp) that serves the
+same directory over the public-URL mapping — no network, no credential. The
+`--offline` path invokes neither.
 """
 
 import importlib.util
 import json
 import pathlib
 import shutil
+import urllib.parse
 
 import pytest
 
@@ -70,6 +72,29 @@ class FakeGcloud:
                 d = self._loc(dst)
                 d.parent.mkdir(parents=True, exist_ok=True)
                 shutil.copy2(s, d)
+
+
+class FakeHttp:
+    """Serves a FakeGcloud's dir over 'HTTPS': public URL -> bytes, 404 if absent.
+
+    The public-URL mapping is the inverse of FakeGcloud's gs:// layout, so one
+    root dir feeds both an upload (FakeGcloud) and the fetch that reads it back.
+    """
+
+    def __init__(self, ip, root):
+        self._ip = ip
+        self.root = pathlib.Path(root)
+        self.calls = []
+
+    def get(self, url):
+        self.calls.append(url)
+        origin = self._ip.PUBLIC_ORIGIN
+        assert url.startswith(origin), url
+        rel = urllib.parse.unquote(url[len(origin):])
+        p = self.root / rel
+        if not p.is_file():
+            raise self._ip.HttpError(url, 404, "Not Found")
+        return p.read_bytes()
 
 
 OPTICAL_PSV = (
@@ -182,6 +207,21 @@ def test_content_addressed_id_changes_on_one_byte(ip, tmp_path):
     assert first != second
 
 
+def test_manifest_ignores_non_product_files_in_product_dirs(ip, tmp_path):
+    tree = make_tree(tmp_path / "t")
+    before = ip.build_manifest(tree, PROV, partial=False)["snapshot_id"]
+    # A tracked README.md inside psv/ (copied in by `cp -R fixtures/psv …`) and a
+    # non-.json note inside horizons/ are not snapshot-shaped: never listed, and
+    # the snapshot id does not move.
+    (tree / "psv" / "README.md").write_text("tracked companion, not a product")
+    (tree / "horizons" / "notes.txt").write_text("not snapshot-shaped")
+    m = ip.build_manifest(tree, PROV, partial=False)
+    assert not any(f["path"].endswith("README.md") for f in m["files"])
+    assert not any(f["path"].endswith("notes.txt") for f in m["files"])
+    assert m["products"] == {"psv": 1, "psv-radar": 1, "horizons": 1, "sbdb": 1}
+    assert m["snapshot_id"] == before
+
+
 # ── pin ──────────────────────────────────────────────────────────────────────
 
 
@@ -265,30 +305,69 @@ def test_upload_post_count_mismatch_fails(ip, tmp_path):
         ip.upload(tree, bucket, yes=True, gcloud=fake)
 
 
-# ── fetch ────────────────────────────────────────────────────────────────────
+# ── fetch (offline = no reader; online = fake HTTP reader) ────────────────────
+
+
+def _publish(ip, tmp_path):
+    """Mint a tree and upload it to a dir-backed bucket at the default gs:// path;
+    the pin already names that bucket. Returns a FakeHttp reading the same dir
+    back over the public-URL mapping (root/empyrean-validation/inputs/<id>/...)."""
+    src = make_tree(tmp_path / "src")
+    manifest, pin, pin_path = mint(ip, src)  # pin bucket == DEFAULT_BUCKET already
+    fake = FakeGcloud(tmp_path / "root")
+    assert ip.upload(src, ip.DEFAULT_BUCKET, yes=True, gcloud=fake) == 0
+    return manifest, pin, pin_path, fake, FakeHttp(ip, tmp_path / "root")
 
 
 def test_fetch_offline_roundtrip_all_kept(ip, tmp_path):
     tree = make_tree(tmp_path / "t")
     _, _, pin_path = mint(ip, tree)
-    assert ip.fetch(pin_path, tree, prune=False, offline=True, gcloud=None) == 0
+    assert ip.fetch(pin_path, tree, prune=False, offline=True) == 0
 
 
 def test_fetch_online_roundtrip(ip, tmp_path):
-    src = make_tree(tmp_path / "src")
-    _, _, pin_path = mint(ip, src)
-    bucket = f"gs://{(tmp_path / 'bkt').as_posix().lstrip('/')}"
-    fake = FakeGcloud(tmp_path / "root")
-    assert ip.upload(src, bucket, yes=True, gcloud=fake) == 0
-    # rewrite pin's bucket to the fake one
-    with open(pin_path) as fh:
-        pin = json.load(fh)
-    pin["bucket"] = bucket
-    ip.atomic_write_json(pin_path, pin)
+    _, _, pin_path, _, http = _publish(ip, tmp_path)
     dest = tmp_path / "dest"
-    assert ip.fetch(pin_path, dest, prune=False, offline=False, gcloud=fake) == 0
+    assert ip.fetch(pin_path, dest, prune=False, offline=False, http_get=http.get) == 0
     assert (dest / "psv" / "Apophis.psv").read_text() == OPTICAL_PSV
     assert (dest / "MANIFEST.json").exists()
+    assert http.calls  # the reader was actually used
+
+
+def test_fetch_offline_never_calls_the_reader(ip, tmp_path):
+    tree = make_tree(tmp_path / "t")
+    _, _, pin_path = mint(ip, tree)
+
+    def boom(url):
+        raise AssertionError(f"reader called under --offline: {url}")
+
+    assert ip.fetch(pin_path, tree, prune=False, offline=True, http_get=boom) == 0
+
+
+def test_fetch_listed_file_404_fails_naming_the_url(ip, tmp_path):
+    manifest, _, pin_path, fake, http = _publish(ip, tmp_path)
+    # Remove one listed object from the bucket -> its URL 404s.
+    gone = fake.root / "empyrean-validation" / "inputs" / manifest["snapshot_id"] / "sbdb" / "Apophis.json"
+    gone.unlink()
+    dest = tmp_path / "dest"
+    with pytest.raises(ip.ContentError) as exc:
+        ip.fetch(pin_path, dest, prune=False, offline=False, http_get=http.get)
+    msg = "\n".join(exc.value.messages)
+    assert "sbdb/Apophis.json" in msg
+    assert "HTTP 404" in msg and "storage.googleapis.com" in msg
+
+
+def test_fetch_bad_hash_fails_and_leaves_no_part_or_target(ip, tmp_path):
+    manifest, _, pin_path, fake, http = _publish(ip, tmp_path)
+    # Corrupt one object's bytes in the bucket so the download hashes wrong.
+    bad = fake.root / "empyrean-validation" / "inputs" / manifest["snapshot_id"] / "psv" / "Apophis.psv"
+    bad.write_text(OPTICAL_PSV + "tampered-in-the-bucket\n")
+    dest = tmp_path / "dest"
+    with pytest.raises(ip.ContentError) as exc:
+        ip.fetch(pin_path, dest, prune=False, offline=False, http_get=http.get)
+    assert "psv/Apophis.psv" in "\n".join(exc.value.messages)
+    assert not (dest / "psv" / "Apophis.psv").exists()
+    assert list((dest / "psv").glob("*.part*")) == []
 
 
 def test_fetch_stale_file_offline_fails(ip, tmp_path):
@@ -296,7 +375,7 @@ def test_fetch_stale_file_offline_fails(ip, tmp_path):
     _, _, pin_path = mint(ip, tree)
     (tree / "psv" / "Apophis.psv").write_text(OPTICAL_PSV + "drifted\n")
     with pytest.raises(ip.ContentError):
-        ip.fetch(pin_path, tree, prune=False, offline=True, gcloud=None)
+        ip.fetch(pin_path, tree, prune=False, offline=True)
 
 
 def test_fetch_missing_file_offline_fails(ip, tmp_path):
@@ -304,7 +383,7 @@ def test_fetch_missing_file_offline_fails(ip, tmp_path):
     _, _, pin_path = mint(ip, tree)
     (tree / "sbdb" / "Apophis.json").unlink()
     with pytest.raises(ip.ContentError):
-        ip.fetch(pin_path, tree, prune=False, offline=True, gcloud=None)
+        ip.fetch(pin_path, tree, prune=False, offline=True)
 
 
 def test_fetch_extra_psv_fails_but_prune_clears(ip, tmp_path):
@@ -312,9 +391,9 @@ def test_fetch_extra_psv_fails_but_prune_clears(ip, tmp_path):
     _, _, pin_path = mint(ip, tree)
     (tree / "psv" / "Stray.psv").write_text(OPTICAL_PSV)
     with pytest.raises(ip.ContentError):
-        ip.fetch(pin_path, tree, prune=False, offline=True, gcloud=None)
+        ip.fetch(pin_path, tree, prune=False, offline=True)
     # --prune removes the unlisted file and the run passes.
-    assert ip.fetch(pin_path, tree, prune=True, offline=True, gcloud=None) == 0
+    assert ip.fetch(pin_path, tree, prune=True, offline=True) == 0
     assert not (tree / "psv" / "Stray.psv").exists()
 
 
@@ -322,7 +401,7 @@ def test_fetch_extra_nonpsv_is_reported_not_fatal(ip, tmp_path):
     tree = make_tree(tmp_path / "t")
     _, _, pin_path = mint(ip, tree)
     (tree / "horizons" / "stray.json").write_text("{}")  # not a .psv
-    assert ip.fetch(pin_path, tree, prune=False, offline=True, gcloud=None) == 0
+    assert ip.fetch(pin_path, tree, prune=False, offline=True) == 0
 
 
 def test_fetch_prune_keeps_readme_but_flags_stray_psv(ip, tmp_path):
@@ -333,15 +412,15 @@ def test_fetch_prune_keeps_readme_but_flags_stray_psv(ip, tmp_path):
     # and never be reported as extra.
     (tree / "psv" / "README.md").write_text("tracked companion, not a product")
     (tree / "horizons" / "notes.txt").write_text("not snapshot-shaped")
-    assert ip.fetch(pin_path, tree, prune=True, offline=True, gcloud=None) == 0
+    assert ip.fetch(pin_path, tree, prune=True, offline=True) == 0
     assert (tree / "psv" / "README.md").exists()
     assert (tree / "horizons" / "notes.txt").exists()
     # A stray unlisted *.psv is still flagged ...
     (tree / "psv" / "Stray.psv").write_text(OPTICAL_PSV)
     with pytest.raises(ip.ContentError):
-        ip.fetch(pin_path, tree, prune=False, offline=True, gcloud=None)
+        ip.fetch(pin_path, tree, prune=False, offline=True)
     # ... and pruned with --prune, while the README still survives.
-    assert ip.fetch(pin_path, tree, prune=True, offline=True, gcloud=None) == 0
+    assert ip.fetch(pin_path, tree, prune=True, offline=True) == 0
     assert not (tree / "psv" / "Stray.psv").exists()
     assert (tree / "psv" / "README.md").exists()
 
@@ -352,35 +431,29 @@ def test_fetch_treehash_mismatch_pin_vs_manifest_offline_fails(ip, tmp_path):
     pin["tree_hash"] = "0" * 64  # pin disagrees with the on-disk manifest
     ip.atomic_write_json(pin_path, pin)
     with pytest.raises(ip.ContentError):
-        ip.fetch(pin_path, tree, prune=False, offline=True, gcloud=None)
+        ip.fetch(pin_path, tree, prune=False, offline=True)
 
 
 def test_fetch_treehash_mismatch_online_fails(ip, tmp_path):
-    src = make_tree(tmp_path / "src")
-    manifest, pin, pin_path = mint(ip, src)
-    bucket = f"gs://{(tmp_path / 'bkt').as_posix().lstrip('/')}"
-    fake = FakeGcloud(tmp_path / "root")
-    ip.upload(src, bucket, yes=True, gcloud=fake)
+    manifest, _, pin_path, fake, http = _publish(ip, tmp_path)
     # Corrupt the bucket manifest's recorded tree_hash; its files[] no longer hash to it.
-    man_loc = fake.root / bucket[len("gs://"):] / manifest["snapshot_id"] / "MANIFEST.json"
+    man_loc = fake.root / "empyrean-validation" / "inputs" / manifest["snapshot_id"] / "MANIFEST.json"
     with open(man_loc) as fh:
         bad = json.load(fh)
     bad["tree_hash"] = "f" * 64
     man_loc.write_text(json.dumps(bad))
-    pin["bucket"] = bucket
-    ip.atomic_write_json(pin_path, pin)
     dest = tmp_path / "dest"
     with pytest.raises(ip.ContentError):
-        ip.fetch(pin_path, dest, prune=False, offline=False, gcloud=fake)
+        ip.fetch(pin_path, dest, prune=False, offline=False, http_get=http.get)
 
 
 def test_fetch_partial_pin_refused(ip, tmp_path):
     tree = make_tree(tmp_path / "t")
     _, _, pin_path = mint(ip, tree, partial=True)
     with pytest.raises(ip.ContentError):
-        ip.fetch(pin_path, tree, prune=False, offline=True, gcloud=None)
+        ip.fetch(pin_path, tree, prune=False, offline=True)
     # --allow-partial lets it through.
-    assert ip.fetch(pin_path, tree, prune=False, offline=True, gcloud=None, allow_partial=True) == 0
+    assert ip.fetch(pin_path, tree, prune=False, offline=True, allow_partial=True) == 0
 
 
 # ── summary ──────────────────────────────────────────────────────────────────
