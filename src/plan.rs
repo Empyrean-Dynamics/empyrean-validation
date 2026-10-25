@@ -95,7 +95,7 @@ impl Default for PlanConfig {
 ///    ephemeris record from observer code [`OBSERVER_CODES`]`[0]`
 ///    (`W84` — CTIO 4m).
 /// 4. Emit propagation plan rows for every `(object, dt, tier, method)` and
-///    ephemeris plan rows for every `(object, observer, dt != 0, method)`,
+///    ephemeris plan rows for every `(object, observer, dt, method)`,
 ///    where `method` ranges over [`plan_methods_for_object`] (composed with
 ///    the `detection_on` arm) — the full uncertainty-method axis when
 ///    `config.uncertainty_axis` is true, `none` only otherwise.
@@ -257,10 +257,10 @@ pub fn build_plan(
         // per (object, dt) — so they are not looped over observers.)
         let mut horizons_ephemeris: HashMap<(&str, i64), EphemerisEntry> = HashMap::new();
         for &obs in OBSERVER_CODES {
+            // The whole dt grid, epoch included: the rust runner queries and
+            // validates the ephemeris at dt = 0 too, so the from-scratch plan
+            // must carry every (observer, dt) to match the stripped reference.
             for &dt in dt_list {
-                if dt == 0.0 {
-                    continue;
-                }
                 let target = epoch + dt;
                 match empyrean::query_horizons(
                     &[obj.horizons_command],
@@ -329,9 +329,6 @@ pub fn build_plan(
         // doesn't iterate force-model tiers).
         for &obs in OBSERVER_CODES {
             for &dt in dt_list {
-                if dt == 0.0 {
-                    continue;
-                }
                 let Some(hor) = horizons_ephemeris.get(&(obs, dt as i64)) else {
                     continue;
                 };
@@ -946,6 +943,20 @@ pub fn strip_to_plan(
 mod tests {
     use super::*;
     use crate::catalog;
+
+    #[test]
+    fn default_ephemeris_grid_includes_the_epoch_and_is_5x17() {
+        // build_plan's ephemeris loops iterate OBSERVER_CODES × dt_list. The
+        // from-scratch plan must cover dt = 0 (the epoch) at every site so its
+        // ephemeris row count matches the stripped reference — 5 × 17 = 85 per
+        // object. A `dt == 0` skip once dropped 5 rows/object and a sealed
+        // offline run caught the resulting cache miss at observer W84, dt = 0.
+        assert!(
+            DEFAULT_DT_DAYS.contains(&0.0),
+            "the default grid must include the epoch (dt = 0)"
+        );
+        assert_eq!(OBSERVER_CODES.len() * DEFAULT_DT_DAYS.len(), 85);
+    }
 
     #[test]
     fn self_perturber_naif_ids_for_pallas() {
