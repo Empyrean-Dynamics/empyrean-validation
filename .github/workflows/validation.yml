@@ -578,11 +578,27 @@ jobs:
         uses: actions/checkout@v4
         with:
           path: empyrean-validation
+      # The c, python and cli channels build the distribution from this sibling
+      # checkout, so it must be the release the manifests pin (runners/rust/
+      # Cargo.toml → crates.io), not the default branch, which moves ahead to an
+      # unreleased rc and makes `check-engine-version` refuse the build. The
+      # engine-setup action pins the same way for the jobs that use it.
+      - name: Resolve the pinned distribution version
+        id: pinned-engine
+        run: |
+          version="$(sed -n 's/^empyrean = "=\(.*\)"/\1/p' empyrean-validation/runners/rust/Cargo.toml)"
+          if [ -z "$version" ]; then
+            echo "ERROR: could not read the pinned empyrean version from empyrean-validation/runners/rust/Cargo.toml." >&2
+            exit 1
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "Pinned distribution: v$version"
       - name: Checkout empyrean (sibling)
         uses: actions/checkout@v4
         with:
           repository: Empyrean-Dynamics/empyrean
           path: empyrean
+          ref: v${{ steps.pinned-engine.outputs.version }}
           token: ${{ secrets.GH_PAT }}
       - name: Checkout empyrean-core (sibling)
         uses: actions/checkout@v4

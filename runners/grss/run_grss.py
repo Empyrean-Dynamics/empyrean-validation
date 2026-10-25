@@ -181,6 +181,38 @@ _KERNELS_BY_DE = {
 # ── grss import ─────────────────────────────────────────────
 
 
+def _freshen_observatory_codes() -> None:
+    """Keep GRSS from re-fetching the MPC observatory codes at import time.
+
+    `grss.utils.initialize()` re-downloads `fit/codes.json` from the MPC API
+    whenever the file is more than a day old. `setup.sh` fetched that file when
+    the tool was built, and a validation run is sealed from the MPC, so the
+    refresh can only fail (connection refused) and take the leg with it. The
+    setup-time copy is the input of record for the run: refresh its
+    modification time so GRSS's age check passes, and say so with the copy's
+    age. A missing file is an error naming setup.sh, never a download.
+    """
+    import importlib.util
+
+    spec = importlib.util.find_spec("grss")
+    if spec is None or not spec.submodule_search_locations:
+        raise SystemExit("ERROR: the grss package is not importable; run runners/grss/setup.sh first.")
+    codes = Path(next(iter(spec.submodule_search_locations))) / "fit" / "codes.json"
+    if not codes.is_file() or codes.stat().st_size == 0:
+        raise SystemExit(
+            f"ERROR: GRSS observatory-code table missing or empty: {codes}\n"
+            "       setup.sh fetches it when the tool is built; the run is sealed from the\n"
+            "       MPC and will not download it. Rerun runners/grss/setup.sh."
+        )
+    age_days = (time.time() - codes.stat().st_mtime) / 86400.0
+    os.utime(codes, None)
+    print(
+        f"  observatory codes: using the setup-time copy of {codes.name} (age {age_days:.1f} d); "
+        "GRSS's daily refresh is suppressed, the run is sealed from the MPC",
+        file=sys.stderr,
+    )
+
+
 def _import_grss():
     """Import `grss`, with its import-time kernel download suppressed.
 
@@ -195,6 +227,8 @@ def _import_grss():
     that shells out for something else shows up in the log rather than
     silently not happening.
     """
+    _freshen_observatory_codes()
+
     real_system = os.system
     blocked: list[str] = []
 
