@@ -45,9 +45,13 @@ pub fn vectors_key(command: &str, epoch_mjd_tdb: f64) -> String {
     format!("{command}|{epoch_mjd_tdb:.8}")
 }
 
-/// The Horizons ephemeris lookup key (`<command>|<observer>|<time MJD TDB>`).
+/// The Horizons ephemeris request, named as the suite issued it
+/// (`<command>|<observer>|<time MJD TDB>`). The engine's own key for this
+/// request carries the time as the Horizons TLIST it sends (a Julian date),
+/// so this names the request, not the engine's key text; a re-mint
+/// reproduces it from these three values.
 pub fn ephemeris_key(command: &str, observer: &str, time_mjd_tdb: f64) -> String {
-    format!("{command}|{observer}|{time_mjd_tdb:.8}")
+    format!("{command}|{observer}|{time_mjd_tdb:.8} MJD TDB")
 }
 
 /// Build the fatal message for a product the pinned snapshot does not carry.
@@ -63,7 +67,7 @@ pub fn missing_input(
     cause: &str,
 ) -> String {
     format!(
-        "{object}: {} not in the pinned inputs snapshot (key `{key}` under {}): \
+        "{object}: {} not in the pinned inputs snapshot (request `{key}` under {}): \
          {cause}. The validation inputs are sealed from JPL and the MPC; re-mint \
          the snapshot to add this input.",
         product.label(),
@@ -114,7 +118,7 @@ mod tests {
         assert_eq!(vectors_key("10", 60000.5), "10|60000.50000000");
         assert_eq!(
             ephemeris_key("DES=99942;", "W84", 60000.25),
-            "DES=99942;|W84|60000.25000000"
+            "DES=99942;|W84|60000.25000000 MJD TDB"
         );
     }
 }
