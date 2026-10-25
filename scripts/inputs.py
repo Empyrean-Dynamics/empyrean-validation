@@ -29,6 +29,7 @@ Verbs (see the contract for the authoritative spec)::
     inputs.py manifest --tree T --provenance P.json [--partial] [--out ...]
     inputs.py summary  --tree T
     inputs.py diff     OLD_MANIFEST NEW_MANIFEST
+    inputs.py merge    --out TREE SHARD_DIR...
     inputs.py upload   --tree T [--bucket ...] [--yes]
     inputs.py pin      --manifest T/MANIFEST.json --out fixtures/manifest.json
                        --minted-by URL [--bucket ...] [--allow-partial]
@@ -47,6 +48,16 @@ no identity. Writes use `gcloud storage` (`upload` only): the writer
 authenticates as the suite's CI identity. Both sides are injectable for tests —
 the gcloud binary via INPUTS_GCLOUD_BIN or a runner passed to `upload`, and the
 HTTP reader as a callable (URL -> bytes) passed to `fetch`.
+
+`merge` folds the per-object mint shards (each a `horizons/` + `sbdb/` cache)
+into one tree. Objects whose SBDB epochs coincide share a Sun-state key
+(`horizons/10_<epoch>.json`), and the two files are byte-different even when the
+data is identical: Horizons stamps its generation time into the `result` text's
+header/footer (`Ephemeris / API_USER <timestamp> …`). So byte identity is the
+wrong test. The identity of a cache entry is its DATA: for a Horizons response
+(`{"result", "signature"}`) that is the `$$SOE…$$EOE` data block of `result`
+with any `signature` dropped; for any other entry (SBDB) it is the parsed
+`response`. Same data under a shared key → keep one copy; different data → fail.
 """
 
 from __future__ import annotations
@@ -56,6 +67,7 @@ import hashlib
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 import time
@@ -468,6 +480,72 @@ def cmd_upload(args: argparse.Namespace) -> int:
     return upload(Path(args.tree), args.bucket, args.yes, Gcloud())
 
 
+# ── merge ────────────────────────────────────────────────────────────────────
+
+
+def _soe_block(result: str) -> str:
+    """The ``$$SOE…$$EOE`` data block of a Horizons ``result``, or the whole
+    text when there is no block (an error response carries no data to isolate)."""
+    s = result.find("$$SOE")
+    e = result.find("$$EOE")
+    if s != -1 and e != -1 and e >= s:
+        return result[s : e + len("$$EOE")]
+    return result
+
+
+def cache_identity(entry: dict) -> object:
+    """The DATA identity of a disk-cache entry, ignoring the Horizons
+    generation-time header. Two entries are the same input iff these are equal."""
+    response = entry.get("response")
+    if isinstance(response, dict) and isinstance(response.get("result"), str):
+        canon = {k: v for k, v in response.items() if k != "signature"}
+        canon["result"] = _soe_block(response["result"])
+        return ("horizons", canon)
+    return ("other", response)
+
+
+def _load_entry(path: Path) -> dict:
+    try:
+        return json.loads(path.read_text())
+    except (OSError, json.JSONDecodeError) as e:
+        raise ContentError(f"{path}: not a readable JSON cache entry ({e})") from e
+
+
+def merge(out: Path, shard_dirs: list[Path]) -> int:
+    out = Path(out)
+    copied = 0
+    owner: dict[str, str] = {}  # rel path -> first shard that wrote it
+    resolved: set[str] = set()  # rel paths whose duplicates were data-identical
+    errors: list[str] = []
+    for shard in sorted(shard_dirs):
+        for product in ("horizons", "sbdb"):
+            d = shard / product
+            if not d.is_dir():
+                continue
+            for f in sorted(d.glob("*.json")):
+                rel = f"{product}/{f.name}"
+                dst = out / rel
+                if not dst.exists():
+                    dst.parent.mkdir(parents=True, exist_ok=True)
+                    shutil.copy2(f, dst)
+                    owner[rel] = shard.name
+                    copied += 1
+                    continue
+                if cache_identity(_load_entry(dst)) == cache_identity(_load_entry(f)):
+                    resolved.add(rel)
+                    print(f"resolved duplicate: {rel} ({shard.name} == {owner.get(rel, '?')})", file=sys.stderr)
+                else:
+                    errors.append(f"{rel}: payload differs between {owner.get(rel, '?')} and {shard.name}")
+    print(f"merged {copied} file(s) into {out}; {len(resolved)} duplicate key(s) resolved (data-identical)")
+    if errors:
+        raise ContentError(errors)
+    return 0
+
+
+def cmd_merge(args: argparse.Namespace) -> int:
+    return merge(Path(args.out), [Path(s) for s in args.shards])
+
+
 # ── pin ──────────────────────────────────────────────────────────────────────
 
 
@@ -664,6 +742,11 @@ def build_parser() -> argparse.ArgumentParser:
     d.add_argument("old")
     d.add_argument("new")
     d.set_defaults(func=cmd_diff)
+
+    mg = sub.add_parser("merge", help="fold per-object mint shards into one tree (payload-identical dedup)")
+    mg.add_argument("--out", required=True)
+    mg.add_argument("shards", nargs="+")
+    mg.set_defaults(func=cmd_merge)
 
     u = sub.add_parser("upload", help="upload a tree to its content-addressed prefix")
     u.add_argument("--tree", required=True)
