@@ -252,6 +252,74 @@ def test_diff_added_removed_changed_and_row_deltas(ip, tmp_path):
     assert "(2 -> 3 rows, +1)" in out
 
 
+# ── merge (payload-identical dedup of shared cache keys) ─────────────────────
+
+
+def hor_entry(ts, soe_body):
+    """A Horizons cache entry whose generation time (ts) is in the header/footer
+    of `result`, outside the $$SOE…$$EOE data block."""
+    result = (
+        "*******************************************************\n"
+        f"Ephemeris / API_USER {ts} Pasadena, USA      / Horizons\n"
+        "Target body name: Sun (10)\n"
+        "$$SOE\n"
+        f"{soe_body}\n"
+        "$$EOE\n"
+        f"footer generated {ts}\n"
+    )
+    return {"key": "10|61380.00000000", "response": {"result": result, "signature": {"version": "1.2", "source": "NASA/JPL Horizons API"}}}
+
+
+def sbdb_entry(epoch):
+    return {"key": "sbdb.api?des=99942", "response": {"object": {"des": "99942"}, "orbit": {"epoch": epoch}}}
+
+
+def write_shard_file(root, shard, product, name, entry):
+    d = root / shard / product
+    d.mkdir(parents=True, exist_ok=True)
+    (d / name).write_text(json.dumps(entry))
+    return root / shard
+
+
+SUN_BODY = "2461000.500000000 = A.D. 2025-Dot  X = 1.0 Y = 2.0 Z = 3.0  VX= 0.1 VY= 0.2 VZ= 0.3"
+
+
+def test_merge_resolves_timestamp_only_horizons_duplicate(ip, tmp_path):
+    shards = tmp_path / "shards"
+    a = write_shard_file(shards, "inputs-shard-A", "horizons", "10_61380.json", hor_entry("Sun Oct 25 10:38:22 2026", SUN_BODY))
+    b = write_shard_file(shards, "inputs-shard-B", "horizons", "10_61380.json", hor_entry("Sun Oct 25 10:38:05 2026", SUN_BODY))
+    out = tmp_path / "tree"
+    assert ip.merge(out, [a, b]) == 0
+    # One copy only — the second shard's byte-different (timestamp) file is the
+    # same input, so it is resolved, not copied. A sorts first, so its bytes win.
+    kept = (out / "horizons" / "10_61380.json").read_text()
+    assert "10:38:22" in kept and "10:38:05" not in kept
+
+
+def test_merge_fails_on_horizons_payload_difference(ip, tmp_path):
+    shards = tmp_path / "shards"
+    a = write_shard_file(shards, "inputs-shard-A", "horizons", "10_61380.json", hor_entry("ts-1", SUN_BODY))
+    b = write_shard_file(shards, "inputs-shard-B", "horizons", "10_61380.json",
+                         hor_entry("ts-2", SUN_BODY.replace("X = 1.0", "X = 9.9")))
+    with pytest.raises(ip.ContentError) as exc:
+        ip.merge(tmp_path / "tree", [a, b])
+    msg = "\n".join(exc.value.messages)
+    assert "horizons/10_61380.json" in msg and "inputs-shard-A" in msg and "inputs-shard-B" in msg
+
+
+def test_merge_sbdb_equal_kept_different_fails(ip, tmp_path):
+    shards = tmp_path / "shards"
+    a = write_shard_file(shards, "inputs-shard-A", "sbdb", "Apophis.json", sbdb_entry(2461000.5))
+    b = write_shard_file(shards, "inputs-shard-B", "sbdb", "Apophis.json", sbdb_entry(2461000.5))
+    assert ip.merge(tmp_path / "tree", [a, b]) == 0
+    shards2 = tmp_path / "shards2"
+    c = write_shard_file(shards2, "inputs-shard-A", "sbdb", "Apophis.json", sbdb_entry(2461000.5))
+    d = write_shard_file(shards2, "inputs-shard-B", "sbdb", "Apophis.json", sbdb_entry(2462000.5))
+    with pytest.raises(ip.ContentError) as exc:
+        ip.merge(tmp_path / "tree2", [c, d])
+    assert "sbdb/Apophis.json" in "\n".join(exc.value.messages)
+
+
 # ── upload (fake gcloud) ─────────────────────────────────────────────────────
 
 

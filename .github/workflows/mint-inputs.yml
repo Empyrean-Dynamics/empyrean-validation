@@ -225,34 +225,19 @@ jobs:
         with:
           pattern: inputs-shard-*
           path: shards-in
-      - name: Merge input shards into one tree (byte-identical collision check)
+      - name: Merge input shards into one tree (payload-identical collision check)
+        working-directory: empyrean-validation
         run: |
-          python3 - "$GITHUB_WORKSPACE/shards-in" "$GITHUB_WORKSPACE/mint/tree" <<'PY'
-          import pathlib, shutil, sys
-          src_root, tree = pathlib.Path(sys.argv[1]), pathlib.Path(sys.argv[2])
-          products = ("horizons", "sbdb")
-          collisions, copied = [], 0
-          for shard in sorted(p for p in src_root.iterdir() if p.is_dir()):
-              for product in products:
-                  d = shard / product
-                  if not d.is_dir():
-                      continue
-                  for f in sorted(p for p in d.rglob("*") if p.is_file()):
-                      rel = f.relative_to(shard)
-                      dst = tree / rel
-                      if dst.exists():
-                          if f.read_bytes() != dst.read_bytes():
-                              collisions.append(f"{rel}: differs between {shard.name} and an earlier shard")
-                          continue
-                      dst.parent.mkdir(parents=True, exist_ok=True)
-                      shutil.copy2(f, dst)
-                      copied += 1
-          if collisions:
-              for c in collisions:
-                  print("ERROR: " + c, file=sys.stderr)
-              sys.exit(1)
-          print(f"merged {copied} input file(s) into {tree}")
-          PY
+          # Objects whose SBDB epochs coincide share a Sun-state key
+          # (horizons/10_<epoch>.json); those files are byte-different only in
+          # Horizons' generation-time header, so merge compares the cache
+          # entries' DATA (the $$SOE…$$EOE block), not bytes. Equal data under a
+          # shared key keeps one copy; different data fails naming both shards.
+          python3 scripts/inputs.py merge \
+            --out "$GITHUB_WORKSPACE/mint/tree" \
+            "$GITHUB_WORKSPACE/shards-in"/* | tee "$RUNNER_TEMP/merge.out"
+          resolved="$(sed -n 's/.*; \([0-9][0-9]*\) duplicate key.*/\1/p' "$RUNNER_TEMP/merge.out")"
+          echo "MERGE_RESOLVED=${resolved:-0}" >> "$GITHUB_ENV"
       - name: Verify the plan builds from the merged tree (all cache hits)
         working-directory: empyrean-validation
         env:
@@ -393,6 +378,7 @@ jobs:
             echo "- Public URL: ${pub}/${SNAPSHOT_ID}/"
             echo "- Uploaded: ${{ inputs.upload }}"
             echo "- PSV source: ${{ inputs.psv_source }}"
+            echo "- Shared keys resolved (data-identical): ${MERGE_RESOLVED:-0}"
             echo ""
             echo '```'
             cat "$GITHUB_WORKSPACE/mint/summary.txt"
