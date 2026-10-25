@@ -31,9 +31,18 @@ inputs:
       gs://empyrean-data — the repository's `GCP_DATA_READER_SA` variable.
     required: false
     default: ""
-  jpl-cache-key:
-    description: Key for the JPL Horizons/SBDB response cache.
-    required: true
+  inputs-snapshot-id:
+    description: >
+      snapshot_id of the pinned inputs snapshot (fixtures/manifest.json),
+      read by the workflow's prep step and passed in — a composite action
+      cannot read `vars` and does not re-read the pin. Keys the inputs cache
+      (`inputs-<id>`) the writer saves and every reader restores. Empty ("")
+      disables the inputs steps entirely: the mint workflow runs engine-setup
+      before any snapshot exists (chicken-and-egg on the first mint) and must
+      never depend on one, so it passes no id. The validation workflow always
+      passes it.
+    required: false
+    default: ""
   role:
     description: >
       `writer` (prep) may download and save the shared caches. `reader` (matrix
@@ -46,11 +55,6 @@ inputs:
     description: Install uv (only the wheel-building jobs need it).
     required: false
     default: "false"
-
-outputs:
-  fixture-snapshot-id:
-    description: snapshot_id from fixtures/manifest.json, for cache keying.
-    value: ${{ steps.fixtures-key.outputs.id }}
 
 runs:
   using: composite
@@ -228,22 +232,6 @@ runs:
         path: data
         key: empyrean-data-${{ inputs.dataset }}
 
-    # JPL Horizons + SBDB API responses. prep is the writer: it fetches every
-    # IC + reference vector once, so the fan-out legs restore a warm cache and
-    # never hammer JPL. Legs restore read-only for the same reason.
-    - name: Cache JPL API responses (writer)
-      if: inputs.role == 'writer'
-      uses: actions/cache@v4
-      with:
-        path: ~/.empyrean/cache
-        key: ${{ inputs.jpl-cache-key }}
-    - name: Restore JPL API responses (reader)
-      if: inputs.role != 'writer'
-      uses: actions/cache/restore@v4
-      with:
-        path: ~/.empyrean/cache
-        key: ${{ inputs.jpl-cache-key }}
-
     - name: Cache cargo state
       uses: actions/cache@v4
       with:
@@ -256,35 +244,71 @@ runs:
         key: cargo-${{ hashFiles('**/Cargo.lock', '**/Cargo.toml') }}
         restore-keys: cargo-
 
-    # ── OD fixtures (GCS snapshot pinned by fixtures/manifest.json) ────
-    # Same poison discipline as the data kernels: restore by snapshot key,
-    # ALWAYS run the fetch — on a cache hit it is a pure sha256 verify of every
-    # file, so a poisoned or truncated cache fails here instead of reaching a
-    # fit — and SAVE only on a miss, after a fully verified fetch. Plain public
-    # HTTPS (the data is public MPC astrometry): no gcloud, no credential, which
-    # is why every role may fetch these itself.
-    - name: Read fixture snapshot id
-      id: fixtures-key
-      shell: bash
-      working-directory: empyrean-validation
-      run: python3 -c "import json; print('id=' + json.load(open('fixtures/manifest.json'))['snapshot_id'])" >> "$GITHUB_OUTPUT"
-    - name: Restore OD fixtures
-      id: cache-fixtures
+    # ── Inputs snapshot (public validation bucket, pinned by the manifest) ──
+    # The four product directories (psv, psv-radar, horizons, sbdb) + the
+    # per-file MANIFEST.json are one immutable snapshot in the suite's
+    # public-read bucket. prep is the sole fetcher, but the fetch is a plain
+    # HTTPS read (python3 + network only, no credential, independent of the
+    # kernel-set auth above): `make fixtures` then saves the cache. Every
+    # reader restores the exact key and refuses on a miss, then re-verifies the
+    # snapshot offline (sha256 of every file), so a poisoned or truncated cache
+    # fails here instead of reaching a fit.
+    # inputs-snapshot-id is empty when the mint runs engine-setup (no snapshot
+    # exists yet on the first mint), which disables every inputs step below;
+    # the validation workflow always passes an id.
+    - name: Restore inputs snapshot (writer)
+      if: inputs.role == 'writer' && inputs.inputs-snapshot-id != ''
+      id: cache-inputs-writer
       uses: actions/cache/restore@v4
       with:
         path: |
-          empyrean-validation/fixtures/psv/*.psv
-          empyrean-validation/fixtures/psv-radar/*.psv
-        key: fixtures-${{ steps.fixtures-key.outputs.id }}
-    - name: Fetch + verify OD fixtures
+          empyrean-validation/fixtures/psv
+          empyrean-validation/fixtures/psv-radar
+          empyrean-validation/fixtures/horizons
+          empyrean-validation/fixtures/sbdb
+          empyrean-validation/fixtures/MANIFEST.json
+        key: inputs-${{ inputs.inputs-snapshot-id }}
+    - name: Fetch + verify the pinned inputs snapshot (writer)
+      if: inputs.role == 'writer' && inputs.inputs-snapshot-id != ''
       shell: bash
       working-directory: empyrean-validation
       run: make fixtures
-    - name: Save OD fixtures
-      if: steps.cache-fixtures.outputs.cache-hit != 'true'
+    - name: Save inputs snapshot (writer)
+      if: inputs.role == 'writer' && inputs.inputs-snapshot-id != '' && steps.cache-inputs-writer.outputs.cache-hit != 'true'
       uses: actions/cache/save@v4
       with:
         path: |
-          empyrean-validation/fixtures/psv/*.psv
-          empyrean-validation/fixtures/psv-radar/*.psv
-        key: fixtures-${{ steps.fixtures-key.outputs.id }}
+          empyrean-validation/fixtures/psv
+          empyrean-validation/fixtures/psv-radar
+          empyrean-validation/fixtures/horizons
+          empyrean-validation/fixtures/sbdb
+          empyrean-validation/fixtures/MANIFEST.json
+        key: inputs-${{ inputs.inputs-snapshot-id }}
+    - name: Restore inputs snapshot (reader)
+      if: inputs.role != 'writer' && inputs.inputs-snapshot-id != ''
+      id: cache-inputs-reader
+      uses: actions/cache/restore@v4
+      with:
+        path: |
+          empyrean-validation/fixtures/psv
+          empyrean-validation/fixtures/psv-radar
+          empyrean-validation/fixtures/horizons
+          empyrean-validation/fixtures/sbdb
+          empyrean-validation/fixtures/MANIFEST.json
+        key: inputs-${{ inputs.inputs-snapshot-id }}
+    - name: Require a warm inputs cache (reader role)
+      if: inputs.role != 'writer' && inputs.inputs-snapshot-id != '' && steps.cache-inputs-reader.outputs.cache-hit != 'true'
+      shell: bash
+      run: |
+        echo "ERROR: inputs-snapshot cache miss on key inputs-${{ inputs.inputs-snapshot-id }}," >&2
+        echo "       and this job's role is 'reader' so it will not fetch them." >&2
+        echo "       prep is the sole writer of this cache. A miss here means prep" >&2
+        echo "       did not run, its fetch failed, or the snapshot id changed" >&2
+        echo "       between jobs in the same run." >&2
+        echo "       Refusing to run against inputs prep did not pin." >&2
+        exit 1
+    - name: Verify the pinned inputs snapshot offline (reader)
+      if: inputs.role != 'writer' && inputs.inputs-snapshot-id != ''
+      shell: bash
+      working-directory: empyrean-validation
+      run: make fixtures INPUTS_OFFLINE=1

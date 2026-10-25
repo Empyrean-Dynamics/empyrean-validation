@@ -18,17 +18,14 @@ Setup:
 """
 
 import argparse
-import hashlib
 import json
-import re
 import sys
 import time
-import urllib.parse
-import urllib.request
 from datetime import datetime, timezone
 from pathlib import Path
 
 import numpy as np
+from snapshot_inputs import MissingInputError, missing_input_message
 
 try:
     import assist
@@ -154,7 +151,6 @@ class HorizonsCache:
     def __init__(self, cache_dir: Path):
         self.cache_dir = cache_dir
         self.hits = 0
-        self.misses = 0
         self._index: dict[tuple[str, float], tuple[np.ndarray, np.ndarray]] = {}
 
         if not cache_dir.exists():
@@ -212,18 +208,6 @@ class HorizonsCache:
         vel = np.array([values["VX"], values["VY"], values["VZ"]])
         return pos, vel
 
-    @staticmethod
-    def _sanitize(key: str) -> str:
-        result = []
-        for c in key:
-            if c in "/ |":
-                result.append("_")
-            elif c.isalnum() or c in "_-.":
-                result.append(c)
-            else:
-                result.append("_")
-        return "".join(result)
-
     def get(self, command: str, epoch_mjd: float):
         key = (command, round(epoch_mjd, 6))
         result = self._index.get(key)
@@ -231,94 +215,29 @@ class HorizonsCache:
             self.hits += 1
         return result
 
-    def put(self, command: str, epoch_mjd: float, pos, vel):
-        """Store a fetched result in the index and write to disk.
 
-        Writes in empyrean's disk-cache format so Rust can read it back.
-        We store the raw Horizons JSON response (with "result" text).
-        """
-        key = (command, round(epoch_mjd, 6))
-        self._index[key] = (np.array(pos), np.array(vel))
-        self.misses += 1
-
-        # We don't have the raw Horizons JSON here — store in legacy format
-        # that this class can read back on next init.
-        cache_key = f"{command}|{epoch_mjd:.8f}"
-        filename = self._sanitize(cache_key) + ".json"
-        path = self.cache_dir / filename
-        data = {
-            "command": command,
-            "epoch_mjd": epoch_mjd,
-            "query_type": "vectors",
-            "pos": [float(x) for x in pos],
-            "vel": [float(x) for x in vel],
-        }
-        # allow_nan=False here too: this is a CACHE, so a non-finite value from
-        # a JPL response would be written once and then silently reused as an
-        # initial condition by every later run. Fail on the way in, not on the
-        # thousandth read.
-        path.write_text(json.dumps(data, indent=2, allow_nan=False))
+# ── Horizons state vectors (pinned snapshot, no network) ────
 
 
-# ── Horizons API ────────────────────────────────────────
+def query_horizons(cache: "HorizonsCache", command: str, epoch_mjd: float, object_name: str):
+    """Read a Horizons state vector for `object_name` from the pinned snapshot.
 
-
-def fetch_horizons_vectors(command: str, epoch_mjd: float):
-    """Fetch SSB ICRF cartesian state from JPL Horizons API."""
-    epoch_jd = epoch_mjd + MJD_TO_JD
-    params = {
-        "format": "json",
-        "COMMAND": f"'{command}'",
-        "OBJ_DATA": "NO",
-        "MAKE_EPHEM": "YES",
-        "EPHEM_TYPE": "VECTORS",
-        "CENTER": "@0",
-        "REF_PLANE": "FRAME",
-        "VEC_TABLE": "2",
-        "TLIST": f"{epoch_jd:.8f}",
-        "VEC_LABELS": "YES",
-        "CSV_FORMAT": "NO",
-        "OUT_UNITS": "AU-D",
-    }
-    url = "https://ssd.jpl.nasa.gov/api/horizons.api?" + urllib.parse.urlencode(params)
-    with urllib.request.urlopen(url, timeout=30) as resp:
-        data = json.loads(resp.read())
-
-    text = data["result"]
-    in_data = False
-    data_lines = []
-    for line in text.split("\n"):
-        if "$$SOE" in line:
-            in_data = True
-            continue
-        if "$$EOE" in line:
-            break
-        if in_data and line.strip():
-            data_lines.append(line.strip())
-
-    values = {}
-    for line in data_lines:
-        for m in re.finditer(r"(V?[XYZ])\s*=\s*([+\-]?\d+\.\d+E[+\-]\d+)", line):
-            values[m.group(1)] = float(m.group(2))
-
-    for k in ["X", "Y", "Z", "VX", "VY", "VZ"]:
-        if k not in values:
-            raise ValueError(f"Missing {k} in Horizons response for {command}")
-
-    return (
-        np.array([values["X"], values["Y"], values["Z"]]),
-        np.array([values["VX"], values["VY"], values["VZ"]]),
-    )
-
-
-def query_horizons(cache: HorizonsCache, command: str, epoch_mjd: float):
-    """Query Horizons with cache."""
+    The snapshot is sealed — the mint is the only workflow that reaches JPL —
+    so there is no fetch path: a cache miss raises :class:`MissingInputError`
+    naming the product, the lookup key (`command|epoch`) and the cache
+    directory, and fails the leg.
+    """
     cached = cache.get(command, epoch_mjd)
-    if cached is not None:
-        return cached
-    pos, vel = fetch_horizons_vectors(command, epoch_mjd)
-    cache.put(command, epoch_mjd, pos, vel)
-    return pos, vel
+    if cached is None:
+        raise MissingInputError(
+            missing_input_message(
+                object_name,
+                "Horizons vectors",
+                f"{command}|{epoch_mjd:.8f}",
+                cache.cache_dir,
+            )
+        )
+    return cached
 
 
 # ── ASSIST propagation ──────────────────────────────────
@@ -627,58 +546,6 @@ ALL_OBJECTS = [
 ]
 
 
-# ── SBDB non-grav parameter fetch ───────────────────────
-
-
-def fetch_sbdb_nongrav(horizons_command: str):
-    """Fetch non-gravitational parameters from JPL SBDB API.
-
-    Returns (a1, a2, a3, epoch_mjd) or None if not available.
-    A1/A2/A3 are converted from AU/day^2 as provided by SBDB.
-    """
-    # Extract designation from Horizons command
-    cmd = horizons_command.strip().rstrip(";")
-    if cmd.startswith("DES="):
-        des = cmd[4:].split(";")[0]
-    else:
-        des = cmd
-
-    url = f"https://ssd-api.jpl.nasa.gov/sbdb.api?sstr={urllib.parse.quote(des)}&phys-par=true&cov=true"
-    try:
-        with urllib.request.urlopen(url, timeout=15) as resp:
-            data = json.loads(resp.read())
-    except Exception:
-        return None
-
-    orbit = data.get("orbit", {})
-    elements = orbit.get("elements", [])
-
-    # Extract non-grav params
-    params = {}
-    for elem in elements:
-        if elem.get("name") in ("A1", "A2", "A3"):
-            params[elem["name"]] = float(elem["value"])
-
-    if not params:
-        return None
-
-    # Get epoch
-    epoch_jd = None
-    for elem in elements:
-        if elem.get("name") == "epoch":
-            epoch_jd = float(elem["value"])
-            break
-
-    epoch_mjd = epoch_jd - MJD_TO_JD if epoch_jd else None
-
-    return {
-        "a1": params.get("A1", 0.0),
-        "a2": params.get("A2", 0.0),
-        "a3": params.get("A3", 0.0),
-        "epoch_mjd": epoch_mjd,
-    }
-
-
 # ── Main ────────────────────────────────────────────────
 
 
@@ -890,14 +757,10 @@ def main():
 
         print(f"{name} ({data['population']})")
 
-        # Get initial conditions from Horizons (with cache)
-        try:
-            cached = query_horizons(cache, obj_def.horizons_command, epoch)
-        except Exception as e:
-            print(f"  SKIP (Horizons IC fetch failed: {e})")
-            continue
-
-        pos0, vel0 = cached
+        # Initial conditions from the pinned Horizons snapshot. A miss is a
+        # gap in the sealed inputs, not a skip: query_horizons raises and the
+        # leg fails, naming the object/product/key.
+        pos0, vel0 = query_horizons(cache, obj_def.horizons_command, epoch, name)
 
         # Non-grav params from empyrean validation results
         a1 = data["a1"]
@@ -918,12 +781,9 @@ def main():
         for dt in dt_days:
             target = epoch + dt
 
-            # Get Horizons reference at target (with cache)
-            try:
-                hor_pos, hor_vel = query_horizons(cache, obj_def.horizons_command, target)
-            except Exception as e:
-                print(f"  dt={dt:>+.0f}d SKIP (Horizons ref: {e})")
-                continue
+            # Horizons reference at target from the pinned snapshot (a miss
+            # raises MissingInputError and fails the leg — never a skip).
+            hor_pos, hor_vel = query_horizons(cache, obj_def.horizons_command, target, name)
 
             # ASSIST propagation over the six arms: three configurations
             # (assist_default / assist_layup / assist_asteroid_institute), each
@@ -1086,4 +946,10 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except MissingInputError as e:
+        # A sealed-snapshot miss: fail the leg with the named error, not a
+        # traceback the reader has to decode.
+        print(f"ERROR: {e}", file=sys.stderr)
+        sys.exit(1)

@@ -221,8 +221,9 @@ struct RunArgs {
     /// Empyrean data directory; defaults to ~/.empyrean/data/.
     #[arg(long)]
     data_dir: Option<PathBuf>,
-    /// Disk-cache directory for SBDB / Horizons queries.
-    #[arg(long, default_value = "~/.empyrean/cache")]
+    /// Pinned inputs snapshot directory for SBDB / Horizons (the suite reads
+    /// this and nothing else; CI sets it via the Makefile's CACHE_DIR).
+    #[arg(long, default_value = "../../fixtures")]
     cache_dir: PathBuf,
     /// Skip attaching a synthetic Cartesian covariance to the input
     /// orbits. By default each test orbit carries a typical-NEO
@@ -258,8 +259,9 @@ struct OdArgs {
     /// Empyrean data directory.
     #[arg(long)]
     data_dir: Option<PathBuf>,
-    /// Disk-cache directory for the SBDB orbit-comparison sidecar query.
-    #[arg(long, default_value = "~/.empyrean/cache")]
+    /// Pinned inputs snapshot directory for the SBDB orbit-comparison sidecar
+    /// (the suite reads this and nothing else; CI sets it via CACHE_DIR).
+    #[arg(long, default_value = "../../fixtures")]
     cache_dir: PathBuf,
 }
 
@@ -600,7 +602,7 @@ fn od(args: OdArgs) -> Result<(), Box<dyn std::error::Error>> {
         args.max_iterations,
         tier,
         Some(&sbdb_cache_dir),
-    );
+    )?;
 
     if let Some(parent) = args.output.parent() {
         std::fs::create_dir_all(parent)?;
@@ -695,7 +697,7 @@ fn run(args: RunArgs) -> Result<(), Box<dyn std::error::Error>> {
         &horizons_cache_dir,
         &sbdb_cache_dir,
         args.threads,
-    );
+    )?;
 
     if let Some(parent) = args.output.parent() {
         std::fs::create_dir_all(parent)?;

@@ -12,14 +12,16 @@ name: Validation Suite
 #                       (one leg per object)        │                ├─► reduce
 #                                                   └─► external ×N ─┘
 #
-#   • prep   — download + cache all shared data ONCE, build the engine and
-#              harness binaries, and emit the per-object fan-out matrix from
-#              the catalog. The only job that touches the authenticated
-#              network (JPL/NAIF/SBDB) to POPULATE the shared caches; it no
-#              longer runs the reference itself. (Every fixture-consuming job
-#              additionally fetches the public OD fixture snapshot pinned by
-#              fixtures/manifest.json — plain HTTPS, no credential, cached by
-#              snapshot id.)
+#   • prep   — build the engine and harness binaries, sync the kernel set, and
+#              fetch the pinned inputs snapshot (SBDB, Horizons, ADES PSVs)
+#              from the suite's public validation bucket ONCE (plain HTTPS, no
+#              credential) into the shared caches, then emit the per-object
+#              fan-out matrix from the catalog. It no longer queries JPL/MPC
+#              live and no longer runs the reference itself; the ONLY workflow
+#              that reaches JPL/MPC is the manual mint-inputs action. Every
+#              other job restores the inputs snapshot from the actions cache by
+#              snapshot id (no credential) and then seals the JPL/MPC hosts
+#              before running.
 #   • reference — one matrix leg per catalog object, each running prop+eph +
 #              OD for its single object into a shard artifact. Running all
 #              three axes over the whole catalog in ONE job took 176 min and
@@ -203,7 +205,6 @@ env:
   # The registered kernel set every empyrean repo pins (lang/workflow/gcp-project.md).
   EMPYREAN_DATASET: kernels-full-2026-10-13
   EMPYREAN_OFFLINE: "1"
-  JPL_CACHE_KEY: empyrean-api-cache-v1
 
 jobs:
   # The full suite needs the empyrean wrapper repo for the rust /
@@ -269,6 +270,10 @@ jobs:
       # The same objects dealt into chunks for the channel legs, and how many.
       chunks: ${{ steps.objects.outputs.chunks }}
       chunk_count: ${{ steps.objects.outputs.chunk_count }}
+      # snapshot_id of the pinned inputs snapshot, read from the manifest.
+      # Every downstream job keys the inputs cache on this (prep is the sole
+      # writer), so they all restore exactly what prep fetched.
+      inputs_id: ${{ steps.inputs-id.outputs.id }}
     steps:
       - name: Log trigger source
         run: |
@@ -287,6 +292,15 @@ jobs:
         with:
           path: empyrean-validation
 
+      # The pinned inputs snapshot id, read once here and exported as a job
+      # output so every downstream job keys the inputs cache identically. A
+      # composite action cannot read `vars` or the repo tree ahead of its own
+      # checkout, so the workflow reads the pin and passes the id in.
+      - name: Read inputs snapshot id
+        id: inputs-id
+        working-directory: empyrean-validation
+        run: python3 -c "import json; print('id=' + json.load(open('fixtures/manifest.json'))['snapshot_id'])" >> "$GITHUB_OUTPUT"
+
       # Shared with the per-object `reference` matrix via a composite action, so
       # a leg cannot set its environment up differently from prep and produce
       # reference numbers that silently are not comparable.
@@ -298,7 +312,7 @@ jobs:
           dataset: ${{ env.EMPYREAN_DATASET }}
           workload-identity-provider: ${{ vars.GCP_WORKLOAD_IDENTITY_PROVIDER }}
           service-account: ${{ vars.GCP_DATA_READER_SA }}
-          jpl-cache-key: ${{ env.JPL_CACHE_KEY }}
+          inputs-snapshot-id: ${{ steps.inputs-id.outputs.id }}
           role: writer
           install-python-tooling: "true"
 
@@ -384,7 +398,7 @@ jobs:
           gh-pat: ${{ secrets.GH_PAT }}
           python-version: ${{ env.PYTHON_VERSION }}
           dataset: ${{ env.EMPYREAN_DATASET }}
-          jpl-cache-key: ${{ env.JPL_CACHE_KEY }}
+          inputs-snapshot-id: ${{ needs.prep.outputs.inputs_id }}
           role: reader
       # `build-reference`, not `build`: only the rust runner, the harness CLI and
       # libempyrean are used here. The full `build` measured 375s on a leg, most
@@ -395,6 +409,13 @@ jobs:
         env:
           DATA_DIR: ${{ env.EMPYREAN_DATA_DIR }}
         run: make build-reference
+      # Reader role: the inputs snapshot is already restored and verified
+      # offline by engine-setup, and this leg downloads nothing from JPL during
+      # setup, so seal before the shard run — a cache miss then fails at the
+      # socket rather than silently querying live.
+      - name: Seal the job from JPL and the MPC
+        working-directory: empyrean-validation
+        run: ./scripts/seal-upstream.sh
       - name: Reference shard — ${{ matrix.object.name }}
         working-directory: empyrean-validation
         env:
@@ -467,6 +488,28 @@ jobs:
       - name: Show staged shards
         working-directory: empyrean-validation/results/shards
         run: find . -maxdepth 1 -mindepth 1 -type d -print | sort
+      # `make plan` reads the pinned Sun/Horizons/SBDB snapshot (the mint's
+      # plan step added the per-epoch Sun vectors), so this job restores the
+      # inputs cache prep wrote and re-verifies it offline before planning.
+      - name: Restore inputs snapshot
+        id: cache-inputs
+        uses: actions/cache/restore@v4
+        with:
+          path: |
+            empyrean-validation/fixtures/psv
+            empyrean-validation/fixtures/psv-radar
+            empyrean-validation/fixtures/horizons
+            empyrean-validation/fixtures/sbdb
+            empyrean-validation/fixtures/MANIFEST.json
+          key: inputs-${{ needs.prep.outputs.inputs_id }}
+      - name: Verify the pinned inputs snapshot offline
+        working-directory: empyrean-validation
+        run: make fixtures INPUTS_OFFLINE=1
+      # Seal before the plan step: a Horizons/SBDB key missing from the
+      # snapshot must fail here, not fetch live.
+      - name: Seal the job from JPL and the MPC
+        working-directory: empyrean-validation
+        run: ./scripts/seal-upstream.sh
       # REFERENCE_ASSEMBLED=1 tells `plan` that the unified reference is already
       # on disk (assemble-reference just wrote it from the shards). Without it,
       # make walks $(RUST) -> $(RUST_PROPEPH)/$(RUST_OD) -> $(RUST_BIN), a file
@@ -586,11 +629,6 @@ jobs:
         with:
           path: data
           key: empyrean-data-${{ env.EMPYREAN_DATASET }}
-      - name: Restore JPL API responses
-        uses: actions/cache/restore@v4
-        with:
-          path: ~/.empyrean/cache
-          key: ${{ env.JPL_CACHE_KEY }}
       - name: Cache cargo state
         uses: actions/cache@v4
         with:
@@ -603,31 +641,23 @@ jobs:
           key: cargo-${{ hashFiles('**/Cargo.lock', '**/Cargo.toml') }}
           restore-keys: cargo-
 
-      # OD fixtures: same restore → always-verify fetch → save-on-miss
-      # discipline as prep (see the comment there).
-      - name: Read fixture snapshot id
-        id: fixtures-key
-        working-directory: empyrean-validation
-        run: python3 -c "import json; print('id=' + json.load(open('fixtures/manifest.json'))['snapshot_id'])" >> "$GITHUB_OUTPUT"
-      - name: Restore OD fixtures
-        id: cache-fixtures
+      # Inputs snapshot (prep is the sole fetcher): restore by snapshot id and
+      # verify offline, no credential. The replay channels fit the pinned PSVs
+      # and read the pinned SBDB for the OD comparison.
+      - name: Restore inputs snapshot
+        id: cache-inputs
         uses: actions/cache/restore@v4
         with:
           path: |
-            empyrean-validation/fixtures/psv/*.psv
-            empyrean-validation/fixtures/psv-radar/*.psv
-          key: fixtures-${{ steps.fixtures-key.outputs.id }}
-      - name: Fetch + verify OD fixtures
+            empyrean-validation/fixtures/psv
+            empyrean-validation/fixtures/psv-radar
+            empyrean-validation/fixtures/horizons
+            empyrean-validation/fixtures/sbdb
+            empyrean-validation/fixtures/MANIFEST.json
+          key: inputs-${{ needs.prep.outputs.inputs_id }}
+      - name: Verify the pinned inputs snapshot offline
         working-directory: empyrean-validation
-        run: make fixtures
-      - name: Save OD fixtures
-        if: steps.cache-fixtures.outputs.cache-hit != 'true'
-        uses: actions/cache/save@v4
-        with:
-          path: |
-            empyrean-validation/fixtures/psv/*.psv
-            empyrean-validation/fixtures/psv-radar/*.psv
-          key: fixtures-${{ steps.fixtures-key.outputs.id }}
+        run: make fixtures INPUTS_OFFLINE=1
 
       - name: Download plan + rust reference
         uses: actions/download-artifact@v4
@@ -656,6 +686,11 @@ jobs:
             core)   make build-core ;;
             *)      echo "unknown channel ${{ matrix.channel }}" >&2; exit 1 ;;
           esac
+      # Seal after the builds (which pull only from cargo/crates/pip) and
+      # before the replay, which reads the snapshot and must never fetch live.
+      - name: Seal the job from JPL and the MPC
+        working-directory: empyrean-validation
+        run: ./scripts/seal-upstream.sh
       - name: Replay plan — ${{ matrix.channel }}
         working-directory: empyrean-validation
         env:
@@ -685,7 +720,10 @@ jobs:
   # the rest of the matrix.
   external:
     name: External — ${{ matrix.tool }}
-    needs: assemble
+    # prep is in `needs` only to read its inputs_id output for the cache key —
+    # no credential crosses here; the external legs stay secretless. assemble
+    # is the real data dependency (the plan artifact).
+    needs: [prep, assemble]
     runs-on: ubuntu-latest
     # Budget from the measured pace (run 169, 2026-10-19): the longest green
     # leg was jorbit at 73 min; orbfit, back to one fit per object, is about
@@ -737,11 +775,6 @@ jobs:
         with:
           path: data
           key: empyrean-data-${{ env.EMPYREAN_DATASET }}
-      - name: Restore JPL API responses
-        uses: actions/cache/restore@v4
-        with:
-          path: ~/.empyrean/cache
-          key: ${{ env.JPL_CACHE_KEY }}
 
       # One cache per tool build tree. The path list is a superset (venv /
       # install / build + find_orb's ~/include ~/lib); absent members are
@@ -773,33 +806,23 @@ jobs:
         if: matrix.tool == 'oorb'
         run: sudo apt-get update && sudo apt-get install -y --no-install-recommends liblapack-dev libblas-dev
 
-      # OD fixtures: same restore → always-verify fetch → save-on-miss
-      # discipline as prep (see the comment there). Public-read objects
-      # over plain HTTPS, so this leg stays exactly as secretless as it
-      # was when the fixtures rode the checkout: no PAT, no GCP identity.
-      - name: Read fixture snapshot id
-        id: fixtures-key
-        working-directory: empyrean-validation
-        run: python3 -c "import json; print('id=' + json.load(open('fixtures/manifest.json'))['snapshot_id'])" >> "$GITHUB_OUTPUT"
-      - name: Restore OD fixtures
-        id: cache-fixtures
+      # Inputs snapshot (prep is the sole fetcher): restore by snapshot id and
+      # verify offline. No gcloud, no PAT, no GCP identity — this leg stays
+      # exactly as secretless as it was when the fixtures rode the checkout.
+      - name: Restore inputs snapshot
+        id: cache-inputs
         uses: actions/cache/restore@v4
         with:
           path: |
-            empyrean-validation/fixtures/psv/*.psv
-            empyrean-validation/fixtures/psv-radar/*.psv
-          key: fixtures-${{ steps.fixtures-key.outputs.id }}
-      - name: Fetch + verify OD fixtures
+            empyrean-validation/fixtures/psv
+            empyrean-validation/fixtures/psv-radar
+            empyrean-validation/fixtures/horizons
+            empyrean-validation/fixtures/sbdb
+            empyrean-validation/fixtures/MANIFEST.json
+          key: inputs-${{ needs.prep.outputs.inputs_id }}
+      - name: Verify the pinned inputs snapshot offline
         working-directory: empyrean-validation
-        run: make fixtures
-      - name: Save OD fixtures
-        if: steps.cache-fixtures.outputs.cache-hit != 'true'
-        uses: actions/cache/save@v4
-        with:
-          path: |
-            empyrean-validation/fixtures/psv/*.psv
-            empyrean-validation/fixtures/psv-radar/*.psv
-          key: fixtures-${{ steps.fixtures-key.outputs.id }}
+        run: make fixtures INPUTS_OFFLINE=1
 
       - name: Download plan
         uses: actions/download-artifact@v4
@@ -822,6 +845,13 @@ jobs:
             findorb|oorb) make setup-assist setup-${{ matrix.tool }} ;;
             *)            make setup-${{ matrix.tool }} ;;
           esac
+
+      # Seal AFTER tool setup — GRSS's setup.sh still downloads two kernels
+      # from ssd.jpl.nasa.gov — and before the run, which reads only the
+      # pinned snapshot.
+      - name: Seal the job from JPL and the MPC
+        working-directory: empyrean-validation
+        run: ./scripts/seal-upstream.sh
 
       - name: Run ${{ matrix.tool }}
         working-directory: empyrean-validation
@@ -884,12 +914,23 @@ jobs:
         with:
           python-version: ${{ env.PYTHON_VERSION }}
 
-      # merge-external reads the SBDB cache for JPL reference elements.
-      - name: Restore JPL API responses
+      # merge-external reads the pinned SBDB snapshot for JPL reference
+      # elements. Restore by snapshot id (prep is the sole fetcher) and verify
+      # offline — no credential.
+      - name: Restore inputs snapshot
+        id: cache-inputs
         uses: actions/cache/restore@v4
         with:
-          path: ~/.empyrean/cache
-          key: ${{ env.JPL_CACHE_KEY }}
+          path: |
+            empyrean-validation/fixtures/psv
+            empyrean-validation/fixtures/psv-radar
+            empyrean-validation/fixtures/horizons
+            empyrean-validation/fixtures/sbdb
+            empyrean-validation/fixtures/MANIFEST.json
+          key: inputs-${{ needs.prep.outputs.inputs_id }}
+      - name: Verify the pinned inputs snapshot offline
+        working-directory: empyrean-validation
+        run: make fixtures INPUTS_OFFLINE=1
       - name: Cache cargo state
         uses: actions/cache@v4
         with:
@@ -938,6 +979,13 @@ jobs:
               --expect "${{ needs.prep.outputs.chunk_count }}" \
               results/validation_${ch}.chunk*.json
           done
+
+      # Seal before the merge: merge-external reads only the pinned SBDB
+      # snapshot, never JPL live. The later GCS publish uses
+      # storage.googleapis.com, which the seal deliberately does not block.
+      - name: Seal the job from JPL and the MPC
+        working-directory: empyrean-validation
+        run: ./scripts/seal-upstream.sh
 
       # reduce builds only the harness, then folds in whichever external
       # channels are present (skipping any that a failed leg left absent).

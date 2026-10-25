@@ -32,6 +32,7 @@
 pub mod catalog;
 pub mod compare;
 pub mod debias;
+pub mod inputs;
 pub mod orbit_compare;
 pub mod plan;
 pub mod predict_compare;

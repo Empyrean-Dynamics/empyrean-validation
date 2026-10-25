@@ -5,14 +5,20 @@ Cargo.lock
 # own isolated workspaces under runners/).
 **/target/
 
-# Fixture DATA is not tracked: fixtures/manifest.json (tracked) pins an
-# immutable public-read GCS snapshot, and scripts/fetch-fixtures.sh
-# materializes + hash-verifies the working copies here. The per-directory
-# READMEs stay in git. Contract: fixtures/README.md.
+# Inputs snapshot DATA is not tracked: fixtures/manifest.json (tracked) pins
+# one immutable snapshot in the private empyrean-data bucket, and
+# scripts/inputs.py materializes + sha256-verifies the four product
+# directories here. The per-directory READMEs and the local, never-tracked
+# walk manifest (fixtures/windows.json) stay out of the snapshot. The
+# materialized MANIFEST.json (the per-file manifest, fetched beside the data)
+# is not tracked either. Contract: fixtures/README.md.
 fixtures/psv/*
 !fixtures/psv/README.md
 fixtures/psv-radar/*
 !fixtures/psv-radar/README.md
+fixtures/horizons/*
+fixtures/sbdb/*
+fixtures/MANIFEST.json
 
 # Compiled C-channel runner binary — `make -C runners/c` output.
 runners/c/runner

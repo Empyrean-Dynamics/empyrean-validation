@@ -24,13 +24,6 @@ on:
         type: string
         required: false
         default: ""
-      psv_source:
-        description: "pinned = the pinned snapshot's PSVs (needs the new-format pin); legacy-public = the old public PSV snapshot (first mint only)."
-        type: choice
-        options:
-          - pinned
-          - legacy-public
-        default: pinned
       upload:
         description: "Upload the minted snapshot to the bucket (off = mint + report only)."
         type: boolean
@@ -84,10 +77,6 @@ jobs:
           gh-pat: ${{ secrets.GH_PAT }}
           python-version: ${{ env.PYTHON_VERSION }}
           dataset: ${{ env.EMPYREAN_DATASET }}
-          # engine-setup on main still requires this input; the mint keeps no JPL
-          # cache, so the key is inert. The consumption PR removes the input and
-          # this line with it.
-          jpl-cache-key: mint-unused
           workload-identity-provider: ${{ vars.GCP_WORKLOAD_IDENTITY_PROVIDER }}
           service-account: ${{ vars.GCP_DATA_READER_SA }}
           role: writer
@@ -147,7 +136,6 @@ jobs:
           gh-pat: ${{ secrets.GH_PAT }}
           python-version: ${{ env.PYTHON_VERSION }}
           dataset: ${{ env.EMPYREAN_DATASET }}
-          jpl-cache-key: mint-unused
           role: reader
       - name: Build the harness
         working-directory: empyrean-validation
@@ -213,7 +201,6 @@ jobs:
           gh-pat: ${{ secrets.GH_PAT }}
           python-version: ${{ env.PYTHON_VERSION }}
           dataset: ${{ env.EMPYREAN_DATASET }}
-          jpl-cache-key: mint-unused
           role: reader
       - name: Build harness binary
         working-directory: empyrean-validation
@@ -271,33 +258,20 @@ jobs:
         with:
           workload_identity_provider: "projects/786706985139/locations/global/workloadIdentityPools/github-pool/providers/github-provider"
           service_account: "empyrean-ci@empyrean-dynamics.iam.gserviceaccount.com"
-      - name: PSV products (pinned)
-        if: inputs.psv_source == 'pinned'
+      - name: PSV products (from the pinned snapshot)
         working-directory: empyrean-validation
         run: |
           # The snapshot bucket is public-read, so inputs.py fetch needs no auth.
-          # Fetch the pinned snapshot (new-format pin) and copy only its *.psv
-          # into the tree; horizons/ + sbdb/ for THIS mint come from the live
-          # reference pass above.
+          # Until the MPC refresh lands, a mint carries the pinned snapshot's PSV
+          # products forward unchanged (only the *.psv files are products, never a
+          # README); horizons/ + sbdb/ for THIS mint come from the live reference
+          # pass above.
           python3 scripts/inputs.py fetch --pin fixtures/manifest.json --dest "$RUNNER_TEMP/psv-src"
           mkdir -p "$GITHUB_WORKSPACE/mint/tree/psv" "$GITHUB_WORKSPACE/mint/tree/psv-radar"
           cp "$RUNNER_TEMP/psv-src/psv/"*.psv "$GITHUB_WORKSPACE/mint/tree/psv/"
           cp "$RUNNER_TEMP/psv-src/psv-radar/"*.psv "$GITHUB_WORKSPACE/mint/tree/psv-radar/"
-      - name: PSV products (legacy-public — first mint only)
-        if: inputs.psv_source == 'legacy-public'
-        working-directory: empyrean-validation
-        run: |
-          # First mint only, before the repo pins a snapshot in the new format:
-          # copy the PSVs from the old public snapshot over plain HTTPS. Only the
-          # *.psv files are products — never the tracked psv/README.md.
-          make fixtures
-          mkdir -p "$GITHUB_WORKSPACE/mint/tree/psv" "$GITHUB_WORKSPACE/mint/tree/psv-radar"
-          cp fixtures/psv/*.psv "$GITHUB_WORKSPACE/mint/tree/psv/"
-          cp fixtures/psv-radar/*.psv "$GITHUB_WORKSPACE/mint/tree/psv-radar/"
       - name: Build provenance
         working-directory: empyrean-validation
-        env:
-          PSV_SOURCE: ${{ inputs.psv_source }}
         run: |
           python3 - > "$GITHUB_WORKSPACE/mint/provenance.json" <<'PY'
           import json, os, tomllib
@@ -307,14 +281,10 @@ jobs:
           if not ver:
               raise SystemExit("ERROR: no empyrean dependency version in runners/rust/Cargo.toml.")
           ver = ver.lstrip("=")
-          # The pinned snapshot id, or the old public one, tags the PSV origin.
-          old_id = "unknown"
-          try:
-              old_id = json.load(open("fixtures/manifest.json"))["snapshot_id"]
-          except Exception:
-              pass
-          source = os.environ["PSV_SOURCE"]
-          psv_source = f"pinned:{old_id}" if source == "pinned" else f"legacy-public:{old_id}"
+          # The pinned snapshot's id tags the PSV origin.
+          with open("fixtures/manifest.json") as fh:
+              old_id = json.load(fh)["snapshot_id"]
+          psv_source = f"pinned:{old_id}"
           prov = {
               "catalog_commit": os.environ["GITHUB_SHA"],
               "distribution_version": ver,
@@ -344,7 +314,6 @@ jobs:
           python3 scripts/inputs.py pin --manifest "$TREE/MANIFEST.json" \
             --out "$GITHUB_WORKSPACE/mint/pin.json" --minted-by "$run_url" $allow
       - name: Diff against the pinned snapshot
-        if: inputs.psv_source == 'pinned'
         working-directory: empyrean-validation
         run: |
           python3 scripts/inputs.py diff "$RUNNER_TEMP/psv-src/MANIFEST.json" \
@@ -377,7 +346,6 @@ jobs:
             echo "- Bucket (gs): \`${BUCKET}/${SNAPSHOT_ID}/\`"
             echo "- Public URL: ${pub}/${SNAPSHOT_ID}/"
             echo "- Uploaded: ${{ inputs.upload }}"
-            echo "- PSV source: ${{ inputs.psv_source }}"
             echo "- Shared keys resolved (data-identical): ${MERGE_RESOLVED:-0}"
             echo ""
             echo '```'

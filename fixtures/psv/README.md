@@ -15,13 +15,15 @@ radar astrometry; their optical tables are byte-identical to the files here.
 
 ## Where the data lives
 
-The `.psv` files here are **working copies, not tracked in git**: the data
-lives in an immutable public-read GCS snapshot, pinned bit-exactly by the
-tracked `../manifest.json`, and materialized + sha256-verified by
-`scripts/fetch-fixtures.sh` (`make fixtures`). See `../README.md` for the
-full contract — immutability, refresh procedure, CI caching.
+The `.psv` files here are **working copies, not tracked in git**: they are one
+product of a single immutable inputs snapshot (optical + radar PSVs alongside
+the SBDB and Horizons responses), pinned bit-exactly by the tracked
+`../manifest.json` and materialized + sha256-verified by `scripts/inputs.py`
+(`make fixtures`). See `../README.md` for the full contract — the four
+products, the pin, the fetch, the CI roles, the upstream seal, and the refresh
+procedure.
 
-History, briefly, because this directory has now lived in all three states:
+History, briefly, because this directory has now lived in all four states:
 
 1. **`.gitignore`d** ("carried out-of-band") for the life of the split-out
    repo — which made the entire OD channel structurally dead in CI: no
@@ -34,11 +36,15 @@ History, briefly, because this directory has now lived in all three states:
    while deliberately carrying **no secrets and no private checkout**, and a
    fetch from any *private* location would have handed each of those legs a
    credential, dissolving the security boundary the matrix was built around.
-3. **GCS snapshot + tracked manifest** (current). Public-read objects
-   dissolve the objection to fetching: this is public MPC astrometry, so the
-   secretless legs fetch over plain HTTPS with no credential at all, and the
-   ~50 MB working set no longer dominates the repository's git objects. The
-   fetch script's always-verify-everything discipline keeps the "no hidden
-   fallbacks" property that tracking used to provide for free, and the
-   manifest keeps the git SHA pinning bit-exact inputs. Tags from era 2
-   still carry their fixtures in-checkout; history was not rewritten.
+3. **Public-read GCS snapshot + tracked manifest.** Public-read objects let
+   the secretless legs fetch over plain HTTPS, and the manifest kept the git
+   SHA pinning bit-exact inputs.
+4. **Unified inputs snapshot** (current). The PSVs are now one product of a
+   single inputs snapshot — the SBDB and Horizons responses the suite used to
+   query live, alongside the optical and radar PSVs — in the same public
+   validation bucket, under `inputs/<snapshot_id>/`. Reads stay plain HTTPS
+   with no credential; CI fetches once in `prep` and the fan-out legs restore
+   from the actions cache. The fetch's always-verify-everything discipline, the
+   hard-fail on any snapshot miss, and the upstream seal keep the "no hidden
+   fallbacks" property. Tags from eras 2–3 still fetch (or carry) their
+   fixtures as they did; history was not rewritten.
