@@ -2116,9 +2116,12 @@ fn parse_min_rows(specs: &[String]) -> Result<Vec<RowFloor>, String> {
 ///   and every replay channel replays what the plan carries. Unscoped, so it
 ///   applies to every strict channel.
 /// - `orbit_determination_radar` — one row per object with a manifest-pinned radar
-///   fixture, scoped to `rust`: those rows are stripped from the plan while
-///   radar OD is rust-only (`plan::PLAN_RUST_ONLY_TEST_TYPES`,
-///   `empyrean-s1ab`), so `rust` is the only channel that has them.
+///   fixture, scoped to `rust`. The radar rows ride the plan and the python
+///   and cli drivers replay them, but the reference channel has no
+///   optical+radar arm and emits no row for the arc, so no channel's radar
+///   row is ever compared (`n_compared` is structurally 0 there) and the
+///   floor can only live where the rows are produced for certain
+///   (`empyrean-s1ab`).
 fn catalog_row_floors() -> Vec<RowFloor> {
     vec![
         RowFloor {
@@ -2217,6 +2220,26 @@ fn ci_check_failures(
                     ));
                 }
             }
+            // Name every pair the summary could not judge (no comparable
+            // metric, no delivery verdict covering both sides) so a shortfall
+            // of one row points at the row instead of sending a reader
+            // through the artifacts.
+            if let Some(unjudged) = ch["unjudged_rows"].as_array() {
+                for u in unjudged {
+                    let obj = u["object"].as_str().unwrap_or("?");
+                    let tt = u["test_type"].as_str().unwrap_or("?");
+                    let dt = u["dt_days"].as_f64().unwrap_or(f64::NAN);
+                    let obs = u["observer"]
+                        .as_str()
+                        .map(|o| format!(" / {o}"))
+                        .unwrap_or_default();
+                    let method = u["method"].as_str().unwrap_or("?");
+                    let reason = u["reason"].as_str().unwrap_or("?");
+                    failures.push(format!(
+                        "{want}: unjudged — {obj} / {tt} / dt {dt:+.0} d{obs} / {method}: {reason}"
+                    ));
+                }
+            }
         }
 
         // Unscoped per-axis floors apply to every strict channel. Scoped
@@ -2263,11 +2286,11 @@ fn ci_check_failures(
 ///   always. This is the structural-death check: an axis nobody ran.
 /// - `n_compared` — this many of them paired with a reference row and were
 ///   actually diffed. Checked only for `--strict-channels`, whose whole job is
-///   to match the reference. It is meaningless for a channel that owns an axis
-///   alone: `orbit_determination_radar` exists on `rust` and nowhere else
-///   (`plan::PLAN_RUST_ONLY_TEST_TYPES`, empyrean-s1ab), so its `n_compared` is
-///   structurally 0 and a floor on it would fail forever no matter how much
-///   radar work ran.
+///   to match the reference. It is meaningless for an axis the reference does
+///   not run: the reference channel has no optical+radar arm and emits no
+///   `orbit_determination_radar` row (empyrean-s1ab), so every channel's
+///   `n_compared` on that axis is structurally 0 and a floor on it would fail
+///   forever no matter how much radar work ran.
 ///
 /// `by_test_type` is keyed by test type; a missing key and a zero count are the
 /// same failure — the axis was not exercised — and are reported as such rather
@@ -2373,6 +2396,28 @@ fn ci_check(args: CiCheckArgs) -> Result<(), Box<dyn std::error::Error>> {
                     "ci-check: {want}: {passing}/{total} rows passed at 1e-10 \
                      ({refused} refused identically)"
                 );
+                // Rows the channel emitted with no reference row are not
+                // compared; say so, per axis, so an un-gated axis reads as
+                // un-gated rather than as green.
+                let unreferenced = ch["n_unreferenced"].as_u64().unwrap_or(0);
+                if unreferenced > 0 {
+                    let per_axis: Vec<String> = ch["by_test_type"]
+                        .as_object()
+                        .map(|m| {
+                            m.iter()
+                                .filter_map(|(tt, x)| {
+                                    let n = x["n_unreferenced"].as_u64().unwrap_or(0);
+                                    (n > 0).then(|| format!("{tt}: {n}"))
+                                })
+                                .collect()
+                        })
+                        .unwrap_or_default();
+                    eprintln!(
+                        "ci-check: {want}: NOTE {unreferenced} row(s) had no reference row and \
+                         were not compared [{}]",
+                        per_axis.join(", ")
+                    );
+                }
             }
         }
         eprintln!(
@@ -2512,6 +2557,36 @@ mod tests {
 
         // Present channels are still checked normally.
         assert!(check(&channels, &["python"], &[]).is_empty());
+    }
+
+    /// A compared pair the summary could not judge is named in the failure
+    /// list — object, axis, offset, method and the side that lacked the
+    /// signal — so a one-row shortfall is actionable from the log alone.
+    #[test]
+    fn ci_check_names_every_unjudged_row() {
+        let mut ch = summary_channel("core", &[("orbit_determination_radar", 1)]);
+        ch["n_passing"] = serde_json::json!(0);
+        ch["unjudged_rows"] = serde_json::json!([{
+            "object": "Apophis",
+            "test_type": "orbit_determination_radar",
+            "dt_days": 0.0,
+            "observer": null,
+            "method": "—",
+            "reason": "the reference row carries neither a comparable metric nor a delivery signal",
+        }]);
+        let failures = check(&[ch], &["core"], &[]);
+        assert_eq!(failures.len(), 2, "{failures:?}");
+        assert!(
+            failures[0].starts_with("core: 0/1 rows passed"),
+            "{failures:?}"
+        );
+        assert!(
+            failures[1].contains(
+                "unjudged — Apophis / orbit_determination_radar / dt +0 d / —: \
+                 the reference row carries neither a comparable metric nor a delivery signal"
+            ),
+            "{failures:?}"
+        );
     }
 
     #[test]

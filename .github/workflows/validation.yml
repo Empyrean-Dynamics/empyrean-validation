@@ -999,14 +999,14 @@ jobs:
       # length and the radar-fixture list to the tree.
       #
       # The radar floor lands on `rust` alone — DELIBERATE and TEMPORARY, see
-      # empyrean-s1ab. Nothing but the rust runner can replay a radar OD row
-      # (the python driver skips rows without an ic state, and empyrean-core's
-      # validate-core has no radar arm), so the plan strips those rows
-      # entirely (plan::PLAN_RUST_ONLY_TEST_TYPES) and the strict channels
-      # never see them. Gating them where they are actually produced keeps the
-      # radar work under a floor instead of quietly un-gating it — an unscoped
-      # floor would fail python and core forever for work they cannot do. When
-      # the replay drivers grow a radar arm, the floor moves back on its own.
+      # empyrean-s1ab. The radar rows ride the plan and the python and cli
+      # drivers replay them, but the reference channel (empyrean-core's
+      # validate-core) has no optical+radar arm: it declines the row and emits
+      # none, so no channel's radar row is ever compared, and a strict-channel
+      # floor on the axis would fail forever for work the reference cannot
+      # judge. Gating the rows where they are produced for certain keeps the
+      # radar work under a floor instead of quietly un-gating it. When the
+      # reference grows a radar arm, move the floor back.
       #
       # Floors are only applied on a full-catalog run: a workflow_dispatch
       # with an OBJECTS subset legitimately produces fewer rows, and a floor
