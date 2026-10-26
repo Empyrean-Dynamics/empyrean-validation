@@ -63,19 +63,18 @@ name: Validation Suite
 # ──────────────────────────────────────────────────────────────────
 # This run costs ~55 jobs and hours of compute, so it fires only when
 # the thing it measures — the empyrean engine as the distribution
-# channels see it — has actually moved. That is exactly two moments:
+# channels see it — has actually moved, or when someone asks:
 #
-#   - repository_dispatch — empyrean or empyrean-core pushed to main
-#                           (see "Cross-repo dispatch" below). The
-#                           engine changed under the channels.
 #   - push                — this repo's main bumped the empyrean pin
 #                           in its OWN dependencies (see "Pin-bump
 #                           push" below). The harness adopted a new
-#                           engine generation.
+#                           engine generation. Every channel builds
+#                           that pinned release (the sibling checkout
+#                           is pinned to its tag), so this is the one
+#                           automatic trigger.
 #   - dispatch            — manual run with optional OBJECTS / TIER
 #                           inputs; the escape hatch for everything
-#                           the two triggers above deliberately no
-#                           longer cover.
+#                           else, and how a published run is started.
 #
 # DELIBERATELY NOT TRIGGERS, each dropped with its coverage story:
 #
@@ -89,15 +88,16 @@ name: Validation Suite
 #     comparator can move and stay unexercised until the next
 #     empyrean change or a manual run.
 #
-#   - engine-repo tag pushes (nolan / villeneuve / scott). The
-#     `sibling-tag-push` event type and all three sender steps were
-#     removed together, so nothing dispatches into a type that is no
-#     longer accepted. NO COVERAGE IS LOST: an engine tag reaches
-#     this suite the moment empyrean-core bumps its pin to it, which
-#     is a push to empyrean-core's main and therefore a
-#     `sibling-main-push`. Validation now gates ADOPTION of an engine
-#     tag rather than its mere existence — the transition that
-#     actually reaches users.
+#   - sibling pushes to main (empyrean, empyrean-core, and before
+#     them the engine repos' tag pushes). Both `sibling-main-push`
+#     and `sibling-tag-push` dispatches once ran this suite; neither
+#     is accepted now. The channels build the release the manifests
+#     pin, from a sibling checkout pinned to that tag, so a sibling's
+#     main moving changes nothing this suite builds: a dispatch spent
+#     a full run re-validating the same release and republished an
+#     identical dashboard. An engine reaches this suite when its pin
+#     moves here — the push trigger above — which is the transition
+#     that reaches users.
 #
 #   - framework-only pushes (schema, report renderer, external-runner
 #     code, the orchestrator Makefile, or this workflow itself).
@@ -126,29 +126,9 @@ name: Validation Suite
 # narrower path list.
 #
 # The python / c / cli / core channels build from the SIBLING
-# empyrean checkout (Makefile: EMPYREAN_ROOT), not from a pin, so
-# they carry no manifest here and are covered entirely by the
-# `sibling-main-push` dispatch.
-#
-# Cross-repo dispatch
-# ──────────────────────────────────────────────────────────────────
-# One event type is accepted:
-#   - sibling-main-push : empyrean / empyrean-core push to main.
-#                         Fires immediately because every push to
-#                         either of those is the next release
-#                         candidate users will feel. Both senders
-#                         gate the dispatch on their own build/test
-#                         jobs, so a red sibling CI never spends a
-#                         run here.
-#
-# `client_payload.source` carries the dispatching repo's full name
-# (`Empyrean-Dynamics/<repo>`) and `client_payload.sha` carries the
-# commit that triggered the run.
-# Senders need a fine-grained PAT scoped to this repo only with
-# `Contents: read and write` (the repository_dispatch endpoint's
-# fine-grained requirement — NOT `actions: write`, which is for the
-# workflow_dispatch endpoint), stored on the sender side as
-# `VALIDATION_DISPATCH_TOKEN`.
+# empyrean checkout (Makefile: EMPYREAN_ROOT), which the channel job
+# and the engine-setup action check out at the tag of the version the
+# runner manifest pins, so the pin-bump push covers them too.
 
 on:
   workflow_dispatch:
@@ -169,8 +149,6 @@ on:
       - "Cargo.toml"
       - "runners/rust/Cargo.toml"
       - "runners/cli/Cargo.toml"
-  repository_dispatch:
-    types: [sibling-main-push]
 
 # Default to read-only for EVERY job. id-token:write (which mints the GCP
 # OIDC token) is granted ONLY to the reduce job that publishes to GCS — never
@@ -278,11 +256,6 @@ jobs:
       - name: Log trigger source
         run: |
           echo "Event: ${{ github.event_name }}"
-          if [ "${{ github.event_name }}" = "repository_dispatch" ]; then
-            echo "Dispatch type:    ${{ github.event.action }}"
-            echo "Source repo:      ${{ github.event.client_payload.source }}"
-            echo "Source sha:       ${{ github.event.client_payload.sha }}"
-          fi
 
       # This repo must land before the composite action below can be resolved:
       # the action lives inside it, and `uses: ./...` only resolves a path that
@@ -1054,10 +1027,10 @@ jobs:
             ${FLOORS}
 
       # ── GCS upload ─────────────────────────────────────────────
-      # Publish on every real trigger INCLUDING repository_dispatch — a
-      # sibling-main-push is exactly the moment the published dashboard must
-      # reflect the new engine commit's validation. (Omitting it left the
-      # bucket stale while the summary still claimed a publish.)
+      # Publish on every real trigger (a pin-bump push or a manual dispatch;
+      # the retired sibling dispatch used to be one too, and omitting a real
+      # trigger here once left the bucket stale while the summary claimed a
+      # publish).
       #
       # But NOT from every ref, and NOT for every object set. `latest/` is the
       # published dashboard: whatever lands there is read as "this is Empyrean's
@@ -1084,7 +1057,7 @@ jobs:
           # lists, so a cron restored in `on:` without a matching edit here
           # would run the full suite and then silently decline to publish it.
           case "${{ github.event_name }}" in
-            schedule|push|workflow_dispatch|repository_dispatch) trigger=1 ;;
+            schedule|push|workflow_dispatch) trigger=1 ;;
           esac
           if [ "$trigger" -ne 1 ]; then
             echo "publish=false" >> "$GITHUB_OUTPUT"
