@@ -694,6 +694,34 @@ fn build_uncertainty_axes(
     axes
 }
 
+/// Build the ephemeris observers for one site at `target`, byte-for-byte as
+/// the python and core channels build them.
+///
+/// [`Context::get_observers`] resolves the observer state, but the
+/// [`Observer`](empyrean::Observer) it returns carries the epoch the C ABI
+/// echoes back — an MJD TDB value that has round-tripped through the engine's
+/// internal time scale \\( (\mathrm{TDB} \to \mathrm{TAI} \to \mathrm{TDB}) \\)
+/// and so need not equal the caller's `target` in its last bit. The python
+/// channel (`empyrean-py`'s `_generate_ephemeris`) and the core channel both
+/// hand [`Context::generate_ephemeris`] the caller's own `target` instead, so
+/// the observer epoch driving the light-time geometry is `target` exactly.
+/// Carry `target` here too — at every offset, \\( \Delta t = 0 \\) included —
+/// so every channel feeds the engine the same observer rather than one that
+/// differs by a single ULP wherever that round-trip is not the identity. Only
+/// the epoch is replaced; position, velocity, observing night and basis stay
+/// exactly as [`Context::get_observers`] computed them.
+fn observers_for_ephemeris(
+    ctx: &Context,
+    obs_code: &str,
+    target: Epoch,
+) -> empyrean::Result<Vec<empyrean::Observer>> {
+    Ok(ctx
+        .get_observers(&[obs_code], &[target], Frame::ICRF, Origin::SSB)?
+        .into_iter()
+        .map(|o| empyrean::Observer { epoch: target, ..o })
+        .collect())
+}
+
 /// Run propagation + ephemeris validation against Horizons reference.
 ///
 /// The IC + reference inputs are read from the pinned snapshot on disk
@@ -1325,16 +1353,14 @@ pub fn run_propagation_validation(
                         (!hor.light_time_days.is_nan()).then_some(hor.light_time_days);
                     let target = Epoch::from_mjd_tdb(data.epoch + dt);
 
-                    // (ICRF, SSB) is the construction basis — observers come
-                    // back exactly as built, untransformed, which is what
-                    // ephemeris generation requires and what this call got
-                    // implicitly before the basis became explicit.
-                    let observers = match ctx.get_observers(
-                        &[obs_code],
-                        &[target],
-                        Frame::ICRF,
-                        Origin::SSB,
-                    ) {
+                    // (ICRF, SSB) is the construction basis — observer states
+                    // come back exactly as built, untransformed, which is what
+                    // ephemeris generation requires. `observers_for_ephemeris`
+                    // then carries the row's own `target` onto each observer so
+                    // the epoch handed to `generate_ephemeris` is bit-identical
+                    // to the python and core channels (which build the observer
+                    // from the raw target, not the C ABI's round-tripped echo).
+                    let observers = match observers_for_ephemeris(ctx, obs_code, target) {
                         Ok(o) => o,
                         Err(e) => {
                             eprintln!("  {} dt={dt:+.0}d SKIP (observer: {e})", data.name);
@@ -4620,5 +4646,63 @@ mod tests {
             chain.kind(),
             "the delivered kind matches the chain accessor's"
         );
+    }
+
+    /// The ephemeris observer carries the row's own target epoch, bit for bit —
+    /// never the epoch [`Context::get_observers`] echoes back through the C
+    /// ABI, which round-trips MJD TDB through the engine's internal scale and
+    /// need not be the identity. This is the seam that made the W84 / Apophis
+    /// ephemeris row at `dt = 0` (SBDB epoch MJD TDB 61200.0) disagree with the
+    /// python and core channels by 1.7e-10 arcsec in RA: the observer was
+    /// computed at a 1-ULP-shifted epoch. Skips when the offline data tier is
+    /// absent, so the from-engine assertions are exercised whenever the suite's
+    /// fixtures are present. Mutation: have `observers_for_ephemeris` return
+    /// `get_observers`' observer unchanged → `obs.epoch` becomes the echoed
+    /// epoch and the equality against the freshly built `target` /
+    /// python-style observer goes red wherever the round-trip moves the last
+    /// bit (the W84 / 61200.0 regime on the reference platform).
+    #[test]
+    fn ephemeris_observer_carries_the_target_epoch_like_python_and_core() {
+        let Some(ctx) = test_ctx() else {
+            return;
+        };
+        // The exact defect coordinates: observer W84 at the Apophis SBDB epoch.
+        let target = Epoch::from_mjd_tdb(61_200.0);
+        let built = match observers_for_ephemeris(&ctx, "W84", target) {
+            Ok(o) if !o.is_empty() => o,
+            _ => return,
+        };
+        let obs = &built[0];
+
+        // The epoch handed to `generate_ephemeris` is the caller's own target,
+        // identical to `Epoch::from_mjd_tdb(61200.0)` to the bit.
+        assert_eq!(
+            obs.epoch, target,
+            "observer carries the row's target epoch, not the round-tripped echo"
+        );
+
+        // Position / velocity / night / basis are the engine's, untouched.
+        let raw = ctx
+            .get_observers(&["W84"], &[target], Frame::ICRF, Origin::SSB)
+            .expect("W84 resolves at the Apophis epoch");
+        assert_eq!(obs.position, raw[0].position);
+        assert_eq!(obs.velocity, raw[0].velocity);
+        assert_eq!(obs.observing_night, raw[0].observing_night);
+        assert_eq!(obs.frame, Frame::ICRF);
+        assert_eq!(obs.origin, Origin::SSB);
+
+        // Byte-for-byte the observer the python channel hands the engine:
+        // `get_observers` for the state, `Epoch::from_mjd_tdb(target)` for the
+        // epoch (empyrean-py `_generate_ephemeris`).
+        let python_style = empyrean::Observer {
+            obs_code: raw[0].obs_code.clone(),
+            epoch: Epoch::from_mjd_tdb(61_200.0),
+            position: raw[0].position,
+            velocity: raw[0].velocity,
+            observing_night: raw[0].observing_night,
+            frame: Frame::ICRF,
+            origin: Origin::SSB,
+        };
+        assert_eq!(*obs, python_style);
     }
 }
