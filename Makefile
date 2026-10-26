@@ -591,7 +591,7 @@ synth-score:
 $(RUST_OD): $(RUST_BIN) | fixtures
 	@echo "──── Rust channel: orbit determination ─────────────────"
 	@$(DYLD) $(RUST_BIN) od $(ONLY_FLAG) --tier $(TIERS) \
-	    --data-dir $(DATA_DIR) \
+	    --data-dir $(DATA_DIR) --cache-dir $(CACHE_DIR) \
 	    --fixtures-dir $(FIXTURES_PSV) \
 	    --output $(RUST_OD)
 	@for f in $(RUST_OD_ORBITS) $(RUST_OD_COMPARE); do \
@@ -680,7 +680,7 @@ shard-reference: $(RUST_BIN) $(EMP_VAL_BIN) | fixtures
 	    --output $(SHARD_DIR)/$(SLUG)/validation_rust_propeph.json
 	@echo "──── Reference shard: $(OBJECT) [orbit determination] ──"
 	@$(DYLD) $(RUST_BIN) od --only "$(OBJECT)" --tier $(TIERS) \
-	    --data-dir $(DATA_DIR) \
+	    --data-dir $(DATA_DIR) --cache-dir $(CACHE_DIR) \
 	    --fixtures-dir $(FIXTURES_PSV) \
 	    --output $(SHARD_DIR)/$(SLUG)/validation_rust_od.json
 	@python3 -c "$$ASSERT_SHARD_COMPLETE" $(SHARD_DIR)/$(SLUG) "$(OBJECT)"
