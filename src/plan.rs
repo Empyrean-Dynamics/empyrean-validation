@@ -784,24 +784,25 @@ pub const PLAN_UNCERTAINTY_AXES: [&str; 7] = [
 /// Test types no replay channel can reproduce, and so must never reach the
 /// plan.
 ///
-/// **Currently empty — the radar OD axis is now replayable everywhere
-/// (`empyrean-s1ab` resolved).** `orbit_determination_radar` used to sit here:
-/// the rust runner emitted the rows, but nothing else could replay them, so a
-/// plan carrying them made the gate unsatisfiable for a reason unrelated to any
-/// regression. That is no longer true. Every replay channel now grows a radar
-/// arm that loads the object's `fixtures/psv-radar/` fixture and folds its
-/// `<radar>` delay/Doppler table into the fit:
+/// `orbit_determination_radar` used to sit here: the rust runner emitted the
+/// rows, but nothing else could replay them, so a plan carrying them made the
+/// gate unsatisfiable for a reason unrelated to any regression. It left the
+/// list when the python and cli drivers grew radar arms that load the object's
+/// `fixtures/psv-radar/` fixture and fold its `<radar>` delay/Doppler table
+/// into the fit:
 ///
-/// - `empyrean-core`'s `validate-core` has a `replay_od_radar` branch,
 /// - `runners/python/run.py` dispatches the `orbit_determination_radar` row to
 ///   the wheel's radar-folding `read_ades` path, and
 /// - `runners/cli/drive.py` points the CLI runner's `od` command at the
 ///   psv-radar fixture (the runner reads radar through `read_ades`).
 ///
-/// So the radar row now describes a real cross-channel comparison, and the
-/// strip keeps it. Its floor moves off the rust-only `--min-rows` special case
-/// and onto the strict channels, exactly as the resolution note that used to
-/// live here promised.
+/// The reference channel has not: empyrean-core's `validate-core` has no
+/// optical+radar arm, declines the row and emits none for it. The strip keeps
+/// the row because the channels that can replay it should, and the report
+/// shows every attempt; but with no reference row to pair against, no
+/// channel's radar row is compared by the gate, and its floor stays scoped to
+/// `rust` (`empyrean-s1ab`; remaining work: a radar arm in `validate-core`,
+/// then move the floor onto the strict channels).
 ///
 /// The machinery ([`PlanExclusion::RustOnlyTestType`], the
 /// [`PlanDrops::rust_only_test_type`] counter) stays: it is the generic guard

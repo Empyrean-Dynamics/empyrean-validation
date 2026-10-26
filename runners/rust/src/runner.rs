@@ -722,6 +722,37 @@ fn observers_for_ephemeris(
         .collect())
 }
 
+/// Sky-plane residuals \\( (\Delta\alpha\cos\delta,\ \Delta\delta) \\) in
+/// arcseconds, as the python and core channels compute them — term for term,
+/// with **no RA wrap**.
+///
+/// The expression is `(emp_ra - ref_ra) * cos(emp_dec)` for RA and
+/// `emp_dec - ref_dec` for Dec, each then `to_degrees() * 3600` — byte-for-byte
+/// `run.py`'s `d_ra = (ra_rad - ref_ra) * cos_d1` / `d_dec = dec_rad - ref_dec`
+/// and `validate-core.rs`'s `(emp_ra_rad - ref_ra) * cos_d1` /
+/// `emp_dec_rad - ref_dec`. The three channels must agree to the bit, so this
+/// carries their exact arithmetic and nothing else.
+///
+/// RA wrapping is deliberately absent here. A `rem_euclid(2\pi)` reduction
+/// rounds a small **negative** \\( \Delta\alpha \\) at the ULP of \\( 2\pi \\)
+/// (\\( \approx 8.9\times10^{-16} \\) rad) and shifts the residual by up to one
+/// ULP, while a small positive \\( \Delta\alpha \\) passes through untouched —
+/// so a wrap on one channel alone splits it from the others at the 1e-10 arcsec
+/// scale (the W84 / Apophis `dt = 0` row). The wrap-safe quantity near
+/// \\( \alpha = 0 / 2\pi \\) is the great-circle separation, which the caller
+/// computes separately via [`compare::angular_separation_arcsec`]. Giving all
+/// three channels a consistent RA wrap is a filed follow-up, not done here.
+fn sky_residuals_arcsec(
+    emp_ra_rad: f64,
+    emp_dec_rad: f64,
+    ref_ra_rad: f64,
+    ref_dec_rad: f64,
+) -> (f64, f64) {
+    let d_ra_arcsec = ((emp_ra_rad - ref_ra_rad) * emp_dec_rad.cos()).to_degrees() * 3600.0;
+    let d_dec_arcsec = (emp_dec_rad - ref_dec_rad).to_degrees() * 3600.0;
+    (d_ra_arcsec, d_dec_arcsec)
+}
+
 /// Run propagation + ephemeris validation against Horizons reference.
 ///
 /// The IC + reference inputs are read from the pinned snapshot on disk
@@ -1460,19 +1491,17 @@ pub fn run_propagation_validation(
                                 hor_ra_rad,
                                 hor_dec_rad,
                             );
-                            // Wrap the RA difference to [-π, π] so an object
-                            // near RA = 0 / 2π doesn't produce a spurious ~2π
-                            // residual. (Dec needs no wrap; separation below is
-                            // great-circle and already wrap-safe.)
-                            let mut d_ra_wrapped =
-                                (emp_ra_rad - hor_ra_rad).rem_euclid(std::f64::consts::TAU);
-                            if d_ra_wrapped > std::f64::consts::PI {
-                                d_ra_wrapped -= std::f64::consts::TAU;
-                            }
-                            let d_ra = d_ra_wrapped * emp_dec_rad.cos();
-                            let d_dec = emp_dec_rad - hor_dec_rad;
-                            let d_ra_arcsec = d_ra.to_degrees() * 3600.0;
-                            let d_dec_arcsec = d_dec.to_degrees() * 3600.0;
+                            // d_ra / d_dec in arcsec, the python and core
+                            // channels' expression term for term and with no RA
+                            // wrap, so the three agree to the bit (see
+                            // `sky_residuals_arcsec`). The wrap-safe quantity
+                            // near RA = 0 / 2π is the great-circle `sep` above.
+                            let (d_ra_arcsec, d_dec_arcsec) = sky_residuals_arcsec(
+                                emp_ra_rad,
+                                emp_dec_rad,
+                                hor_ra_rad,
+                                hor_dec_rad,
+                            );
 
                             // Sky-plane 2×2 covariance (arcsec², RA·cosδ). Two
                             // sources: the harness projection of the input
@@ -4704,5 +4733,43 @@ mod tests {
             origin: Origin::SSB,
         };
         assert_eq!(*obs, python_style);
+    }
+
+    /// `sky_residuals_arcsec` is the python and core channels' residual
+    /// expression, term for term, with no RA wrap — so the three channels agree
+    /// to the bit. The retired runner expression reduced the RA difference
+    /// through `rem_euclid(2π)`, which rounds a small negative Δα at the ULP of
+    /// 2π and split the W84 / Apophis dt = 0 row from the other channels by
+    /// 1.726e-10 arcsec (the other rows' Δα were positive or rounded clean).
+    /// Mutation: restore the `rem_euclid(TAU)` wrap → `old_d_ra_arcsec` becomes
+    /// the helper's output and the `delta > 0` assertion below goes red.
+    #[test]
+    fn sky_residuals_match_the_channels_without_the_ra_wrap() {
+        // A tiny NEGATIVE Δα — the regime the old wrap perturbed. `ref_ra = 0`
+        // so `emp_ra - ref_ra` is exactly -9e-11 rad; dec ~0.34 rad, Δδ = 0.
+        let emp_ra_rad = -9e-11_f64;
+        let ref_ra_rad = 0.0_f64;
+        let emp_dec_rad = 0.34_f64;
+        let ref_dec_rad = 0.34_f64;
+        let (d_ra_arcsec, d_dec_arcsec) =
+            sky_residuals_arcsec(emp_ra_rad, emp_dec_rad, ref_ra_rad, ref_dec_rad);
+
+        // Term for term the python / core expression, bit for bit.
+        let expected_d_ra = ((emp_ra_rad - ref_ra_rad) * emp_dec_rad.cos()).to_degrees() * 3600.0;
+        let expected_d_dec = (emp_dec_rad - ref_dec_rad).to_degrees() * 3600.0;
+        assert_eq!(d_ra_arcsec, expected_d_ra, "d_ra mirrors the channels");
+        assert_eq!(d_dec_arcsec, expected_d_dec, "d_dec mirrors the channels");
+
+        // The retired `rem_euclid(2π)` wrap differs on this negative Δα —
+        // non-zero (so this test fails against the old formula) but only at the
+        // ULP of 2π, far below any tolerance.
+        let mut wrapped = (emp_ra_rad - ref_ra_rad).rem_euclid(std::f64::consts::TAU);
+        if wrapped > std::f64::consts::PI {
+            wrapped -= std::f64::consts::TAU;
+        }
+        let old_d_ra_arcsec = (wrapped * emp_dec_rad.cos()).to_degrees() * 3600.0;
+        let delta = (old_d_ra_arcsec - d_ra_arcsec).abs();
+        assert!(delta > 0.0, "the RA wrap perturbs d_ra on a negative Δα");
+        assert!(delta < 1e-9, "but only at the ULP of 2π");
     }
 }

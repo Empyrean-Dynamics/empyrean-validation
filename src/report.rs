@@ -532,6 +532,19 @@ struct ChannelRollup {
     /// One record per refusal mismatch, for the gate to name (object, test
     /// type, method, which side delivered).
     refusal_mismatches: Vec<RefusalMismatch>,
+    /// Pairs the comparison could not judge: no fidelity metric was
+    /// comparable AND the delivery rule had nothing to read on at least one
+    /// side (a row with neither a metric nor a delivery signal). Counted in
+    /// `n_total_compared`, never in `n_passing`, and each is named in
+    /// `unjudged_rows`: a compared pair the gate cannot classify fails by
+    /// name, not as an anonymous shortfall.
+    n_unjudged: usize,
+    unjudged_rows: Vec<UnjudgedRow>,
+    /// Rows this channel emitted for which the reference emitted no row of
+    /// the same key. Never compared, so never in `n_total_compared`; counted
+    /// here and per test type so an axis the reference does not run stays
+    /// visible instead of vanishing from the gate.
+    n_unreferenced: usize,
     p50_time_ms: f64,
     p50_rust_time_ms: f64,
     p50_speed_ratio: f64,
@@ -550,6 +563,23 @@ struct RefusalMismatch {
     /// `"reference"` or `"channel"` — the side that delivered the orbit the
     /// other refused.
     delivered_side: &'static str,
+}
+
+/// A compared pair neither rule could judge: no fidelity metric was
+/// comparable, and at least one side carried no delivery signal for the
+/// refusal rule to read. Named per channel so the summary JSON carries it and
+/// `ci-check` prints the row behind a shortfall.
+#[derive(Debug, Clone)]
+struct UnjudgedRow {
+    object: String,
+    test_type: String,
+    dt_days: f64,
+    observer: Option<String>,
+    /// The uncertainty method the row ran under, named as the report names
+    /// it (see [`refused_method_name`]).
+    method: String,
+    /// Which side lacked the signal, in words.
+    reason: &'static str,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -584,6 +614,12 @@ struct TestTypeRollup {
     /// Of this test type's compared pairs, how many were a refusal mismatch
     /// (one side delivered, the other refused). NOT counted toward passing.
     n_refusal_mismatch: usize,
+    /// Of this test type's compared pairs, how many neither rule could judge
+    /// (see [`ChannelRollup::n_unjudged`]). NOT counted toward passing.
+    n_unjudged: usize,
+    /// Rows of this test type the channel emitted with no reference row to
+    /// pair against; not compared (see [`ChannelRollup::n_unreferenced`]).
+    n_unreferenced: usize,
     p50_dr_km: f64,
     p95_dr_km: f64,
     p99_dr_km: f64,
@@ -752,6 +788,11 @@ fn rollup_channels(results: &[ValidationResult]) -> Vec<ChannelRollup> {
         let mut refusal_mismatches: Vec<RefusalMismatch> = Vec::new();
         let mut by_tt_refused_identically: BTreeMap<String, usize> = BTreeMap::new();
         let mut by_tt_refusal_mismatch: BTreeMap<String, usize> = BTreeMap::new();
+        let mut n_unjudged = 0;
+        let mut unjudged_rows: Vec<UnjudgedRow> = Vec::new();
+        let mut by_tt_unjudged: BTreeMap<String, usize> = BTreeMap::new();
+        let mut n_unreferenced = 0;
+        let mut by_tt_unreferenced: BTreeMap<String, usize> = BTreeMap::new();
         let mut channel_times: Vec<f64> = Vec::new();
         let mut core_match_times: Vec<f64> = Vec::new();
         // A position-vector-only `dr_km` stream was historically tracked
@@ -789,6 +830,12 @@ fn rollup_channels(results: &[ValidationResult]) -> Vec<ChannelRollup> {
                 r.propagation_uncertainty.clone(),
             );
             let Some(&core_r) = core_by_key.get(&key) else {
+                // No reference row of this key: the row cannot be compared.
+                // Counted, not dropped — an axis the reference never runs
+                // (today the optical+radar fit, which the core runner has no
+                // arm for) must stay visible in the gate's accounting.
+                n_unreferenced += 1;
+                *by_tt_unreferenced.entry(r.test_type.clone()).or_default() += 1;
                 continue;
             };
             n_compared += 1;
@@ -868,9 +915,21 @@ fn rollup_channels(results: &[ValidationResult]) -> Vec<ChannelRollup> {
                 // emp_pos, no residuals) carries none. Classify both sides'
                 // delivery (empyrean-57o6n). Both refusing is parity and counts
                 // as passing; one side delivering while the other refused is a
-                // real divergence that is named, not passed. A row that is not a
-                // fit on either side (NotApplicable) leaves the counts untouched,
-                // exactly as before.
+                // real divergence that is named, not passed. A pair with no
+                // delivery signal on one side or both is judged by neither rule
+                // and is counted and named as unjudged below.
+                let mut unjudged = |reason: &'static str| {
+                    n_unjudged += 1;
+                    *by_tt_unjudged.entry(r.test_type.clone()).or_default() += 1;
+                    unjudged_rows.push(UnjudgedRow {
+                        object: r.object.clone(),
+                        test_type: r.test_type.clone(),
+                        dt_days: r.dt_days,
+                        observer: r.observer.clone(),
+                        method: refused_method_name(r),
+                        reason,
+                    });
+                };
                 match (od_delivery(core_r), od_delivery(r)) {
                     (Delivery::NotDelivered, Delivery::NotDelivered) => {
                         n_passing += 1;
@@ -903,7 +962,26 @@ fn rollup_channels(results: &[ValidationResult]) -> Vec<ChannelRollup> {
                             delivered_side: "channel",
                         });
                     }
-                    _ => {}
+                    // The remaining pairs carry no comparable metric and no
+                    // delivery verdict that covers both sides, so neither rule
+                    // above can judge them. They stay in `n_total_compared`
+                    // and out of `n_passing` — exactly as the silent arm this
+                    // replaces counted them — but each is NAMED, so the gate's
+                    // shortfall points at a row. The optical+radar arc sat
+                    // here for every channel: its reference row was one the
+                    // core runner had skipped and written back hollow.
+                    (Delivery::Delivered, Delivery::Delivered) => unjudged(
+                        "both sides delivered an orbit but no fidelity metric was comparable",
+                    ),
+                    (Delivery::NotApplicable, Delivery::NotApplicable) => {
+                        unjudged("neither row carries a comparable metric or a delivery signal")
+                    }
+                    (Delivery::NotApplicable, _) => unjudged(
+                        "the reference row carries neither a comparable metric nor a delivery signal",
+                    ),
+                    (_, Delivery::NotApplicable) => unjudged(
+                        "the channel row carries neither a comparable metric nor a delivery signal",
+                    ),
                 }
             }
 
@@ -949,6 +1027,8 @@ fn rollup_channels(results: &[ValidationResult]) -> Vec<ChannelRollup> {
                     n_bit_identical,
                     n_refused_identically: by_tt_refused_identically.get(tt).copied().unwrap_or(0),
                     n_refusal_mismatch: by_tt_refusal_mismatch.get(tt).copied().unwrap_or(0),
+                    n_unjudged: by_tt_unjudged.get(tt).copied().unwrap_or(0),
+                    n_unreferenced: by_tt_unreferenced.get(tt).copied().unwrap_or(0),
                     p50_dr_km: p50,
                     p95_dr_km: p95,
                     p99_dr_km: p99,
@@ -972,6 +1052,9 @@ fn rollup_channels(results: &[ValidationResult]) -> Vec<ChannelRollup> {
             n_refused_identically,
             n_refusal_mismatch,
             refusal_mismatches,
+            n_unjudged,
+            unjudged_rows,
+            n_unreferenced,
             p50_time_ms: {
                 if channel == "core" {
                     let mut all_rust: Vec<f64> = rows
@@ -1117,6 +1200,8 @@ fn write_summary(
                             "n_bit_identical": x.n_bit_identical,
                             "n_refused_identically": x.n_refused_identically,
                             "n_refusal_mismatch": x.n_refusal_mismatch,
+                            "n_unjudged": x.n_unjudged,
+                            "n_unreferenced": x.n_unreferenced,
                             "p50_dr_km": nan_or(x.p50_dr_km),
                             "p95_dr_km": nan_or(x.p95_dr_km),
                             "p99_dr_km": nan_or(x.p99_dr_km),
@@ -1143,6 +1228,20 @@ fn write_summary(
                         "delivered_side": m.delivered_side,
                     }))
                     .collect::<Vec<_>>(),
+                "n_unjudged": r.n_unjudged,
+                "unjudged_rows": r
+                    .unjudged_rows
+                    .iter()
+                    .map(|u| serde_json::json!({
+                        "object": u.object,
+                        "test_type": u.test_type,
+                        "dt_days": u.dt_days,
+                        "observer": u.observer,
+                        "method": u.method,
+                        "reason": u.reason,
+                    }))
+                    .collect::<Vec<_>>(),
+                "n_unreferenced": r.n_unreferenced,
                 "max_dr_km": r.max_dr_km,
                 "max_sep_diff_arcsec": r.max_sep_diff_arcsec,
                 "max_d_ra_diff_arcsec": r.max_d_ra_diff_arcsec,
@@ -4100,9 +4199,7 @@ fn empyrean_convergence_cell(
     let Some(r) = row else {
         if radar && channel != "rust" {
             return ConvergenceCell::NotAttempted {
-                reason: format!(
-                    "the optical+radar arc is a rust-only plan axis, so the {channel} channel is never handed it"
-                ),
+                reason: format!("the {channel} channel emitted no row for the optical+radar arc"),
             };
         }
         return ConvergenceCell::NotAttempted {
@@ -13098,6 +13195,89 @@ mod tests {
             .iter()
             .find(|r| r.channel == channel)
             .unwrap_or_else(|| panic!("channel {channel} present in rollup"))
+    }
+
+    // (e) A reference row with neither a comparable metric nor a delivery
+    // signal — the shape the core runner wrote back for the optical+radar fit
+    // it had skipped — cannot be judged against a channel that refused the
+    // fit. The pair stays compared and unpassed, exactly as before, but is
+    // NAMED: the gate's shortfall points at the row.
+    #[test]
+    fn unjudged_pair_is_counted_and_named() {
+        // Hollow reference: no metrics, no delivery fields, od_converged None.
+        let core = parity_od_row("core", "first_order_detection_on");
+        let mut py = parity_od_row("python", "first_order_detection_on");
+        py.od_converged = Some(false);
+        let expected_method = refused_method_name(&py);
+
+        let rollups = rollup_channels(&[core, py]);
+        let py_r = rollup_for(&rollups, "python");
+        assert_eq!(py_r.n_total_compared, 1);
+        assert_eq!(py_r.n_passing, 0, "an unjudged pair is not parity");
+        assert_eq!(py_r.n_refused_identically, 0);
+        assert_eq!(py_r.n_refusal_mismatch, 0);
+        assert_eq!(py_r.n_unjudged, 1);
+        assert_eq!(py_r.by_test_type["orbit_determination"].n_unjudged, 1);
+        let u = &py_r.unjudged_rows[0];
+        assert_eq!(u.object, "Chiron");
+        assert_eq!(u.test_type, "orbit_determination");
+        assert_eq!(u.dt_days, 0.0);
+        assert_eq!(u.observer, None);
+        assert_eq!(u.method, expected_method);
+        assert_eq!(
+            u.reason,
+            "the reference row carries neither a comparable metric nor a delivery signal"
+        );
+    }
+
+    // (f) The side that lacks the signal is the one named: here the channel
+    // row is the hollow one.
+    #[test]
+    fn unjudged_pair_names_the_hollow_channel_side() {
+        let mut core = parity_od_row("core", "first_order_detection_on");
+        core.od_converged = Some(false);
+        let py = parity_od_row("python", "first_order_detection_on");
+
+        let rollups = rollup_channels(&[core, py]);
+        let py_r = rollup_for(&rollups, "python");
+        assert_eq!(py_r.n_total_compared, 1);
+        assert_eq!(py_r.n_passing, 0);
+        assert_eq!(py_r.n_unjudged, 1);
+        assert_eq!(
+            py_r.unjudged_rows[0].reason,
+            "the channel row carries neither a comparable metric nor a delivery signal"
+        );
+    }
+
+    // (g) A channel row with no reference row of its key is not compared at
+    // all; it is counted as unreferenced, per channel and per test type, so an
+    // axis the reference never runs stays visible in the gate's accounting.
+    #[test]
+    fn unreferenced_row_is_counted_not_compared() {
+        let mut core = parity_od_row("core", "first_order_detection_on");
+        core.od_converged = Some(false);
+        let mut py = parity_od_row("python", "first_order_detection_on");
+        py.od_converged = Some(false);
+        let mut py_radar = parity_od_row("python", "first_order_detection_on");
+        py_radar.test_type = "orbit_determination_radar".to_string();
+        py_radar.od_converged = Some(false);
+
+        let rollups = rollup_channels(&[core, py, py_radar]);
+        let py_r = rollup_for(&rollups, "python");
+        assert_eq!(py_r.n_rows, 2);
+        assert_eq!(
+            py_r.n_total_compared, 1,
+            "the radar row has no reference row"
+        );
+        assert_eq!(py_r.n_passing, 1, "the paired refusal is parity");
+        assert_eq!(py_r.n_unreferenced, 1);
+        assert_eq!(
+            py_r.by_test_type["orbit_determination_radar"].n_unreferenced,
+            1
+        );
+        assert_eq!(py_r.by_test_type["orbit_determination_radar"].n_compared, 0);
+        assert_eq!(py_r.by_test_type["orbit_determination_radar"].n_rows, 1);
+        assert_eq!(py_r.by_test_type["orbit_determination"].n_unreferenced, 0);
     }
 
     // (a) Both sides refuse → the pair is parity: it counts as passing and
