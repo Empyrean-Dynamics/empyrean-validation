@@ -984,8 +984,8 @@ run-assist: $(PLAN) check-plan $(ASSIST_PY)
 	    --horizons-cache $(CACHE_DIR)/horizons \
 	    --data-dir $(DATA_DIR)
 
-# find_orb's binary is an optional, non-fatal BUILD (see findorb/setup.sh) —
-# but a missing binary at RUN time is a failure, not a skip. This used to
+# find_orb's build fails loudly (see findorb/setup.sh), and a missing binary
+# at RUN time is a failure too, not a skip. This used to
 # `echo '[]' > $(FINDORB_OUT)` and succeed, which handed the merge a
 # syntactically valid file asserting "find_orb compared zero objects" and
 # produced a green leg that ran no comparator at all. Fail with the fix
@@ -1024,8 +1024,8 @@ $(OORB_BIN):
 	@cd $(EMP_VAL_RUNNERS)/oorb && ./setup.sh
 
 run-oorb: $(OORB_OUT)
-# Same rule as find_orb: an optional BUILD, but a missing binary at RUN time
-# is a failure. The `echo '[]'` fallback made a leg that compared nothing
+# find_orb's RUN-time rule (OpenOrb's BUILD stays optional): a missing binary
+# at RUN time is a failure. The `echo '[]'` fallback made a leg that compared nothing
 # indistinguishable from a leg that compared everything and agreed.
 $(OORB_OUT): $(PLAN) $(ASSIST_PY) | check-plan
 	@test -x "$(OORB_BIN)" || { \
@@ -1108,8 +1108,8 @@ $(GRSS_PY):
 	@cd $(EMP_VAL_RUNNERS)/grss && DATA_DIR="$(DATA_DIR)" ./setup.sh
 
 run-grss: $(GRSS_OUT)
-# Same rule as find_orb / layup: the venv is an optional BUILD, but a missing
-# interpreter at RUN time is a failure, not a skip. An empty result file would
+# find_orb's and layup's RUN-time rule (the venv BUILD stays optional): a
+# missing interpreter at RUN time is a failure, not a skip. An empty result file would
 # report a comparator that never executed as a successful empty comparison.
 $(GRSS_OUT): $(PLAN) | check-plan fixtures
 	@test -x "$(GRSS_PY)" || { \

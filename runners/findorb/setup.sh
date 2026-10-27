@@ -2,7 +2,8 @@
 # Setup find_orb for OD comparison.
 #
 # Clones and builds find_orb (Bill Gray's orbit determination software)
-# along with its dependencies (lunar, jpl_eph, sat_code).
+# along with its dependencies (lunar, jpl_eph, sat_code), each at the commit
+# pinned below.
 #
 # find_orb is GPL-licensed and never linked into empyrean. This script
 # builds it as an external tool for comparison purposes only.
@@ -27,32 +28,69 @@ PREFIX="${1:-$SCRIPT_DIR/install}"
 BUILD_DIR="$SCRIPT_DIR/build"
 NPROC="$(nproc 2>/dev/null || sysctl -n hw.ncpu 2>/dev/null || echo 4)"
 
+# ── Pinned upstream commits ────────────────────────────────────────────────
+# The four repositories carry no tags and no releases, so the build is pinned
+# to one coordinated commit set, recorded here (the weekly upstream scan,
+# .github/workflows/upstream-scan.yml, mirrors FIND_ORB_COMMIT to report
+# drift). An unpinned clone builds whatever upstream pushed last, and
+# "empyrean agrees with find_orb to X" says little while find_orb floats.
+#
+# Pinned 2026-10-27 to each repository's newest commit on that date: find_orb,
+# lunar and sat_code were last committed together on 2026-10-21, jpl_eph's
+# newest is 2026-07-09. The set builds from scratch without a single warning
+# under g++ 13.3 on Ubuntu 24.04 x86_64 (the hosted runner's compiler) and
+# aarch64, under g++ 15.2 on Ubuntu 26.04 x86_64, and under Apple clang on
+# macOS arm64.
+#
+# To move the pin, change all four together, rebuild from scratch on Linux
+# (x86_64 and aarch64) and macOS, fit a fixture, and update the date above.
+# The workflow's tool-build cache is keyed on this file's hash, so a pin
+# change also retires the cached build of the previous set.
+LUNAR_COMMIT=110ab53d46e3e5f1952318360e7bb01cb4884674
+JPL_EPH_COMMIT=a73f25e54d02b99b1c0d9a9d6c61acfbb2fa3a26
+SAT_CODE_COMMIT=2814ea074e814d0f69b4ec1aab03425ea7a6d342
+FIND_ORB_COMMIT=1de55cca12e7a585c9c7384acbb80538ea2afc3c
+
+# find_orb's lsquare.cpp inverts its normal matrix in __float128 unless it sees
+# an ARM target, but the guard tests `__aarch64_`, one underscore short of the
+# compiler's `__aarch64__`. On aarch64 Linux g++ therefore takes the __float128
+# branch, which GCC does not provide on that target, and lsquare.o fails to
+# compile ("'__float128' does not name a type", followed by -Werror'd
+# unused-parameter warnings in the code that no longer parses). No find_orb
+# commit compiles there unaided: GCC has no __float128 on aarch64, and the
+# guard has never excluded it (2016: GCC >= 4.6 alone; 2019: + __arm__; 2024:
+# + the misspelled name).
+# Defining the misspelled name makes the guard select long double, which is
+# what upstream intends on ARM (its commit 3caa731). Nothing is downgraded:
+# long double on aarch64 Linux is IEEE binary128, the format __float128 has on
+# x86_64. The source stays untouched, so the checked-out commit the runner
+# records is exactly what was compiled. On macOS, Apple clang reports itself
+# as GCC 4.2, below the guard's 4.6 threshold, so the define is inert there.
+FO_ADDED_CXXFLAGS=""
+case "$(uname -m)" in
+    aarch64|arm64) FO_ADDED_CXXFLAGS="-D__aarch64_" ;;
+esac
+
 echo "find_orb setup"
 echo "  build dir: $BUILD_DIR"
 echo "  prefix:    $PREFIX"
 echo
+pinned_set() {
+    echo "  lunar    $LUNAR_COMMIT"
+    echo "  jpl_eph  $JPL_EPH_COMMIT"
+    echo "  sat_code $SAT_CODE_COMMIT"
+    echo "  find_orb $FIND_ORB_COMMIT"
+}
 
 mkdir -p "$BUILD_DIR" "$PREFIX/bin"
 
-# find_orb and its dependencies (lunar/jpl_eph/sat_code) are cloned at
-# unpinned upstream HEAD and aren't release-tagged (all four repos carry
-# zero tags and zero releases), so upstream can change under us at any
-# time. Pinning to a coordinated commit set is tracked separately as
-# bd empyrean-t4bp — it is a validation-of-record concern, since
-# "empyrean agrees with find_orb to X" says little while X floats.
+# A failure anywhere in this toolchain stops the script with a nonzero exit
+# and no `fo` binary. find_orb is one of the suite's external OD references; a
+# run without it is a different run, and a comparator that drops out of the
+# report because its build broke is a hidden fallback. (build_findorb is
+# invoked as an `if` condition, so `set -e` is suspended inside it and the
+# explicit `|| return 1` guards drive the control flow.)
 #
-# It is NOT what keeps this build working: the breakages seen so far have
-# been in utility targets find_orb never links, and the fix for those is
-# to stop building them (see the library-only builds below).
-#
-# find_orb is one of several optional external OD
-# references, so any failure anywhere in this toolchain is non-fatal:
-# the function returns non-zero, we warn loudly, and leave no `fo`
-# binary — so the suite runs without this one comparator rather than
-# failing the whole validation. The absence is surfaced by the runner
-# skip and by the report, never silently substituted. (Invoked as an
-# `if` condition, so `set -e` is suspended inside it and the explicit
-# `|| return 1` guards drive the control flow.)
 # find_orb REQUIRES a config directory and asserts if it cannot find one
 # (see the comment inside). The directory lives in $HOME, outside the cached
 # build tree, so a cached build on a fresh runner has no config dir: this runs
@@ -86,18 +124,33 @@ install_config_dir() {
     return 0
 }
 
+# Clone <repo> when absent, then check out <commit> detached and delete every
+# untracked file, so the tree is exactly the pinned commit and no object built
+# from a previous pin links into this one.
+checkout_pinned() {
+    local repo=$1 commit=$2
+    if [ ! -d "$repo/.git" ]; then
+        echo "Cloning $repo..."
+        git clone --quiet "https://github.com/Bill-Gray/$repo.git" "$repo" || return 1
+    fi
+    if ! git -C "$repo" cat-file -e "$commit^{commit}" 2>/dev/null; then
+        echo "Fetching $repo (pinned commit not in the local clone)..."
+        git -C "$repo" fetch --quiet origin || return 1
+    fi
+    git -C "$repo" -c advice.detachedHead=false checkout --quiet --force --detach "$commit" || {
+        echo "ERROR: could not check out $repo at $commit." >&2
+        return 1; }
+    git -C "$repo" clean -fdxq || return 1
+    echo "  $repo @ $(git -C "$repo" rev-parse HEAD)"
+}
+
 build_findorb() {
-    # Clone / update the four repos.
-    cd "$BUILD_DIR"
-    for repo in lunar jpl_eph sat_code find_orb; do
-        if [ ! -d "$repo" ]; then
-            echo "Cloning $repo..."
-            git clone "https://github.com/Bill-Gray/$repo.git" || return 1
-        else
-            echo "$repo: already cloned"
-            ( cd "$repo" && git pull --ff-only ) || return 1
-        fi
-    done
+    cd "$BUILD_DIR" || return 1
+    echo "Checking out the pinned commits..."
+    checkout_pinned lunar "$LUNAR_COMMIT" || return 1
+    checkout_pinned jpl_eph "$JPL_EPH_COMMIT" || return 1
+    checkout_pinned sat_code "$SAT_CODE_COMMIT" || return 1
+    checkout_pinned find_orb "$FIND_ORB_COMMIT" || return 1
 
     # Build ONLY the libraries find_orb links, never each repo's default
     # target. find_orb's link line is `-llunar -ljpl -lsatell`
@@ -124,22 +177,17 @@ build_findorb() {
 
     # sat_code must INSTALL, not just build: find_orb's elem2tle.cpp does
     # `#include "norad.h"` unconditionally, and that header only reaches
-    # ~/include via sat_code's install. Previously this step ran a bare `make`
-    # and never installed, so norad.h was never placed — the build just never
-    # got far enough to notice, dying earlier in lunar. `install_lib` is the
-    # library+header target (`install` additionally wants sat_id built).
-    #
-    # Left non-fatal because find_orb's own build is the real gate: without
-    # norad.h it fails there, with `|| return 1`, which is where the failure
-    # belongs.
+    # ~/include via sat_code's install. `install_lib` is the library+header
+    # target (`install` additionally wants sat_id built).
     echo
     echo "Building sat_code library..."
-    ( cd "$BUILD_DIR/sat_code" && make -j"$NPROC" libsatell.a && make install_lib ) \
-        || echo "Warning: sat_code build failed (find_orb will fail on norad.h)"
+    ( cd "$BUILD_DIR/sat_code" && make -j"$NPROC" libsatell.a && make install_lib ) || return 1
 
     echo
-    echo "Building find_orb..."
-    ( cd "$BUILD_DIR/find_orb" && make -j"$NPROC" fo && cp fo "$PREFIX/bin/fo" ) || return 1
+    echo "Building find_orb...${FO_ADDED_CXXFLAGS:+ (ADDED_CXXFLAGS=$FO_ADDED_CXXFLAGS)}"
+    ( cd "$BUILD_DIR/find_orb" \
+        && make -j"$NPROC" fo ADDED_CXXFLAGS="$FO_ADDED_CXXFLAGS" \
+        && cp fo "$PREFIX/bin/fo" ) || return 1
 
     # find_orb REQUIRES a config directory and asserts if it cannot find one.
     # miscell.cpp:212 `default_config_dir_name` tries exactly four locations for
@@ -171,21 +219,28 @@ if [ "$CONFIG_ONLY" = 1 ]; then
     exit 0
 fi
 
-if build_findorb; then
-    echo
-    echo "find_orb built successfully."
-    echo "  binary: $PREFIX/bin/fo"
-else
-    echo
-    echo "############################################################"
-    echo "WARNING: find_orb build FAILED (upstream HEAD version skew)."
-    echo "The find_orb external OD comparison will be SKIPPED; all other"
-    echo "channels and comparators are unaffected. Pin the four Bill-Gray"
-    echo "repos to a compatible commit set to restore it."
-    echo "############################################################"
-    echo
+# A binary from an earlier build must not survive a failed one: `make
+# setup-findorb` treats the binary as proof the setup completed.
+rm -f "$PREFIX/bin/fo"
+if ! build_findorb; then
     rm -f "$PREFIX/bin/fo"
+    {
+        echo
+        echo "############################################################"
+        echo "ERROR: find_orb build FAILED at the pinned commit set:"
+        pinned_set
+        echo "find_orb is a required external OD reference, so setup stops"
+        echo "here instead of letting the suite run without it. The failing"
+        echo "step's output is above."
+        echo "############################################################"
+    } >&2
+    exit 1
 fi
+
+echo
+echo "find_orb built successfully."
+echo "  binary: $PREFIX/bin/fo"
+pinned_set
 
 echo
 echo "Run OD comparison with:"
