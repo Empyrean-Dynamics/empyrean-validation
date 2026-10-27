@@ -14,13 +14,13 @@ name: Upstream Reference Scan
 #   find_orb  — git Bill-Gray/find_orb, pinned SHA 1de55cca…     → compared
 #   OpenOrb   — git clone oorb/oorb at HEAD (unpinned)           → HEAD reported
 #   kete      — PyPI `kete`, floor `kete>=2.0` (unpinned)        → latest reported
-#   jorbit    — PyPI `jorbit`, floor `jorbit>=1.0` (unpinned)    → latest reported
+#   jorbit    — PyPI `jorbit`, pinned `jorbit==1.7.1`            → compared
 #   layup     — git Smithsonian/layup, pinned SHA 60b5b753…      → compared
 #   OrbFit    — docker minorplanetcenter/orbfit:latest (unpinned)→ digest reported
 #
 # Where the repo does not pin a version we say "unpinned (tracks …)" honestly
-# rather than faking a match/mismatch. Only pinned tools (ASSIST, find_orb,
-# layup) get a real up-to-date verdict.
+# rather than faking a match/mismatch. Only pinned tools (ASSIST, GRSS,
+# find_orb, jorbit, layup) get a real up-to-date verdict.
 #
 # Triggers:
 #   - cron     — Monday 07:00 UTC. This used to sit one hour behind the
@@ -28,7 +28,7 @@ name: Upstream Reference Scan
 #                gone (validation.yml now fires only on an empyrean /
 #                empyrean-core change or a pin bump), which makes this scan
 #                the ONLY standing weekly signal on comparator drift. The
-#                three unpinned tools above — kete, jorbit, OrbFit
+#                two unpinned tools above — kete, OrbFit
 #                — can now move without the suite exercising them until the
 #                next empyrean change, so this report is what surfaces that
 #                gap. Keep it weekly, and keep it report-only.
@@ -174,8 +174,11 @@ jobs:
                   "repo_url": "https://github.com/rahil-makadia/grss",
               },
               {
+                  # Pinned in runners/jorbit/setup.sh (JORBIT_VERSION, with
+                  # jax/jaxlib pinned beside it) — keep this in step with that
+                  # default when the pin moves.
                   "name": "jorbit", "kind": "pypi", "pkg": "jorbit",
-                  "current": None, "current_desc": "unpinned (floor >=1.0)",
+                  "current": "1.7.1", "current_desc": "pinned 1.7.1",
                   "source_url": "https://pypi.org/project/jorbit/",
                   "repo_url": "https://github.com/ben-cassese/jorbit",
               },

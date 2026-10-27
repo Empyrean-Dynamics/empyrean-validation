@@ -1135,16 +1135,18 @@ $(GRSS_OUT): $(PLAN) | check-plan fixtures
 JORBIT_VENV := $(EMP_VAL_RUNNERS)/jorbit/.venv
 JORBIT_PY := $(JORBIT_VENV)/bin/python
 
+# Offline: jorbit's DE440 and SB441-N16 are staged from the registered kernel
+# set in DATA_DIR (runners/jorbit/jorbit_offline.py), never downloaded.
 setup-jorbit: $(JORBIT_PY)
 $(JORBIT_PY):
 	@echo "──── Setting up jorbit venv ────────────────────────────"
-	@cd $(EMP_VAL_RUNNERS)/jorbit && ./setup.sh
+	@cd $(EMP_VAL_RUNNERS)/jorbit && DATA_DIR="$(DATA_DIR)" ./setup.sh
 
 run-jorbit: $(JORBIT_OUT)
 $(JORBIT_OUT): $(PLAN) $(JORBIT_PY) | check-plan
 	@echo "──── jorbit: external (opt-in) reference ───────────────"
 	@$(JORBIT_PY) $(EMP_VAL_RUNNERS)/jorbit/run_jorbit.py \
-	    --input $(PLAN) --output $(JORBIT_OUT)
+	    --input $(PLAN) --output $(JORBIT_OUT) --data-dir $(DATA_DIR)
 
 # ── layup (opt-in external OD reference) ─────────────────────
 # MIT-licensed, ASSIST-backed orbit fitter (Smithsonian / CfA; Matthew
