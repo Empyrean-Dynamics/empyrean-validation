@@ -15,7 +15,7 @@ name: Upstream Reference Scan
 #   OpenOrb   — git clone oorb/oorb at HEAD (unpinned)           → HEAD reported
 #   kete      — PyPI `kete`, floor `kete>=2.0` (unpinned)        → latest reported
 #   jorbit    — PyPI `jorbit`, pinned `jorbit==1.7.1`            → compared
-#   layup     — git Smithsonian/layup, pinned SHA 60b5b753…      → compared
+#   layup     — PyPI `layup`, pinned `layup==1.1.0`              → compared
 #   OrbFit    — docker minorplanetcenter/orbfit:latest (unpinned)→ digest reported
 #
 # Where the repo does not pin a version we say "unpinned (tracks …)" honestly
@@ -183,10 +183,10 @@ jobs:
                   "repo_url": "https://github.com/ben-cassese/jorbit",
               },
               {
-                  "name": "layup", "kind": "github", "repo": "Smithsonian/layup",
-                  "current": "60b5b753fb74446fa5350fa12e5866de12fb1ba1",
-                  "current_desc": "60b5b75 (pinned SHA)",
-                  "source_url": "https://github.com/Smithsonian/layup",
+                  "name": "layup", "kind": "pypi", "pkg": "layup",
+                  "current": "1.1.0", "current_desc": "pinned 1.1.0",
+                  "source_url": "https://pypi.org/project/layup/",
+                  "repo_url": "https://github.com/Smithsonian/layup",
               },
               {
                   "name": "OrbFit", "kind": "docker",

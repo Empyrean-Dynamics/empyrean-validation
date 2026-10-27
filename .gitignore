@@ -28,8 +28,10 @@ runners/findorb/build/
 runners/findorb/install/
 runners/oorb/build/
 runners/oorb/install/
-# layup: setup.sh clones the upstream repo (recursive submodules) here and
-# builds it into the runner's venv.
+# layup: its data directory, staged from the registered kernel set by
+# runners/layup/stage_data.py (links + derived files, never tracked). build/
+# held the upstream clone before setup.sh pinned the PyPI release.
+runners/layup/data/
 runners/layup/build/
 # layup's LayupLogger writes timestamped log/err files to the CWD (repo root
 # when invoked via `make run-layup` / `layup-bootstrap`); never track them.

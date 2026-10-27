@@ -1155,11 +1155,15 @@ $(JORBIT_OUT): $(PLAN) $(JORBIT_PY) | check-plan
 # find_orb + OrbFit. Opt-in via WITH_LAYUP=1 (heavy C-extension build).
 LAYUP_VENV := $(EMP_VAL_RUNNERS)/layup/.venv
 LAYUP_PY := $(LAYUP_VENV)/bin/python
+# layup's data directory (its --ar): every kernel, the observatory codes and
+# the debiasing table under layup's own names, staged from $(DATA_DIR) by
+# stage_data.py. layup never downloads at run time.
+LAYUP_DATA := $(EMP_VAL_RUNNERS)/layup/data
 
 setup-layup: $(LAYUP_PY)
 $(LAYUP_PY):
-	@echo "──── Setting up layup venv (clone + build + bootstrap) ─"
-	@cd $(EMP_VAL_RUNNERS)/layup && ./setup.sh
+	@echo "──── Setting up layup venv (pinned release + staged data) ─"
+	@cd $(EMP_VAL_RUNNERS)/layup && DATA_DIR="$(DATA_DIR)" ./setup.sh
 
 run-layup: $(LAYUP_OUT)
 # layup's venv is an optional, heavy BUILD (see layup/setup.sh), but it is
@@ -1173,9 +1177,13 @@ $(LAYUP_OUT): | fixtures
 	    echo "       Build it with: make setup-layup, or opt out with WITH_LAYUP="; \
 	    exit 1; }
 	@echo "──── layup: external OD reference (ADES PSV) ───────────"
+	@# Re-staged on every run: a venv restored from the tool cache skips
+	@# setup.sh, and the data must be the set this run synced.
+	@$(LAYUP_PY) $(EMP_VAL_RUNNERS)/layup/stage_data.py \
+	    --data-dir "$(DATA_DIR)" --dest "$(LAYUP_DATA)"
 	@mkdir -p $(RESULTS_DIR)
 	@$(LAYUP_PY) $(EMP_VAL_RUNNERS)/layup/run_layup.py $(FIXTURES_PSV) \
-	    --output $(LAYUP_OUT)
+	    --ar-data-path "$(LAYUP_DATA)" --output $(LAYUP_OUT)
 
 # ── Merge external + report ────────────────────────────────
 # Channel-agnostic meta operations live in this repo's CLI binary. It
