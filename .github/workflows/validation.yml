@@ -614,10 +614,23 @@ jobs:
         run: pip install uv
 
       - name: Restore empyrean data kernels
+        id: cache-data
         uses: actions/cache/restore@v4
         with:
           path: data
           key: empyrean-data-${{ env.EMPYREAN_DATASET }}-set-codes
+      # Under `gh act` the data directory comes from the host mount when act's
+      # cache server had nothing for the key (see engine-setup); never on a
+      # hosted run.
+      - name: Copy the registered kernel set from the host mount (act)
+        if: env.ACT == 'true' && steps.cache-data.outputs.cache-hit != 'true'
+        run: |
+          src="${ACT_DATA_DIR:-/host-data}"
+          if [ ! -f "$src/obscodes_extended.json" ] || [ ! -f "$src/de440.bsp" ]; then
+            echo "ERROR: running under act, but no registered kernel set is mounted at $src." >&2
+            exit 1
+          fi
+          rm -rf data && mkdir -p data && cp -a "$src"/. data/
       - name: Cache cargo state
         uses: actions/cache@v4
         with:
@@ -760,10 +773,23 @@ jobs:
           python-version: ${{ env.PYTHON_VERSION }}
 
       - name: Restore empyrean data kernels
+        id: cache-data
         uses: actions/cache/restore@v4
         with:
           path: data
           key: empyrean-data-${{ env.EMPYREAN_DATASET }}-set-codes
+      # Under `gh act` the data directory comes from the host mount when act's
+      # cache server had nothing for the key (see engine-setup); never on a
+      # hosted run.
+      - name: Copy the registered kernel set from the host mount (act)
+        if: env.ACT == 'true' && steps.cache-data.outputs.cache-hit != 'true'
+        run: |
+          src="${ACT_DATA_DIR:-/host-data}"
+          if [ ! -f "$src/obscodes_extended.json" ] || [ ! -f "$src/de440.bsp" ]; then
+            echo "ERROR: running under act, but no registered kernel set is mounted at $src." >&2
+            exit 1
+          fi
+          rm -rf data && mkdir -p data && cp -a "$src"/. data/
 
       # One cache per tool build tree. The path list is a superset (venv /
       # install / build + find_orb's ~/include ~/lib); absent members are
@@ -1062,6 +1088,9 @@ jobs:
           if [ "$trigger" -ne 1 ]; then
             echo "publish=false" >> "$GITHUB_OUTPUT"
             echo "Not publishing: ${{ github.event_name }} is not a publishing trigger."
+          elif [ "${ACT:-}" = "true" ]; then
+            echo "publish=false" >> "$GITHUB_OUTPUT"
+            echo "Not publishing: this is a local rehearsal under act."
           elif [ "${{ github.ref }}" != "refs/heads/main" ]; then
             echo "publish=false" >> "$GITHUB_OUTPUT"
             echo "::notice title=Not publishing::ref is ${{ github.ref }}, not refs/heads/main — results stay as run artifacts so a branch under test cannot overwrite the published dashboard."
