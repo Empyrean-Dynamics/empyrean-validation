@@ -1084,7 +1084,7 @@ $(KETE_OUT): $(PLAN) $(KETE_PY) | check-plan fixtures
 	@echo "──── Kete: external all-test-types reference ──────────"
 	@$(KETE_PY) $(EMP_VAL_RUNNERS)/kete/run_kete.py \
 	    --input $(PLAN) --output $(KETE_OUT) \
-	    --fixtures-dir $(FIXTURES_PSV)
+	    --fixtures-dir $(FIXTURES_PSV) --data-dir $(DATA_DIR)
 
 # ── GRSS external comparison — propagation + ephemeris + OD ──
 # The Gauss-Radau Small-body Simulator (Makadia et al.;

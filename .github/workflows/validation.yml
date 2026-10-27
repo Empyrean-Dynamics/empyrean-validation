@@ -80,8 +80,8 @@ name: Validation Suite
 #
 #   - the weekly cron. It re-ran an unchanged stack against upstream
 #     comparators that mostly drift on their own schedule. What it
-#     did buy was drift detection on the four UNPINNED comparators
-#     (find_orb @ HEAD, kete / jorbit @ latest PyPI, OrbFit @
+#     did buy was drift detection on the three UNPINNED comparators
+#     (find_orb @ HEAD, jorbit @ latest PyPI, OrbFit @
 #     :latest); that signal now comes from upstream-scan.yml's
 #     Monday 07:00 UTC report, which surfaces the drift without
 #     spending the suite on it. Consequence, stated plainly: a

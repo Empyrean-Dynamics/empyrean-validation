@@ -18,15 +18,32 @@ Kete-specific fields:
     kete_d_dec_arcsec        — dDec vs Horizons (ephemeris rows)
     kete_d_rho_km            — range diff vs Horizons (ephemeris rows)
     kete_time_ms             — wall-clock per row
-    kete_od_iterations       — DC iterations (OD rows)
     kete_od_converged        — bool (OD rows)
-    kete_od_rms_ra_arcsec    — post-fit residual RMS (OD rows)
-    kete_od_rms_dec_arcsec   — post-fit residual RMS (OD rows)
-    kete_od_chi2             — chi-squared (OD rows)
+    kete_od_rms_ra_arcsec    — post-fit RMS of dRA·cos(Dec), included obs (OD rows)
+    kete_od_rms_dec_arcsec   — post-fit RMS of dDec, included obs (OD rows)
+    kete_od_rms_weighted     — kete's reduced weighted RMS (OD rows)
+    kete_od_n_records        — data rows in the pinned PSV (OD rows)
+    kete_od_n_obs_ingested   — rows that became kete observations (OD rows)
+    kete_od_dropped          — {reason: count} for rows that did not (OD rows)
+    kete_od_n_obs_used       — observations kept after outlier rejection (OD rows)
+    kete_od_fit_epoch_mjd_tdb — epoch kete fitted at, before propagation to
+                               t_mjd_tdb (OD rows)
+    kete_od_error            — why an OD row has no fit (OD failure rows)
 
-Both the propagation and OD paths are best-effort: when kete cannot
-process a row, the row is emitted with `kete_*: None` and a note is
-logged to stderr.
+kete exposes no iteration count or chi-squared for a fit, so OD rows carry
+neither.
+
+Orbit determination fits the pinned ADES PSV fixture offline: `ades_psv`
+turns its rows into kete observations under kete's own ADES ingestion rules
+(observatory table, sigmas, EFCC18 debiasing from the data directory's
+`bias.dat`), then kete's initial_orbit_determination seeds fit_orbit. The
+fitted state is propagated to the row's epoch and reported SSB-centred in
+the equatorial (ICRF) frame, like `emp_pos_au`. An OD row kete cannot fit is
+emitted with `kete_od_error` naming the cause.
+
+Propagation and ephemeris rows are best-effort: when kete cannot process
+one, the row is emitted without `kete_*` fields and a note is logged to
+stderr.
 """
 
 from __future__ import annotations
@@ -40,6 +57,8 @@ import time
 from datetime import datetime, timezone
 from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
+
+import ades_psv
 
 try:
     import kete
@@ -251,53 +270,93 @@ def _ephemeris_with_kete(row: dict) -> dict | None:
     return res
 
 
-def _od_with_kete(row: dict, fixtures_dir: Path) -> dict | None:
+def _load_debias(data_dir: Path):
+    """kete's EFCC18 debias table from the data directory, or why it is missing.
+
+    Loaded once per run. A failure is returned as a message that every OD row
+    then carries as its `kete_od_error`: kete's ADES ingestion debiases every
+    record, so a fit without the table would be a different fit, not a
+    degraded one.
+    """
+    try:
+        return ades_psv.load_debias_table(data_dir)
+    except Exception as e:  # noqa: BLE001
+        return f"EFCC18 debias table unavailable: {type(e).__name__}: {e}"
+
+
+def _od_failure(row: dict, msg: str, extra: dict | None = None) -> dict:
+    print(f"  {row['object']} OD FAIL: {msg}", file=sys.stderr)
+    return {**(extra or {}), "kete_od_error": msg}
+
+
+def _od_with_kete(row: dict, fixtures_dir: Path, debias) -> dict | None:
     if not _HAVE_KETE:
         return None
-    psv_path = fixtures_dir / f"{row['object']}.psv"
-    if not psv_path.exists():
-        return None
+    if isinstance(debias, str):
+        return _od_failure(row, debias)
+    # Fixture files replace the "/" of comet and interstellar designations.
+    psv_path = fixtures_dir / f"{row['object'].replace('/', '_')}.psv"
+    if not psv_path.is_file():
+        return _od_failure(row, f"no pinned PSV fixture at {psv_path}")
     t0 = time.perf_counter()
     try:
-        psv_text = psv_path.read_text()
-        # Parse PSV as MPC-style observations. kete's parser is
-        # MPC-format-oriented; PSV (ADES) needs a small adapter. If kete
-        # can't accept the PSV directly, this raises NotImplementedError
-        # and we mark the row skipped.
-        obs = kete.orbit_fitting.fetch_observations(psv_text) \
-            if hasattr(kete.orbit_fitting, "fetch_observations") \
-            else None
-        if obs is None:
-            raise NotImplementedError("kete PSV parser not available in this release")
-        # Initial-orbit determination → DC
-        iod = kete.orbit_fitting.initial_orbit_determination(obs)
-        result = kete.orbit_fitting.fit_orbit(obs, iod)
-    except Exception as e:
-        print(f"  {row['object']} OD FAIL: {e}", file=sys.stderr)
-        return None
-    ms = (time.perf_counter() - t0) * 1000.0
-    state = result.state if hasattr(result, "state") else result
-    res: dict = {
-        "kete_pos_au": list(state.pos),
-        "kete_time_ms": ms,
+        records = ades_psv.parse_psv(psv_path.read_text())
+        ing = ades_psv.to_observations(records, debias)
+    except Exception as e:  # noqa: BLE001  (any cause becomes the row's kete_od_error)
+        return _od_failure(row, f"PSV ingestion failed: {type(e).__name__}: {e}")
+    counts: dict = {
+        "kete_od_n_records": ing.n_records,
+        "kete_od_n_obs_ingested": len(ing.observations),
     }
-    if hasattr(result, "iterations"):
-        res["kete_od_iterations"] = int(result.iterations)
-    if hasattr(result, "converged"):
-        res["kete_od_converged"] = bool(result.converged)
-    if hasattr(result, "rms_ra_arcsec"):
-        res["kete_od_rms_ra_arcsec"] = float(result.rms_ra_arcsec)
-    if hasattr(result, "rms_dec_arcsec"):
-        res["kete_od_rms_dec_arcsec"] = float(result.rms_dec_arcsec)
-    if hasattr(result, "chi2"):
-        res["kete_od_chi2"] = float(result.chi2)
-    return res
+    if ing.dropped:
+        counts["kete_od_dropped"] = dict(ing.dropped)
+        print(
+            f"  {row['object']} OD: {sum(ing.dropped.values())} of {ing.n_records} "
+            f"PSV rows not ingested: {dict(ing.dropped)}",
+            file=sys.stderr,
+        )
+    # The fit uses the force model the propagation arm uses for this object.
+    prop_opts = _kete_prop_opts(row)
+    fit_opts: dict = {"include_asteroids": prop_opts["include_asteroids"]}
+    if "non_gravs" in prop_opts:
+        fit_opts["non_grav"] = prop_opts["non_gravs"][0]
+    target_jd = row["t_mjd_tdb"] + 2_400_000.5
+    try:
+        iod = kete.orbit_fitting.initial_orbit_determination(ing.observations)
+        if not iod:
+            raise RuntimeError("initial_orbit_determination returned no candidate orbit")
+        result = kete.orbit_fitting.fit_orbit(iod[0][1], ing.observations, **fit_opts)
+        at_epoch = kete.propagate_n_body([result.state], target_jd, **prop_opts)[0]
+    except Exception as e:  # noqa: BLE001  (any cause becomes the row's kete_od_error)
+        return _od_failure(row, f"{type(e).__name__}: {e}", counts)
+    ms = (time.perf_counter() - t0) * 1000.0
+    pos = list(at_epoch.change_center(0).as_equatorial.pos)
+    residuals = result.residuals
+    if not residuals:
+        return _od_failure(row, "fit kept no observations", counts)
+    rms_ra = math.sqrt(sum(r[0] ** 2 for r in residuals) / len(residuals))
+    rms_dec = math.sqrt(sum(r[1] ** 2 for r in residuals) / len(residuals))
+    if not all(math.isfinite(v) for v in (*pos, rms_ra, rms_dec, result.rms)):
+        return _od_failure(row, f"kete returned a non-finite fit (pos={pos})", counts)
+    return {
+        **counts,
+        "kete_pos_au": pos,
+        "kete_time_ms": ms,
+        "kete_od_converged": bool(result.converged),
+        "kete_od_rms_ra_arcsec": rms_ra,
+        "kete_od_rms_dec_arcsec": rms_dec,
+        "kete_od_rms_weighted": float(result.rms),
+        "kete_od_n_obs_used": len(residuals),
+        "kete_od_fit_epoch_mjd_tdb": result.state.jd - 2_400_000.5,
+    }
 
 
 def _executive_summary(rows: list[dict]) -> str:
     prop = [r for r in rows if r["test_type"] == "propagation" and r.get("kete_vs_horizons_km") is not None]
     eph = [r for r in rows if r["test_type"] == "ephemeris" and r.get("kete_separation_arcsec") is not None]
     od = [r for r in rows if r["test_type"] == "orbit_determination" and r.get("kete_pos_au") is not None]
+    od_failed = [r for r in rows if r.get("kete_od_error") is not None]
+    od_conv = [r for r in od if r.get("kete_od_converged")]
 
     def km_pct(arr: list[float], p: float) -> str:
         if not arr:
@@ -337,14 +396,17 @@ def _executive_summary(rows: list[dict]) -> str:
     if eph:
         sep = [r["kete_separation_arcsec"] for r in eph]
         lines.append(f"    Angular sep         p50={asec_pct(sep, 0.5)}   p95={asec_pct(sep, 0.95)}   max={asec_pct(sep, 1.0)}")
-    lines.append(f"  OD rows compared: {len(od)}")
+    lines.append(f"  OD rows compared: {len(od)}   failed: {len(od_failed)}")
     if od:
-        chi2 = [r["kete_od_chi2"] for r in od if r.get("kete_od_chi2") is not None]
-        rms = [r["kete_od_rms_ra_arcsec"] for r in od if r.get("kete_od_rms_ra_arcsec") is not None]
-        if chi2:
-            lines.append(f"    χ²                  p50={statistics.median(chi2):.2e}   max={max(chi2):.2e}")
+        lines.append(f"    Converged           {len(od_conv)} of {len(od)}")
+        rms = [r["kete_od_rms_ra_arcsec"] for r in od_conv]
         if rms:
-            lines.append(f"    Post-fit RMS RA     p50={statistics.median(rms):.3f}″   max={max(rms):.3f}″")
+            lines.append(f"    Post-fit RMS RA     p50={statistics.median(rms):.3f}″   max={max(rms):.3f}″ (converged)")
+    for r in od:
+        if not r.get("kete_od_converged"):
+            lines.append(f"    NOT CONVERGED {r['object']} ({r.get('propagation_uncertainty')})")
+    for r in od_failed:
+        lines.append(f"    FAIL {r['object']} ({r.get('propagation_uncertainty')}): {r['kete_od_error']}")
     if not _HAVE_KETE:
         lines.append("  NOTE: kete is not installed; all rows skipped. Run `make setup-kete` first.")
     lines.append("─" * 56)
@@ -366,6 +428,12 @@ def main() -> int:
         default=Path(__file__).parent.parent.parent / "fixtures" / "psv",
         help="PSV fixture directory for OD rows",
     )
+    p.add_argument(
+        "--data-dir",
+        type=Path,
+        default=Path.home() / ".empyrean" / "data",
+        help="engine data directory; OD reads its EFCC18 bias.dat (default: ~/.empyrean/data)",
+    )
     args = p.parse_args()
 
     plan = json.loads(args.input.read_text())
@@ -379,6 +447,13 @@ def main() -> int:
     source_version = _kete_source_version()
     out_rows: list[dict] = []
     n_skipped = 0
+    n_od_failed = 0
+    debias = None
+    if _HAVE_KETE and any(r.get("test_type") == "orbit_determination" for r in plan):
+        debias = _load_debias(args.data_dir)
+    # kete has no uncertainty method, so an object's OD rows (the untagged one
+    # and each `none_*` arm) are one fit: it runs once per object and epoch.
+    od_fits: dict = {}
 
     for r in plan:
         # Uncertainty axis: skip covariance-bearing rows. The kete runner
@@ -400,13 +475,18 @@ def main() -> int:
         elif tt == "ephemeris":
             update = _ephemeris_with_kete(r)
         elif tt == "orbit_determination":
-            update = _od_with_kete(r, args.fixtures_dir)
+            key = (r["object"], r["t_mjd_tdb"])
+            if key not in od_fits:
+                od_fits[key] = _od_with_kete(r, args.fixtures_dir, debias)
+            update = od_fits[key]
         else:
             update = None
         if update is None:
             n_skipped += 1
         else:
             new.update(update)
+            if "kete_od_error" in update:
+                n_od_failed += 1
         out_rows.append(new)
 
     args.output.parent.mkdir(parents=True, exist_ok=True)
@@ -428,7 +508,8 @@ def main() -> int:
         return 1
     args.output.write_text(payload)
     print(
-        f"Wrote {len(out_rows)} kete rows to {args.output} ({n_skipped} skipped)",
+        f"Wrote {len(out_rows)} kete rows to {args.output} "
+        f"({n_skipped} skipped, {n_od_failed} OD failures)",
         file=sys.stderr,
     )
 
