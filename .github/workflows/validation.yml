@@ -617,7 +617,7 @@ jobs:
         uses: actions/cache/restore@v4
         with:
           path: data
-          key: empyrean-data-${{ env.EMPYREAN_DATASET }}
+          key: empyrean-data-${{ env.EMPYREAN_DATASET }}-set-codes
       - name: Cache cargo state
         uses: actions/cache@v4
         with:
@@ -763,7 +763,7 @@ jobs:
         uses: actions/cache/restore@v4
         with:
           path: data
-          key: empyrean-data-${{ env.EMPYREAN_DATASET }}
+          key: empyrean-data-${{ env.EMPYREAN_DATASET }}-set-codes
 
       # One cache per tool build tree. The path list is a superset (venv /
       # install / build + find_orb's ~/include ~/lib); absent members are
