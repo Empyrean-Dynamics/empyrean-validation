@@ -24,6 +24,14 @@ HOSTS=(
 )
 
 echo "Sealing the job from JPL and the MPC (pinned-snapshot inputs only):"
+# A container-generated hosts file need not end with a newline. Appending to
+# such a file glues the first entry onto its last line, so the host lands on
+# that line's address instead of 127.0.0.1 (seen under act, where the first
+# host resolved to the ff02::2 line) and the verification below fails closed.
+# Terminate the file first so every entry starts a line of its own.
+if [ -n "$(tail -c1 /etc/hosts)" ]; then
+  printf '\n' | sudo tee -a /etc/hosts >/dev/null
+fi
 for h in "${HOSTS[@]}"; do
   echo "127.0.0.1 ${h}" | sudo tee -a /etc/hosts >/dev/null
 done

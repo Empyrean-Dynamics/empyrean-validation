@@ -159,7 +159,7 @@ runs:
         key: empyrean-data-${{ inputs.dataset }}-set-codes
         restore-keys: ${{ inputs.role == 'writer' && 'empyrean-data-' || '' }}
     - name: Require a warm kernel cache (reader role)
-      if: inputs.role != 'writer' && steps.cache-data.outputs.cache-hit != 'true'
+      if: inputs.role != 'writer' && steps.cache-data.outputs.cache-hit != 'true' && env.ACT != 'true'
       shell: bash
       run: |
         echo "ERROR: data-kernel cache miss on key empyrean-data-${{ inputs.dataset }}-set-codes," >&2
@@ -170,7 +170,7 @@ runs:
         echo "       Refusing to run the reference against kernels prep did not use." >&2
         exit 1
     - name: Require the kernel-bucket identity (writer)
-      if: inputs.role == 'writer' && (inputs.workload-identity-provider == '' || inputs.service-account == '')
+      if: inputs.role == 'writer' && env.ACT != 'true' && (inputs.workload-identity-provider == '' || inputs.service-account == '')
       shell: bash
       run: |
         echo "ERROR: this job is the kernel-set writer but received no Workload Identity" >&2
@@ -179,19 +179,38 @@ runs:
         echo "       engine-setup (lang/workflow/gcp-project.md, 'CI consumption')." >&2
         exit 1
     - name: Authenticate to the kernel bucket (writer)
-      if: inputs.role == 'writer'
+      if: inputs.role == 'writer' && env.ACT != 'true'
       uses: google-github-actions/auth@v2
       with:
         workload_identity_provider: ${{ inputs.workload-identity-provider }}
         service_account: ${{ inputs.service-account }}
     - name: Sync the registered kernel set (writer)
-      if: inputs.role == 'writer'
+      if: inputs.role == 'writer' && env.ACT != 'true'
       shell: bash
       run: |
         gcloud storage cp gs://empyrean-data/tools/empyrean-data.py "$RUNNER_TEMP/empyrean-data.py"
         # The target is the workflow's EMPYREAN_DATA_DIR (= $GITHUB_WORKSPACE/data);
         # the Makefile receives the same path as DATA_DIR.
         python3 "$RUNNER_TEMP/empyrean-data.py" sync "${{ inputs.dataset }}" "$GITHUB_WORKSPACE/data" --prune
+    # Under `gh act` (a local rehearsal; act sets ACT=true in the job container)
+    # there is no identity federation, so the set cannot be synced from the
+    # bucket. The host bind-mounts its own synced copy of the SAME slug and the
+    # job copies it in — the writer always, a reader only when act's cache
+    # server had nothing for the key. Nothing else about the run changes, so a
+    # local pass rehearses the hosted one; a hosted run never takes this step.
+    - name: Copy the registered kernel set from the host mount (act)
+      if: env.ACT == 'true' && (inputs.role == 'writer' || steps.cache-data.outputs.cache-hit != 'true')
+      shell: bash
+      run: |
+        src="${ACT_DATA_DIR:-/host-data}"
+        if [ ! -f "$src/obscodes_extended.json" ] || [ ! -f "$src/de440.bsp" ]; then
+          echo "ERROR: running under act, but no registered kernel set is mounted at $src." >&2
+          echo "       Mount the locally synced '${{ inputs.dataset }}' directory, e.g." >&2
+          echo "       --container-options '--mount type=bind,source=<local copy>,target=/host-data,readonly'" >&2
+          exit 1
+        fi
+        rm -rf "$GITHUB_WORKSPACE/data" && mkdir -p "$GITHUB_WORKSPACE/data" && cp -a "$src"/. "$GITHUB_WORKSPACE/data"/
+        echo "act: copied $(ls "$GITHUB_WORKSPACE/data" | wc -l) files of ${{ inputs.dataset }} from $src"
     # One suite-specific file written AFTER the sync so `--prune` cannot remove
     # it: find_orb's binary DE440 (linux_p1550p2650.440) is not an engine kernel
     # and not in the registered set; it comes from a stable SSD URL and is cached
