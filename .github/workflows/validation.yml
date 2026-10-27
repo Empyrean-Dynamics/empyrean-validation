@@ -573,12 +573,27 @@ jobs:
           path: empyrean
           ref: v${{ steps.pinned-engine.outputs.version }}
           token: ${{ secrets.GH_PAT }}
+      # The reference channel builds the engine the distribution binds (see
+      # engine-setup): the same tag, read from the pinned distribution's C ABI
+      # manifest, never empyrean-core's default branch.
+      - name: Resolve the engine the distribution binds
+        id: pinned-core
+        run: |
+          tag="$(sed -n 's/^empyrean-core = {.*tag = "\([^"]*\)".*/\1/p' empyrean/empyrean-c/Cargo.toml)"
+          if [ -z "$tag" ]; then
+            echo "ERROR: could not read the empyrean-core tag from empyrean/empyrean-c/Cargo.toml" >&2
+            echo "       of the pinned distribution v${{ steps.pinned-engine.outputs.version }}." >&2
+            exit 1
+          fi
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "Reference engine: empyrean-core $tag"
       - name: Checkout empyrean-core (sibling)
         uses: actions/checkout@v4
         with:
           repository: Empyrean-Dynamics/empyrean-core
           path: empyrean-core
           token: ${{ secrets.GH_PAT }}
+          ref: ${{ steps.pinned-core.outputs.tag }}
       - name: Checkout core dep (transitive)
         uses: actions/checkout@v4
         with:

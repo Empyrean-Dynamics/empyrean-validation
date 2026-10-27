@@ -93,15 +93,31 @@ runs:
         path: empyrean
         token: ${{ inputs.gh-pat }}
         # Pin to the released tag the manifests resolve to (see above), not the
-        # default branch. The other siblings stay on their default branch; the
-        # core channel's pin is a separate follow-up.
+        # default branch.
         ref: v${{ steps.pinned-engine.outputs.version }}
+    # The reference channel is the engine the distribution under test binds,
+    # not whatever empyrean-core's default branch holds today: read the tag the
+    # pinned distribution's C ABI crate names and check empyrean-core out at
+    # it. A manifest without that pin is a stop, not a fall-through to main.
+    - name: Resolve the engine the distribution binds
+      id: pinned-core
+      shell: bash
+      run: |
+        tag="$(sed -n 's/^empyrean-core = {.*tag = "\([^"]*\)".*/\1/p' empyrean/empyrean-c/Cargo.toml)"
+        if [ -z "$tag" ]; then
+          echo "ERROR: could not read the empyrean-core tag from empyrean/empyrean-c/Cargo.toml" >&2
+          echo "       of the pinned distribution v${{ steps.pinned-engine.outputs.version }}." >&2
+          exit 1
+        fi
+        echo "tag=$tag" >> "$GITHUB_OUTPUT"
+        echo "Reference engine: empyrean-core $tag"
     - name: Checkout empyrean-core (sibling)
       uses: actions/checkout@v4
       with:
         repository: Empyrean-Dynamics/empyrean-core
         path: empyrean-core
         token: ${{ inputs.gh-pat }}
+        ref: ${{ steps.pinned-core.outputs.tag }}
     - name: Checkout core dep (transitive)
       uses: actions/checkout@v4
       with:

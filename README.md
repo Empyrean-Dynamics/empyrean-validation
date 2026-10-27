@@ -5,7 +5,7 @@ Cross-channel and external-reference validation for the empyrean astrodynamics s
 
 <a href="https://github.com/Empyrean-Dynamics/empyrean-validation/actions/workflows/rust.yml"><img src="https://github.com/Empyrean-Dynamics/empyrean-validation/actions/workflows/rust.yml/badge.svg" alt="CI"></a>
 <a href="https://github.com/Empyrean-Dynamics/empyrean-validation/actions/workflows/validation.yml"><img src="https://github.com/Empyrean-Dynamics/empyrean-validation/actions/workflows/validation.yml/badge.svg" alt="Validation Suite"></a>
-<a href="https://github.com/Empyrean-Dynamics/empyrean/releases/tag/v0.11.0-rc.0"><img src="https://img.shields.io/badge/validates-empyrean%200.11.0--rc.0-1a1a2e?style=flat-square" alt="validates empyrean 0.11.0-rc.0"></a>
+<a href="https://github.com/Empyrean-Dynamics/empyrean/releases/tag/v0.11.0-rc.1"><img src="https://img.shields.io/badge/validates-empyrean%200.11.0--rc.1-1a1a2e?style=flat-square" alt="validates empyrean 0.11.0-rc.1"></a>
 <br>
 <a href="LICENSE"><img src="https://img.shields.io/badge/license-BSD--3--Clause-blue.svg?style=flat-square" alt="License"></a>
 <a href="https://doi.org/10.5281/zenodo.21315119"><img src="https://zenodo.org/badge/1225313390.svg" alt="DOI"></a>
@@ -152,13 +152,30 @@ building from, and revert them before committing.
 
 ### What the current pins validate
 
-The committed manifests pin **empyrean `0.11.0-rc.0`** (crates.io and
-PyPI) and **hyperjet `1.15.0`**, against the **empyrean-core `0.11.0`**
-reference channel. Two things about that generation change how a run is
+The committed manifests pin **empyrean `0.11.0-rc.1`** (crates.io and
+PyPI) and **hyperjet `1.15.0`**, against the **empyrean-core `0.11.1`**
+reference channel. Four things about that generation change how a run is
 set up:
 
+- **Every time crosses the distribution's API with its scale.** The Rust
+  surface takes and returns `Epoch` values, the Python tables carry
+  `Epochs` sub-tables, and the CLI requires `--scale` on an MJD argument.
+  The suite's inputs are MJD TDB throughout, so the rust and cli runners
+  build `Epoch::from_mjd_tdb` for every instant the plan carries — the
+  SBDB epoch, the offset grid, the Horizons queries, the weighting-layer
+  windows, the walk's output epoch — and read `mjd_tdb()` back, so the
+  rows and the result files stay MJD TDB. The Python channel's low-level
+  entry points still take and return MJD TDB arrays.
+- **The reference channel is the engine the distribution binds.** The
+  workflow reads the `empyrean-core` tag from the pinned distribution's
+  C ABI manifest and checks the reference out at it, so the core channel
+  can no longer drift onto empyrean-core's default branch. The engines
+  stamp their versions from their manifests, so every channel's recorded
+  `source_version` now names releases (empyrean-core 0.11.1, villeneuve
+  1.26.5, scott 1.19.5) instead of a `-dev` suffix.
 - **The C ABI is distribution-versioned and the load handshake is an
-  equality check** — `EMPYREAN_ABI_VERSION` is `1100`. The C-channel
+  equality check** — `EMPYREAN_ABI_VERSION` is `1100`, unchanged by this
+  candidate, which adds only the two time-scale constants. The C-channel
   runner now asserts it at startup against the loaded `libempyrean` and
   refuses to run on a mismatch, because the versions encode struct
   layout: a stale library is not a degraded run but a reinterpretation of
