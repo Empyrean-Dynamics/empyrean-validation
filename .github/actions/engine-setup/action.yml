@@ -146,19 +146,23 @@ runs:
     # The cache carries the slug; `restore-keys` restores the previous set so a
     # slug bump fetches only the delta; the writer ALWAYS syncs, which re-hashes
     # every file, so the cache is verified, not trusted. Readers restore the
-    # exact slug key and refuse on a miss: prep is the sole writer.
+    # exact slug key and refuse on a miss: prep is the sole writer. The key also
+    # names what the suite writes into the directory beside the set (`set-codes`:
+    # the registered observatory codes, nothing written over them); a change of
+    # that policy must miss the old cache, or readers would restore the previous
+    # policy's directory while the writer re-synced its own.
     - name: Restore empyrean data kernels
       id: cache-data
       uses: actions/cache/restore@v4
       with:
         path: data
-        key: empyrean-data-${{ inputs.dataset }}
+        key: empyrean-data-${{ inputs.dataset }}-set-codes
         restore-keys: ${{ inputs.role == 'writer' && 'empyrean-data-' || '' }}
     - name: Require a warm kernel cache (reader role)
       if: inputs.role != 'writer' && steps.cache-data.outputs.cache-hit != 'true'
       shell: bash
       run: |
-        echo "ERROR: data-kernel cache miss on key empyrean-data-${{ inputs.dataset }}," >&2
+        echo "ERROR: data-kernel cache miss on key empyrean-data-${{ inputs.dataset }}-set-codes," >&2
         echo "       and this job's role is 'reader' so it will not sync them." >&2
         echo "       prep is the sole writer of this cache. A miss here means prep" >&2
         echo "       did not run, its sync failed, or the slug changed between" >&2
@@ -188,16 +192,18 @@ runs:
         # The target is the workflow's EMPYREAN_DATA_DIR (= $GITHUB_WORKSPACE/data);
         # the Makefile receives the same path as DATA_DIR.
         python3 "$RUNNER_TEMP/empyrean-data.py" sync "${{ inputs.dataset }}" "$GITHUB_WORKSPACE/data" --prune
-    # Two suite-specific files written AFTER the sync so `--prune` cannot remove
-    # them. (1) find_orb's binary DE440 (linux_p1550p2650.440) is not an engine
-    # kernel and not in the registered set; it comes from a stable SSD URL and is
-    # cached under its own key — the one direct NASA URL this repo keeps, listed
-    # as the documented exception in lang's drift checker. (2) The observatory
-    # codes: the registered set carries the engine's own obscodes_extended.json
-    # (277 KB), but the validation of record was produced with the copy vendored
-    # in-repo (275 KB, kept because MPC throttles Actions IPs), so this run keeps
-    # the vendored copy for parity. Switching to the registered copy changes
-    # numbers and needs a measured re-baseline — a separate, tracked change.
+    # One suite-specific file written AFTER the sync so `--prune` cannot remove
+    # it: find_orb's binary DE440 (linux_p1550p2650.440) is not an engine kernel
+    # and not in the registered set; it comes from a stable SSD URL and is cached
+    # under its own key — the one direct NASA URL this repo keeps, listed as the
+    # documented exception in lang's drift checker. The observatory codes are the
+    # registered set's own obscodes_extended.json, synced above — the file every
+    # other empyrean repo's CI reads. The copy once vendored in-repo (July 2026,
+    # kept for parity with the validation of record) differed from it at two
+    # stations the fixtures use (Z84 by about 38 m, B42 by about 300 m), enough
+    # to flip the marginal Apophis optical+radar fit on one platform (2026-10-26).
+    # Nothing is written over the set's file any more; the cache key suffix
+    # records that.
     - name: Restore find_orb DE440 binary
       if: inputs.role == 'writer'
       id: cache-de440-bin
@@ -219,18 +225,17 @@ runs:
       with:
         path: de440-bin
         key: findorb-de440-linux_p1550p2650
-    - name: Add the suite extras to the data directory (writer)
+    - name: Add find_orb's DE440 to the data directory (writer)
       if: inputs.role == 'writer'
       shell: bash
       run: |
         cp de440-bin/linux_p1550p2650.440 data/linux_p1550p2650.440
-        gunzip -c "$GITHUB_WORKSPACE/empyrean-validation/assets/obscodes_extended.json.gz" > data/obscodes_extended.json
     - name: Save empyrean data kernels
       if: inputs.role == 'writer' && steps.cache-data.outputs.cache-hit != 'true'
       uses: actions/cache/save@v4
       with:
         path: data
-        key: empyrean-data-${{ inputs.dataset }}
+        key: empyrean-data-${{ inputs.dataset }}-set-codes
 
     - name: Cache cargo state
       uses: actions/cache@v4
