@@ -984,8 +984,8 @@ run-assist: $(PLAN) check-plan $(ASSIST_PY)
 	    --horizons-cache $(CACHE_DIR)/horizons \
 	    --data-dir $(DATA_DIR)
 
-# find_orb's binary is an optional, non-fatal BUILD (see findorb/setup.sh) —
-# but a missing binary at RUN time is a failure, not a skip. This used to
+# find_orb's build fails loudly (see findorb/setup.sh), and a missing binary
+# at RUN time is a failure too, not a skip. This used to
 # `echo '[]' > $(FINDORB_OUT)` and succeed, which handed the merge a
 # syntactically valid file asserting "find_orb compared zero objects" and
 # produced a green leg that ran no comparator at all. Fail with the fix
@@ -1024,8 +1024,8 @@ $(OORB_BIN):
 	@cd $(EMP_VAL_RUNNERS)/oorb && ./setup.sh
 
 run-oorb: $(OORB_OUT)
-# Same rule as find_orb: an optional BUILD, but a missing binary at RUN time
-# is a failure. The `echo '[]'` fallback made a leg that compared nothing
+# find_orb's RUN-time rule (OpenOrb's BUILD stays optional): a missing binary
+# at RUN time is a failure. The `echo '[]'` fallback made a leg that compared nothing
 # indistinguishable from a leg that compared everything and agreed.
 $(OORB_OUT): $(PLAN) $(ASSIST_PY) | check-plan
 	@test -x "$(OORB_BIN)" || { \
@@ -1084,7 +1084,7 @@ $(KETE_OUT): $(PLAN) $(KETE_PY) | check-plan fixtures
 	@echo "──── Kete: external all-test-types reference ──────────"
 	@$(KETE_PY) $(EMP_VAL_RUNNERS)/kete/run_kete.py \
 	    --input $(PLAN) --output $(KETE_OUT) \
-	    --fixtures-dir $(FIXTURES_PSV)
+	    --fixtures-dir $(FIXTURES_PSV) --data-dir $(DATA_DIR)
 
 # ── GRSS external comparison — propagation + ephemeris + OD ──
 # The Gauss-Radau Small-body Simulator (Makadia et al.;
@@ -1108,8 +1108,8 @@ $(GRSS_PY):
 	@cd $(EMP_VAL_RUNNERS)/grss && DATA_DIR="$(DATA_DIR)" ./setup.sh
 
 run-grss: $(GRSS_OUT)
-# Same rule as find_orb / layup: the venv is an optional BUILD, but a missing
-# interpreter at RUN time is a failure, not a skip. An empty result file would
+# find_orb's and layup's RUN-time rule (the venv BUILD stays optional): a
+# missing interpreter at RUN time is a failure, not a skip. An empty result file would
 # report a comparator that never executed as a successful empty comparison.
 $(GRSS_OUT): $(PLAN) | check-plan fixtures
 	@test -x "$(GRSS_PY)" || { \
@@ -1135,16 +1135,18 @@ $(GRSS_OUT): $(PLAN) | check-plan fixtures
 JORBIT_VENV := $(EMP_VAL_RUNNERS)/jorbit/.venv
 JORBIT_PY := $(JORBIT_VENV)/bin/python
 
+# Offline: jorbit's DE440 and SB441-N16 are staged from the registered kernel
+# set in DATA_DIR (runners/jorbit/jorbit_offline.py), never downloaded.
 setup-jorbit: $(JORBIT_PY)
 $(JORBIT_PY):
 	@echo "──── Setting up jorbit venv ────────────────────────────"
-	@cd $(EMP_VAL_RUNNERS)/jorbit && ./setup.sh
+	@cd $(EMP_VAL_RUNNERS)/jorbit && DATA_DIR="$(DATA_DIR)" ./setup.sh
 
 run-jorbit: $(JORBIT_OUT)
 $(JORBIT_OUT): $(PLAN) $(JORBIT_PY) | check-plan
 	@echo "──── jorbit: external (opt-in) reference ───────────────"
 	@$(JORBIT_PY) $(EMP_VAL_RUNNERS)/jorbit/run_jorbit.py \
-	    --input $(PLAN) --output $(JORBIT_OUT)
+	    --input $(PLAN) --output $(JORBIT_OUT) --data-dir $(DATA_DIR)
 
 # ── layup (opt-in external OD reference) ─────────────────────
 # MIT-licensed, ASSIST-backed orbit fitter (Smithsonian / CfA; Matthew
@@ -1153,11 +1155,15 @@ $(JORBIT_OUT): $(PLAN) $(JORBIT_PY) | check-plan
 # find_orb + OrbFit. Opt-in via WITH_LAYUP=1 (heavy C-extension build).
 LAYUP_VENV := $(EMP_VAL_RUNNERS)/layup/.venv
 LAYUP_PY := $(LAYUP_VENV)/bin/python
+# layup's data directory (its --ar): every kernel, the observatory codes and
+# the debiasing table under layup's own names, staged from $(DATA_DIR) by
+# stage_data.py. layup never downloads at run time.
+LAYUP_DATA := $(EMP_VAL_RUNNERS)/layup/data
 
 setup-layup: $(LAYUP_PY)
 $(LAYUP_PY):
-	@echo "──── Setting up layup venv (clone + build + bootstrap) ─"
-	@cd $(EMP_VAL_RUNNERS)/layup && ./setup.sh
+	@echo "──── Setting up layup venv (pinned release + staged data) ─"
+	@cd $(EMP_VAL_RUNNERS)/layup && DATA_DIR="$(DATA_DIR)" ./setup.sh
 
 run-layup: $(LAYUP_OUT)
 # layup's venv is an optional, heavy BUILD (see layup/setup.sh), but it is
@@ -1171,9 +1177,13 @@ $(LAYUP_OUT): | fixtures
 	    echo "       Build it with: make setup-layup, or opt out with WITH_LAYUP="; \
 	    exit 1; }
 	@echo "──── layup: external OD reference (ADES PSV) ───────────"
+	@# Re-staged on every run: a venv restored from the tool cache skips
+	@# setup.sh, and the data must be the set this run synced.
+	@$(LAYUP_PY) $(EMP_VAL_RUNNERS)/layup/stage_data.py \
+	    --data-dir "$(DATA_DIR)" --dest "$(LAYUP_DATA)"
 	@mkdir -p $(RESULTS_DIR)
 	@$(LAYUP_PY) $(EMP_VAL_RUNNERS)/layup/run_layup.py $(FIXTURES_PSV) \
-	    --output $(LAYUP_OUT)
+	    --ar-data-path "$(LAYUP_DATA)" --output $(LAYUP_OUT)
 
 # ── Merge external + report ────────────────────────────────
 # Channel-agnostic meta operations live in this repo's CLI binary. It

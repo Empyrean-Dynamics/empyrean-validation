@@ -8,7 +8,7 @@ suite. Compares empyrean's OD pipeline against
 layup is a useful comparison point because:
 
 - It is **ASSIST-backed** — its N-body fit integrates with ASSIST over
-  DE441 + the SB441-N16 asteroid set, the same dynamical model the
+  DE440 + the SB441-N16 asteroid set, the same dynamical model the
   validation suite's ASSIST propagation channel uses. So layup and
   empyrean fit the same physics through independent code, and a
   disagreement isolates the *fitter*, not the force model.
@@ -112,27 +112,59 @@ per-object time column — is tracked as a follow-up.
 
 layup runs in its own venv (heavy dep graph: a C extension built via
 scikit-build-core against the `assist` + `rebound` C libraries, plus
-`sorcha` from git and `jax`). `setup.sh` clones a pinned layup ref
-recursively, builds it into the venv, and runs `layup bootstrap` to
-download the ephemeris + reference data.
+`sorcha` and `jax`). `setup.sh` installs the pinned PyPI release
+(`layup==1.1.0`, released 2026-09-21; layup publishes an sdist only, so
+the install compiles the extension), then stages layup's data directory.
 
 ```bash
-./setup.sh                        # pinned ref (LAYUP_REF to override)
+./setup.sh                        # pinned release (LAYUP_VERSION to override)
+DATA_DIR=/path/to/set ./setup.sh  # stage from another synced kernel set
 ```
 
-Prerequisites: python ≥3.11, git, a C compiler, cmake.
+Prerequisites: python ≥3.11, a C compiler, cmake.
+
+### Data: staged from the registered kernel set, never downloaded
+
+layup reads every kernel, the observatory codes and its debiasing table
+from one directory (`--ar`), under the names its own `layup bootstrap`
+downloads, and its fit path downloads any name that is missing, from the
+address the release names. Those addresses move: NAIF's renaming of its
+dated Earth-orientation kernels made every fit fail with a 404. So the
+suite never bootstraps. `stage_data.py` builds the directory (`data/`
+here) from the engine data directory — the registered kernel set the suite
+syncs (`DATA_DIR`, default `~/.empyrean/data`) — taking layup's file names
+from the installed layup itself:
+
+| layup reads | staged from the data directory |
+|---|---|
+| `de440s.bsp` | `de440.bsp` (full DE440, a superset of the short file) |
+| Earth orientation: historical, predicted, high precision | `earth_620120_*.bpc`, `earth_*_predict.bpc`, `earth_latest_high_prec.bpc` |
+| `linux_p1550p2650.440`, `sb441-n16.bsp` (ASSIST) | same names (the binary DE440 is the suite's find_orb file) |
+| `naif0012.tls`, `pck00010.pck` | `naif0012.tls`, `pck00010.tpc` |
+| `ObsCodes.json` (+ `.gz`) | `obscodes_extended.json` (and its gzip) |
+| `debias_hires2018.tgz`, `bias.dat` | `debias_hires2018.tgz` (and the table extracted from it) |
+| `meta_kernel.txt` | written: loads the data directory's own kernel files |
+
+Each staged file links to exactly one data-directory file; no match, two
+matches (a set synced without `--prune`) or an empty file stops staging
+with every such file named. The set's own `bias.dat` is the
+low-resolution debiasing table and is never staged under layup's name,
+which indexes the high-resolution one. `make run-layup` re-stages before
+every run, and `run_layup.py` refuses to start when any file layup checks
+for is missing from its data directory.
 
 ## Usage
 
 ```bash
 # Fit every optical OD fixture through layup.
+./.venv/bin/python stage_data.py --data-dir ~/.empyrean/data --dest data
 ./.venv/bin/python run_layup.py ../../fixtures/psv \
-    --output ../../results/validation_layup.json
+    --ar-data-path data --output ../../results/validation_layup.json
 
 # Subset / tune:
 #   --only Apophis,Eros     fit only these objects (fixture stems, `/`→`_`)
 #   --timeout 900           per-fixture fit timeout (seconds)
-#   --ar-data-path DIR      ASSIST+Rebound bootstrap dir (passthrough to --ar)
+#   --ar-data-path DIR      layup's staged data dir (passthrough to --ar; default data/)
 ```
 
 The output JSON is consumed by `empyrean-validation merge-external

@@ -80,8 +80,8 @@ name: Validation Suite
 #
 #   - the weekly cron. It re-ran an unchanged stack against upstream
 #     comparators that mostly drift on their own schedule. What it
-#     did buy was drift detection on the four UNPINNED comparators
-#     (find_orb @ HEAD, kete / jorbit @ latest PyPI, OrbFit @
+#     did buy was drift detection on the three UNPINNED comparators
+#     (find_orb @ HEAD, jorbit @ latest PyPI, OrbFit @
 #     :latest); that signal now comes from upstream-scan.yml's
 #     Monday 07:00 UTC report, which surfaces the drift without
 #     spending the suite on it. Consequence, stated plainly: a
@@ -573,12 +573,27 @@ jobs:
           path: empyrean
           ref: v${{ steps.pinned-engine.outputs.version }}
           token: ${{ secrets.GH_PAT }}
+      # The reference channel builds the engine the distribution binds (see
+      # engine-setup): the same tag, read from the pinned distribution's C ABI
+      # manifest, never empyrean-core's default branch.
+      - name: Resolve the engine the distribution binds
+        id: pinned-core
+        run: |
+          tag="$(sed -n 's/^empyrean-core = {.*tag = "\([^"]*\)".*/\1/p' empyrean/empyrean-c/Cargo.toml)"
+          if [ -z "$tag" ]; then
+            echo "ERROR: could not read the empyrean-core tag from empyrean/empyrean-c/Cargo.toml" >&2
+            echo "       of the pinned distribution v${{ steps.pinned-engine.outputs.version }}." >&2
+            exit 1
+          fi
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "Reference engine: empyrean-core $tag"
       - name: Checkout empyrean-core (sibling)
         uses: actions/checkout@v4
         with:
           repository: Empyrean-Dynamics/empyrean-core
           path: empyrean-core
           token: ${{ secrets.GH_PAT }}
+          ref: ${{ steps.pinned-core.outputs.tag }}
       - name: Checkout core dep (transitive)
         uses: actions/checkout@v4
         with:
@@ -614,10 +629,23 @@ jobs:
         run: pip install uv
 
       - name: Restore empyrean data kernels
+        id: cache-data
         uses: actions/cache/restore@v4
         with:
           path: data
-          key: empyrean-data-${{ env.EMPYREAN_DATASET }}
+          key: empyrean-data-${{ env.EMPYREAN_DATASET }}-set-codes
+      # Under `gh act` the data directory comes from the host mount when act's
+      # cache server had nothing for the key (see engine-setup); never on a
+      # hosted run.
+      - name: Copy the registered kernel set from the host mount (act)
+        if: env.ACT == 'true' && steps.cache-data.outputs.cache-hit != 'true'
+        run: |
+          src="${ACT_DATA_DIR:-/host-data}"
+          if [ ! -f "$src/obscodes_extended.json" ] || [ ! -f "$src/de440.bsp" ]; then
+            echo "ERROR: running under act, but no registered kernel set is mounted at $src." >&2
+            exit 1
+          fi
+          rm -rf data && mkdir -p data && cp -a "$src"/. data/
       - name: Cache cargo state
         uses: actions/cache@v4
         with:
@@ -760,10 +788,23 @@ jobs:
           python-version: ${{ env.PYTHON_VERSION }}
 
       - name: Restore empyrean data kernels
+        id: cache-data
         uses: actions/cache/restore@v4
         with:
           path: data
-          key: empyrean-data-${{ env.EMPYREAN_DATASET }}
+          key: empyrean-data-${{ env.EMPYREAN_DATASET }}-set-codes
+      # Under `gh act` the data directory comes from the host mount when act's
+      # cache server had nothing for the key (see engine-setup); never on a
+      # hosted run.
+      - name: Copy the registered kernel set from the host mount (act)
+        if: env.ACT == 'true' && steps.cache-data.outputs.cache-hit != 'true'
+        run: |
+          src="${ACT_DATA_DIR:-/host-data}"
+          if [ ! -f "$src/obscodes_extended.json" ] || [ ! -f "$src/de440.bsp" ]; then
+            echo "ERROR: running under act, but no registered kernel set is mounted at $src." >&2
+            exit 1
+          fi
+          rm -rf data && mkdir -p data && cp -a "$src"/. data/
 
       # One cache per tool build tree. The path list is a superset (venv /
       # install / build + find_orb's ~/include ~/lib); absent members are
@@ -1062,6 +1103,9 @@ jobs:
           if [ "$trigger" -ne 1 ]; then
             echo "publish=false" >> "$GITHUB_OUTPUT"
             echo "Not publishing: ${{ github.event_name }} is not a publishing trigger."
+          elif [ "${ACT:-}" = "true" ]; then
+            echo "publish=false" >> "$GITHUB_OUTPUT"
+            echo "Not publishing: this is a local rehearsal under act."
           elif [ "${{ github.ref }}" != "refs/heads/main" ]; then
             echo "publish=false" >> "$GITHUB_OUTPUT"
             echo "::notice title=Not publishing::ref is ${{ github.ref }}, not refs/heads/main — results stay as run artifacts so a branch under test cannot overwrite the published dashboard."

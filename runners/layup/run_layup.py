@@ -10,9 +10,14 @@ folds the fields onto the ``orbit_determination`` rows of the reference channel
 
 layup is invoked as a CLI subprocess (``layup orbitfit <input> ADES_psv``) so no
 layup code is imported into empyrean; it runs entirely inside its own venv (see
-``setup.sh``). Its N-body fit uses ASSIST with DE441 + the SB441-N16 asteroid
-set — the same dynamical model the ASSIST propagation channel uses — which makes
-it a strong independent cross-check of empyrean's OD pipeline.
+``setup.sh``). Its N-body fit uses ASSIST with the binary DE440 planets + the
+SB441-N16 asteroid set — the same dynamical model the ASSIST propagation channel
+uses — which makes it a strong independent cross-check of empyrean's OD pipeline.
+
+Every file layup reads comes from its data directory (``--ar-data-path``), which
+``stage_data.py`` builds from the registered kernel set; this runner refuses to
+start when any file layup checks for is missing there, because layup would
+otherwise download it from its upstream address mid-fit.
 
 layup-specific fields (all keyed by object; ``test_type`` is stamped so the merge
 routes them onto the optical OD rows):
@@ -101,6 +106,9 @@ except Exception as e:  # noqa: BLE001
 # Primary-id column injected into every prepared fixture. Named distinctly so it
 # never collides with the fixtures' own (mostly-blank) provID / permID columns.
 _PRIMARY_ID = "layupID"
+
+# layup's data directory as `make run-layup` stages it (stage_data.py).
+_STAGED_DATA = Path(__file__).resolve().parent / "data"
 
 
 def _orbitfit_binary() -> Path | None:
@@ -201,7 +209,9 @@ def _fit_one(
         prepared = _prepare_input(psv_path, obj_token, work)
         if prepared is None:
             return None
-        out_stem = work / "layup_orbit"
+        # layup 1.1 takes an output DIRECTORY (-o, which also receives its
+        # log files) and a file stem (--stem); the fit lands at <dir>/<stem>.csv.
+        out_stem = "layup_orbit"
         cmd = [
             str(orbitfit_bin),
             str(prepared),
@@ -209,7 +219,9 @@ def _fit_one(
             "--primary-id-column-name",
             _PRIMARY_ID,
             "-o",
-            str(out_stem),
+            str(work),
+            "--stem",
+            out_stem,
             "-f",
         ]
         if weight_data:
@@ -237,7 +249,7 @@ def _fit_one(
             print(f"  {obj_token}: orbitfit exit {proc.returncode}: {' | '.join(tail)}", file=sys.stderr)
             return None
 
-        row = _read_orbitfit_csv(Path(f"{out_stem}.csv"))
+        row = _read_orbitfit_csv(work / f"{out_stem}.csv")
         if row is None:
             print(f"  {obj_token}: no fitted orbit in output", file=sys.stderr)
             return None
@@ -276,17 +288,17 @@ def _fit_one(
     return payload
 
 
-def _layup_version(orbitfit_bin: Path) -> str | None:
+def _layup_version() -> str | None:
+    """The installed layup distribution's version (setup.sh pins the release).
+
+    ``layup.__version__`` is the literal ``"unknown version"`` in a PyPI build,
+    so the distribution metadata is the only source that identifies the fitter.
+    """
+    from importlib import metadata
+
     try:
-        out = subprocess.run(
-            [str(sys.executable), "-c", "import layup, sys; sys.stdout.write(getattr(layup,'__version__','?'))"],
-            capture_output=True,
-            text=True,
-            timeout=30,
-        )
-        v = (out.stdout or "").strip()
-        return v or None
-    except Exception:  # noqa: BLE001
+        return metadata.version("layup")
+    except metadata.PackageNotFoundError:
         return None
 
 
@@ -329,9 +341,11 @@ def main() -> int:
     p.add_argument(
         "--ar-data-path",
         type=str,
-        default=None,
-        help="ASSIST+Rebound data directory from `layup bootstrap` (passed through as --ar). "
-        "Default: let layup resolve its own bootstrap cache.",
+        default=str(_STAGED_DATA),
+        help="layup's data directory, staged from the registered kernel set by stage_data.py "
+        "(passed through as --ar). Every file layup checks for must be present: layup "
+        "downloads a missing one at fit time, which this runner refuses to allow. "
+        f"Default: {_STAGED_DATA.name}/ beside this script (what `make run-layup` stages).",
     )
     p.add_argument(
         "--timeout",
@@ -390,7 +404,7 @@ def main() -> int:
         only = {s.strip() for s in args.only.split(",") if s.strip()}
 
     timestamp = datetime.now(timezone.utc).isoformat()
-    version = _layup_version(orbitfit_bin) if orbitfit_bin else None
+    version = _layup_version()
     # Provenance stamped on every record. Reuse the version already resolved
     # from the layup venv above (the same interpreter this runs under).
     # No-hidden-fallbacks: an unresolved version stamps an explicit
@@ -424,7 +438,27 @@ def main() -> int:
         )
         return 1
 
+    # layup checks for every data file before it fits and downloads a missing
+    # one from the address its release names; a renamed upstream file then
+    # fails every fit with a 404. Refuse to start instead, naming the files.
+    from stage_data import Layout, verify
+
+    # Absolute: each fit runs with its scratch directory as the working directory.
+    args.ar_data_path = str(Path(args.ar_data_path).absolute())
+    missing_data = verify(Path(args.ar_data_path), Layout.from_layup())
+    if missing_data:
+        print(
+            f"ERROR: layup's data directory {args.ar_data_path} lacks: {', '.join(missing_data)}.\n"
+            "       Stage it from the registered kernel set first:\n"
+            f"         {sys.executable} {Path(__file__).with_name('stage_data.py')} "
+            f"--data-dir <synced set> --dest {args.ar_data_path}\n"
+            "       (`make run-layup` does this before every run.)",
+            file=sys.stderr,
+        )
+        return 1
+
     print(f"layup OD validation ({len(psv_files)} fixtures)", file=sys.stderr)
+    print(f"  data:  {args.ar_data_path}", file=sys.stderr)
     print(f"  layup: {orbitfit_bin} (version {version or '?'})", file=sys.stderr)
 
     for psv_path in psv_files:

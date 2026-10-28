@@ -845,7 +845,7 @@ pub fn run_propagation_validation(
 
         let (hor_pos, hor_vel) = match empyrean::query_horizons_vectors(
             obj.horizons_command,
-            epoch,
+            Epoch::from_mjd_tdb(epoch),
             Some(horizons_cache_dir),
         ) {
             Ok(h) => h,
@@ -896,7 +896,7 @@ pub fn run_propagation_validation(
             let target = epoch + dt;
             match empyrean::query_horizons_vectors(
                 obj.horizons_command,
-                target,
+                Epoch::from_mjd_tdb(target),
                 Some(horizons_cache_dir),
             ) {
                 Ok(h) => {
@@ -923,7 +923,7 @@ pub fn run_propagation_validation(
                 match empyrean::query_horizons(
                     &[obj.horizons_command],
                     obs_code,
-                    &[target],
+                    &[Epoch::from_mjd_tdb(target)],
                     Some(horizons_cache_dir),
                 ) {
                     Ok(r) if !r.is_empty() => {

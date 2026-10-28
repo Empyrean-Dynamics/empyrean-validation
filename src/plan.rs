@@ -162,7 +162,7 @@ pub fn build_plan(
         // 2. Horizons IC at SBDB epoch.
         let (ic_pos, ic_vel) = match empyrean::query_horizons_vectors(
             obj.horizons_command,
-            epoch,
+            empyrean::Epoch::from_mjd_tdb(epoch),
             Some(horizons_cache_dir),
         ) {
             Ok(h) => h,
@@ -218,7 +218,7 @@ pub fn build_plan(
             let target = epoch + dt;
             match empyrean::query_horizons_vectors(
                 obj.horizons_command,
-                target,
+                empyrean::Epoch::from_mjd_tdb(target),
                 Some(horizons_cache_dir),
             ) {
                 Ok(h) => {
@@ -234,7 +234,11 @@ pub fn build_plan(
                     ));
                 }
             }
-            match empyrean::query_horizons_vectors("10", target, Some(horizons_cache_dir)) {
+            match empyrean::query_horizons_vectors(
+                "10",
+                empyrean::Epoch::from_mjd_tdb(target),
+                Some(horizons_cache_dir),
+            ) {
                 Ok(h) => {
                     sun_vectors.insert(dt as i64, h);
                 }
@@ -265,7 +269,7 @@ pub fn build_plan(
                 match empyrean::query_horizons(
                     &[obj.horizons_command],
                     obs,
-                    &[target],
+                    &[empyrean::Epoch::from_mjd_tdb(target)],
                     Some(horizons_cache_dir),
                 ) {
                     Ok(r) if !r.is_empty() => {

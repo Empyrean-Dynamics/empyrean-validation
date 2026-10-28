@@ -2,12 +2,18 @@
 
 Reads the canonical test plan (`validation_plan.json`) and replays each
 row through jorbit (Ben Cassese's JAX-based N-body integrator). Emits
-one row per input row with jorbit-specific fields populated. Output
-JSON is consumed by the empyrean-validation report renderer alongside
-ASSIST, find_orb, kete, and pyoorb.
+one row per replayed plan row with jorbit-specific fields populated.
+Output JSON is consumed by the empyrean-validation report renderer
+alongside ASSIST, find_orb, kete, and pyoorb.
 
 jorbit is GPL-licensed and never linked into empyrean. This script
 runs independently in its own virtual environment.
+
+Runs with no network access. jorbit's two SPICE kernels (DE440 and
+SB441-N16) come from the registered kernel set in DATA_DIR, staged into
+a runner-private astropy cache under jorbit's own URL keys, with
+astropy's internet access off; a missing kernel is a hard stop, never a
+download (see `jorbit_offline.py`).
 
 Schema mirrors the ValidationResult shape used by every other channel.
 jorbit-specific fields:
@@ -18,6 +24,14 @@ jorbit-specific fields:
     jorbit_d_dec_arcsec        — dDec vs Horizons (eph rows)
     jorbit_d_rho_km            — range diff vs Horizons (eph rows)
     jorbit_time_ms             — wall-clock per row
+
+Ephemeris rows run for the geocentric observer (500) only, with the
+observer at jorbit's own DE440 geocentre. jorbit's only observer model
+for a ground site is a live JPL Horizons query, which the suite's seal
+forbids and the pinned inputs snapshot cannot stand in for, so those
+rows are not attempted: each object gets ONE explicit row instead,
+carrying `jorbit_not_attempted` (the reason),
+`jorbit_not_attempted_observers` and `jorbit_not_attempted_rows`.
 
 OD rows are skipped — jorbit's gradient-based orbit-fitting hooks need
 a custom likelihood + Jacobian setup per fit and don't fit the
@@ -36,35 +50,84 @@ from datetime import datetime, timezone
 from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
 
-try:
-    import jax.numpy as jnp
-    import numpy as np
-
-    import jorbit
-
-    _HAVE_JORBIT = True
-except Exception as e:  # noqa: BLE001
-    print(f"warning: jorbit import failed: {e}", file=sys.stderr)
-    _HAVE_JORBIT = False
-
+# Bound by _load_jorbit_offline(); importing jorbit any earlier would run its
+# import-time initializer, which downloads kernels when they are not cached.
+jnp = None
+np = None
+jorbit = None
 
 _AU_KM = 149_597_870.700
 _MJD_TO_JD = 2_400_000.5
+
+RUNNER_DIR = Path(__file__).resolve().parent
+# Runner-private astropy download cache holding the registered set's kernels
+# under jorbit's URL keys (gitignored; restaged and byte-verified every run).
+ASTROPY_CACHE_DIR = RUNNER_DIR / ".astropy-cache"
+# The suite's documented default data directory (the Makefile's DATA_DIR).
+DEFAULT_DATA_DIR = Path.home() / ".empyrean" / "data"
+
+GEOCENTER = "500"
+SITE_NOT_ATTEMPTED_REASON = (
+    "jorbit's only observer model for a ground site is a live JPL Horizons query "
+    "(jorbit.utils.horizons.get_observer_positions); the suite runs sealed from JPL "
+    "and the pinned inputs snapshot carries no observer position vectors. The "
+    "geocentric observer (500) runs from jorbit's own DE440 Earth."
+)
+
+
+def _dist_version(name: str) -> str:
+    """Installed distribution version, or an explicit ``unknown (<reason>)``."""
+    try:
+        return version(name)
+    except PackageNotFoundError:
+        return "unknown (distribution not found)"
+    except Exception as e:  # noqa: BLE001
+        return f"unknown ({e})"
 
 
 def _jorbit_source_version() -> str:
     """Provenance string stamped on every jorbit-channel row.
 
-    Reports the installed ``jorbit`` distribution version. No-hidden-fallbacks:
-    when jorbit is absent or its version can't be read, stamp an explicit
-    ``jorbit unknown (<reason>)`` rather than a silent blank.
+    Carries the installed jorbit, JAX and jaxlib versions (JAX changes the
+    numbers jorbit produces as much as jorbit does) and the kernel case, which
+    is always DE440 + SB441-N16 from the registered set. No-hidden-fallbacks:
+    a version that can't be read is stamped ``unknown (<reason>)``, never left
+    blank.
     """
+    return (
+        f"jorbit {_dist_version('jorbit')} (jax {_dist_version('jax')}, "
+        f"jaxlib {_dist_version('jaxlib')}; DE440+SB441-N16)"
+    )
+
+
+def _load_jorbit_offline(data_dir: Path) -> None:
+    """Stage the registered kernels, cut astropy off the network, import jorbit.
+
+    Exits with the reason when jorbit cannot run from local files alone.
+    """
+    global jnp, np, jorbit
+    sys.path.insert(0, str(RUNNER_DIR))
+    from jorbit_offline import OfflineSetupError, import_jorbit_offline
+
+    print(f"jorbit: kernels from the registered set in {data_dir}", file=sys.stderr)
     try:
-        return f"jorbit {version('jorbit')}"
-    except PackageNotFoundError:
-        return "jorbit unknown (distribution not found)"
-    except Exception as e:  # noqa: BLE001
-        return f"jorbit unknown ({e})"
+        jorbit, lines, suppressed = import_jorbit_offline(data_dir, ASTROPY_CACHE_DIR)
+    except OfflineSetupError as e:
+        sys.exit(f"ERROR: jorbit cannot run offline: {e}")
+    for line in lines:
+        print(f"  {line}", file=sys.stderr)
+    if suppressed:
+        names = ", ".join(sorted({u.rsplit("/", 1)[-1] for u in suppressed}))
+        print(
+            f"  jorbit's import-time download of its mpchecker bundle ({names}) was "
+            "suppressed: no code path this runner uses reads it, and astropy's "
+            "internet access is off, so any read of it fails loudly",
+            file=sys.stderr,
+        )
+    import jax.numpy as _jnp
+    import numpy as _np
+
+    jnp, np = _jnp, _np
 
 
 def _angular_sep_arcsec(ra1: float, dec1: float, ra2: float, dec2: float) -> float:
@@ -127,9 +190,87 @@ def _row_gravity(row: dict) -> str:
     return "default solar system"
 
 
+class _Geocenter:
+    """Barycentric position of observer 500 (the geocentre) from jorbit's DE440.
+
+    jorbit's string-observer path asks Horizons for the Earth-Moon barycentre
+    from the SSB and from the observer and differences them; for the geocentre
+    that is the Earth's barycentric position, which jorbit's own `Ephemeris`
+    reads from the same DE440 it integrates against. One ephemeris spans every
+    geocentric row of the plan.
+    """
+
+    def __init__(self, t_min_mjd_tdb: float, t_max_mjd_tdb: float) -> None:
+        from astropy.time import Time
+
+        self._eph = jorbit.Ephemeris(
+            ssos="default planets",
+            earliest_time=Time(t_min_mjd_tdb + _MJD_TO_JD - 1.0, format="jd", scale="tdb"),
+            latest_time=Time(t_max_mjd_tdb + _MJD_TO_JD + 1.0, format="jd", scale="tdb"),
+            de_ephemeris_version="440",
+        )
+
+    def position_au(self, times) -> jnp.ndarray:
+        """(N, 3) barycentric ICRF positions in AU at an astropy Time array."""
+        return jnp.asarray(self._eph.state(times)["earth"]["x"].to_value("au"))
+
+
+class SiteRowsNotAttempted:
+    """Ground-site ephemeris rows jorbit cannot replay offline, grouped per object.
+
+    The rows are not replayed and not emitted one by one; each object gets one
+    explicit row naming the reason, the observers and how many plan rows it
+    stands for.
+    """
+
+    def __init__(self, reason: str) -> None:
+        self.reason = reason
+        self._by_object: dict[str, dict] = {}
+
+    def add(self, row: dict) -> None:
+        entry = self._by_object.setdefault(
+            row["object"], {"first": row, "observers": set(), "rows": 0}
+        )
+        entry["observers"].add(row.get("observer"))
+        entry["rows"] += 1
+
+    @property
+    def n_rows(self) -> int:
+        return sum(e["rows"] for e in self._by_object.values())
+
+    def __len__(self) -> int:
+        return len(self._by_object)
+
+    def rows(self, timestamp: str, source_version: str) -> list[dict]:
+        out = []
+        for name, e in self._by_object.items():
+            first = e["first"]
+            out.append(
+                {
+                    "object": name,
+                    "population": first.get("population"),
+                    "epoch_mjd_tdb": first.get("epoch_mjd_tdb"),
+                    "test_type": "ephemeris",
+                    "propagation_uncertainty": first.get("propagation_uncertainty"),
+                    "channel": "jorbit",
+                    "timestamp": timestamp,
+                    "source_version": source_version,
+                    "jorbit_not_attempted": self.reason,
+                    "jorbit_not_attempted_observers": sorted(e["observers"]),
+                    "jorbit_not_attempted_rows": e["rows"],
+                }
+            )
+        return out
+
+    def report_lines(self) -> list[str]:
+        return [
+            f"  {name}: ephemeris from {','.join(sorted(e['observers']))} "
+            f"({e['rows']} rows) not attempted — {self.reason}"
+            for name, e in self._by_object.items()
+        ]
+
+
 def _propagate_with_jorbit(row: dict) -> dict | None:
-    if not _HAVE_JORBIT:
-        return None
     ic_pos = row.get("ic_pos_au")
     ic_vel = row.get("ic_vel_au_d")
     if ic_pos is None or ic_vel is None:
@@ -172,13 +313,11 @@ def _propagate_with_jorbit(row: dict) -> dict | None:
     return res
 
 
-def _ephemeris_with_jorbit(row: dict) -> dict | None:
-    if not _HAVE_JORBIT:
-        return None
+def _ephemeris_with_jorbit(row: dict, geocenter: _Geocenter) -> dict | None:
+    """Geocentric (observer 500) astrometric RA/Dec through jorbit."""
     ic_pos = row.get("ic_pos_au")
     ic_vel = row.get("ic_vel_au_d")
-    obs_code = row.get("observer")
-    if ic_pos is None or ic_vel is None or not obs_code:
+    if ic_pos is None or ic_vel is None or row.get("observer") != GEOCENTER:
         return None
 
     t0 = time.perf_counter()
@@ -191,25 +330,15 @@ def _ephemeris_with_jorbit(row: dict) -> dict | None:
         # `SkyCoord` in ICRS, including light-time correction. The
         # docstring accepts a bare jnp array (TDB JD), but the
         # implementation dereferences `.jd` — pass an astropy Time
-        # explicitly (upstream array path is broken).
+        # explicitly (upstream array path is broken). The observer is
+        # handed over as a barycentric position vector, so jorbit's
+        # string-observer path (a live Horizons query) is never taken.
         from astropy.time import Time
-        target_t = Time(float(row["t_mjd_tdb"]) + _MJD_TO_JD, format="jd", scale="tdb")
-        # jorbit resolves observer strings via the Horizons API: '@' marks a
-        # Horizons-interpretable code, so MPC site codes need the '@399'
-        # (Earth topocentric) suffix. The string-observer branch of
-        # Particle.ephemeris additionally trips an astropy units bug, so
-        # fetch the barycentric observer position ourselves and hand the
-        # vector over (the jnp.ndarray branch works).
-        from jorbit.observation import get_observer_positions
-        obs_pos = get_observer_positions(
-            times=target_t,
-            observatories=f"{obs_code}@399",
-            de_ephemeris_version="de440",
-        )
-        sky = particle.ephemeris(times=target_t, observer=jnp.asarray(obs_pos))
+        target_t = Time([float(row["t_mjd_tdb"]) + _MJD_TO_JD], format="jd", scale="tdb")
+        obs_pos = geocenter.position_au(target_t)
+        sky = particle.ephemeris(times=target_t, observer=obs_pos)
         # SkyCoord.ra / .dec are astropy Longitude / Latitude objects;
-        # `.rad` extracts the radian-scaled float. `.distance.to('au')`
-        # gives the geocentric range. Use the first (and only) entry.
+        # `.rad` extracts the radian-scaled float. Use the first (and only) entry.
         ra_rad = float(sky.ra.rad[0]) if sky.ra.shape else float(sky.ra.rad)
         dec_rad = float(sky.dec.rad[0]) if sky.dec.shape else float(sky.dec.rad)
         # jorbit's ephemeris SkyCoord carries RA/Dec only — its distance is a
@@ -217,7 +346,6 @@ def _ephemeris_with_jorbit(row: dict) -> dict | None:
         # simply not available from this API; emit angles only.
         rho_au = None
         try:
-            import astropy.units as u
             if sky.distance.unit.physical_type == "length":
                 rho_obj = sky.distance
                 rho_au = float(rho_obj.to("au").value[0]) if rho_obj.shape else float(
@@ -249,7 +377,7 @@ def _ephemeris_with_jorbit(row: dict) -> dict | None:
     return res
 
 
-def _executive_summary(rows: list[dict]) -> str:
+def _executive_summary(rows: list[dict], not_attempted: SiteRowsNotAttempted) -> str:
     prop = [
         r
         for r in rows
@@ -301,36 +429,73 @@ def _executive_summary(rows: list[dict]) -> str:
             lines.append(
                 f"    Wall clock          p50={statistics.median(times):.1f} ms   max={max(times):.0f} ms"
             )
-    lines.append(f"  Ephemeris rows compared: {len(eph)}")
+    lines.append(f"  Ephemeris rows compared (geocentric): {len(eph)}")
     if eph:
         sep = [r["jorbit_separation_arcsec"] for r in eph]
         lines.append(
             f"    Angular sep         p50={asec_pct(sep, 0.5)}   p95={asec_pct(sep, 0.95)}   max={asec_pct(sep, 1.0)}"
         )
-    if not _HAVE_JORBIT:
+    if len(not_attempted):
         lines.append(
-            "  NOTE: jorbit is not installed; all rows skipped. Run `./setup.sh` first."
+            f"  Ephemeris rows NOT ATTEMPTED (ground-site observers): {not_attempted.n_rows} "
+            f"across {len(not_attempted)} objects, one explicit row each — {not_attempted.reason}"
         )
     lines.append("─" * 56)
     return "\n".join(lines)
 
 
+def _check(data_dir: Path) -> int:
+    """Setup smoke test: stage the kernels, import jorbit offline, read DE440."""
+    _load_jorbit_offline(data_dir)
+    from astropy.time import Time
+
+    j2000 = 51544.5
+    earth = _Geocenter(j2000, j2000).position_au(
+        Time([j2000 + _MJD_TO_JD], format="jd", scale="tdb")
+    )
+    r = float(np.linalg.norm(np.asarray(earth)[0]))
+    print(
+        f"{_jorbit_source_version()} offline OK: geocentre |r| = {r:.6f} au at J2000 "
+        "from the staged DE440",
+        file=sys.stderr,
+    )
+    return 0
+
+
 def main() -> int:
     p = argparse.ArgumentParser(description=__doc__)
-    p.add_argument("--input", required=True, type=Path, help="validation plan JSON")
+    p.add_argument("--input", type=Path, help="validation plan JSON")
     p.add_argument(
         "--output",
         type=Path,
         default=Path("results/validation_jorbit.json"),
         help="output JSON",
     )
+    p.add_argument(
+        "--data-dir",
+        type=Path,
+        default=DEFAULT_DATA_DIR,
+        help="registered kernel set (the suite's DATA_DIR); jorbit's DE440 and "
+        "SB441-N16 are read from here, never downloaded",
+    )
+    p.add_argument(
+        "--check",
+        action="store_true",
+        help="stage the kernels, import jorbit offline and read DE440, then exit",
+    )
     args = p.parse_args()
+
+    if args.check:
+        return _check(args.data_dir)
+    if args.input is None:
+        p.error("--input is required (unless --check)")
 
     plan = json.loads(args.input.read_text())
     if not plan:
         print("input plan empty", file=sys.stderr)
         return 1
 
+    _load_jorbit_offline(args.data_dir)
     print(
         f"Loaded {len(plan)} plan rows; running through jorbit...", file=sys.stderr
     )
@@ -339,8 +504,10 @@ def main() -> int:
     source_version = _jorbit_source_version()
     out_rows: list[dict] = []
     n_skipped = 0
+    not_attempted = SiteRowsNotAttempted(SITE_NOT_ATTEMPTED_REASON)
+    geocenter: _Geocenter | None = None
 
-    for r in plan:
+    def replayed(r: dict) -> bool:
         # Uncertainty axis: skip covariance-bearing rows. jorbit can produce
         # STMs via JAX autodiff (`jax.jacfwd` over `Particle.integrate`), but
         # cross-tool Jet1 parity needs a separate handshake on the covariance
@@ -348,19 +515,34 @@ def main() -> int:
         # pass here. The tag is a composite `<method>_<arm>`, so the method is
         # read off the prefix: a `None` tag (OD rows) and every arm of `none`
         # are covariance-free.
-        _u = r.get("propagation_uncertainty")
-        if _u is not None and not (_u == "none" or _u.startswith("none_")):
+        u = r.get("propagation_uncertainty")
+        return u is None or u == "none" or u.startswith("none_")
+
+    geo_times = [
+        float(r["t_mjd_tdb"])
+        for r in plan
+        if replayed(r) and r.get("test_type") == "ephemeris"
+        and r.get("observer") == GEOCENTER and r.get("t_mjd_tdb") is not None
+    ]
+    if geo_times:
+        geocenter = _Geocenter(min(geo_times), max(geo_times))
+
+    for r in plan:
+        if not replayed(r):
             n_skipped += 1
+            continue
+        tt = r.get("test_type")
+        if tt == "ephemeris" and r.get("observer") != GEOCENTER:
+            not_attempted.add(r)
             continue
         new = dict(r)
         new["channel"] = "jorbit"
         new["timestamp"] = timestamp
         new["source_version"] = source_version
-        tt = r.get("test_type")
         if tt == "propagation":
             update = _propagate_with_jorbit(r)
         elif tt == "ephemeris":
-            update = _ephemeris_with_jorbit(r)
+            update = _ephemeris_with_jorbit(r, geocenter)
         else:
             # OD rows: jorbit's gradient-based fitting needs a custom
             # likelihood per fit (different state representation,
@@ -372,6 +554,10 @@ def main() -> int:
         else:
             new.update(update)
         out_rows.append(new)
+
+    for line in not_attempted.report_lines():
+        print(line, file=sys.stderr)
+    out_rows.extend(not_attempted.rows(timestamp, source_version))
 
     args.output.parent.mkdir(parents=True, exist_ok=True)
     try:
@@ -387,11 +573,13 @@ def main() -> int:
         raise
     args.output.write_text(_payload)
     print(
-        f"Wrote {len(out_rows)} jorbit rows to {args.output} ({n_skipped} skipped)",
+        f"Wrote {len(out_rows)} jorbit rows to {args.output} ({n_skipped} skipped, "
+        f"{not_attempted.n_rows} ground-site ephemeris rows not attempted as "
+        f"{len(not_attempted)} explicit rows)",
         file=sys.stderr,
     )
 
-    print(_executive_summary(out_rows), file=sys.stderr)
+    print(_executive_summary(out_rows, not_attempted), file=sys.stderr)
     return 0
 
 

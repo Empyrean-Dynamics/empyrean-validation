@@ -258,7 +258,9 @@ def _populate_mixture_tallies(result: dict, row: dict) -> None:
     villeneuve's pre-retention tallies — a cross-channel surface difference,
     not physics).
     """
-    chains = build_mixture_chains(result)
+    # The suite works in MJD TDB throughout; asking for the chains' close-
+    # approach epochs in that scale keeps every tally column as it was.
+    chains = build_mixture_chains(result, "tdb")
     if chains is None or len(chains) == 0:
         return
     # Components retained for this (single) orbit.
@@ -313,7 +315,7 @@ def _fill_propagation_products(row: dict, result: dict, attach_cov: bool) -> Non
     # named on the outcome below rather than back-filled.
     withheld: str | None = None
     if attach_cov:
-        tagged = _build_tagged_covariance(result)
+        tagged = _build_tagged_covariance(result, "tdb")
         pj = None
         if (
             tagged is not None

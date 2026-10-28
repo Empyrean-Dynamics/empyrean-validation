@@ -93,15 +93,31 @@ runs:
         path: empyrean
         token: ${{ inputs.gh-pat }}
         # Pin to the released tag the manifests resolve to (see above), not the
-        # default branch. The other siblings stay on their default branch; the
-        # core channel's pin is a separate follow-up.
+        # default branch.
         ref: v${{ steps.pinned-engine.outputs.version }}
+    # The reference channel is the engine the distribution under test binds,
+    # not whatever empyrean-core's default branch holds today: read the tag the
+    # pinned distribution's C ABI crate names and check empyrean-core out at
+    # it. A manifest without that pin is a stop, not a fall-through to main.
+    - name: Resolve the engine the distribution binds
+      id: pinned-core
+      shell: bash
+      run: |
+        tag="$(sed -n 's/^empyrean-core = {.*tag = "\([^"]*\)".*/\1/p' empyrean/empyrean-c/Cargo.toml)"
+        if [ -z "$tag" ]; then
+          echo "ERROR: could not read the empyrean-core tag from empyrean/empyrean-c/Cargo.toml" >&2
+          echo "       of the pinned distribution v${{ steps.pinned-engine.outputs.version }}." >&2
+          exit 1
+        fi
+        echo "tag=$tag" >> "$GITHUB_OUTPUT"
+        echo "Reference engine: empyrean-core $tag"
     - name: Checkout empyrean-core (sibling)
       uses: actions/checkout@v4
       with:
         repository: Empyrean-Dynamics/empyrean-core
         path: empyrean-core
         token: ${{ inputs.gh-pat }}
+        ref: ${{ steps.pinned-core.outputs.tag }}
     - name: Checkout core dep (transitive)
       uses: actions/checkout@v4
       with:
@@ -146,19 +162,23 @@ runs:
     # The cache carries the slug; `restore-keys` restores the previous set so a
     # slug bump fetches only the delta; the writer ALWAYS syncs, which re-hashes
     # every file, so the cache is verified, not trusted. Readers restore the
-    # exact slug key and refuse on a miss: prep is the sole writer.
+    # exact slug key and refuse on a miss: prep is the sole writer. The key also
+    # names what the suite writes into the directory beside the set (`set-codes`:
+    # the registered observatory codes, nothing written over them); a change of
+    # that policy must miss the old cache, or readers would restore the previous
+    # policy's directory while the writer re-synced its own.
     - name: Restore empyrean data kernels
       id: cache-data
       uses: actions/cache/restore@v4
       with:
         path: data
-        key: empyrean-data-${{ inputs.dataset }}
+        key: empyrean-data-${{ inputs.dataset }}-set-codes
         restore-keys: ${{ inputs.role == 'writer' && 'empyrean-data-' || '' }}
     - name: Require a warm kernel cache (reader role)
-      if: inputs.role != 'writer' && steps.cache-data.outputs.cache-hit != 'true'
+      if: inputs.role != 'writer' && steps.cache-data.outputs.cache-hit != 'true' && env.ACT != 'true'
       shell: bash
       run: |
-        echo "ERROR: data-kernel cache miss on key empyrean-data-${{ inputs.dataset }}," >&2
+        echo "ERROR: data-kernel cache miss on key empyrean-data-${{ inputs.dataset }}-set-codes," >&2
         echo "       and this job's role is 'reader' so it will not sync them." >&2
         echo "       prep is the sole writer of this cache. A miss here means prep" >&2
         echo "       did not run, its sync failed, or the slug changed between" >&2
@@ -166,7 +186,7 @@ runs:
         echo "       Refusing to run the reference against kernels prep did not use." >&2
         exit 1
     - name: Require the kernel-bucket identity (writer)
-      if: inputs.role == 'writer' && (inputs.workload-identity-provider == '' || inputs.service-account == '')
+      if: inputs.role == 'writer' && env.ACT != 'true' && (inputs.workload-identity-provider == '' || inputs.service-account == '')
       shell: bash
       run: |
         echo "ERROR: this job is the kernel-set writer but received no Workload Identity" >&2
@@ -175,29 +195,50 @@ runs:
         echo "       engine-setup (lang/workflow/gcp-project.md, 'CI consumption')." >&2
         exit 1
     - name: Authenticate to the kernel bucket (writer)
-      if: inputs.role == 'writer'
+      if: inputs.role == 'writer' && env.ACT != 'true'
       uses: google-github-actions/auth@v2
       with:
         workload_identity_provider: ${{ inputs.workload-identity-provider }}
         service_account: ${{ inputs.service-account }}
     - name: Sync the registered kernel set (writer)
-      if: inputs.role == 'writer'
+      if: inputs.role == 'writer' && env.ACT != 'true'
       shell: bash
       run: |
         gcloud storage cp gs://empyrean-data/tools/empyrean-data.py "$RUNNER_TEMP/empyrean-data.py"
         # The target is the workflow's EMPYREAN_DATA_DIR (= $GITHUB_WORKSPACE/data);
         # the Makefile receives the same path as DATA_DIR.
         python3 "$RUNNER_TEMP/empyrean-data.py" sync "${{ inputs.dataset }}" "$GITHUB_WORKSPACE/data" --prune
-    # Two suite-specific files written AFTER the sync so `--prune` cannot remove
-    # them. (1) find_orb's binary DE440 (linux_p1550p2650.440) is not an engine
-    # kernel and not in the registered set; it comes from a stable SSD URL and is
-    # cached under its own key — the one direct NASA URL this repo keeps, listed
-    # as the documented exception in lang's drift checker. (2) The observatory
-    # codes: the registered set carries the engine's own obscodes_extended.json
-    # (277 KB), but the validation of record was produced with the copy vendored
-    # in-repo (275 KB, kept because MPC throttles Actions IPs), so this run keeps
-    # the vendored copy for parity. Switching to the registered copy changes
-    # numbers and needs a measured re-baseline — a separate, tracked change.
+    # Under `gh act` (a local rehearsal; act sets ACT=true in the job container)
+    # there is no identity federation, so the set cannot be synced from the
+    # bucket. The host bind-mounts its own synced copy of the SAME slug and the
+    # job copies it in — the writer always, a reader only when act's cache
+    # server had nothing for the key. Nothing else about the run changes, so a
+    # local pass rehearses the hosted one; a hosted run never takes this step.
+    - name: Copy the registered kernel set from the host mount (act)
+      if: env.ACT == 'true' && (inputs.role == 'writer' || steps.cache-data.outputs.cache-hit != 'true')
+      shell: bash
+      run: |
+        src="${ACT_DATA_DIR:-/host-data}"
+        if [ ! -f "$src/obscodes_extended.json" ] || [ ! -f "$src/de440.bsp" ]; then
+          echo "ERROR: running under act, but no registered kernel set is mounted at $src." >&2
+          echo "       Mount the locally synced '${{ inputs.dataset }}' directory, e.g." >&2
+          echo "       --container-options '--mount type=bind,source=<local copy>,target=/host-data,readonly'" >&2
+          exit 1
+        fi
+        rm -rf "$GITHUB_WORKSPACE/data" && mkdir -p "$GITHUB_WORKSPACE/data" && cp -a "$src"/. "$GITHUB_WORKSPACE/data"/
+        echo "act: copied $(ls "$GITHUB_WORKSPACE/data" | wc -l) files of ${{ inputs.dataset }} from $src"
+    # One suite-specific file written AFTER the sync so `--prune` cannot remove
+    # it: find_orb's binary DE440 (linux_p1550p2650.440) is not an engine kernel
+    # and not in the registered set; it comes from a stable SSD URL and is cached
+    # under its own key — the one direct NASA URL this repo keeps, listed as the
+    # documented exception in lang's drift checker. The observatory codes are the
+    # registered set's own obscodes_extended.json, synced above — the file every
+    # other empyrean repo's CI reads. The copy once vendored in-repo (July 2026,
+    # kept for parity with the validation of record) differed from it at two
+    # stations the fixtures use (Z84 by about 38 m, B42 by about 300 m), enough
+    # to flip the marginal Apophis optical+radar fit on one platform (2026-10-26).
+    # Nothing is written over the set's file any more; the cache key suffix
+    # records that.
     - name: Restore find_orb DE440 binary
       if: inputs.role == 'writer'
       id: cache-de440-bin
@@ -219,18 +260,17 @@ runs:
       with:
         path: de440-bin
         key: findorb-de440-linux_p1550p2650
-    - name: Add the suite extras to the data directory (writer)
+    - name: Add find_orb's DE440 to the data directory (writer)
       if: inputs.role == 'writer'
       shell: bash
       run: |
         cp de440-bin/linux_p1550p2650.440 data/linux_p1550p2650.440
-        gunzip -c "$GITHUB_WORKSPACE/empyrean-validation/assets/obscodes_extended.json.gz" > data/obscodes_extended.json
     - name: Save empyrean data kernels
       if: inputs.role == 'writer' && steps.cache-data.outputs.cache-hit != 'true'
       uses: actions/cache/save@v4
       with:
         path: data
-        key: empyrean-data-${{ inputs.dataset }}
+        key: empyrean-data-${{ inputs.dataset }}-set-codes
 
     - name: Cache cargo state
       uses: actions/cache@v4

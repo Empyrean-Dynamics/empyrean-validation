@@ -730,8 +730,8 @@ impl StationRule {
         Ok(empyrean::WeightingLayer::ObservatoryRule {
             obs_code: self.obs_code.clone(),
             sigma: self.sigma_arcsec,
-            start_epoch_mjd_tdb: self.start_epoch_mjd_tdb,
-            end_epoch_mjd_tdb: self.end_epoch_mjd_tdb,
+            start_epoch: self.start_epoch_mjd_tdb.map(Epoch::from_mjd_tdb),
+            end_epoch: self.end_epoch_mjd_tdb.map(Epoch::from_mjd_tdb),
             scale: self.scale,
             noise_model,
         })
@@ -858,7 +858,7 @@ fn arm_config(
 ) -> Result<ODConfig, String> {
     let mut cfg = ODConfig {
         force_model: tier,
-        output_epoch: OutputEpoch::Epoch(cut_mjd_tdb),
+        output_epoch: OutputEpoch::Epoch(Epoch::from_mjd_tdb(cut_mjd_tdb)),
         num_threads: 1,
         excluded_perturbers: excluded_perturbers.to_vec(),
         ..ODConfig::default()

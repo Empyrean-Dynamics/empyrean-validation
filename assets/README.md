@@ -1,23 +1,17 @@
 # Vendored data assets
 
-## `obscodes_extended.json.gz`
+## `empyrean-tokens.css`
 
-MPC observatory codes (site name + parallax constants), used to place the
-five observer stations in the validation catalog (`W84`, `F51`, `X05`,
-`500`, `I41`).
+Design tokens referenced by the report renderer (`src/report.rs`).
 
-**Vendored, not fetched.** The Minor Planet Center
-(`minorplanetcenter.net`) throttles GitHub Actions IP ranges, so a live
-download reliably times out in CI. The file is ~77 KB and the
-observatories used are long-established (their coordinates do not move),
-so pinning a copy both unblocks CI and makes the validation inputs
-reproducible for a given release.
+## Observatory codes — no longer vendored
 
-**Refresh** (only needed if a catalog observatory isn't in the file):
-
-```sh
-curl -sSfL -o assets/obscodes_extended.json.gz \
-  https://minorplanetcenter.net/Extended_Files/obscodes_extended.json.gz
-```
-
-Source: <https://minorplanetcenter.net/Extended_Files/obscodes_extended.json.gz>
+Until 2026-10-26 this directory carried `obscodes_extended.json.gz`, a July
+2026 copy of the MPC observatory codes that CI wrote over the registered
+kernel set's file. The copy differed from the registered file at two stations
+the fixtures use (Z84 by about 38 m, B42 by about 300 m), enough to flip the
+marginal Apophis optical+radar fit on one platform. The engine now reads the
+registered set's
+`obscodes_extended.json`, synced by `.github/actions/engine-setup`, the same
+file every other empyrean repo's CI reads; refreshing it is a kernel-set
+release, not a repository change.

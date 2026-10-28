@@ -19,7 +19,7 @@ fi
 pip install --upgrade pip
 # Pin to a known-good kete release. Update intentionally so we don't
 # inadvertently change comparison reference between runs.
-pip install "kete>=2.0"
+pip install "kete==3.3.0"
 
 echo
 echo "kete venv ready: $(pwd)/.venv"
