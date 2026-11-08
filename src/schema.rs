@@ -191,9 +191,11 @@ pub mod test_types {
     /// differential-correction fit, so it sits OUTSIDE
     /// [`ORBIT_DETERMINATION_FAMILY`] alongside propagation/ephemeris and
     /// carries a method tag the way those rows do (the fit rows'
-    /// `propagation_uncertainty` is the requested fit method). Every engine
-    /// channel replays it (it is **not** a [`crate::plan::PLAN_RUST_ONLY_TEST_TYPES`]
-    /// row): ruling 9 puts every method at this seam on every channel.
+    /// `propagation_uncertainty` is the requested fit method). It is **not** a
+    /// [`crate::plan::PLAN_RUST_ONLY_TEST_TYPES`] row: ruling 9 puts every
+    /// method at this seam on every channel, so every channel is handed it. At
+    /// this pin the python, c and cli channels do not produce it
+    /// ([`super::NOT_PRODUCED_AT_THIS_PIN`]); the core channel does.
     pub const ORBIT_DETERMINATION_TRANSPORT: &str = "orbit_determination_transport";
 
     /// Every canonical test type, in declaration order.
@@ -239,6 +241,60 @@ pub mod test_types {
     pub fn is_orbit_determination(test_type: &str) -> bool {
         ORBIT_DETERMINATION_FAMILY.contains(&test_type)
     }
+}
+
+/// `(channel, test_type)` pairs a replay channel does not produce at this pin,
+/// by design.
+///
+/// The declaration is the replay runners' own: each skips these rows beside a
+/// comment saying the channel does not produce them at this pin and the core
+/// channel does (`runners/python/run.py`, `runners/c/drive.py`,
+/// `runners/cli/drive.py`). This is its machine-readable form for the gate,
+/// which requires a strict channel's row for every reference row of a test
+/// type the channel produces and excuses exactly these pairs. A test checks
+/// each listed runner still skips what is listed, so an entry cannot outlive
+/// its skip.
+pub const NOT_PRODUCED_AT_THIS_PIN: [(&str, &str); 3] = [
+    (channels::PYTHON, test_types::ORBIT_DETERMINATION_TRANSPORT),
+    (channels::C, test_types::ORBIT_DETERMINATION_TRANSPORT),
+    (channels::CLI, test_types::ORBIT_DETERMINATION_TRANSPORT),
+];
+
+/// Does `channel` produce rows of `test_type` at this pin? False only for a
+/// pair in [`NOT_PRODUCED_AT_THIS_PIN`].
+pub fn channel_produces(channel: &str, test_type: &str) -> bool {
+    !NOT_PRODUCED_AT_THIS_PIN.contains(&(channel, test_type))
+}
+
+/// The [`ValidationResult::orbit_status`] vocabulary every channel writes, read
+/// off the per-orbit outcome, so the same engine condition reads the same on
+/// every channel:
+///
+/// - [`DELIVERED`](orbit_status::DELIVERED): the engine delivered the orbit.
+///   A `none`-method row (no covariance requested) reads this too, off its
+///   outcome, exactly like every other method (the rust reference's rule); a
+///   delivered ephemeris entry reads this with or without a joint, since the
+///   ephemeris seam has no withheld channel.
+/// - [`COV_WITHHELD_ABSENT`](orbit_status::COV_WITHHELD_ABSENT): a propagation
+///   row under a covariance-bearing method delivered its state but no
+///   covariance (the propagated state carries no packed joint). The engine's
+///   wording for why stays out of the status, so the spelling is one token on
+///   every channel.
+/// - `failed:<variant>`, with [`FAILED_PREFIX`](orbit_status::FAILED_PREFIX):
+///   the engine declined the orbit; `<variant>` names its
+///   `EMPYREAN_PROPAGATE_FAILURE_*` class.
+///
+/// A test checks the c and python runners, which cannot import these, spell
+/// them exactly so.
+pub mod orbit_status {
+    /// The engine delivered the orbit.
+    pub const DELIVERED: &str = "delivered";
+    /// The reason carried by [`COV_WITHHELD_ABSENT`].
+    pub const COVARIANCE_ABSENT: &str = "covariance_absent";
+    /// A propagation row delivered its state but no covariance.
+    pub const COV_WITHHELD_ABSENT: &str = "cov_withheld:covariance_absent";
+    /// The prefix of a declined orbit's `failed:<variant>`.
+    pub const FAILED_PREFIX: &str = "failed:";
 }
 
 /// Canonical [`ValidationResult::propagation_uncertainty`] values.
@@ -865,7 +921,8 @@ pub struct ValidationResult {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub orbit_delivered: Option<bool>,
     /// The per-orbit outcome as a string: `delivered`, `failed:<variant>`, or
-    /// `cov_withheld:<reason>`. Keeps a refusal visible by name instead of
+    /// `cov_withheld:covariance_absent` — one vocabulary for every channel,
+    /// [`orbit_status`](crate::schema::orbit_status). Keeps a refusal visible by name instead of
     /// collapsing into a blank cell. On an OD fit row refused for its
     /// uncertainty method (`second_order` / `sigma_point` / `monte_carlo` /
     /// `gaussian_mixture`) it carries the engine's refusal text verbatim, which
@@ -1717,6 +1774,79 @@ mod tests {
             .map(str::trim)
             .collect();
         assert_eq!(listed, test_types::ORBIT_DETERMINATION_FAMILY.to_vec());
+    }
+
+    #[test]
+    fn not_produced_pairs_match_the_runners_skips() {
+        // The replay runners carry this declaration as code: each skips the
+        // rows of a test type it does not produce. Check every listed pair
+        // against its runner's skip (`== "<test_type>":`, then `continue`;
+        // the runner's row account counts a plan row with no row as
+        // skipped), so a runner that starts producing the test type cannot
+        // stay excused from the gate.
+        let runner = |ch: &str| match ch {
+            channels::PYTHON => "runners/python/run.py",
+            channels::C => "runners/c/drive.py",
+            channels::CLI => "runners/cli/drive.py",
+            other => panic!("{other} has no replay runner"),
+        };
+        for (ch, tt) in NOT_PRODUCED_AT_THIS_PIN {
+            let path = format!("{}/{}", env!("CARGO_MANIFEST_DIR"), runner(ch));
+            let src = std::fs::read_to_string(&path).unwrap();
+            let lines: Vec<&str> = src.lines().map(str::trim).collect();
+            let skips = lines.windows(2).any(|w| {
+                w[0].starts_with("if ")
+                    && w[0].ends_with(&format!("== \"{tt}\":"))
+                    && w[1] == "continue"
+            });
+            assert!(
+                skips,
+                "{path} no longer skips {tt}; drop ({ch}, {tt}) from the list"
+            );
+        }
+        assert!(!channel_produces(
+            channels::PYTHON,
+            test_types::ORBIT_DETERMINATION_TRANSPORT
+        ));
+        assert!(channel_produces(
+            channels::CORE,
+            test_types::ORBIT_DETERMINATION_TRANSPORT
+        ));
+        assert!(channel_produces(channels::PYTHON, test_types::EPHEMERIS));
+    }
+
+    #[test]
+    fn orbit_status_vocabulary_is_spelled_alike_by_every_runner() {
+        // The withheld status is the prefix plus its one reason.
+        assert_eq!(
+            orbit_status::COV_WITHHELD_ABSENT,
+            format!("cov_withheld:{}", orbit_status::COVARIANCE_ABSENT)
+        );
+        // The c and python runners cannot import these constants, so check
+        // their spellings in the source: every `cov_withheld` reason they can
+        // write is the one reason, and the c runner writes the whole status.
+        let read = |rel: &str| {
+            std::fs::read_to_string(format!("{}/{rel}", env!("CARGO_MANIFEST_DIR"))).unwrap()
+        };
+        let c = read("runners/c/runner.c");
+        let n_withheld = c.matches("\"cov_withheld:").count();
+        assert!(n_withheld > 0, "runner.c writes a withheld status");
+        assert_eq!(
+            c.matches(&format!("\"{}\"", orbit_status::COV_WITHHELD_ABSENT))
+                .count(),
+            n_withheld,
+            "runner.c writes a cov_withheld status other than the vocabulary's"
+        );
+        let py = read("runners/python/run.py");
+        let reasons: Vec<&str> = py
+            .lines()
+            .filter_map(|l| l.trim().strip_prefix("withheld = \""))
+            .map(|rest| rest.trim_end_matches('"'))
+            .collect();
+        assert!(!reasons.is_empty(), "run.py assigns a withheld reason");
+        for r in reasons {
+            assert_eq!(r, orbit_status::COVARIANCE_ABSENT, "run.py withheld reason");
+        }
     }
 
     #[test]

@@ -36,6 +36,10 @@ Verbs (see the contract for the authoritative spec)::
     inputs.py fetch    --pin fixtures/manifest.json --dest fixtures
                        [--prune] [--offline] [--allow-partial]
 
+`fetch` keeps the snapshot's MANIFEST.json beside the data as
+<dest>/snapshot-manifest.json, never as <dest>/MANIFEST.json: the dest holds
+the pin (fixtures/manifest.json), and the two names differ only in case.
+
 Exit codes: 0 ok, 1 content/verification failure, 2 usage. Content failures
 are listed one per line on stderr, each naming the path and the
 expected/actual value. Nothing is ever written partially: a temp file is
@@ -85,6 +89,12 @@ PSV_PRODUCTS = ("psv", "psv-radar")
 # a README.md, a dotfile, or a subdirectory is never extra and never pruned.
 PRODUCT_EXT = {"psv": ".psv", "psv-radar": ".psv", "horizons": ".json", "sbdb": ".json"}
 DEFAULT_BUCKET = "gs://empyrean-validation/inputs"
+# `fetch` materializes the snapshot's MANIFEST.json beside the data under this
+# name. It must not be MANIFEST.json: the fetch dest is fixtures/, which holds
+# the tracked pin fixtures/manifest.json, and on a case-insensitive filesystem
+# (macOS) the two names are one file, so the manifest read returned the pin
+# (no files[]) and the manifest write replaced it.
+LOCAL_MANIFEST = "snapshot-manifest.json"
 # The snapshot bucket is public-read; a gs:// URI maps to this HTTPS origin.
 PUBLIC_ORIGIN = "https://storage.googleapis.com/"
 HTTP_TIMEOUT = 30.0
@@ -590,14 +600,19 @@ def _verified(path: Path, entry: dict) -> bool:
 
 def _resolve_manifest(pin: dict, dest: Path, base: str, offline: bool, http_get: HttpGet) -> dict:
     sid = pin["snapshot_id"]
-    local = dest / "MANIFEST.json"
+    local = dest / LOCAL_MANIFEST
     if local.is_file():
         m = load_json(local)
         if m.get("snapshot_id") == sid and m.get("tree_hash") == pin["tree_hash"]:
+            if not isinstance(m.get("files"), list):
+                raise ContentError(
+                    f"{local}: has the pin's snapshot_id and tree_hash but no files[]; "
+                    f"it is a pin, not the snapshot's per-file manifest."
+                )
             return m
     if offline:
         raise ContentError(
-            f"MANIFEST.json for {sid} is absent or does not match the pin, and --offline was given."
+            f"{LOCAL_MANIFEST} for {sid} is absent or does not match the pin, and --offline was given."
         )
     url = f"{public_url(base)}/MANIFEST.json"
     try:

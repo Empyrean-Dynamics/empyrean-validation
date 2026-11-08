@@ -1477,15 +1477,15 @@ fn run_shard(
                 });
                 // Capture the fitted orbit + 6×6 in the standard three-view
                 // form (the cross-tool comparison and the future
-                // common-propagation arm consume these). A capture failure
-                // is loud — it means the covariance transform broke.
-                let native = crate::runner::propagated_state_to_coord(&r.state());
+                // common-propagation arm consume these). The capture
+                // transports the fit's packed joint; a failure is loud — it
+                // means the covariance transform broke.
                 let (captured, capture_failure) = match crate::runner::capture_orbit(
                     ctx,
                     &obj.object,
                     orbit_sources::EMPYREAN_OD,
                     engine_version.clone(),
-                    &native,
+                    &r.orbit,
                 ) {
                     Ok(c) => (Some(c), None),
                     Err(e) => (None, Some(format!("capture: {e}"))),

@@ -26,9 +26,11 @@ horizons/<file>.json       Horizons state vectors (the IC at the SBDB epoch,
                            corrected) per observer per dt
 psv/<name>.psv             optical OD astrometry, ADES 2017 PSV
 psv-radar/<name>.psv       optical + <radar> table for the radar objects
-MANIFEST.json              per-file manifest (fetched beside the data; not
-                           tracked), verified against the pin before any file
-                           is trusted
+snapshot-manifest.json     the snapshot's per-file MANIFEST.json (fetched
+                           beside the data; not tracked), verified against the
+                           pin before any file is trusted; never named
+                           MANIFEST.json here, which on a case-insensitive
+                           filesystem is the pin manifest.json itself
 ```
 
 `sbdb/` and `horizons/` files are the engine's own disk-cache files, named by

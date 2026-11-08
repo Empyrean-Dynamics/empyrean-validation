@@ -72,6 +72,16 @@
 //! before (`ra_deg dec_deg rho_au lt_d time_ms`), so the first-order goldens are
 //! unchanged.
 //!
+//! # Perturber exclusions and declined orbits (daemon prop / eph)
+//!
+//! Every daemon `prop` / `eph` line carries the row's `excluded_perturbers_naif`
+//! as an EXCL token (`-` for none, else comma-separated NAIF ids) after the 18
+//! fields (`prop`) or the observer (`eph`), ahead of the optional method token,
+//! and the binary binds it to the propagation config exactly as the core
+//! channel does. A call that returns no state / entry is the engine declining
+//! the orbit: the line is `refused failed:<variant> <engine text>`, read off the
+//! per-orbit outcome, never an `ok` line built from unfilled values.
+//!
 //! # Ephemeris file (eph mode, `--out`)
 //!
 //! `--mode eph --out <path>` writes the generated ephemeris as a 28-column CSV
@@ -90,6 +100,7 @@ use empyrean::{
     ForceModelTier, Frame, ODConfig, Orbit, OrbitOutcome, Origin, PropagationConfig,
     Representation, SolveForParams, UncertaintyMethod,
 };
+use empyrean_validation::schema::orbit_status;
 use empyrean_validation::schema::uncertainty_modes as um;
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq, ValueEnum)]
@@ -154,6 +165,11 @@ struct Cli {
     /// output byte-identical to before.
     #[arg(long)]
     uncertainty_method: Option<String>,
+    /// The plan row's `excluded_perturbers_naif` (prop / eph): NAIF ids,
+    /// comma-separated, removed from the force model exactly as the core
+    /// channel removes them (the daemon lines' EXCL token). Omitted → none.
+    #[arg(long, value_delimiter = ',')]
+    excluded_perturbers: Vec<i32>,
 
     // ── shared ────────────────────────────────────────────────
     /// Force-model tier: 0=Approximate, 1=Basic, 2=Standard.
@@ -329,7 +345,7 @@ fn outcome_channel(outcome: &OrbitOutcome, withheld: Option<&str>) -> (bool, Str
     match outcome {
         OrbitOutcome::Delivered { .. } => match withheld {
             Some(reason) => (true, format!("cov_withheld:{reason}")),
-            None => (true, "delivered".to_string()),
+            None => (true, orbit_status::DELIVERED.to_string()),
         },
         OrbitOutcome::Failed { code, message } => (
             false,
@@ -401,25 +417,32 @@ struct Products {
 
 impl Products {
     /// Read the per-method products off a delivered propagation result.
+    ///
+    /// The delivered covariance IS the per-state packed joint, read for every
+    /// kind, the SAMPLING kinds (SigmaPoint / MonteCarlo) included: their
+    /// sample covariance lives on the propagated state and is not reachable
+    /// through the sensitivity-chain point accessor (`covariance_at_cartesian`
+    /// errors for a sampled kind), which is what marked those rows
+    /// `cov_withheld` before. Mirrors the rust channel's `read_prop_products`.
     /// `expected_cov` is true when the method attached a covariance, so a
-    /// delivered-but-unreadable covariance is reported as `cov_withheld:…`
-    /// on the outcome rather than silently dropped.
+    /// delivered state with no joint reads the vocabulary's
+    /// `cov_withheld:covariance_absent` rather than silently dropping it.
     fn from_result(result: &empyrean::PropagationResult, expected_cov: bool) -> Self {
         let mut resolved_method = None;
         let mut cov_kind = None;
         let mut cov_joint_width = None;
         let mut cov_tri = None;
         let mut withheld: Option<String> = None;
-        match result.covariance_at_cartesian(0, 0) {
-            Ok(tc) => {
-                resolved_method = Some(resolved_method_tag(tc.kind()));
-                cov_kind = Some(cov_kind_wire(tc.joint.kind));
-                cov_joint_width = Some(tc.joint.width as u32);
-                cov_tri = Some(tc.joint.tri.clone());
+        match result.states.first().and_then(|s| s.joint.as_ref()) {
+            Some(joint) => {
+                resolved_method = Some(resolved_method_tag(joint.kind));
+                cov_kind = Some(cov_kind_wire(joint.kind));
+                cov_joint_width = Some(joint.width as u32);
+                cov_tri = Some(joint.tri.clone());
             }
-            Err(e) => {
+            None => {
                 if expected_cov {
-                    withheld = Some(e.to_string());
+                    withheld = Some(orbit_status::COVARIANCE_ABSENT.to_string());
                 }
             }
         }
@@ -526,7 +549,7 @@ impl Products {
             cov_joint_width,
             cov_tri,
             orbit_delivered: true,
-            orbit_status: "delivered".to_string(),
+            orbit_status: orbit_status::DELIVERED.to_string(),
             mix: None,
         }
     }
@@ -539,33 +562,24 @@ impl Products {
     /// `entry.cov_kind` (whose `Linear` default on a covariance-free row names no
     /// delivery). The six mix tallies are the engine's PRE-RETENTION
     /// `entry.mixture_tally`, present only on a row it derived as a mixture;
-    /// absent → `na`, never a fabricated zero. `expected_cov` names a withheld
-    /// covariance on the outcome rather than dropping it.
-    fn from_ephemeris(
-        entry: &EphemerisEntry,
-        outcome: Option<&OrbitOutcome>,
-        expected_cov: bool,
-    ) -> Self {
+    /// absent → `na`, never a fabricated zero. A delivered entry reads
+    /// `delivered` whether or not it carries a joint: the ephemeris seam has no
+    /// withheld-covariance channel (the rust reference's rule, and the python
+    /// channel's), so a covariance-free delivered row is told apart by its
+    /// absent kind / joint, not by a status spelling.
+    fn from_ephemeris(entry: &EphemerisEntry, outcome: Option<&OrbitOutcome>) -> Self {
         let mut resolved_method = None;
         let mut cov_kind = None;
         let mut cov_joint_width = None;
         let mut cov_tri = None;
-        let mut withheld: Option<String> = None;
-        match entry.joint.as_ref() {
-            Some(j) => {
-                resolved_method = Some(resolved_method_tag(j.kind));
-                cov_kind = Some(cov_kind_wire(j.kind));
-                cov_joint_width = Some(j.width as u32);
-                cov_tri = Some(j.tri.clone());
-            }
-            None => {
-                if expected_cov {
-                    withheld = Some("covariance absent from the ephemeris entry".to_string());
-                }
-            }
+        if let Some(j) = entry.joint.as_ref() {
+            resolved_method = Some(resolved_method_tag(j.kind));
+            cov_kind = Some(cov_kind_wire(j.kind));
+            cov_joint_width = Some(j.width as u32);
+            cov_tri = Some(j.tri.clone());
         }
         let (orbit_delivered, orbit_status) = match outcome {
-            Some(oc) => outcome_channel(oc, withheld.as_deref()),
+            Some(oc) => outcome_channel(oc, None),
             None => (false, "no_outcome".to_string()),
         };
         let mix = entry.mixture_tally.as_ref().map(|t| MixTallies {
@@ -662,6 +676,92 @@ fn run_daemon(ctx: &Context) -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
+/// Parse the EXCL token of a prop / eph daemon line: `-` (no exclusion) or the
+/// plan row's `excluded_perturbers_naif` as comma-separated NAIF ids, mapped to
+/// the origins the propagation config excludes, exactly as the core channel
+/// applies the row's exclusions. On a self-perturber row this keeps the body
+/// out of its own force model; without it the engine serves the body's SPK
+/// instead of integrating, a different request than the reference's.
+fn parse_excluded(tok: &str) -> Result<Vec<Origin>, String> {
+    if tok == "-" {
+        return Ok(Vec::new());
+    }
+    let ids = tok
+        .split(',')
+        .map(|s| {
+            s.parse::<i32>()
+                .map_err(|_| format!("bad_excluded_perturbers:{tok}"))
+        })
+        .collect::<Result<Vec<i32>, String>>()?;
+    naif_origins(&ids)
+}
+
+/// The origins NAIF ids name, for a propagation config's
+/// `excluded_perturbers`; an id with no origin is refused by name.
+fn naif_origins(ids: &[i32]) -> Result<Vec<Origin>, String> {
+    ids.iter()
+        .map(|&naif| Origin::from_naif_id(naif).ok_or_else(|| format!("unknown_naif_{naif}")))
+        .collect()
+}
+
+/// The one-shot `--mode prop` propagation config: the same fields the daemon
+/// line binds, the row's exclusions included, so this path cannot drop a
+/// config field the daemon carries.
+fn one_shot_prop_config(
+    cli: &Cli,
+    force: ForceModelTier,
+    method: UncertaintyMethod,
+) -> Result<PropagationConfig, String> {
+    Ok(PropagationConfig {
+        force_model: force,
+        excluded_perturbers: naif_origins(&cli.excluded_perturbers)?,
+        uncertainty_method: method,
+        frame: Frame::ICRF,
+        // Per-row fork-exec runner: only one orbit per invocation, so
+        // a Rayon pool buys nothing and burns thread budget when the
+        // driver runs many of these in parallel (the default
+        // `num_threads: None` would request all cores per process and
+        // hit ulimit -u very quickly).
+        num_threads: std::num::NonZeroUsize::new(1),
+        ..PropagationConfig::default()
+    })
+}
+
+/// The one-shot `--mode eph` ephemeris config (line and `--out` file), with
+/// the row's exclusions on the embedded propagation config.
+fn one_shot_eph_config(
+    cli: &Cli,
+    force: ForceModelTier,
+    method: UncertaintyMethod,
+) -> Result<EphemerisConfig, String> {
+    let mut cfg = EphemerisConfig::with_force_model(force);
+    // Per-row fork-exec runner — pin to 1 thread (see one_shot_prop_config).
+    cfg.propagation.num_threads = std::num::NonZeroUsize::new(1);
+    cfg.propagation.uncertainty_method = method;
+    cfg.propagation.excluded_perturbers = naif_origins(&cli.excluded_perturbers)?;
+    Ok(cfg)
+}
+
+/// The line for an orbit the engine declined: a call that returned no state /
+/// entry carries a FAILED per-orbit outcome, written as `refused
+/// failed:<variant> <engine text>` (the status token is the schema's
+/// `failed:<variant>`; the engine's text is the rest of the line). `None` when
+/// the outcome is not a failure, which the caller reports as a failure of its
+/// own: never an `ok` line built from unfilled values.
+fn refusal_line(outcome: Option<&OrbitOutcome>) -> Option<String> {
+    match outcome {
+        Some(OrbitOutcome::Failed { code, message }) => Some(format!(
+            "refused failed:{} {}",
+            propagate_failure_variant(*code, message)
+                .split_whitespace()
+                .collect::<Vec<_>>()
+                .join("_"),
+            message.replace(['\n', '\r'], " "),
+        )),
+        _ => None,
+    }
+}
+
 #[allow(clippy::type_complexity)]
 fn parse_prop_args(
     rest: &str,
@@ -671,16 +771,17 @@ fn parse_prop_args(
         ForceModelTier,
         Epoch,
         Option<(bool, UncertaintyMethod)>,
+        Vec<Origin>,
     ),
     String,
 > {
     // Layout (matches runner.c handle_prop): epoch x y z vx vy vz
     // a1 a2 a3 g0 g1 g2 g3 g4 force_model target non_grav_dt  (18 fields),
-    // plus an OPTIONAL 19th token: a `propagation_uncertainty` method tag.
-    // The driver's 18-field line leaves the method absent → covariance-free
-    // first order, output byte-identical to before. A 19th token requests
-    // that method and attaches the synthetic covariance (all tags but
-    // `none`); an unrecognized tag is refused by name.
+    // then the EXCL token (always sent; `-` for none), then an OPTIONAL
+    // `propagation_uncertainty` method tag. Without a tag the run is
+    // covariance-free first order; a tag requests that method and attaches
+    // the synthetic covariance (all tags but `none`); an unrecognized tag is
+    // refused by name.
     let mut tokens = rest.split_whitespace();
     let mut f: Vec<f64> = Vec::with_capacity(18);
     for _ in 0..18 {
@@ -689,6 +790,11 @@ fn parse_prop_args(
             None => return Err(format!("prop_parse_{}_fields", f.len())),
         }
     }
+    let excluded = parse_excluded(
+        tokens
+            .next()
+            .ok_or_else(|| "prop_parse_missing_excluded".to_string())?,
+    )?;
     let method = match tokens.next() {
         Some(tag) => {
             Some(method_for_tag(tag).ok_or_else(|| format!("unknown_uncertainty_method:{tag}"))?)
@@ -732,17 +838,20 @@ fn parse_prop_args(
     if non_grav_dt.is_finite() {
         orbit = orbit.with_non_grav_dt(Some(non_grav_dt));
     }
-    Ok((orbit, tier_from_int(force_model), target, method))
+    Ok((orbit, tier_from_int(force_model), target, method, excluded))
 }
 
 fn daemon_prop(ctx: &Context, rest: &str, warmed_up: &mut bool) -> Result<String, String> {
-    let (orbit, force, target, method) = parse_prop_args(rest)?;
+    let (orbit, force, target, method, excluded) = parse_prop_args(rest)?;
     let (attach_cov, umethod) = match &method {
         Some((a, m)) => (*a, m.clone()),
         None => (false, UncertaintyMethod::FirstOrder),
     };
     let cfg = PropagationConfig {
         force_model: force,
+        // The row's perturber exclusions, exactly as the core channel
+        // applies them.
+        excluded_perturbers: excluded,
         uncertainty_method: umethod,
         frame: Frame::ICRF,
         // Daemon mode also single-threaded: each call is one orbit, so
@@ -778,6 +887,15 @@ fn daemon_prop(ctx: &Context, rest: &str, warmed_up: &mut bool) -> Result<String
             best_ms = ms;
         }
         last_result = Some(result);
+    }
+    // A propagate that returned no state declined the orbit; its per-orbit
+    // outcome carries why. Never an `ok` line built from the zero initialisers.
+    if let Some(r) = last_result.as_ref()
+        && r.states.is_empty()
+    {
+        return refusal_line(r.outcomes.first()).ok_or_else(|| {
+            "propagate returned no state and no failed per-orbit outcome".to_string()
+        });
     }
     // No method → byte-identical to before. A method → append the delivered
     // per-method products so the driver can carry them into the schema's
@@ -820,7 +938,14 @@ fn daemon_eph(ctx: &Context, rest: &str) -> Result<String, String> {
     let obs_code = tokens
         .next()
         .ok_or_else(|| "eph_parse_missing_observer".to_string())?;
-    // Optional method token after the observer (exactly like `parse_prop_args`):
+    // The EXCL token after the observer (always sent; `-` for none), bound to
+    // the embedded propagation config like the prop line's.
+    let excluded = parse_excluded(
+        tokens
+            .next()
+            .ok_or_else(|| "eph_parse_missing_excluded".to_string())?,
+    )?;
+    // Optional method token after EXCL (exactly like `parse_prop_args`):
     // a composite uncertainty tag → attach the synthetic covariance and request
     // that rung, so the entry carries a delivered joint; absent → the
     // covariance-free line, byte-identical to before.
@@ -872,6 +997,9 @@ fn daemon_eph(ctx: &Context, rest: &str) -> Result<String, String> {
     let mut cfg = EphemerisConfig::with_force_model(force);
     cfg.propagation.num_threads = std::num::NonZeroUsize::new(1);
     cfg.propagation.uncertainty_method = umethod;
+    // The row's perturber exclusions, exactly as the core channel applies them
+    // to its ephemeris config.
+    cfg.propagation.excluded_perturbers = excluded;
     let _ = ctx.generate_ephemeris(std::slice::from_ref(&orbit), &observers, &cfg);
     let mut best_ms = f64::INFINITY;
     let mut last_ra = f64::NAN;
@@ -896,6 +1024,16 @@ fn daemon_eph(ctx: &Context, rest: &str) -> Result<String, String> {
         }
         last_eph = Some(entries);
     }
+    // An ephemeris that returned no entry declined the orbit; its per-orbit
+    // outcome carries why. Without this the line printed the NaN initialisers
+    // above as an `ok` row the driver could not parse.
+    if let Some(eph) = last_eph.as_ref()
+        && eph.entries.is_empty()
+    {
+        return refusal_line(eph.outcomes.first()).ok_or_else(|| {
+            "generate_ephemeris returned no entry and no failed per-orbit outcome".to_string()
+        });
+    }
     // No method → byte-identical to before. A method → append the delivered
     // per-method products read off the entry's own packed joint + pre-retention
     // tally, exactly as the prop line does off the propagated state.
@@ -908,9 +1046,9 @@ fn daemon_eph(ctx: &Context, rest: &str) -> Result<String, String> {
             let products = last_eph
                 .as_ref()
                 .and_then(|eph| {
-                    eph.entries.first().map(|e| {
-                        Products::from_ephemeris(e, eph.outcomes.first(), attach_cov).render()
-                    })
+                    eph.entries
+                        .first()
+                        .map(|e| Products::from_ephemeris(e, eph.outcomes.first()).render())
                 })
                 .unwrap_or_default();
             Ok(format!(
@@ -1189,18 +1327,7 @@ fn run_prop(
         }
     };
     let orbit = build_orbit(cli, attach_cov);
-    let cfg = PropagationConfig {
-        force_model: force,
-        uncertainty_method: method,
-        frame: Frame::ICRF,
-        // Per-row fork-exec runner: only one orbit per invocation, so
-        // a Rayon pool buys nothing and burns thread budget when the
-        // driver runs many of these in parallel (the default
-        // `num_threads: None` would request all cores per process and
-        // hit ulimit -u very quickly).
-        num_threads: std::num::NonZeroUsize::new(1),
-        ..PropagationConfig::default()
-    };
+    let cfg = one_shot_prop_config(cli, force, method)?;
 
     // Warm-up: first propagation pays one-time costs (lazy SPK segment
     // loads, gravity-field table allocations, jet-buffer allocator
@@ -1231,6 +1358,16 @@ fn run_prop(
         last_result = Some(result);
     }
 
+    // No state: the engine declined the orbit, said as the daemon line says
+    // it, never a line of the zero initialisers above.
+    if let Some(r) = last_result.as_ref()
+        && r.states.is_empty()
+    {
+        let line = refusal_line(r.outcomes.first())
+            .ok_or("propagate returned no state and no failed per-orbit outcome")?;
+        println!("{line}");
+        return Ok(());
+    }
     // Output: x y z vx vy vz time_ms. When a method was requested, the
     // delivered per-method products (resolved_method, packed joint, outcome,
     // mixture tallies) are appended as key=value tokens; without a method the
@@ -1286,9 +1423,7 @@ fn run_eph(
             .as_deref()
             .expect("--observer required for eph");
         let observers = ctx.get_observers(&[obs_code], &[target], Frame::ICRF, Origin::SSB)?;
-        let mut cfg = EphemerisConfig::with_force_model(force);
-        cfg.propagation.num_threads = std::num::NonZeroUsize::new(1);
-        cfg.propagation.uncertainty_method = method;
+        let cfg = one_shot_eph_config(cli, force, method)?;
         let result = ctx.generate_ephemeris(std::slice::from_ref(&orbit), &observers, &cfg)?;
         empyrean::write_ephemeris_csv(out, &result.entries)?;
         println!(
@@ -1321,12 +1456,14 @@ fn run_eph(
     // (ICRF, SSB) is the construction basis; see run_eph_line.
     let observers = ctx.get_observers(&[obs_code], &[target], Frame::ICRF, Origin::SSB)?;
 
-    let mut cfg = EphemerisConfig::with_force_model(force);
-    // Per-row fork-exec runner — pin to 1 thread (see run_prop comment).
-    cfg.propagation.num_threads = std::num::NonZeroUsize::new(1);
-    if let Some((_, m)) = &method {
-        cfg.propagation.uncertainty_method = m.clone();
-    }
+    let cfg = one_shot_eph_config(
+        cli,
+        force,
+        method
+            .as_ref()
+            .map(|(_, m)| m.clone())
+            .unwrap_or(UncertaintyMethod::FirstOrder),
+    )?;
 
     // Best-of-3 with one warm-up.
     let _ = ctx.generate_ephemeris(std::slice::from_ref(&orbit), &observers, &cfg);
@@ -1352,6 +1489,16 @@ fn run_eph(
         last_eph = Some(entries);
     }
 
+    // No entry: the engine declined the orbit, said as the daemon line says it,
+    // never a line of the NaN initialisers above.
+    if let Some(eph) = last_eph.as_ref()
+        && eph.entries.is_empty()
+    {
+        let line = refusal_line(eph.outcomes.first())
+            .ok_or("generate_ephemeris returned no entry and no failed per-orbit outcome")?;
+        println!("{line}");
+        return Ok(());
+    }
     // Output: ra_deg dec_deg rho_au lt_d time_ms, plus the delivered product
     // tokens when a method was requested (byte-identical without one).
     match method {
@@ -1363,9 +1510,9 @@ fn run_eph(
             let products = last_eph
                 .as_ref()
                 .and_then(|eph| {
-                    eph.entries.first().map(|e| {
-                        Products::from_ephemeris(e, eph.outcomes.first(), attach_cov).render()
-                    })
+                    eph.entries
+                        .first()
+                        .map(|e| Products::from_ephemeris(e, eph.outcomes.first()).render())
                 })
                 .unwrap_or_default();
             println!(
@@ -1625,6 +1772,131 @@ mod tests {
         assert!(s.contains("mix_n_sky_linearization_refused=na"), "{s}");
         // Every value is a single whitespace-free token.
         assert!(!s.contains("resolved_method= "), "{s}");
+    }
+
+    /// The shared propagation readback ([`Products::from_result`]) delivers
+    /// the SAMPLING kinds off the per-state packed joint, not `cov_withheld`
+    /// — the cli twin of the rust channel's test of the same name. A
+    /// SigmaPoint propagation delivers a width-6 joint (21-cell lower
+    /// triangle) tagged kind 5; a MonteCarlo one tagged kind 4; both read
+    /// `orbit_status == "delivered"`. The sensitivity-chain
+    /// `covariance_at_cartesian` accessor returns an error for these kinds,
+    /// so the pre-fix readback marked them `cov_withheld`. Mutation: read the
+    /// chain accessor only in `from_result` → `cov_kind` `None`, status
+    /// `cov_withheld:…` → red.
+    #[test]
+    fn sampled_rows_deliver_the_per_state_joint_not_cov_withheld() {
+        let ctx = match Context::from_data_dir(None) {
+            Ok(c) => c,
+            Err(e) => {
+                eprintln!("SKIP: ephemeris data tier unavailable ({e})");
+                return;
+            }
+        };
+        let state = CoordinateState {
+            epoch: Epoch::from_mjd_tdb(59000.0),
+            elements: [1.0, 0.1, 0.05, -0.002, 0.017, 0.001],
+            covariance: Some(synthetic_covariance()),
+            representation: Representation::Cartesian,
+            frame: Frame::ICRF,
+            origin: Origin::SSB,
+        };
+        let orbit = Orbit::new(state);
+        let target = Epoch::from_mjd_tdb(59_030.0);
+        for (tag, want_wire) in [
+            (
+                um::SIGMA_POINT_DETECTION_ON,
+                cov_kind_wire(CovarianceKind::SigmaPoint),
+            ),
+            (
+                um::MONTE_CARLO_DETECTION_ON,
+                cov_kind_wire(CovarianceKind::MonteCarlo),
+            ),
+        ] {
+            let (attach, method) = method_for_tag(tag).expect("a vocabulary tag");
+            let cfg = PropagationConfig {
+                force_model: ForceModelTier::Standard,
+                uncertainty_method: method,
+                frame: Frame::ICRF,
+                ..PropagationConfig::default()
+            };
+            let result = ctx
+                .propagate(std::slice::from_ref(&orbit), &[target], &cfg)
+                .expect("propagation under the requested method");
+            let p = Products::from_result(&result, attach);
+            assert_eq!(p.cov_kind, Some(want_wire), "{tag}: delivered kind");
+            assert_eq!(p.cov_joint_width, Some(6), "{tag}: state-only joint width");
+            assert_eq!(
+                p.cov_tri.as_ref().map(Vec::len),
+                Some(21),
+                "{tag}: packed 6×6 lower triangle"
+            );
+            assert!(p.orbit_delivered, "{tag}: the orbit delivered its state");
+            assert_eq!(
+                p.orbit_status,
+                orbit_status::DELIVERED,
+                "{tag}: delivered, never cov_withheld"
+            );
+        }
+    }
+
+    /// The one-shot `--mode prop` / `--mode eph` configs carry the row's
+    /// exclusions exactly as the daemon lines do, so the one-shot path cannot
+    /// drop the config field whose absence sent the self-perturber rows a
+    /// different request than the reference's. Mutation: drop the
+    /// `excluded_perturbers` line from either config builder → red.
+    #[test]
+    fn one_shot_configs_carry_the_rows_exclusions() {
+        let cli = Cli::try_parse_from([
+            "empyrean-cli-runner",
+            "--mode",
+            "prop",
+            "--epoch",
+            "61200",
+            "--target",
+            "61565",
+            "--excluded-perturbers",
+            "2000004,2000002",
+        ])
+        .expect("parse");
+        let want = naif_origins(&[2000004, 2000002]).expect("two SB441 bodies");
+        assert_eq!(want.len(), 2);
+        let prop = one_shot_prop_config(
+            &cli,
+            ForceModelTier::Standard,
+            UncertaintyMethod::FirstOrder,
+        )
+        .expect("prop config");
+        assert_eq!(prop.excluded_perturbers, want);
+        let eph = one_shot_eph_config(
+            &cli,
+            ForceModelTier::Standard,
+            UncertaintyMethod::FirstOrder,
+        )
+        .expect("eph config");
+        assert_eq!(eph.propagation.excluded_perturbers, want);
+        // Omitted → no exclusion; an id with no origin is refused by name.
+        let none = Cli::try_parse_from([
+            "empyrean-cli-runner",
+            "--mode",
+            "prop",
+            "--epoch",
+            "61200",
+            "--target",
+            "61565",
+        ])
+        .expect("parse");
+        assert!(
+            one_shot_prop_config(
+                &none,
+                ForceModelTier::Standard,
+                UncertaintyMethod::FirstOrder
+            )
+            .expect("prop config")
+            .excluded_perturbers
+            .is_empty()
+        );
+        assert!(naif_origins(&[123_456_789]).is_err());
     }
 
     // An f64 (covariance-free) row renders every covariance field `na` and the

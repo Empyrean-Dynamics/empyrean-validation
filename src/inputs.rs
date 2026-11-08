@@ -38,9 +38,8 @@ impl InputProduct {
 
 /// The Horizons state-vector lookup key (`<command>|<epoch MJD TDB>`), named
 /// in the error so a re-mint can reproduce exactly the missing response. This
-/// is the semantic key, not the on-disk file name — the key→file-name
-/// sanitize rule lives in the engine (and in the two existing readers) and is
-/// deliberately not re-spelled here.
+/// is the semantic key, not the on-disk file name; [`cache_file_name`] maps a
+/// key to the file the snapshot holds it in.
 pub fn vectors_key(command: &str, epoch_mjd_tdb: f64) -> String {
     format!("{command}|{epoch_mjd_tdb:.8}")
 }
@@ -52,6 +51,32 @@ pub fn vectors_key(command: &str, epoch_mjd_tdb: f64) -> String {
 /// reproduces it from these three values.
 pub fn ephemeris_key(command: &str, observer: &str, time_mjd_tdb: f64) -> String {
     format!("{command}|{observer}|{time_mjd_tdb:.8} MJD TDB")
+}
+
+/// The snapshot file a cache key lives in: `<sanitized key>.json`.
+///
+/// The snapshot's `sbdb/` and `horizons/` files are the engine's own disk
+/// cache: the mint's `plan --cache-dir` hands each key (an SBDB entry's key is
+/// the catalog's `sbdb_query`) to the engine, whose disk cache names the file
+/// by keeping every ASCII letter, digit, `_`, `-` and `.` and writing `_` for
+/// every other character (`/`, space, `|`, `;`, `=`, `'`, ...). This is that
+/// rule, for the reader here that opens a snapshot file by key instead of
+/// asking the engine (`merge-external --jpl-sbdb-cache`). A reader with its
+/// own rule reports an input missing that the snapshot holds: replacing only
+/// spaces turned `C/2023 A3` into `C/2023_A3.json`, while the snapshot holds
+/// `C_2023_A3.json`.
+pub fn cache_file_name(key: &str) -> String {
+    let stem: String = key
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.') {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    format!("{stem}.json")
 }
 
 /// Build the fatal message for a product the pinned snapshot does not carry.
@@ -111,6 +136,73 @@ mod tests {
             InputProduct::HorizonsEphemeris.label(),
             "Horizons ephemeris"
         );
+    }
+
+    #[test]
+    fn cache_file_name_is_the_engine_disk_cache_rule() {
+        // File names the pinned snapshot carries, from the keys stored inside
+        // those files.
+        // A comet: the slash and the space both become `_`.
+        assert_eq!(cache_file_name("C/2023 A3"), "C_2023_A3.json");
+        // A provisional designation with a space.
+        assert_eq!(cache_file_name("2024 YR4"), "2024_YR4.json");
+        // Numbered bodies, bare and with a name.
+        assert_eq!(cache_file_name("3200"), "3200.json");
+        assert_eq!(cache_file_name("7 Iris"), "7_Iris.json");
+        // A Horizons key: `;`, `=` and `|` become `_`; `.` is kept.
+        assert_eq!(
+            cache_file_name("DES=103P;CAP;NOFRAG|500|2451677.5000000000"),
+            "DES_103P_CAP_NOFRAG_500_2451677.5000000000.json"
+        );
+        assert_eq!(
+            cache_file_name("10;|500|2455725.5000000000"),
+            "10__500_2455725.5000000000.json"
+        );
+        // An apostrophe becomes `_` like any other character outside the
+        // kept set. (The catalog queries SBDB for 1I/'Oumuamua as `1I`, so
+        // this name never reaches the SBDB cache; the rule still covers it.)
+        assert_eq!(cache_file_name("1I/'Oumuamua"), "1I__Oumuamua.json");
+        assert_eq!(cache_file_name("1I"), "1I.json");
+    }
+
+    /// Every catalog object's SBDB file is where the reader looks for it, and
+    /// every SBDB file in the snapshot is named from its stored key by the
+    /// same rule. Reads the fetched snapshot (`make fixtures`, pinned by
+    /// fixtures/manifest.json), as the radar-fixture catalog test does.
+    #[test]
+    fn every_catalog_sbdb_query_names_a_snapshot_file() {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("fixtures/sbdb");
+        for o in crate::catalog::all_objects() {
+            let p = dir.join(cache_file_name(o.sbdb_query));
+            assert!(
+                p.is_file(),
+                "{}: no SBDB snapshot file at {} for query `{}`",
+                o.name,
+                p.display(),
+                o.sbdb_query
+            );
+        }
+        let entries =
+            std::fs::read_dir(&dir).unwrap_or_else(|e| panic!("read {}: {e}", dir.display()));
+        let mut n = 0;
+        for e in entries {
+            let p = e.unwrap().path();
+            if p.extension().and_then(|x| x.to_str()) != Some("json") {
+                continue;
+            }
+            let v: serde_json::Value =
+                serde_json::from_str(&std::fs::read_to_string(&p).unwrap()).unwrap();
+            let key = v["key"]
+                .as_str()
+                .unwrap_or_else(|| panic!("{}: no key", p.display()));
+            assert_eq!(
+                cache_file_name(key),
+                p.file_name().unwrap().to_str().unwrap(),
+                "key `{key}`"
+            );
+            n += 1;
+        }
+        assert_eq!(n, crate::catalog::all_objects().len());
     }
 
     #[test]

@@ -411,6 +411,106 @@ def test_synthetic_covariance_matches_the_rust_channel() -> None:
                 assert c[i, j] == 0.0
 
 
+# ── Perturber exclusions and declined orbits ─────────────────────────────────
+
+_PLAN = _REPO / "results" / "validation_plan.json"
+
+
+def _vesta_eph_row(tag: str) -> dict | None:
+    """Vesta's F51 dt=+365 ephemeris plan row under ``tag`` (a self-perturber
+    row: ``excluded_perturbers_naif`` names Vesta itself), read off the staged
+    plan; ``None`` when no plan is staged."""
+    if not _PLAN.exists():
+        return None
+    for r in json.loads(_PLAN.read_text()):
+        if (
+            r.get("object") == "Vesta"
+            and r.get("test_type") == "ephemeris"
+            and r.get("observer") == "F51"
+            and r.get("dt_days") == 365.0
+            and r.get("propagation_uncertainty") == tag
+        ):
+            return r
+    return None
+
+
+def test_write_declined_records_the_refusal_without_residuals() -> None:
+    """A declined orbit is recorded on its row by name — ``orbit_delivered``
+    false, the ``failed:<variant>`` status, the engine's text in ``notes`` — and
+    its measured fields are left untouched (the caller resets them to null)."""
+    row = {"notes": "SB441-N16 perturber", "d_ra_arcsec": None}
+    run._write_declined(row, run._Declined("failed:other", "sampled sky delivery refused"))
+    assert row["orbit_delivered"] is False
+    assert row["orbit_status"] == "failed:other"
+    assert row["notes"] == (
+        "SB441-N16 perturber; engine declined the orbit: sampled sky delivery refused"
+    )
+    assert row["d_ra_arcsec"] is None
+
+
+@pytest.mark.skipif(
+    _vesta_eph_row("sigma_point_detection_on") is None, reason="no staged plan"
+)
+def test_vesta_exclusion_delivers_and_its_absence_is_a_declined_row(tmp_path, capsys) -> None:
+    """From-engine, on Vesta's own self-perturber row: with the plan's exclusion
+    the sigma-point ephemeris DELIVERS (the core channel's request), with finite
+    residuals; with the exclusion forced off the engine declines the orbit, and
+    the runner writes ONE declined row naming the engine's text (never a skip,
+    never a NaN residual)."""
+    r = _vesta_eph_row("sigma_point_detection_on")
+    forced = dict(r, excluded_perturbers_naif=[], notes="forced")
+    rows = _run([r, forced], tmp_path)
+    assert len(rows) == 2, "a declined orbit is a row, not a skip"
+    delivered, declined = rows
+    assert delivered["orbit_delivered"] is True
+    assert delivered["orbit_status"] == "delivered"
+    for f in ("d_ra_arcsec", "d_dec_arcsec", "d_rho_km"):
+        assert delivered[f] is not None and delivered[f] == delivered[f], f
+    assert declined["orbit_delivered"] is False
+    assert declined["orbit_status"] == "failed:other"
+    assert "sampled sky delivery refused" in declined["notes"], declined["notes"]
+    for f in ("emp_time_ms", "separation_arcsec", "d_ra_arcsec", "d_dec_arcsec", "d_rho_km"):
+        assert declined[f] is None, f
+    err = capsys.readouterr().err
+    assert "Loaded 2 rows; wrote 1, declined 1, skipped 0 (1 + 1 + 0 = 2)" in err, err
+
+
+def test_row_account_line_is_honest() -> None:
+    """Every plan row is counted once — written, declined or skipped — so
+    W + D + S = N; a declined row is not also counted as skipped, and the
+    non-grav row the legacy fit's second pass generates stands for the plan's
+    non_grav_recovery row. A surplus row fails the account."""
+    acct = run._RowAccount(5)
+    out: list = []
+    plan = [
+        {"test_type": "propagation"},
+        {"test_type": "ephemeris"},
+        {"test_type": "orbit_determination_transport"},
+        {"test_type": "orbit_determination"},
+        {"test_type": "non_grav_recovery"},
+    ]
+    acct.begin(plan[0], out)
+    out.append({"test_type": "propagation"})
+    acct.begin(plan[1], out)
+    out.append(acct.declined_row({"test_type": "ephemeris", "orbit_delivered": False}))
+    acct.begin(plan[2], out)  # transport: not produced, no row
+    acct.begin(plan[3], out)
+    out.append({"test_type": "non_grav_recovery"})  # the second pass's row
+    out.append({"test_type": "orbit_determination"})
+    acct.begin(plan[4], out)  # the plan's non-grav row: written by the pass above
+    line, ok = acct.line(out, "CH", "out.json")
+    assert ok, line
+    assert line.startswith("Loaded 5 rows; wrote 3, declined 1, skipped 1 (3 + 1 + 1 = 5); 4 CH rows")
+    # A plan non-grav row with no generated row is skipped; a surplus row fails.
+    acct = run._RowAccount(2)
+    out = []
+    acct.begin({"test_type": "non_grav_recovery"}, out)
+    acct.begin({"test_type": "propagation"}, out)
+    out.extend([{"test_type": "propagation"}, {"test_type": "propagation"}])
+    w, d, s, ok = acct.finish(out)
+    assert (w, d, s, ok) == (1, 0, 1, False)
+
+
 if __name__ == "__main__":
     os.environ.setdefault("EMPYREAN_DATA_DIR", _DATA_DIR)
     raise SystemExit(pytest.main([__file__, "-v"]))

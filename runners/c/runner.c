@@ -6,9 +6,16 @@
  *
  * Four modes, dispatched on the first whitespace-separated token:
  *
- *   prop EPOCH IC[6] A1 A2 A3 G[5] FORCE TARGET [METHOD]
+ *   prop EPOCH IC[6] A1 A2 A3 G[5] FORCE TARGET DT EXCL [METHOD]
  *     → ok x y z vx vy vz time_ms
- *       The optional 19th METHOD token is the plan row's
+ *       EXCL (the 19th token, always sent) is the plan row's
+ *       `excluded_perturbers_naif`: `-` for none, or a comma-separated list of
+ *       NAIF ids, bound to `num_excluded_perturbers` /
+ *       `excluded_perturbers_naif` exactly as the core channel applies the
+ *       row's exclusions. On a self-perturber row this keeps the body out of
+ *       its own force model; without it the engine serves the body's SPK
+ *       instead of integrating, a different request than the reference's.
+ *       The optional 20th METHOD token is the plan row's
  *       `<method>_<arm>` uncertainty tag (every covariance-bearing method;
  *       `none` / the untagged legacy row send the bare 18-field line). With a
  *       token, the synthetic input covariance is attached, the rung set, and
@@ -21,9 +28,11 @@
  *       outcome (`outcomes[0]`), and — for a mixture — `mixture_tally`. An
  *       absent scalar / triangle renders as the literal `na`.
  *
- *   eph EPOCH IC[6] A1 A2 A3 G[5] FORCE TARGET OBS_CODE [METHOD]
+ *   eph EPOCH IC[6] A1 A2 A3 G[5] FORCE TARGET DT OBS_CODE EXCL [METHOD]
  *     → ok ra_deg dec_deg rho_au lt_d time_ms
- *       The optional 20th METHOD token (after the observer) carries the plan
+ *       EXCL (after the observer, always sent) is the row's exclusions, as on
+ *       the prop line, bound to the embedded propagation config.
+ *       The optional 21st METHOD token (after EXCL) carries the plan
  *       row's `<method>_<arm>` uncertainty tag, exactly like the prop line's
  *       19th token: with a token the synthetic covariance is attached, the rung
  *       set, and the same 12 `key=value` product tokens appended after
@@ -50,6 +59,12 @@
  *       a* / a*_sigma are emitted as the token "null" when non-grav was
  *       not actually recovered (has_covariance_9x9 == 0, or a non-finite
  *       fitted value) — see the None/NaN guard below.
+ *
+ * A prop / eph call that returns 0 with no state / entry is the engine
+ * declining that orbit; its per-orbit outcome says why:
+ *     → refused failed:<variant> <engine text>
+ * (the status token is the schema's `failed:<variant>`; the engine's text is
+ * the rest of the line). Never an `ok` line built from unfilled values.
  *
  * On any failure: fail <message>
  *
@@ -360,6 +375,61 @@ static void sanitize_status(char* dst, size_t dstsz, const char* src) {
     dst[j] = '\0';
 }
 
+/* The most NAIF ids one EXCL token may carry. */
+#define MAX_EXCLUDED_PERTURBERS 16
+
+/* Parse the EXCL token of a prop / eph line into `out` (at most `max` ids):
+ * `-` means no exclusion; otherwise a comma-separated list of NAIF ids. Returns
+ * the count, or -1 for a malformed token (the caller refuses it by name). */
+static int parse_excluded(const char* tok, int32_t* out, int max) {
+    if (strcmp(tok, "-") == 0) {
+        return 0;
+    }
+    int n = 0;
+    const char* p = tok;
+    for (;;) {
+        char* end = NULL;
+        long v = strtol(p, &end, 10);
+        if (end == p || n >= max) {
+            return -1;
+        }
+        out[n++] = (int32_t)v;
+        if (*end == '\0') {
+            return n;
+        }
+        if (*end != ',' || end[1] == '\0') {
+            return -1;
+        }
+        p = end + 1;
+    }
+}
+
+/* Read why the engine declined an orbit: a call that returned 0 with no state /
+ * entry carries a FAILED per-orbit outcome. Fills `status` with the sanitized
+ * `failed:<variant>` token and `message` with the engine's own text on one line
+ * (newlines would split the protocol line). Returns 1 when such an outcome is
+ * present, 0 when there is none (the caller reports that as a failure). */
+static int read_refusal(const struct EmpyreanOrbitOutcome* outcomes, uintptr_t num_orbits,
+                        char* status, size_t status_sz, char* message, size_t message_sz) {
+    if (!outcomes || num_orbits < 1 || outcomes[0].status != EMPYREAN_ORBIT_OUTCOME_FAILED) {
+        return 0;
+    }
+    char variant[256];
+    char raw[512];
+    propagate_failure_variant(variant, sizeof(variant), outcomes[0].error_code,
+                              outcomes[0].error_message);
+    snprintf(raw, sizeof(raw), "failed:%s", variant);
+    sanitize_status(status, status_sz, raw);
+    const char* text = outcomes[0].error_message ? outcomes[0].error_message : "";
+    size_t j = 0;
+    for (size_t i = 0; text[i] && j + 1 < message_sz; i++) {
+        char c = text[i];
+        message[j++] = (c == '\n' || c == '\r') ? ' ' : c;
+    }
+    message[j] = '\0';
+    return 1;
+}
+
 /* The 0.11 per-method products carried on a propagation or OD fit row, read off
  * the engine-delivered result (never recomputed). Absent scalars render as the
  * `na` token the driver maps to null; the packed triangle is a comma-separated
@@ -498,11 +568,13 @@ static void capture_prop_products(struct Products* p,
  * six mixture tallies are the engine's PRE-RETENTION accounting
  * (`entry->has_mixture_tally` + `entry->mixture_tally`), unlike the propagation
  * row's retained-component tally. Copy the library-owned `tri` out BEFORE the
- * result is freed. `attach` names a withheld covariance rather than dropping it. */
+ * result is freed. A delivered entry reads `delivered` whether or not it carries
+ * a joint: the ephemeris seam has no withheld-covariance channel (the rust
+ * reference's rule, and the python channel's), so a covariance-free delivered
+ * row is told apart by its absent kind / joint, not by a status spelling. */
 static void capture_eph_products(struct Products* p,
                                  const struct EmpyreanEphemerisResult* res,
-                                 const struct EmpyreanEphemerisEntry* entry,
-                                 int attach) {
+                                 const struct EmpyreanEphemerisEntry* entry) {
     memset(p, 0, sizeof(*p));
     const struct EmpyreanPackedJoint* j = &entry->joint;
     int have_cov = (j->width > 0 && j->tri != NULL);
@@ -529,12 +601,7 @@ static void capture_eph_products(struct Products* p,
         sanitize_status(p->orbit_status, sizeof(p->orbit_status), raw);
     } else if (oc) {
         p->orbit_delivered = 1;
-        if (attach && !have_cov) {
-            sanitize_status(p->orbit_status, sizeof(p->orbit_status),
-                            "cov_withheld:covariance_absent");
-        } else {
-            sanitize_status(p->orbit_status, sizeof(p->orbit_status), "delivered");
-        }
+        sanitize_status(p->orbit_status, sizeof(p->orbit_status), "delivered");
     } else {
         p->orbit_delivered = 0;
         sanitize_status(p->orbit_status, sizeof(p->orbit_status), "no_outcome");
@@ -556,22 +623,29 @@ static int handle_prop(EmpyreanContext* ctx, const char* rest, int* warmed_up) {
     int force_model;
     double target;
     double non_grav_dt;
-    /* Optional 19th token: the plan row's `propagation_uncertainty` composite
-     * tag (every covariance-bearing method; `none` / the untagged legacy row
-     * send the bare 18-field line, unchanged). `%63s` sets `parsed == 19` only
-     * when a token is present. */
+    /* The 19th token is the row's exclusions (EXCL, always sent); the optional
+     * 20th is the plan row's `propagation_uncertainty` composite tag (every
+     * covariance-bearing method; `none` / the untagged legacy row send no
+     * tag). `%63s` sets `parsed == 20` only when a tag is present. */
+    char excl_tok[128] = {0};
     char method[64] = {0};
     int parsed = sscanf(
         rest,
-        "%lf %lf %lf %lf %lf %lf %lf %lf %lf %lf %lf %lf %lf %lf %lf %d %lf %lf %63s",
+        "%lf %lf %lf %lf %lf %lf %lf %lf %lf %lf %lf %lf %lf %lf %lf %d %lf %lf %127s %63s",
         &epoch, &x, &y, &z, &vx, &vy, &vz,
         &a1, &a2, &a3, &g[0], &g[1], &g[2], &g[3], &g[4],
-        &force_model, &target, &non_grav_dt, method);
-    if (parsed != 18 && parsed != 19) {
+        &force_model, &target, &non_grav_dt, excl_tok, method);
+    if (parsed != 19 && parsed != 20) {
         printf("fail prop_parse_%d_fields\n", parsed);
         return 0;
     }
-    int has_method = (parsed == 19);
+    int has_method = (parsed == 20);
+    int32_t excluded[MAX_EXCLUDED_PERTURBERS];
+    int n_excluded = parse_excluded(excl_tok, excluded, MAX_EXCLUDED_PERTURBERS);
+    if (n_excluded < 0) {
+        printf("fail bad_excluded_perturbers_%s\n", excl_tok);
+        return 0;
+    }
 
     double pos[3] = {x, y, z}, vel[3] = {vx, vy, vz};
     struct EmpyreanOrbit orbit;
@@ -579,6 +653,10 @@ static int handle_prop(EmpyreanContext* ctx, const char* rest, int* warmed_up) {
     orbit.non_grav_dt = non_grav_dt;
     struct EmpyreanPropagationConfig cfg;
     build_prop_config(&cfg, force_model);
+    /* The row's perturber exclusions, exactly as the core channel applies them
+     * (`excluded` outlives every propagate call below). */
+    cfg.num_excluded_perturbers = (uintptr_t)n_excluded;
+    cfg.excluded_perturbers_naif = n_excluded > 0 ? excluded : NULL;
 
     /* Per-method path: bind `uncertainty_method` and, for a covariance-bearing
      * method, attach the synthetic input covariance as the single packed joint.
@@ -616,6 +694,12 @@ static int handle_prop(EmpyreanContext* ctx, const char* rest, int* warmed_up) {
     double best_ms = 1.0e308;
     int last_code = 0;
     const char* last_err = NULL;
+    /* Set when the call returned 0 with no state: the engine declined the
+     * orbit, and `refusal_*` carry its per-orbit outcome. */
+    int no_state = 0;
+    int refused = 0;
+    char refusal_status[512] = {0};
+    char refusal_msg[2048] = {0};
 
     for (int rep = 0; rep < 3; rep++) {
         struct EmpyreanPropagationResult result;
@@ -623,9 +707,16 @@ static int handle_prop(EmpyreanContext* ctx, const char* rest, int* warmed_up) {
         double t0 = now_ms();
         int code = empyrean_propagate(ctx, &orbit, 1, &target, 1, &cfg, &result);
         double ms = now_ms() - t0;
-        if (code != 0 || result.num_states < 1) {
+        if (code != 0) {
             last_code = code;
             last_err = empyrean_last_error();
+            empyrean_propagation_result_free(&result);
+            break;
+        }
+        if (result.num_states < 1) {
+            no_state = 1;
+            refused = read_refusal(result.outcomes, result.num_orbits, refusal_status,
+                                   sizeof(refusal_status), refusal_msg, sizeof(refusal_msg));
             empyrean_propagation_result_free(&result);
             break;
         }
@@ -640,6 +731,14 @@ static int handle_prop(EmpyreanContext* ctx, const char* rest, int* warmed_up) {
     }
     if (last_code != 0) {
         printf("fail %s\n", last_err ? last_err : "");
+        return 0;
+    }
+    if (refused) {
+        printf("refused %s %s\n", refusal_status, refusal_msg);
+        return 0;
+    }
+    if (no_state) {
+        printf("fail propagate returned no state and no failed per-orbit outcome\n");
         return 0;
     }
     if (!has_method) {
@@ -664,21 +763,29 @@ static int handle_eph(EmpyreanContext* ctx, const char* rest) {
     double target;
     double non_grav_dt;
     char obs_code[16] = {0};
-    /* Optional 20th token: the plan row's `propagation_uncertainty` composite
-     * tag. `%63s` sets `parsed == 20` only when present; a 19-field line (no
-     * method) stays the covariance-free line, byte-identical to before. */
+    /* After the observer: the row's exclusions (EXCL, always sent), then the
+     * optional `propagation_uncertainty` composite tag. `%63s` sets
+     * `parsed == 21` only when a tag is present; without one the line stays
+     * covariance-free. */
+    char excl_tok[128] = {0};
     char method[64] = {0};
     int parsed = sscanf(
         rest,
-        "%lf %lf %lf %lf %lf %lf %lf %lf %lf %lf %lf %lf %lf %lf %lf %d %lf %lf %15s %63s",
+        "%lf %lf %lf %lf %lf %lf %lf %lf %lf %lf %lf %lf %lf %lf %lf %d %lf %lf %15s %127s %63s",
         &epoch, &x, &y, &z, &vx, &vy, &vz,
         &a1, &a2, &a3, &g[0], &g[1], &g[2], &g[3], &g[4],
-        &force_model, &target, &non_grav_dt, obs_code, method);
-    if (parsed != 19 && parsed != 20) {
+        &force_model, &target, &non_grav_dt, obs_code, excl_tok, method);
+    if (parsed != 20 && parsed != 21) {
         printf("fail eph_parse_%d_fields\n", parsed);
         return 0;
     }
-    int has_method = (parsed == 20);
+    int has_method = (parsed == 21);
+    int32_t excluded[MAX_EXCLUDED_PERTURBERS];
+    int n_excluded = parse_excluded(excl_tok, excluded, MAX_EXCLUDED_PERTURBERS);
+    if (n_excluded < 0) {
+        printf("fail bad_excluded_perturbers_%s\n", excl_tok);
+        return 0;
+    }
 
     double pos[3] = {x, y, z}, vel[3] = {vx, vy, vz};
     struct EmpyreanOrbit orbit;
@@ -693,6 +800,10 @@ static int handle_eph(EmpyreanContext* ctx, const char* rest) {
      * propagation phase is integrated in EclipticJ2000. */
     cfg.propagation.frame = 1; /* EclipticJ2000 */
     cfg.compute_diagnostics = 1;
+    /* The row's perturber exclusions, exactly as the core channel applies them
+     * to its ephemeris config (`excluded` outlives every generate call). */
+    cfg.propagation.num_excluded_perturbers = (uintptr_t)n_excluded;
+    cfg.propagation.excluded_perturbers_naif = n_excluded > 0 ? excluded : NULL;
 
     /* Per-method path: bind `uncertainty_method` and, for a covariance-bearing
      * method, attach the synthetic input covariance as the single packed joint.
@@ -736,6 +847,13 @@ static int handle_eph(EmpyreanContext* ctx, const char* rest) {
     const char* last_err = NULL;
     struct Products prod;
     memset(&prod, 0, sizeof(prod));
+    /* Set when the call returned 0 with no entry: the engine declined the
+     * orbit, and `refusal_*` carry its per-orbit outcome. Without this the
+     * line printed the NaN initialisers above as an `ok` row. */
+    int no_entry = 0;
+    int refused = 0;
+    char refusal_status[512] = {0};
+    char refusal_msg[2048] = {0};
 
     for (int rep = 0; rep < 3; rep++) {
         memset(&result, 0, sizeof(result));
@@ -744,9 +862,16 @@ static int handle_eph(EmpyreanContext* ctx, const char* rest) {
                                               obs_result.observers, 1,
                                               &cfg, &result);
         double ms = now_ms() - t0;
-        if (rc != 0 || result.num_entries < 1) {
+        if (rc != 0) {
             last_code = rc;
             last_err = empyrean_last_error();
+            empyrean_ephemeris_result_free(&result);
+            break;
+        }
+        if (result.num_entries < 1) {
+            no_entry = 1;
+            refused = read_refusal(result.outcomes, result.num_orbits, refusal_status,
+                                   sizeof(refusal_status), refusal_msg, sizeof(refusal_msg));
             empyrean_ephemeris_result_free(&result);
             break;
         }
@@ -759,7 +884,7 @@ static int handle_eph(EmpyreanContext* ctx, const char* rest) {
          * delivered entry (copying the library-owned joint triangle) before the
          * free. */
         if (has_method) {
-            capture_eph_products(&prod, &result, &result.entries[0], attach);
+            capture_eph_products(&prod, &result, &result.entries[0]);
         }
         empyrean_ephemeris_result_free(&result);
     }
@@ -767,6 +892,14 @@ static int handle_eph(EmpyreanContext* ctx, const char* rest) {
 
     if (last_code != 0) {
         printf("fail %s\n", last_err ? last_err : "");
+        return 0;
+    }
+    if (refused) {
+        printf("refused %s %s\n", refusal_status, refusal_msg);
+        return 0;
+    }
+    if (no_entry) {
+        printf("fail generate_ephemeris returned no entry and no failed per-orbit outcome\n");
         return 0;
     }
     if (!has_method) {

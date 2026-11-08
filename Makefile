@@ -58,6 +58,9 @@ TIERS ?= standard
 # artifact, so the plan target only asserts its presence instead of rebuilding
 # it from the rust channel. This lets the replay + external channels run in
 # isolated matrix legs that never build or run the rust reference themselves.
+# With OBJECTS set as well (a channel leg's object chunk), the four
+# distribution replay channels read that plan filtered to those objects; see
+# CHANNEL_PLAN below.
 PLAN_PREBUILT ?=
 DATA_DIR ?= $(HOME)/.empyrean/data
 # The JPL cache (SBDB + Horizons) is the pinned inputs snapshot on disk, not a
@@ -157,6 +160,22 @@ ONLY_FLAG := $(if $(OBJECTS),--only "$(OBJECTS)",)
 # stripping channel-specific fields, so the IC/ref data is shared via the
 # Horizons disk cache rather than re-fetched per channel.
 PLAN := $(RESULTS_DIR)/validation_plan.json
+# The plan the four distribution replay channels (python / c / cli / core)
+# read. A CI channel leg runs with PLAN_PREBUILT=1 and one object chunk in
+# OBJECTS (scripts/channel-chunks.py split), and replays only that chunk:
+# $(PLAN_CHUNK), the prebuilt plan filtered to those objects. OBJECTS used to
+# reach the plan only when the plan is generated, which PLAN_PREBUILT=1 skips,
+# so every chunk leg replayed the whole plan (2026-10-28: 30,033 rows on every
+# leg; 38 of 40 legs cut off at the 240-minute wall). Without PLAN_PREBUILT the
+# plan is generated for OBJECTS already, and with OBJECTS empty there is no
+# chunk: both read $(PLAN) unchanged. The external comparators read $(PLAN)
+# in every mode.
+PLAN_CHUNK := $(RESULTS_DIR)/validation_plan.chunk.json
+ifeq ($(PLAN_PREBUILT),1)
+CHANNEL_PLAN := $(if $(OBJECTS),$(PLAN_CHUNK),$(PLAN))
+else
+CHANNEL_PLAN := $(PLAN)
+endif
 RUST_PROPEPH := $(RESULTS_DIR)/validation_rust_propeph.json
 RUST_OD := $(RESULTS_DIR)/validation_rust_od.json
 RUST := $(RESULTS_DIR)/validation_rust.json
@@ -954,25 +973,44 @@ endif
 check-plan: $(PLAN)
 	@python3 -c "$$ASSERT_PLAN_HAS_OD" $(PLAN) $(OD_TEST_TYPES)
 
-run-python: $(PLAN) check-plan fixtures
+# One channel leg's slice of the prebuilt plan (see CHANNEL_PLAN).
+#
+# check-plan runs on the FULL prebuilt plan, before the filter, and never on
+# the chunk. Its assertion is about the plan the assemble job staged (some OD
+# row, and some `orbit_determination` row among them). Zero OD rows is legal
+# for a single object (see ASSERT_SHARD_COMPLETE), so a chunk of a few such
+# objects could hold none and a per-chunk assertion would fail a correct leg;
+# asserting it on the full plan first means no leg replays a slice of a
+# gutted plan. What a chunk can get wrong on its own,
+# losing an object, the filter refuses by name: an empty OBJECTS, an empty
+# or repeated entry, and any named object with no plan rows.
+#
+# check-plan is phony, so this target is remade on every invocation and a
+# chunk left by an earlier OBJECTS is never reused.
+$(PLAN_CHUNK): $(PLAN) check-plan
+	@echo "──── Plan: filter the prebuilt plan to this leg's object chunk ──"
+	@python3 $(ROOT)/scripts/channel-chunks.py filter --plan $(PLAN) \
+	    --objects "$(OBJECTS)" --output $(PLAN_CHUNK)
+
+run-python: $(CHANNEL_PLAN) check-plan fixtures
 	@echo "──── Python channel: replay plan ───────────────────────"
 	@$(WHEEL_PY) $(EMPYREAN_RUNNERS)/python/run.py \
-	    --input $(PLAN) --output $(PYTHON) \
+	    --input $(CHANNEL_PLAN) --output $(PYTHON) \
 	    --fixtures-dir $(FIXTURES_PSV) \
 	    --data-dir $(DATA_DIR)
 
-run-c: $(PLAN) $(C_BIN) check-plan fixtures
+run-c: $(CHANNEL_PLAN) $(C_BIN) check-plan fixtures
 	@echo "──── C channel: replay plan (prop / eph / OD) ──────────"
 	@$(WHEEL_PY) $(EMPYREAN_RUNNERS)/c/drive.py \
-	    --input $(PLAN) \
+	    --input $(CHANNEL_PLAN) \
 	    --output $(C_OUT) --runner $(C_BIN) \
 	    --fixtures-dir $(FIXTURES_PSV) \
 	    $(if $(filter-out $(HOME)/.empyrean/data,$(DATA_DIR)),--data-dir $(DATA_DIR),)
 
-run-cli: $(PLAN) $(CLI_BIN) check-plan fixtures
+run-cli: $(CHANNEL_PLAN) $(CLI_BIN) check-plan fixtures
 	@echo "──── CLI channel: fork-exec one binary per plan row ────"
 	@$(DYLD) $(WHEEL_PY) $(EMPYREAN_RUNNERS)/cli/drive.py \
-	    --input $(PLAN) \
+	    --input $(CHANNEL_PLAN) \
 	    --output $(CLI_OUT) --runner $(CLI_BIN) \
 	    --fixtures-dir $(FIXTURES_PSV) \
 	    $(if $(filter-out $(HOME)/.empyrean/data,$(DATA_DIR)),--data-dir $(DATA_DIR),)
@@ -1059,9 +1097,9 @@ ifneq ($(WITH_CORE),1)
 	@echo "──── Core channel skipped (empyrean-core not found) ────"
 endif
 
-$(CORE_OUT): $(PLAN) $(CORE_BIN) | check-plan fixtures
+$(CORE_OUT): $(CHANNEL_PLAN) $(CORE_BIN) | check-plan fixtures
 	@echo "──── Core channel: replay plan via empyrean-core ───────"
-	@$(DYLD) $(CORE_BIN) --input $(PLAN) --output $(CORE_OUT) \
+	@$(DYLD) $(CORE_BIN) --input $(CHANNEL_PLAN) --output $(CORE_OUT) \
 	    --fixtures-dir $(FIXTURES_PSV)
 
 # ── Kete external comparison (standalone, not in report) ───
@@ -1312,7 +1350,7 @@ ARCHIVE_DIR := $(RESULTS_DIR)/archive
 # responses cached at the time). Removing them is now something you have to ask
 # for by name.
 clean:
-	@rm -f $(REPORT) $(REPORT_DATA) $(SUMMARY) $(RUST_MERGED) $(CORE_MERGED) $(PLAN)
+	@rm -f $(REPORT) $(REPORT_DATA) $(SUMMARY) $(RUST_MERGED) $(CORE_MERGED) $(PLAN) $(PLAN_CHUNK)
 	@echo "Removed the derived report / summary / merge / plan from $(RESULTS_DIR)."
 	@echo "Per-channel results are PRESERVED — 'make clean-results' removes those,"
 	@echo "'make archive' snapshots them to $(ARCHIVE_DIR)/<timestamp>/ first."

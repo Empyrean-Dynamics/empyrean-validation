@@ -133,9 +133,15 @@ PROV = {"catalog_commit": "abc", "distribution_version": "0.11.0-rc.0", "psv_sou
 
 
 def mint(ip, tree, partial=False):
-    """manifest -> pin, returning (manifest dict, pin dict, pin_path)."""
+    """manifest -> pin, returning (manifest dict, pin dict, pin_path).
+
+    The minted tree doubles as an already-fetched dest for the offline fetch
+    tests, so the manifest is also written where `fetch` keeps it
+    (ip.LOCAL_MANIFEST), beside the snapshot's own MANIFEST.json.
+    """
     manifest = ip.build_manifest(pathlib.Path(tree), PROV, partial)
     ip.atomic_write_json(pathlib.Path(tree) / "MANIFEST.json", manifest)
+    ip.atomic_write_json(pathlib.Path(tree) / ip.LOCAL_MANIFEST, manifest)
     pin = ip.build_pin(manifest, "http://run/1", ip.DEFAULT_BUCKET, partial)
     pin_path = pathlib.Path(tree).parent / "pin.json"
     ip.atomic_write_json(pin_path, pin)
@@ -398,8 +404,48 @@ def test_fetch_online_roundtrip(ip, tmp_path):
     dest = tmp_path / "dest"
     assert ip.fetch(pin_path, dest, prune=False, offline=False, http_get=http.get) == 0
     assert (dest / "psv" / "Apophis.psv").read_text() == OPTICAL_PSV
-    assert (dest / "MANIFEST.json").exists()
+    assert (dest / ip.LOCAL_MANIFEST).exists()
+    assert not (dest / "MANIFEST.json").exists()
     assert http.calls  # the reader was actually used
+
+
+def test_fetch_beside_the_pin_never_reads_or_replaces_it(ip, tmp_path):
+    # `make fixtures` fetches into fixtures/, which holds the tracked pin
+    # fixtures/manifest.json. On a case-insensitive filesystem (macOS) a
+    # materialized fixtures/MANIFEST.json is that same file: the manifest read
+    # returned the pin (KeyError 'files') and the manifest write replaced the
+    # pin. No name fetch writes may equal the pin's name up to case.
+    _, _, src_pin, _, http = _publish(ip, tmp_path)
+    dest = tmp_path / "fixtures"
+    dest.mkdir()
+    pin_path = dest / "manifest.json"
+    shutil.copyfile(src_pin, pin_path)
+    pin_bytes = pin_path.read_bytes()
+
+    assert ip.fetch(pin_path, dest, prune=True, offline=False, http_get=http.get) == 0
+    assert pin_path.read_bytes() == pin_bytes
+    names = [p.name.casefold() for p in dest.iterdir() if p.is_file()]
+    assert len(names) == len(set(names)), sorted(names)
+    with open(dest / ip.LOCAL_MANIFEST) as fh:
+        assert isinstance(json.load(fh)["files"], list)
+
+    # The offline verify pass (make fixtures INPUTS_OFFLINE=1) then finds the
+    # manifest, keeps every file, and still leaves the pin alone.
+    assert ip.fetch(pin_path, dest, prune=True, offline=True) == 0
+    assert pin_path.read_bytes() == pin_bytes
+
+
+def test_fetch_refuses_a_pin_in_the_manifest_slot_by_name(ip, tmp_path):
+    # A pin carries the snapshot_id and tree_hash a manifest is matched on, but
+    # no files[]; read as the manifest it must fail naming the file, never as a
+    # KeyError.
+    tree = make_tree(tmp_path / "t")
+    _, pin, pin_path = mint(ip, tree)
+    ip.atomic_write_json(tree / ip.LOCAL_MANIFEST, pin)
+    with pytest.raises(ip.ContentError) as exc:
+        ip.fetch(pin_path, tree, prune=False, offline=True)
+    msg = "\n".join(exc.value.messages)
+    assert ip.LOCAL_MANIFEST in msg and "no files[]" in msg
 
 
 def test_fetch_offline_never_calls_the_reader(ip, tmp_path):

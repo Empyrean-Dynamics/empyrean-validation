@@ -386,8 +386,8 @@ fn populate_mixture_tallies(
 /// its `kind` is the delivered kind, so the one joint carries both — reading the
 /// chain accessor would add nothing it lacks. A covariance is `withheld` only
 /// when the per-state joint is absent though one was expected (`attach_cov`),
-/// and then it is carried by name with the engine's own reason (the point
-/// accessor's error) rather than as a blank cell.
+/// and then it is carried by name, as the vocabulary's
+/// `cov_withheld:covariance_absent`, rather than as a blank cell.
 struct PropProducts {
     /// The delivered covariance kind (the joint's `kind`); `None` when no
     /// covariance was delivered.
@@ -428,11 +428,13 @@ fn read_prop_products(
             cov_joint = Some(joint);
         }
         None => {
+            // The vocabulary's one withheld reason
+            // (`empyrean_validation::schema::orbit_status`), so this condition
+            // reads the same on every channel; the engine's wording for why
+            // stays out of the status.
             if attach_cov {
-                withheld = Some(match result.covariance_at_cartesian(0, 0) {
-                    Err(e) => e.to_string(),
-                    Ok(_) => "covariance absent from the propagated state".to_string(),
-                });
+                withheld =
+                    Some(empyrean_validation::schema::orbit_status::COVARIANCE_ABSENT.to_string());
             }
         }
     }
@@ -2801,19 +2803,19 @@ pub fn run_od_validation(
             let orbit = determine_result.state();
             let meta = SolveMetadata::from_fit(&determine_result);
 
-            // Capture the fitted state + cov in three coordinate views
-            // (native Cartesian, Sun-centered ICRF Cartesian, Sun-centered
-            // ecliptic-J2000 Keplerian) for the orbit-comparison panel.
-            // Transformation via `ctx.transform` propagates covariance
-            // through the Jacobian.
-            let fit_native = propagated_state_to_coord(&orbit);
+            // Capture the fitted orbit in three coordinate views (native
+            // Cartesian, Sun-centered ICRF Cartesian, Sun-centered
+            // ecliptic-J2000 Keplerian) for the orbit-comparison panel. The
+            // capture transports the fit's whole packed joint through the
+            // transform (`capture_orbit`).
+            let fit_orbit = &determine_result.orbit;
             let empy_version = engine_version.clone();
             let fit_captured = match capture_orbit(
                 ctx,
                 obj.name,
                 orbit_sources::EMPYREAN_OD,
                 empy_version.clone(),
-                &fit_native,
+                fit_orbit,
             ) {
                 Ok(captured) => Some(captured),
                 Err(e) => {
@@ -2835,15 +2837,17 @@ pub fn run_od_validation(
             let (sbdb_native, sbdb_captured, sbdb_nongrav) =
                 match empyrean::query_sbdb(&[obj.sbdb_query], sbdb_cache_dir) {
                     Ok(batch) if !batch.orbits.is_empty() => {
-                        let sbdb_state = batch.orbits[0].state;
+                        // The published orbit with its packed joint, as the
+                        // reader delivered it.
+                        let sbdb_orbit = batch.orbits[0].clone();
                         let sbdb_orbit_id = batch.orbit_ids.first().cloned();
-                        let sbdb_ng = (batch.orbits[0].a1, batch.orbits[0].a2, batch.orbits[0].a3);
+                        let sbdb_ng = (sbdb_orbit.a1, sbdb_orbit.a2, sbdb_orbit.a3);
                         let captured = match capture_orbit(
                             ctx,
                             obj.name,
                             orbit_sources::SBDB,
                             sbdb_orbit_id,
-                            &sbdb_state,
+                            &sbdb_orbit,
                         ) {
                             Ok(c) => {
                                 captured_orbits.push(c.clone());
@@ -2857,7 +2861,7 @@ pub fn run_od_validation(
                                 None
                             }
                         };
-                        (Some(sbdb_state), captured, Some(sbdb_ng))
+                        (Some(sbdb_orbit), captured, Some(sbdb_ng))
                     }
                     Ok(_) => {
                         // A present SBDB record with no published orbit is
@@ -2890,12 +2894,7 @@ pub fn run_od_validation(
             if let (Some(fit_c), Some(sbdb_native), Some(sbdb_c)) =
                 (&fit_captured, &sbdb_native, &sbdb_captured)
             {
-                let prop_cfg = empyrean::PropagationConfig {
-                    force_model: tier,
-                    uncertainty_method: empyrean::UncertaintyMethod::FirstOrder,
-                    frame: empyrean::Frame::ICRF,
-                    ..empyrean::PropagationConfig::default()
-                };
+                let prop_cfg = comparison_prop_config(&od_config);
 
                 // Direction A: bring sbdb to fit's epoch; compare at fit's epoch.
                 match propagate_and_capture(
@@ -2934,7 +2933,7 @@ pub fn run_od_validation(
                     obj.name,
                     "fit_at_sbdb_epoch",
                     empy_version.clone(),
-                    &fit_native,
+                    fit_orbit,
                     sbdb_c.epoch_mjd_tdb,
                     &prop_cfg,
                 ) {
@@ -3437,23 +3436,22 @@ pub fn run_od_validation(
     })
 }
 
-/// Propagate a native CoordinateState (any representation) to
+/// Propagate a source orbit (its state and packed joint) to
 /// `target_epoch_mjd_tdb` via `ctx.propagate` with the supplied config
 /// and capture the result as a [`CapturedOrbit`] tagged with `source`.
-/// Covariance is propagated through the STM by the propagator (when
-/// the input state carries one).
+/// The joint is propagated through the STM, and the propagated state's
+/// joint is what the capture then transports.
 fn propagate_and_capture(
     ctx: &Context,
     object: &str,
     source: &str,
     source_version: Option<String>,
-    native: &CoordinateState,
+    orbit: &empyrean::Orbit,
     target_epoch_mjd_tdb: f64,
     prop_cfg: &empyrean::PropagationConfig,
 ) -> Result<CapturedOrbit, empyrean::Error> {
-    let orbit = empyrean::Orbit::new(*native);
     let target = Epoch::from_mjd_tdb(target_epoch_mjd_tdb);
-    let result = ctx.propagate(&[orbit], &[target], prop_cfg)?;
+    let result = ctx.propagate(std::slice::from_ref(orbit), &[target], prop_cfg)?;
     let propagated = result.states.first().ok_or_else(|| empyrean::Error {
         code: -4,
         message: "propagation returned no states (AGM mixture-only return or empty result)"
@@ -3467,8 +3465,53 @@ fn propagate_and_capture(
         orbit_id: None,
         epoch_mjd_tdb: None,
     })?;
-    let propagated_coord = propagated_state_to_coord(propagated);
-    capture_orbit(ctx, object, source, source_version, &propagated_coord)
+    capture_orbit(
+        ctx,
+        object,
+        source,
+        source_version,
+        &propagated_orbit(propagated),
+    )
+}
+
+/// The propagation config of the bidirectional orbit-vs-orbit comparison:
+/// first order, ICRF, at the fit's tier and with the fit's own perturber
+/// exclusions. On a self-perturber the propagation otherwise serves the body's
+/// SPK, which delivers no covariance, and that side of the comparison came out
+/// with no σ and no Mahalanobis distance.
+fn comparison_prop_config(od_config: &ODConfig) -> empyrean::PropagationConfig {
+    empyrean::PropagationConfig {
+        force_model: od_config.force_model,
+        excluded_perturbers: od_config.excluded_perturbers.clone(),
+        uncertainty_method: empyrean::UncertaintyMethod::FirstOrder,
+        frame: empyrean::Frame::ICRF,
+        ..empyrean::PropagationConfig::default()
+    }
+}
+
+/// An invalid-input error the harness raises itself (the wrapper's own
+/// constructor is crate-private): code `-1`, naming no orbit, batch index or
+/// epoch, like the synthetic error above.
+fn harness_input_error(message: impl Into<String>) -> empyrean::Error {
+    empyrean::Error {
+        code: -1,
+        message: message.into(),
+        missing_data_files: Vec::new(),
+        orbit_index: None,
+        orbit_id: None,
+        epoch_mjd_tdb: None,
+    }
+}
+
+/// A propagated or fitted state as the orbit the capture transforms: its
+/// state, and its packed joint as the one covariance home (the flat 6×6 is
+/// the joint's state block, so it is not carried twice).
+pub(crate) fn propagated_orbit(state: &empyrean::PropagatedState) -> empyrean::Orbit {
+    let mut coord = propagated_state_to_coord(state);
+    coord.covariance = None;
+    let mut orbit = empyrean::Orbit::new(coord);
+    orbit.covariance = state.joint.clone();
+    orbit
 }
 
 /// Promote an `empyrean::PropagatedState` (OD output shape) to a full
@@ -3498,15 +3541,31 @@ pub(crate) fn propagated_state_to_coord(orbit: &empyrean::PropagatedState) -> Co
 /// Transform any source's native orbit + covariance into the three
 /// canonical views used by the orbit-comparison panel: the native view
 /// (as-supplied), Sun-centered ICRF Cartesian, and Sun-centered
-/// ecliptic-J2000 Keplerian. Covariance is propagated through the
-/// Jacobian by `ctx.transform`.
+/// ecliptic-J2000 Keplerian.
+///
+/// The transform is `ctx.transform_orbits`, which carries the orbit's whole
+/// packed joint through the element Jacobian. The state-only
+/// `transform_coordinates_single` refuses a covariance-bearing state by
+/// design, which is what left every capture failing ("coordinate transform
+/// carries the state only") and the orbit comparison empty; dropping the
+/// covariance to get past it would silently narrow a comparison whose kernel
+/// compares covariances. A state that carries a covariance without its joint
+/// is refused here by name for the same reason.
 pub(crate) fn capture_orbit(
     ctx: &Context,
     object: &str,
     source: &str,
     source_version: Option<String>,
-    native: &CoordinateState,
+    orbit: &empyrean::Orbit,
 ) -> Result<CapturedOrbit, empyrean::Error> {
+    let native = &orbit.state;
+    if native.covariance.is_some() && orbit.covariance.is_none() {
+        return Err(harness_input_error(format!(
+            "{object} ({source}): the state carries a covariance but the orbit has no packed \
+             joint; the capture transports the joint, so it refuses rather than drop the \
+             covariance"
+        )));
+    }
     let epoch_mjd_tdb = native.epoch.mjd_tdb().unwrap_or(f64::NAN);
     let native_repr = match native.representation {
         Representation::Cartesian => "cartesian",
@@ -3523,23 +3582,31 @@ pub(crate) fn capture_orbit(
     .to_string();
     let native_origin_naif = native.origin.naif_id();
 
-    // Sun-centered ICRF Cartesian. `transform` split into a batch form and
-    // this single-state one at 0.10; one state at a time is what this
-    // per-object capture has, and the single form is the same computation.
-    let cart_sun = ctx.transform_coordinates_single(
-        native,
-        Representation::Cartesian,
-        Frame::ICRF,
-        Origin::SUN,
-    )?;
-
+    // The joint is the covariance home: the transform input carries it
+    // alone, and each output's flat 6×6 is the transported joint's state
+    // block.
+    let mut input = orbit.clone();
+    input.state.covariance = None;
+    let transport = |rep: Representation,
+                     frame: Frame|
+     -> Result<CoordinateState, empyrean::Error> {
+        let batch = ctx.transform_orbits(std::slice::from_ref(&input), rep, frame, Origin::SUN)?;
+        batch
+            .orbits
+            .into_iter()
+            .next()
+            .map(|o| o.state)
+            .ok_or_else(|| harness_input_error("transform_orbits returned no orbit"))
+    };
+    // Sun-centered ICRF Cartesian.
+    let cart_sun = transport(Representation::Cartesian, Frame::ICRF)?;
     // Sun-centered ecliptic-J2000 Keplerian.
-    let kep_sun = ctx.transform_coordinates_single(
-        native,
-        Representation::Keplerian,
-        Frame::EclipticJ2000,
-        Origin::SUN,
-    )?;
+    let kep_sun = transport(Representation::Keplerian, Frame::EclipticJ2000)?;
+    // The native 6×6: the state's own when it carries one, else the joint's
+    // state block.
+    let native_cov_6x6 = native
+        .covariance
+        .or_else(|| orbit.covariance.as_ref().map(|j| j.state_block()));
 
     Ok(CapturedOrbit {
         object: object.to_string(),
@@ -3550,7 +3617,7 @@ pub(crate) fn capture_orbit(
         native_frame,
         native_origin_naif,
         native_state: native.elements,
-        native_cov_6x6: native.covariance,
+        native_cov_6x6,
         state_cart_icrf_sun: cart_sun.elements,
         cov_cart_icrf_sun_6x6: cart_sun.covariance,
         state_kep_ecliptic_sun: kep_sun.elements,
@@ -4587,6 +4654,108 @@ mod tests {
             assert!(delivered, "{tag}: the orbit delivered its state");
             assert_eq!(status, "delivered", "{tag}: delivered, never cov_withheld");
         }
+    }
+
+    /// The orbit capture transports the orbit's packed joint into both
+    /// Sun-centered views (`transform_orbits`), so every captured view
+    /// carries its 6×6. The old capture called the state-only
+    /// `transform_coordinates_single` on the covariance-bearing state, which
+    /// the 0.11 engine refuses ("coordinate transform carries the state
+    /// only"), so every fit and SBDB capture failed and the orbit comparison
+    /// came out empty. Mutation: put the state-only transform back in
+    /// `capture_orbit` → the capture errors → red.
+    #[test]
+    fn capture_transports_the_joint_into_every_view() {
+        let Some(ctx) = test_ctx() else {
+            return;
+        };
+        // A delivered state with its joint: the synthetic NEO prior
+        // propagated under first order.
+        let config = PropagationConfig {
+            force_model: ForceModelTier::Standard,
+            uncertainty_method: empyrean::UncertaintyMethod::FirstOrder,
+            frame: Frame::ICRF,
+            ..PropagationConfig::default()
+        };
+        let result = ctx
+            .propagate(
+                std::slice::from_ref(&synthetic_neo_orbit()),
+                &[Epoch::from_mjd_tdb(59_030.0)],
+                &config,
+            )
+            .expect("first-order propagation");
+        let orbit = propagated_orbit(&result.states[0]);
+        assert!(
+            orbit.covariance.is_some(),
+            "the propagated state carries a joint"
+        );
+        // The engine's own contract, which is why the capture cannot use the
+        // state-only transform on this state.
+        let mut with_cov = orbit.state;
+        with_cov.covariance = orbit.covariance.as_ref().map(|j| j.state_block());
+        assert!(
+            ctx.transform_coordinates_single(
+                &with_cov,
+                Representation::Cartesian,
+                Frame::ICRF,
+                Origin::SUN
+            )
+            .is_err(),
+            "the state-only transform refuses a covariance-bearing state"
+        );
+        let captured = capture_orbit(&ctx, "TestNEO", orbit_sources::EMPYREAN_OD, None, &orbit)
+            .expect("the capture transports the joint");
+        let cart = captured
+            .cov_cart_icrf_sun_6x6
+            .expect("Sun ICRF Cartesian covariance");
+        let kep = captured
+            .cov_kep_ecliptic_sun_6x6
+            .expect("Sun ecliptic Keplerian covariance");
+        assert!(captured.native_cov_6x6.is_some(), "native covariance");
+        for i in 0..6 {
+            assert!(cart[i][i] > 0.0 && cart[i][i].is_finite(), "cart σ²[{i}]");
+            assert!(kep[i][i] >= 0.0 && kep[i][i].is_finite(), "kep σ²[{i}]");
+        }
+        // A pure origin shift leaves the Cartesian position block's trace
+        // unchanged to rounding: the joint was transported, not rebuilt.
+        let native = captured.native_cov_6x6.unwrap();
+        let tr = |m: &[[f64; 6]; 6]| m[0][0] + m[1][1] + m[2][2];
+        assert!(
+            (tr(&cart) - tr(&native)).abs() <= 1e-9 * tr(&native),
+            "position-block trace survives the SSB→Sun shift"
+        );
+    }
+
+    /// The comparison propagation carries the fit's tier and perturber
+    /// exclusions. Mutation: drop `excluded_perturbers` from
+    /// `comparison_prop_config` → red (and, end to end, the Vesta comparison
+    /// loses one side's σ).
+    #[test]
+    fn comparison_propagation_carries_the_fits_exclusions() {
+        let excluded = naif_to_origins(&[2000004]).expect("Vesta");
+        let od_config = ODConfig {
+            force_model: ForceModelTier::Standard,
+            excluded_perturbers: excluded.clone(),
+            ..ODConfig::default()
+        };
+        let cfg = comparison_prop_config(&od_config);
+        assert_eq!(cfg.excluded_perturbers, excluded);
+        assert_eq!(cfg.force_model, ForceModelTier::Standard);
+    }
+
+    /// A state that carries a covariance without its packed joint is refused
+    /// by name: the capture transports the joint, so transporting the state
+    /// alone would silently narrow the comparison.
+    #[test]
+    fn capture_refuses_a_covariance_without_its_joint() {
+        let Some(ctx) = test_ctx() else {
+            return;
+        };
+        let bare = synthetic_neo_orbit();
+        assert!(bare.state.covariance.is_some() && bare.covariance.is_none());
+        let err = capture_orbit(&ctx, "TestNEO", orbit_sources::EMPYREAN_OD, None, &bare)
+            .expect_err("a covariance without its joint is refused");
+        assert!(err.message.contains("no packed joint"), "{}", err.message);
     }
 
     /// The post-fit OD transport leg delivers the SAMPLING kinds too: the

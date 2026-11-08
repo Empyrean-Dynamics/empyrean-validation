@@ -10,15 +10,16 @@ Cargo.lock
 # scripts/inputs.py materializes + sha256-verifies the four product
 # directories here. The per-directory READMEs and the local, never-tracked
 # walk manifest (fixtures/windows.json) stay out of the snapshot. The
-# materialized MANIFEST.json (the per-file manifest, fetched beside the data)
-# is not tracked either. Contract: fixtures/README.md.
+# materialized per-file manifest (the snapshot's MANIFEST.json, fetched beside
+# the data as snapshot-manifest.json so it never shares a name, up to case,
+# with the pin) is not tracked either. Contract: fixtures/README.md.
 fixtures/psv/*
 !fixtures/psv/README.md
 fixtures/psv-radar/*
 !fixtures/psv-radar/README.md
 fixtures/horizons/*
 fixtures/sbdb/*
-fixtures/MANIFEST.json
+fixtures/snapshot-manifest.json
 
 # Compiled C-channel runner binary — `make -C runners/c` output.
 runners/c/runner

@@ -27,6 +27,7 @@ import time
 from datetime import datetime, timezone
 from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
+from typing import NamedTuple
 
 import empyrean
 import numpy as np
@@ -249,6 +250,53 @@ def _orbit_outcome_channel(
     return True, "delivered"
 
 
+class _Declined(NamedTuple):
+    """An orbit the engine declined: the call returned no state / entry, and
+    the per-orbit outcome is FAILED. ``status`` is the schema's
+    ``failed:<variant>``; ``message`` is the engine's own text."""
+
+    status: str
+    message: str
+
+
+def _declined(result: dict) -> _Declined | None:
+    """Read why a call that returned no state / entry delivered nothing, off its
+    per-orbit outcome table. ``None`` when the outcome is not a failure (the
+    caller reports that as a failure of its own, never a silent skip)."""
+    status = build_orbit_statuses(result["outcomes"])
+    if len(status) == 0:
+        return None
+    outcome = status.outcome.to_pylist()[0]
+    err_code = status.error_code.to_pylist()[0]
+    err_msg = status.error_message.to_pylist()[0] or ""
+    delivered, orbit_status = _orbit_outcome_channel(outcome, err_code, err_msg, None)
+    if delivered:
+        return None
+    return _Declined(orbit_status, err_msg)
+
+
+def _excluded_wire(excluded_perturbers_naif: list[int] | None) -> list[int]:
+    """The row's perturber exclusions as the config dicts' NAIF list (empty for
+    none), applied exactly as the core channel applies them. On a self-perturber
+    row this keeps the body out of its own force model; without it the engine
+    serves the body's SPK instead of integrating, a different request than the
+    reference's."""
+    return [int(n) for n in (excluded_perturbers_naif or [])]
+
+
+def _write_declined(row: dict, declined: _Declined) -> None:
+    """Record an orbit the engine declined on its (already reset) output row:
+    ``orbit_delivered = false``, ``orbit_status = failed:<variant>`` and the
+    engine's text in ``notes``; the measured fields stay null, so no residual is
+    ever computed from a position that was not delivered. Mirrors the c / cli
+    drivers' ``_refused_row``."""
+    row["orbit_delivered"] = False
+    row["orbit_status"] = declined.status
+    base = row.get("notes") or ""
+    note = f"engine declined the orbit: {declined.message}"
+    row["notes"] = note if not base else f"{base}; {note}"
+
+
 def _populate_mixture_tallies(result: dict, row: dict) -> None:
     """Fill a row's six Gaussian-mixture tallies from the wrapper's RETAINED
     mixture components (the per-component status table — the 0.11 product).
@@ -337,7 +385,9 @@ def _fill_propagation_products(row: dict, result: dict, attach_cov: bool) -> Non
             m = pj.state_block()
             row["emp_pos_cov_au2"] = [[float(m[i][j]) for j in range(3)] for i in range(3)]
         else:
-            withheld = "no tagged covariance returned"
+            # The vocabulary's one withheld reason (src/schema.rs
+            # `orbit_status`), spelled as every channel spells it.
+            withheld = "covariance_absent"
 
     row["orbit_delivered"], row["orbit_status"] = _orbit_outcome_channel(
         outcome, err_code, err_msg, withheld
@@ -512,9 +562,12 @@ def _propagate_one(
     force_model: str,
     method_tag: str,
     n_timing_runs: int,
-) -> tuple[list[float], float, dict] | None:
+    excluded_perturbers_naif: list[int] | None = None,
+) -> tuple[list[float], float, dict] | _Declined | None:
     """Propagate once under ``method_tag``'s uncertainty method, returning
-    ``(out_pos_au, min_time_ms, raw_result)`` or ``None`` on failure.
+    ``(out_pos_au, min_time_ms, raw_result)``, the engine's refusal
+    (:class:`_Declined`) when it delivered no state, or ``None`` on failure.
+    The row's ``excluded_perturbers_naif`` rides the propagation config dict.
 
     The method is mapped to an ``UncertaintyMethod`` and lowered to the
     low-level wire int; every method but ``none`` attaches the synthetic
@@ -625,6 +678,9 @@ def _propagate_one(
                 ng_ks=ng_ks,
                 non_grav_dts=non_grav_dts,
                 with_tagged_covariance=attach_cov,
+                propagation_config_dict={
+                    "excluded_perturbers_naif": _excluded_wire(excluded_perturbers_naif)
+                },
                 **mc_kwargs,
             )
         except Exception as e:  # noqa: BLE001
@@ -636,8 +692,19 @@ def _propagate_one(
         timings_ms.append((time.perf_counter() - t0) * 1000.0)
         last_result = result
 
-    if last_result is None or len(last_result.get("x", [])) == 0:
+    if last_result is None:
         return None
+    if len(last_result.get("x", [])) == 0:
+        # No state: the engine declined the orbit, and its per-orbit outcome
+        # says why. Returned for the caller to write a refused row.
+        declined = _declined(last_result)
+        if declined is None:
+            print(
+                f"  {object_id} {force_model} dt→{target_t_mjd_tdb}: FAIL no state "
+                "and no failed per-orbit outcome",
+                file=sys.stderr,
+            )
+        return declined
     pos = [
         float(last_result["x"][0]),
         float(last_result["y"][0]),
@@ -665,9 +732,12 @@ def _ephemeris_one(
     force_model: str,
     n_timing_runs: int,
     method_tag: str,
-) -> tuple[float, float, float, float, float, dict] | BaseException | None:
+    excluded_perturbers_naif: list[int] | None = None,
+) -> tuple[float, float, float, float, float, dict] | _Declined | BaseException | None:
     """Generate ephemeris at target_t for obs_code under ``method_tag``'s
-    uncertainty method.
+    uncertainty method, with the row's ``excluded_perturbers_naif`` on the
+    embedded propagation config. When the engine delivers no entry, returns its
+    refusal (:class:`_Declined`) for the caller to write a refused row.
 
     Return ``(ra_rad, dec_rad, rho_au, light_time_days, emp_time_ms,
     raw_result)`` where ``emp_time_ms`` is the best-of-``n_timing_runs`` wall
@@ -794,6 +864,11 @@ def _ephemeris_one(
                 ng_ks=ng_ks,
                 non_grav_dts=non_grav_dts,
                 uncertainty_method=um_int,
+                ephemeris_config_dict={
+                    "propagation": {
+                        "excluded_perturbers_naif": _excluded_wire(excluded_perturbers_naif)
+                    }
+                },
                 **mc_kwargs,
             )
         except Exception as e:  # noqa: BLE001
@@ -808,8 +883,18 @@ def _ephemeris_one(
             return e
         timings_ms.append((time.perf_counter() - t0) * 1000.0)
 
-    if result is None or len(result.get("ra", [])) == 0:
+    if result is None:
         return None
+    if len(result.get("ra", [])) == 0:
+        # No entry: the engine declined the orbit, and its per-orbit outcome
+        # says why. Returned for the caller to write a refused row, never a
+        # silent skip.
+        declined = _declined(result)
+        if declined is None:
+            return RuntimeError(
+                "generate_ephemeris returned no entry and no failed per-orbit outcome"
+            )
+        return declined
 
     ra_deg = float(result["ra"][0])
     dec_deg = float(result["dec"][0])
@@ -1060,6 +1145,83 @@ def _read_fitted_non_grav(raw: dict) -> tuple[list[float | None], list[float | N
     return a_out, s_out
 
 
+class _RowAccount:
+    """The runner's own count line, honest by construction: every plan row
+    ends as exactly one of written, declined (written, but the engine
+    declined it: ``orbit_delivered = false`` or a FAIL note carrying the
+    engine's error) or skipped (no row), so W + D + S = N. A plan
+    ``non_grav_recovery`` row is written by its object's legacy fit (the
+    second pass), so the row that pass generates stands for it. Mirrored in
+    the python / c / cli drivers.
+    """
+
+    def __init__(self, n_loaded: int) -> None:
+        self.n = n_loaded
+        self.written = 0
+        self.declined = 0
+        self.skipped = 0
+        self.ng_plan = 0
+        self.ng_generated = 0
+        self.surplus = 0
+        self._declined_ids: set[int] = set()
+        self._row: dict | None = None
+        self._start = 0
+
+    def declined_row(self, row: dict) -> dict:
+        """Mark ``row`` as a declined row, and return it for the append."""
+        self._declined_ids.add(id(row))
+        return row
+
+    def begin(self, r: dict, out_rows: list) -> None:
+        """Settle the previous plan row, then start ``r``."""
+        self._settle(out_rows)
+        self._row, self._start = r, len(out_rows)
+
+    def _settle(self, out_rows: list) -> None:
+        r, produced = self._row, out_rows[self._start :]
+        self._row = None
+        if r is None:
+            return
+        tt = r.get("test_type")
+        if not produced:
+            if tt == "non_grav_recovery":
+                self.ng_plan += 1
+            else:
+                self.skipped += 1
+            return
+        main = next((x for x in produced if x.get("test_type") == tt), produced[0])
+        if id(main) in self._declined_ids:
+            self.declined += 1
+        else:
+            self.written += 1
+        for x in produced:
+            if x is main:
+                continue
+            if x.get("test_type") == "non_grav_recovery":
+                self.ng_generated += 1
+            else:
+                self.surplus += 1
+
+    def finish(self, out_rows: list) -> tuple[int, int, int, bool]:
+        """Settle the last row and return ``(written, declined, skipped, ok)``;
+        ``ok`` is false when the rows do not account for the plan exactly."""
+        self._settle(out_rows)
+        written = self.written + min(self.ng_generated, self.ng_plan)
+        skipped = self.skipped + max(0, self.ng_plan - self.ng_generated)
+        surplus = self.surplus + max(0, self.ng_generated - self.ng_plan)
+        ok = surplus == 0 and written + self.declined + skipped == self.n
+        return written, self.declined, skipped, ok
+
+    def line(self, out_rows: list, channel: str, path) -> tuple[str, bool]:
+        """The count line: ``Loaded N rows; wrote W, declined D, skipped S``."""
+        w, d, s, ok = self.finish(out_rows)
+        return (
+            f"Loaded {self.n} rows; wrote {w}, declined {d}, skipped {s} "
+            f"({w} + {d} + {s} = {w + d + s}); {len(out_rows)} {channel} rows to {path}",
+            ok,
+        )
+
+
 def main() -> int:
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--input", required=True, type=Path, help="rust-channel JSON")
@@ -1109,9 +1271,10 @@ def main() -> int:
             ref_non_grav[r["object"]] = (a1, a2, a3)
 
     out_rows = []
-    n_skipped = 0
+    acct = _RowAccount(len(rust_rows))
     n_missing_fixture = 0
     for r in rust_rows:
+        acct.begin(r, out_rows)
         ic_pos = r.get("ic_pos_au")
         ic_vel = r.get("ic_vel_au_d")
         # OD rows (optical and optical+radar) discover the orbit from
@@ -1121,7 +1284,6 @@ def main() -> int:
             "orbit_determination",
             "orbit_determination_radar",
         ) and (ic_pos is None or ic_vel is None):
-            n_skipped += 1
             continue
         # Per-method OD transport rows are `not produced` at this pin: this
         # runner's post-fit transport is the orbit-versus-reference compare,
@@ -1129,7 +1291,6 @@ def main() -> int:
         # them), exactly as the rust channel. Their absence from this channel's
         # output reads as `not produced` in the report — never a blank row.
         if r["test_type"] == "orbit_determination_transport":
-            n_skipped += 1
             continue
 
         new = dict(r)
@@ -1178,9 +1339,13 @@ def main() -> int:
                 force_model=r["force_model"],
                 method_tag=r.get("propagation_uncertainty"),
                 n_timing_runs=args.n_timing_runs,
+                excluded_perturbers_naif=r.get("excluded_perturbers_naif"),
             )
+            if isinstance(ret, _Declined):
+                _write_declined(new, ret)
+                out_rows.append(acct.declined_row(new))
+                continue
             if ret is None:
-                n_skipped += 1
                 continue
             pos, ms, prop_result = ret
             new["emp_pos_au"] = pos
@@ -1211,7 +1376,6 @@ def main() -> int:
                     file=sys.stderr,
                 )
                 n_missing_fixture += 1
-                n_skipped += 1
                 continue
             psv_text = psv_path.read_text()
             # The OD method axis: the input row's `propagation_uncertainty` tag
@@ -1232,7 +1396,6 @@ def main() -> int:
                         f"  {r['object']} OD: SKIP unknown uncertainty_method {tag!r}",
                         file=sys.stderr,
                     )
-                    n_skipped += 1
                     continue
                 attach, method = _METHOD_BY_TAG[method_name]
             ret = _determine_one(
@@ -1250,8 +1413,7 @@ def main() -> int:
                     # do, instead of silently dropping the object.
                     new["od_converged"] = False
                     new["notes"] = f"determine FAIL: {ret}"
-                    out_rows.append(new)
-                    n_skipped += 1
+                    out_rows.append(acct.declined_row(new))
                 else:
                     # A method-tagged fit the engine refused BY NAME (the richer
                     # methods have no honest first-order implementation): record
@@ -1261,10 +1423,9 @@ def main() -> int:
                     base = new.get("notes") or ""
                     refused = f"uncertainty method {method_name} refused by the engine"
                     new["notes"] = refused if not base else f"{base}; {refused}"
-                    out_rows.append(new)
+                    out_rows.append(acct.declined_row(new))
                 continue
             if ret is None:
-                n_skipped += 1
                 continue
             pos, raw, ms = ret
             new["emp_pos_au"] = pos
@@ -1366,7 +1527,6 @@ def main() -> int:
                     file=sys.stderr,
                 )
                 n_missing_fixture += 1
-                n_skipped += 1
                 continue
             psv_text = psv_path.read_text()
             ret = _determine_one(
@@ -1379,11 +1539,9 @@ def main() -> int:
             if isinstance(ret, BaseException):
                 new["od_converged"] = False
                 new["notes"] = f"radar determine FAIL: {ret}"
-                out_rows.append(new)
-                n_skipped += 1
+                out_rows.append(acct.declined_row(new))
                 continue
             if ret is None:
-                n_skipped += 1
                 continue
             pos, raw, ms = ret
             new["emp_pos_au"] = pos
@@ -1409,7 +1567,6 @@ def main() -> int:
         elif r["test_type"] == "ephemeris":
             obs_code = r.get("observer")
             if not obs_code:
-                n_skipped += 1
                 continue
             ret = _ephemeris_one(
                 object_id=r["object"],
@@ -1430,17 +1587,20 @@ def main() -> int:
                 force_model=r["force_model"],
                 n_timing_runs=args.n_timing_runs,
                 method_tag=r.get("propagation_uncertainty"),
+                excluded_perturbers_naif=r.get("excluded_perturbers_naif"),
             )
+            if isinstance(ret, _Declined):
+                _write_declined(new, ret)
+                out_rows.append(acct.declined_row(new))
+                continue
             if isinstance(ret, BaseException):
                 # Failed ephemeris (e.g. "no dense trajectory: initial state
                 # overlaps" for a self-perturbing main-belt asteroid): emit a
                 # FAIL row carrying the engine's message rather than dropping it.
                 new["notes"] = f"ephemeris FAIL: {ret}"
-                out_rows.append(new)
-                n_skipped += 1
+                out_rows.append(acct.declined_row(new))
                 continue
             if ret is None:
-                n_skipped += 1
                 continue
             ra_rad, dec_rad, rho_au, lt_d, ms, eph_result = ret
             new["emp_time_ms"] = ms
@@ -1487,10 +1647,15 @@ def main() -> int:
         )
         raise
     args.output.write_text(_payload)
-    print(
-        f"Wrote {len(out_rows)} python rows to {args.output} (skipped {n_skipped})",
-        file=sys.stderr,
-    )
+    line, accounted = acct.line(out_rows, "python", args.output)
+    print(line, file=sys.stderr)
+    if not accounted:
+        print(
+            "ERROR: the rows written do not account for the plan rows loaded "
+            "(written + declined + skipped must equal loaded, with no surplus row).",
+            file=sys.stderr,
+        )
+        return 1
     if n_missing_fixture:
         print(
             f"ERROR: {n_missing_fixture} OD row(s) had no PSV fixture under "

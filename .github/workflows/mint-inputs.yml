@@ -316,7 +316,8 @@ jobs:
       - name: Diff against the pinned snapshot
         working-directory: empyrean-validation
         run: |
-          python3 scripts/inputs.py diff "$RUNNER_TEMP/psv-src/MANIFEST.json" \
+          # fetch keeps the pinned snapshot's MANIFEST.json as snapshot-manifest.json.
+          python3 scripts/inputs.py diff "$RUNNER_TEMP/psv-src/snapshot-manifest.json" \
             "$GITHUB_WORKSPACE/mint/tree/MANIFEST.json" | tee "$GITHUB_WORKSPACE/mint/diff.txt"
       - name: Upload snapshot to the bucket
         if: inputs.upload

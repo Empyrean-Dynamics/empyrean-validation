@@ -43,9 +43,9 @@ name: Validation Suite
 #              skipped job.
 #   • empyrean — the four remaining distribution channels (python / c / cli /
 #              core) that need the private empyrean + empyrean-core source
-#              built; they share one build so they run together in a single
-#              job. The rust channel is the reference and is produced by the
-#              `reference` matrix above.
+#              built, one leg per channel per object chunk; each leg replays
+#              the plan filtered to its chunk's objects. The rust channel is
+#              the reference and is produced by the `reference` matrix above.
 #   • external — one matrix leg per independent reference implementation
 #              (ASSIST, find_orb, OpenOrb, kete, jorbit, layup, OrbFit).
 #              Each replays the *prebuilt* plan; needs no secrets and no
@@ -345,9 +345,11 @@ jobs:
     name: Reference — ${{ matrix.object.name }}
     needs: prep
     runs-on: ubuntu-latest
-    # The heaviest object (2020 CD3, a minimoon with Monte Carlo rows) took 37,
-    # 51 and then more than 90 minutes on three runs of the same code: runner
-    # variance, not a regression. Budget from the measured spread.
+    # The heaviest object (2020 CD3, a minimoon with Monte Carlo rows) took 37
+    # and 51 minutes, then ran past a 90-minute budget, on three runs of the
+    # same code, and took 96 minutes on 2026-10-28: runner variance, not a
+    # regression. Budget from the measured spread: 180 minutes is nearly twice
+    # the slowest leg measured to completion.
     timeout-minutes: 180
     strategy:
       fail-fast: false
@@ -473,7 +475,7 @@ jobs:
             empyrean-validation/fixtures/psv-radar
             empyrean-validation/fixtures/horizons
             empyrean-validation/fixtures/sbdb
-            empyrean-validation/fixtures/MANIFEST.json
+            empyrean-validation/fixtures/snapshot-manifest.json
           key: inputs-${{ needs.prep.outputs.inputs_id }}
       - name: Verify the pinned inputs snapshot offline
         working-directory: empyrean-validation
@@ -527,8 +529,9 @@ jobs:
   # ── empyrean ───────────────────────────────────────────────────────
   # The four remaining distribution channels (python / c / cli / core)
   # that need the private empyrean + empyrean-core build. rust already ran
-  # in prep (it seeds the plan), so this job replays the prebuilt plan
-  # through the wheel, the C ABI, the CLI, and empyrean-core direct.
+  # in the reference legs (assemble strips it into the plan), so this job
+  # replays the prebuilt plan, one object chunk per leg, through the wheel,
+  # the C ABI, the CLI, and empyrean-core direct.
   empyrean:
     name: Empyrean channel — ${{ matrix.channel }} · ${{ matrix.chunk.id }}
     needs: [prep, assemble]
@@ -538,8 +541,16 @@ jobs:
     # fit either (run 171, 2026-10-22: python and core were each still
     # replaying at 240 minutes), so the channel job fans out over the chunks
     # prep dealt from the same object matrix the reference legs use. Each leg
-    # builds only what its channel links and uploads one chunk file; reduce
-    # concatenates the chunks per channel before the merge.
+    # replays only its chunk: `make run-<channel> PLAN_PREBUILT=1
+    # OBJECTS=<chunk>` asserts the full prebuilt plan (check-plan), filters it
+    # to the chunk's objects (scripts/channel-chunks.py filter, into
+    # results/validation_plan.chunk.json) and hands the runner that filtered
+    # plan. Before the filter, OBJECTS reached no runner and every leg replayed
+    # the whole plan (2026-10-28: all 30,033 rows on every leg; 38 of 40 legs
+    # cut off at 240 minutes, the other two lost their runners first). Each
+    # leg builds only what its channel links and
+    # uploads one chunk file; reduce concatenates the chunks per channel
+    # before the merge.
     timeout-minutes: 240
     strategy:
       fail-fast: false
@@ -670,7 +681,7 @@ jobs:
             empyrean-validation/fixtures/psv-radar
             empyrean-validation/fixtures/horizons
             empyrean-validation/fixtures/sbdb
-            empyrean-validation/fixtures/MANIFEST.json
+            empyrean-validation/fixtures/snapshot-manifest.json
           key: inputs-${{ needs.prep.outputs.inputs_id }}
       - name: Verify the pinned inputs snapshot offline
         working-directory: empyrean-validation
@@ -684,7 +695,7 @@ jobs:
 
       # Build the wheel / C ABI / CLI / core binaries, then replay the
       # prebuilt plan through each. PLAN_PREBUILT=1 stops the Makefile
-      # from trying to rebuild the rust reference (it lives in prep).
+      # from trying to rebuild the rust reference (assemble produced it).
       # Build only what the four replay channels need: the native lib
       # (C/CLI/core link it via DYLD), the C ABI runner, the CLI runner,
       # the wheel, and empyrean-core direct. The rust runner is not built
@@ -708,6 +719,9 @@ jobs:
       - name: Seal the job from JPL and the MPC
         working-directory: empyrean-validation
         run: ./scripts/seal-upstream.sh
+      # OBJECTS is this leg's chunk, so the run-* target replays the plan
+      # filtered to it (see the job comment); the log's "Plan chunk: N rows"
+      # line is the row count this leg replays.
       - name: Replay plan — ${{ matrix.channel }}
         working-directory: empyrean-validation
         env:
@@ -848,7 +862,7 @@ jobs:
             empyrean-validation/fixtures/psv-radar
             empyrean-validation/fixtures/horizons
             empyrean-validation/fixtures/sbdb
-            empyrean-validation/fixtures/MANIFEST.json
+            empyrean-validation/fixtures/snapshot-manifest.json
           key: inputs-${{ needs.prep.outputs.inputs_id }}
       - name: Verify the pinned inputs snapshot offline
         working-directory: empyrean-validation
@@ -956,7 +970,7 @@ jobs:
             empyrean-validation/fixtures/psv-radar
             empyrean-validation/fixtures/horizons
             empyrean-validation/fixtures/sbdb
-            empyrean-validation/fixtures/MANIFEST.json
+            empyrean-validation/fixtures/snapshot-manifest.json
           key: inputs-${{ needs.prep.outputs.inputs_id }}
       - name: Verify the pinned inputs snapshot offline
         working-directory: empyrean-validation
@@ -1052,7 +1066,15 @@ jobs:
       # Floors are only applied on a full-catalog run: a workflow_dispatch
       # with an OBJECTS subset legitimately produces fewer rows, and a floor
       # that fires on a deliberate subset would train everyone to ignore it.
-      - name: ci-check (gate on python + core parity and OD row floors)
+      #
+      # `--plan` applies on every run, subset or not: every object the plan
+      # names (results/validation_plan.json, from the prep-plan-and-rust
+      # artifact staged above) must have at least one reference (core) row in
+      # the summary, and objects with none fail by name ("reference leg
+      # missing: ..."). Without it an object the reference never replayed
+      # left every other channel's rows for it unreferenced, which the gate
+      # only notes, and the run passed with that object never compared.
+      - name: ci-check (gate on python + core parity, OD row floors, reference rows per object)
         working-directory: empyrean-validation
         run: |
           if [ -z "${OBJECTS}" ]; then
@@ -1064,6 +1086,7 @@ jobs:
           fi
           ./target/release/empyrean-validation ci-check \
             --summary results/validation_summary.json \
+            --plan results/validation_plan.json \
             --strict-channels python,core \
             ${FLOORS}
 

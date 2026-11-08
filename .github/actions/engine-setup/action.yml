@@ -286,7 +286,8 @@ runs:
 
     # ── Inputs snapshot (public validation bucket, pinned by the manifest) ──
     # The four product directories (psv, psv-radar, horizons, sbdb) + the
-    # per-file MANIFEST.json are one immutable snapshot in the suite's
+    # per-file MANIFEST.json (kept beside the data as
+    # fixtures/snapshot-manifest.json) are one immutable snapshot in the suite's
     # public-read bucket. prep is the sole fetcher, but the fetch is a plain
     # HTTPS read (python3 + network only, no credential, independent of the
     # kernel-set auth above): `make fixtures` then saves the cache. Every
@@ -306,7 +307,7 @@ runs:
           empyrean-validation/fixtures/psv-radar
           empyrean-validation/fixtures/horizons
           empyrean-validation/fixtures/sbdb
-          empyrean-validation/fixtures/MANIFEST.json
+          empyrean-validation/fixtures/snapshot-manifest.json
         key: inputs-${{ inputs.inputs-snapshot-id }}
     - name: Fetch + verify the pinned inputs snapshot (writer)
       if: inputs.role == 'writer' && inputs.inputs-snapshot-id != ''
@@ -322,7 +323,7 @@ runs:
           empyrean-validation/fixtures/psv-radar
           empyrean-validation/fixtures/horizons
           empyrean-validation/fixtures/sbdb
-          empyrean-validation/fixtures/MANIFEST.json
+          empyrean-validation/fixtures/snapshot-manifest.json
         key: inputs-${{ inputs.inputs-snapshot-id }}
     - name: Restore inputs snapshot (reader)
       if: inputs.role != 'writer' && inputs.inputs-snapshot-id != ''
@@ -334,7 +335,7 @@ runs:
           empyrean-validation/fixtures/psv-radar
           empyrean-validation/fixtures/horizons
           empyrean-validation/fixtures/sbdb
-          empyrean-validation/fixtures/MANIFEST.json
+          empyrean-validation/fixtures/snapshot-manifest.json
         key: inputs-${{ inputs.inputs-snapshot-id }}
     - name: Require a warm inputs cache (reader role)
       if: inputs.role != 'writer' && inputs.inputs-snapshot-id != '' && steps.cache-inputs-reader.outputs.cache-hit != 'true'

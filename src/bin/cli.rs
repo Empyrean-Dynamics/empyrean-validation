@@ -23,7 +23,8 @@
 //! - [`ci-check`](CiCheckArgs) — read the CI summary JSON written by
 //!   `report --summary` and exit non-zero if any channel in
 //!   `--strict-channels` is absent from the summary, failed binding
-//!   fidelity at 1e-10, or fell below a `--min-rows` per-axis floor.
+//!   fidelity at 1e-10, or fell below a `--min-rows` per-axis floor, or
+//!   if any object `--plan` names has no reference-channel row.
 //!
 //! Per-channel runners (the binaries that actually execute
 //! propagation / ephemeris / OD against a specific empyrean
@@ -39,7 +40,7 @@ use empyrean_validation::{
     catalog::{
         RADAR_FIXTURE_OBJECTS, ValidationObject, all_objects, filter_by_name, filter_by_population,
     },
-    inputs::{InputProduct, missing_input},
+    inputs::{InputProduct, cache_file_name, missing_input},
     plan::{PlanConfig, build_plan},
     report::{SUMMARY_TEST_TYPES, generate_report},
     schema::{OrbitComparison, ValidationResult, channels, test_types},
@@ -375,6 +376,18 @@ struct CiCheckArgs {
     /// [`empyrean_validation::catalog`], so the two cannot drift.
     #[arg(long)]
     catalog_floors: bool,
+    /// The plan the run replayed (`results/validation_plan.json`). Every
+    /// object it names must have at least one reference-channel row in the
+    /// summary (`reference_rows_by_object`, written by `report --summary`);
+    /// objects with none fail the gate by name.
+    ///
+    /// The per-axis NOTE for unreferenced rows stays a note: an axis the
+    /// reference does not run is a known gap. An object with no reference
+    /// rows at all is not: the reference leg that should have replayed it
+    /// delivered nothing, every other channel's rows for it went
+    /// unreferenced, and the strict-channel check passed on the rest.
+    #[arg(long)]
+    plan: Option<PathBuf>,
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -1709,8 +1722,9 @@ fn read_sbdb_od_ref(
     sbdb_cache_dir: &std::path::Path,
     sbdb_query: &str,
 ) -> Result<Option<SbdbOdRef>, String> {
-    let fname = format!("{}.json", sbdb_query.replace(' ', "_"));
-    let path = sbdb_cache_dir.join(fname);
+    // The snapshot file is named by the engine's disk-cache rule, never a
+    // reader-local spelling of it (see `cache_file_name`).
+    let path = sbdb_cache_dir.join(cache_file_name(sbdb_query));
     let txt = std::fs::read_to_string(&path).map_err(|e| {
         missing_input(
             sbdb_query,
@@ -2214,8 +2228,21 @@ fn ci_check_failures(
                     let tt = m["test_type"].as_str().unwrap_or("?");
                     let method = m["method"].as_str().unwrap_or("?");
                     let side = m["delivered_side"].as_str().unwrap_or("?");
+                    // The row's offset and observer, as the unjudged and
+                    // missing lines name them: a propagation / ephemeris
+                    // mismatch is one of many rows per object and method.
+                    let at = match m["dt_days"].as_f64() {
+                        Some(dt) => {
+                            let obs = m["observer"]
+                                .as_str()
+                                .map(|o| format!(" / {o}"))
+                                .unwrap_or_default();
+                            format!(" / dt {dt:+.0} d{obs}")
+                        }
+                        None => String::new(),
+                    };
                     failures.push(format!(
-                        "{want}: refusal mismatch — {obj} / {tt} / {method}: \
+                        "{want}: refusal mismatch — {obj} / {tt}{at} / {method}: \
                          {side} delivered, the other refused"
                     ));
                 }
@@ -2240,6 +2267,40 @@ fn ci_check_failures(
                     ));
                 }
             }
+        }
+
+        // Reference rows the channel emitted nothing for. `passing == total`
+        // counts only the pairs the channel's own rows formed, so a skipped
+        // reference row was invisible and a channel could skip any row and
+        // still pass. Every reference row of a test type the channel produces
+        // must have the channel's row; the summary excuses only the test types
+        // the channel does not produce at this pin, and names the rest.
+        match ch["missing_rows"].as_array() {
+            None => failures.push(format!(
+                "{want}: the summary carries no missing_rows; it predates the \
+                 reference row coverage check, so regenerate it with this build of `report`"
+            )),
+            Some(missing) if !missing.is_empty() => {
+                failures.push(format!(
+                    "{want}: {} reference row(s) of a test type {want} produces have no {want} row",
+                    missing.len()
+                ));
+                for m in missing {
+                    let obj = m["object"].as_str().unwrap_or("?");
+                    let tt = m["test_type"].as_str().unwrap_or("?");
+                    let dt = m["dt_days"].as_f64().unwrap_or(f64::NAN);
+                    let obs = m["observer"]
+                        .as_str()
+                        .map(|o| format!(" / {o}"))
+                        .unwrap_or_default();
+                    let method = m["method"].as_str().unwrap_or("?");
+                    failures.push(format!(
+                        "{want}: missing — {obj} / {tt} / dt {dt:+.0} d{obs} / {method}: \
+                         the reference row has no {want} row"
+                    ));
+                }
+            }
+            Some(_) => {}
         }
 
         // Unscoped per-axis floors apply to every strict channel. Scoped
@@ -2276,6 +2337,68 @@ fn ci_check_failures(
         failures.extend(floor_failures(ch, want, f, strict));
     }
     failures
+}
+
+/// The distinct objects a plan names, in plan order.
+///
+/// Only the `object` key is read; serde skips the rest of each row, so the
+/// full plan parses without building its rows.
+fn planned_objects(path: &std::path::Path) -> Result<Vec<String>, String> {
+    #[derive(serde::Deserialize)]
+    struct PlanRow {
+        object: String,
+    }
+    let raw = std::fs::read_to_string(path).map_err(|e| format!("read {}: {e}", path.display()))?;
+    let rows: Vec<PlanRow> =
+        serde_json::from_str(&raw).map_err(|e| format!("parse {}: {e}", path.display()))?;
+    let mut seen = std::collections::HashSet::new();
+    Ok(rows
+        .into_iter()
+        .filter_map(|r| seen.insert(r.object.clone()).then_some(r.object))
+        .collect())
+}
+
+/// Why the summary fails the `--plan` check: planned objects with no
+/// reference-channel row, named in plan order.
+///
+/// Split out from [`ci_check`] for the same reason as [`ci_check_failures`]:
+/// the gate's logic is testable without a process exit.
+fn reference_coverage_failures(summary: &serde_json::Value, planned: &[String]) -> Vec<String> {
+    if planned.is_empty() {
+        return vec![
+            "the plan names no objects; there is nothing to check reference coverage against"
+                .to_string(),
+        ];
+    }
+    let Some(by_object) = summary["reference_rows_by_object"].as_object() else {
+        return vec![
+            "the summary carries no reference_rows_by_object; it predates per-object \
+             reference counts, so regenerate it with this build of `report`"
+                .to_string(),
+        ];
+    };
+    let channel = summary["reference_channel"].as_str().unwrap_or("core");
+    let missing: Vec<&str> = planned
+        .iter()
+        .map(String::as_str)
+        .filter(|o| {
+            by_object
+                .get(*o)
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(0)
+                == 0
+        })
+        .collect();
+    if missing.is_empty() {
+        return Vec::new();
+    }
+    vec![format!(
+        "reference leg missing: {}; {} of {} planned objects have no {channel} rows, \
+         so no other channel's rows for them were compared",
+        missing.join(", "),
+        missing.len(),
+        planned.len()
+    )]
 }
 
 /// Evaluate one row floor against one summary channel entry.
@@ -2378,7 +2501,14 @@ fn ci_check(args: CiCheckArgs) -> Result<(), Box<dyn std::error::Error>> {
     if args.catalog_floors {
         min_rows.extend(catalog_row_floors());
     }
-    let failures = ci_check_failures(channels, &args.strict_channels, &min_rows, &args.summary);
+    let mut failures = ci_check_failures(channels, &args.strict_channels, &min_rows, &args.summary);
+    let planned = match &args.plan {
+        Some(plan) => Some(planned_objects(plan)?),
+        None => None,
+    };
+    if let Some(planned) = &planned {
+        failures.extend(reference_coverage_failures(&summary, planned));
+    }
 
     if failures.is_empty() {
         // One pass line per strict channel, carrying the refused-identically
@@ -2418,12 +2548,40 @@ fn ci_check(args: CiCheckArgs) -> Result<(), Box<dyn std::error::Error>> {
                         per_axis.join(", ")
                     );
                 }
+                eprintln!(
+                    "ci-check: {want}: every reference row of a test type {want} produces \
+                     has a {want} row"
+                );
+                // Reference rows of a test type the channel does not produce at
+                // this pin are excused, not compared; say so, per type.
+                let not_produced: Vec<String> = ch["not_produced_by_test_type"]
+                    .as_object()
+                    .map(|m| {
+                        m.iter()
+                            .filter_map(|(tt, n)| n.as_u64().map(|n| format!("{tt}: {n}")))
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                if !not_produced.is_empty() {
+                    eprintln!(
+                        "ci-check: {want}: NOTE reference row(s) of a test type {want} does not \
+                         produce at this pin were not required [{}]",
+                        not_produced.join(", ")
+                    );
+                }
             }
         }
         eprintln!(
             "ci-check: all strict channels [{}] passed binding fidelity at 1e-10",
             args.strict_channels.join(", ")
         );
+        if let (Some(planned), Some(plan)) = (&planned, &args.plan) {
+            eprintln!(
+                "ci-check: every object in {} ({}) has reference rows",
+                plan.display(),
+                planned.len()
+            );
+        }
         if min_rows.is_empty() {
             eprintln!(
                 "ci-check: no per-axis row floors were requested \
@@ -2525,6 +2683,8 @@ mod tests {
             "n_rows": total,
             "n_passing": total,
             "n_total_compared": total,
+            "missing_rows": [],
+            "not_produced_by_test_type": {},
             "by_test_type": by_test_type,
         })
     }
@@ -2585,6 +2745,137 @@ mod tests {
                 "unjudged — Apophis / orbit_determination_radar / dt +0 d / —: \
                  the reference row carries neither a comparable metric nor a delivery signal"
             ),
+            "{failures:?}"
+        );
+    }
+
+    /// A reference row a strict channel emitted nothing for fails the gate by
+    /// name, after a count line, even though every pair the channel did form
+    /// passed (the shape that read "python: 1238/1238 rows passed").
+    #[test]
+    fn ci_check_names_every_missing_reference_row() {
+        let mut ch = summary_channel("python", &[("ephemeris", 10)]);
+        ch["missing_rows"] = serde_json::json!([{
+            "object": "Vesta",
+            "test_type": "ephemeris",
+            "dt_days": -5475.0,
+            "observer": "W84",
+            "method": "second order",
+        }]);
+        let failures = check(&[ch.clone()], &["python"], &[]);
+        assert_eq!(failures.len(), 2, "{failures:?}");
+        assert_eq!(
+            failures[0],
+            "python: 1 reference row(s) of a test type python produces have no python row"
+        );
+        assert_eq!(
+            failures[1],
+            "python: missing — Vesta / ephemeris / dt -5475 d / W84 / second order: \
+             the reference row has no python row"
+        );
+        // Only strict channels are held to it.
+        assert!(check(&[ch], &[], &[]).is_empty());
+    }
+
+    /// A refusal mismatch on an ephemeris row names the row's offset and
+    /// observer, as the unjudged and missing lines do.
+    #[test]
+    fn ci_check_names_the_row_of_a_refusal_mismatch() {
+        let mut ch = summary_channel("python", &[("ephemeris", 1)]);
+        ch["n_passing"] = serde_json::json!(0);
+        ch["refusal_mismatches"] = serde_json::json!([{
+            "object": "Vesta",
+            "test_type": "ephemeris",
+            "dt_days": 365.0,
+            "observer": "F51",
+            "method": "sigma-point",
+            "delivered_side": "reference",
+        }]);
+        let failures = check(&[ch], &["python"], &[]);
+        assert_eq!(failures.len(), 2, "{failures:?}");
+        assert_eq!(
+            failures[1],
+            "python: refusal mismatch — Vesta / ephemeris / dt +365 d / F51 / sigma-point: \
+             reference delivered, the other refused"
+        );
+    }
+
+    /// A summary written before the coverage check existed carries no
+    /// missing_rows; it must not pass by having nothing to read.
+    #[test]
+    fn ci_check_refuses_a_summary_without_missing_rows() {
+        let mut ch = summary_channel("python", &[("ephemeris", 10)]);
+        ch.as_object_mut().unwrap().remove("missing_rows");
+        let failures = check(&[ch], &["python"], &[]);
+        assert_eq!(failures.len(), 1, "{failures:?}");
+        assert!(
+            failures[0].contains("carries no missing_rows"),
+            "{failures:?}"
+        );
+    }
+
+    /// End to end through the renderer: a strict channel that skipped a
+    /// reference row it produces fails naming it; the transport rows the
+    /// channel does not produce at this pin do not fail it.
+    #[test]
+    fn report_summary_feeds_the_missing_row_gate() {
+        let dir = tempfile::tempdir().unwrap();
+        let row = |channel: &str, test_type: &str, dt: f64| {
+            let mut r = ValidationResult::empty();
+            r.channel = channel.into();
+            r.object = "Bennu".into();
+            r.test_type = test_type.into();
+            r.dt_days = dt;
+            // An identical position on both sides: a pair that passes.
+            r.emp_pos_au = Some([1.0, 0.0, 0.0]);
+            r
+        };
+        let run = |python: &[ValidationResult]| {
+            let results = vec![
+                // The renderer requires the rust reference file; rust is not
+                // strict here.
+                write_results(
+                    dir.path(),
+                    "validation_rust.json",
+                    &[row("rust", "propagation", 30.0)],
+                ),
+                write_results(
+                    dir.path(),
+                    "validation_core.json",
+                    &[
+                        row("core", "propagation", 30.0),
+                        row("core", "propagation", 90.0),
+                        row("core", test_types::ORBIT_DETERMINATION_TRANSPORT, 0.0),
+                    ],
+                ),
+                write_results(dir.path(), "validation_python.json", python),
+            ];
+            let summary_path = dir.path().join("validation_summary.json");
+            report(ReportArgs {
+                results,
+                output: dir.path().join("report.html"),
+                summary: Some(summary_path.clone()),
+                predict_agg: vec![],
+                predict_run: vec![],
+            })
+            .expect("report");
+            let summary: serde_json::Value =
+                serde_json::from_str(&std::fs::read_to_string(&summary_path).unwrap()).unwrap();
+            let channels = summary["channels"].as_array().unwrap().clone();
+            check(&channels, &["python", "core"], &[])
+        };
+        // Every propagation row present; the transport row is not produced.
+        let full = [
+            row("python", "propagation", 30.0),
+            row("python", "propagation", 90.0),
+        ];
+        let failures = run(&full);
+        assert!(failures.is_empty(), "{failures:?}");
+        // One propagation row skipped: named.
+        let failures = run(&full[..1]);
+        assert_eq!(failures.len(), 2, "{failures:?}");
+        assert!(
+            failures[1].starts_with("python: missing — Bennu / propagation / dt +90 d / —:"),
             "{failures:?}"
         );
     }
@@ -2893,6 +3184,132 @@ mod tests {
             failures[0].contains("rust:orbit_determination_radar>=5"),
             "names the floor that could not be evaluated: {failures:?}"
         );
+    }
+
+    // ── ci-check --plan: reference rows per planned object ───────────
+
+    fn summary_with_reference(counts: &[(&str, u64)]) -> serde_json::Value {
+        let by_object: serde_json::Map<String, serde_json::Value> = counts
+            .iter()
+            .map(|(o, n)| ((*o).to_string(), serde_json::json!(n)))
+            .collect();
+        serde_json::json!({
+            "channels": [],
+            "reference_channel": "core",
+            "reference_rows_by_object": by_object,
+        })
+    }
+
+    #[test]
+    fn reference_coverage_passes_when_every_planned_object_has_reference_rows() {
+        let summary = summary_with_reference(&[("Bennu", 730), ("Eris", 625), ("Vesta", 625)]);
+        let failures = reference_coverage_failures(&summary, &strict(&["Bennu", "Eris"]));
+        assert!(failures.is_empty(), "{failures:?}");
+    }
+
+    #[test]
+    fn reference_coverage_fails_naming_every_planned_object_without_reference_rows() {
+        // A zero count and an absent key are the same failure: the reference
+        // delivered nothing for the object.
+        let summary = summary_with_reference(&[("Bennu", 730), ("Eris", 0)]);
+        let failures =
+            reference_coverage_failures(&summary, &strict(&["Bennu", "Eris", "2024 PT5"]));
+        assert_eq!(failures.len(), 1, "{failures:?}");
+        assert!(
+            failures[0].starts_with("reference leg missing: Eris, 2024 PT5;"),
+            "{failures:?}"
+        );
+        assert!(
+            failures[0].contains("2 of 3 planned objects have no core rows"),
+            "{failures:?}"
+        );
+    }
+
+    #[test]
+    fn reference_coverage_refuses_a_stale_summary_and_an_empty_plan() {
+        // A summary written before the per-object counts existed must not
+        // pass the check by having nothing to read.
+        let stale = serde_json::json!({ "channels": [] });
+        let failures = reference_coverage_failures(&stale, &strict(&["Bennu"]));
+        assert_eq!(failures.len(), 1, "{failures:?}");
+        assert!(
+            failures[0].contains("no reference_rows_by_object"),
+            "{failures:?}"
+        );
+        let summary = summary_with_reference(&[("Bennu", 730)]);
+        let failures = reference_coverage_failures(&summary, &[]);
+        assert_eq!(failures.len(), 1, "{failures:?}");
+        assert!(failures[0].contains("names no objects"), "{failures:?}");
+    }
+
+    #[test]
+    fn planned_objects_are_distinct_and_in_plan_order() {
+        let dir = tempfile::tempdir().unwrap();
+        let plan = dir.path().join("validation_plan.json");
+        std::fs::write(
+            &plan,
+            r#"[{"object":"Eris","test_type":"propagation","dt_days":1.0},
+                {"object":"1I/'Oumuamua","test_type":"ephemeris","observer":"500"},
+                {"object":"Eris","test_type":"orbit_determination"}]"#,
+        )
+        .unwrap();
+        assert_eq!(
+            planned_objects(&plan).unwrap(),
+            strict(&["Eris", "1I/'Oumuamua"])
+        );
+        let err = planned_objects(&dir.path().join("absent.json")).unwrap_err();
+        assert!(err.contains("absent.json"), "{err}");
+    }
+
+    /// End to end through the renderer: the summary `report` writes carries
+    /// the per-object reference counts, and the gate fails naming the object
+    /// whose reference rows never arrived while the replay channel's rows for
+    /// it sat unreferenced.
+    #[test]
+    fn report_summary_feeds_the_reference_coverage_gate() {
+        let dir = tempfile::tempdir().unwrap();
+        let row = |channel: &str, object: &str| {
+            let mut r = ValidationResult::empty();
+            r.channel = channel.into();
+            r.object = object.into();
+            r.test_type = "propagation".into();
+            r
+        };
+        let results = vec![
+            write_results(
+                dir.path(),
+                "validation_rust.json",
+                &[row("rust", "Bennu"), row("rust", "Eris")],
+            ),
+            write_results(
+                dir.path(),
+                "validation_python.json",
+                &[row("python", "Bennu"), row("python", "Eris")],
+            ),
+            write_results(dir.path(), "validation_core.json", &[row("core", "Bennu")]),
+        ];
+        let summary_path = dir.path().join("validation_summary.json");
+        report(ReportArgs {
+            results,
+            output: dir.path().join("report.html"),
+            summary: Some(summary_path.clone()),
+            predict_agg: vec![],
+            predict_run: vec![],
+        })
+        .expect("report");
+        let summary: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&summary_path).unwrap()).unwrap();
+        assert_eq!(
+            summary["reference_rows_by_object"],
+            serde_json::json!({ "Bennu": 1 })
+        );
+        let failures = reference_coverage_failures(&summary, &strict(&["Bennu", "Eris"]));
+        assert_eq!(failures.len(), 1, "{failures:?}");
+        assert!(
+            failures[0].starts_with("reference leg missing: Eris;"),
+            "{failures:?}"
+        );
+        assert!(reference_coverage_failures(&summary, &strict(&["Bennu"])).is_empty());
     }
 
     // ── orbit-comparison sidecar ─────────────────────────────────────
@@ -3281,11 +3698,35 @@ mod tests {
 
     /// Write a mock SBDB cache file under `dir/{query}.json` for `merge_jpl`.
     fn write_sbdb(dir: &std::path::Path, query: &str, orbit_json: &str) {
+        write_sbdb_file(dir, &cache_file_name(query), orbit_json);
+    }
+
+    /// Write an SBDB snapshot file under a literal file name, so a test pins
+    /// the name the snapshot uses instead of re-deriving it.
+    fn write_sbdb_file(dir: &std::path::Path, file_name: &str, orbit_json: &str) {
         std::fs::write(
-            dir.join(format!("{}.json", query.replace(' ', "_"))),
+            dir.join(file_name),
             format!(r#"{{"response":{{"orbit":{orbit_json}}}}}"#),
         )
         .unwrap();
+    }
+
+    #[test]
+    fn merge_jpl_resolves_a_comet_query_to_the_snapshot_file_name() {
+        // The snapshot holds C/2023 A3's SBDB response as C_2023_A3.json (the
+        // engine's disk-cache name). Replacing only spaces looked for
+        // C/2023_A3.json and failed the full-catalog merge on a file the
+        // snapshot carries.
+        let dir = tempfile::tempdir().unwrap();
+        write_sbdb_file(
+            dir.path(),
+            "C_2023_A3.json",
+            r#"{"rms":".5","n_obs_used":402}"#,
+        );
+        let mut rows = vec![od_row("C/2023 A3")];
+        let n = merge_jpl(&mut rows, dir.path()).unwrap();
+        assert_eq!(n, 1);
+        assert_eq!(rows[0].ref_od_n_obs_used, Some(402));
     }
 
     #[test]
