@@ -43,9 +43,11 @@ name: Validation Suite
 #              skipped job.
 #   • empyrean — the four remaining distribution channels (python / c / cli /
 #              core) that need the private empyrean + empyrean-core source
-#              built, one leg per channel per object chunk; each leg replays
-#              the plan filtered to its chunk's objects. The rust channel is
-#              the reference and is produced by the `reference` matrix above.
+#              built, in cost-balanced row-level legs: assemble packs the
+#              plan's rows into legs from the committed cost table
+#              (scripts/schedule.py), and each leg replays only its rows.
+#              The rust channel is the reference and is produced by the
+#              `reference` matrix above.
 #   • external — one matrix leg per independent reference implementation
 #              (ASSIST, find_orb, OpenOrb, kete, jorbit, layup, OrbFit).
 #              Each replays the *prebuilt* plan; needs no secrets and no
@@ -141,6 +143,10 @@ on:
         description: "Force model tier (approximate / basic / standard)"
         type: string
         default: "standard"
+      channel_legs:
+        description: "Total channel legs over python / c / cli / core (empty = the default budget; a rehearsal passes a small number)"
+        type: string
+        default: ""
   push:
     branches: [main]
     # The empyrean pin, and nothing else. See "Pin-bump push" above for why
@@ -173,9 +179,12 @@ env:
   # sibling dispatch) validates the complete catalog; pass a comma-separated
   # subset via workflow_dispatch `objects` for a quick targeted run.
   OBJECTS: ${{ inputs.objects || '' }}
-  # Object chunks per channel leg (scripts/channel-chunks.py); capped at the
-  # object count, so a subset dispatch fans out no wider than its objects.
-  CHANNEL_CHUNKS: "10"
+  # Channel legs over python / c / cli / core, in total (scripts/schedule.py
+  # packs the plan's rows into them by predicted cost). What is left of the
+  # account's 60 concurrent jobs after the external legs and a reserve; a
+  # channel never gets more legs than it has scheduling units, so a subset
+  # dispatch fans out no wider than its rows.
+  CHANNEL_LEGS: ${{ inputs.channel_legs || '50' }}
   TIER: ${{ inputs.tier || 'standard' }}
   # Shared cache keys — every job restores by these exact keys so the
   # downloads/builds `prep` populates fan out warm. Bump a version suffix
@@ -249,9 +258,6 @@ jobs:
     outputs:
       # The per-object fan-out matrix, generated from the catalog.
       objects: ${{ steps.objects.outputs.objects }}
-      # The same objects dealt into chunks for the channel legs, and how many.
-      chunks: ${{ steps.objects.outputs.chunks }}
-      chunk_count: ${{ steps.objects.outputs.chunk_count }}
       # snapshot_id of the pinned inputs snapshot, read from the manifest.
       # Every downstream job keys the inputs cache on this (prep is the sole
       # writer), so they all restore exactly what prep fetched.
@@ -360,11 +366,6 @@ jobs:
           test "$count" -gt 0 || { echo "ERROR: matrix is empty — no objects to validate." >&2; exit 1; }
           echo "objects=$matrix" >> "$GITHUB_OUTPUT"
           echo "Fanning out $count per-object reference legs."
-          chunks="$(python3 scripts/channel-chunks.py split --objects results/objects.json --count "${CHANNEL_CHUNKS}")"
-          chunk_count="$(python3 -c 'import json,sys;print(len(json.loads(sys.argv[1])))' "$chunks")"
-          echo "chunks=$chunks" >> "$GITHUB_OUTPUT"
-          echo "chunk_count=$chunk_count" >> "$GITHUB_OUTPUT"
-          echo "Fanning out 4 channels x $chunk_count object chunks."
 
   # ── reference (per-object matrix) ───────────────────────────────────
   # One leg per catalog object. Each restores the caches prep warmed, rebuilds
@@ -464,6 +465,11 @@ jobs:
     if: always() && needs.prep.result == 'success'
     runs-on: ubuntu-latest
     timeout-minutes: 30
+    outputs:
+      # The channel leg matrix, [{"channel","leg"}], from the schedule below. The
+      # schedule itself (which rows each leg replays) travels in the
+      # prep-plan-and-rust artifact; only this short list is a job output.
+      leg_matrix: ${{ steps.schedule.outputs.leg_matrix }}
     steps:
       - name: Checkout empyrean-validation (default)
         uses: actions/checkout@v4
@@ -536,6 +542,25 @@ jobs:
           make assemble-reference OBJECTS="${OBJECTS}"
           make plan REFERENCE_ASSEMBLED=1 OBJECTS="${OBJECTS}" TIERS="${TIER}"
 
+      # Pack the plan's rows into cost-balanced channel legs: a pure function
+      # of the plan, the committed cost table (fixtures/costs.json, refreshed
+      # by PR from a named run) and the leg budget. The log lists each channel's
+      # predicted leg walls and names every row the cost table does not know
+      # (priced at a class estimate, never zero). The leg matrix is read from the
+      # FILE the target writes, never from make's stdout.
+      - name: Schedule the channel legs
+        id: schedule
+        working-directory: empyrean-validation
+        run: |
+          make schedule PLAN_PREBUILT=1 CHANNEL_LEG_BUDGET="${CHANNEL_LEGS}"
+          python3 scripts/schedule.py validate --plan results/validation_plan.json \
+            --schedule results/schedule.json --costs fixtures/costs.json
+          matrix="$(cat results/leg-matrix.json)"
+          count="$(python3 -c 'import json;print(len(json.load(open("results/leg-matrix.json"))))')"
+          test "$count" -gt 0 || { echo "ERROR: the channel leg matrix is empty." >&2; exit 1; }
+          echo "leg_matrix=$matrix" >> "$GITHUB_OUTPUT"
+          echo "Fanning out $count channel legs."
+
       # Stage the plan + the rust channel outputs for the downstream jobs.
       #
       # Including the two JSONL sidecars `validate od` writes next to
@@ -563,6 +588,8 @@ jobs:
             empyrean-validation/results/validation_rust.json
             empyrean-validation/results/validation_rust_od_orbits.jsonl
             empyrean-validation/results/validation_rust_od_compare.jsonl
+            empyrean-validation/results/schedule.json
+            empyrean-validation/results/leg-matrix.json
           retention-days: 30
           if-no-files-found: error
 
@@ -570,33 +597,34 @@ jobs:
   # The four remaining distribution channels (python / c / cli / core)
   # that need the private empyrean + empyrean-core build. rust already ran
   # in the reference legs (assemble strips it into the plan), so this job
-  # replays the prebuilt plan, one object chunk per leg, through the wheel,
-  # the C ABI, the CLI, and empyrean-core direct.
+  # replays the prebuilt plan, one cost-balanced row-level leg at a time,
+  # through the wheel, the C ABI, the CLI, and empyrean-core direct.
   empyrean:
-    name: Empyrean channel — ${{ matrix.channel }} · ${{ matrix.chunk.id }}
+    name: Empyrean channel — ${{ matrix.channel }} · ${{ matrix.leg }}
     needs: [prep, assemble]
     runs-on: ubuntu-latest
-    # One leg per channel per object chunk. The per-method plan replays every
-    # uncertainty method on every channel; a single leg per channel does not
-    # fit either (run 171, 2026-10-22: python and core were each still
-    # replaying at 240 minutes), so the channel job fans out over the chunks
-    # prep dealt from the same object matrix the reference legs use. Each leg
-    # replays only its chunk: `make run-<channel> PLAN_PREBUILT=1
-    # OBJECTS=<chunk>` asserts the full prebuilt plan (check-plan), filters it
-    # to the chunk's objects (scripts/channel-chunks.py filter, into
-    # results/validation_plan.chunk.json) and hands the runner that filtered
-    # plan. Before the filter, OBJECTS reached no runner and every leg replayed
-    # the whole plan (2026-10-28: all 30,033 rows on every leg; 38 of 40 legs
-    # cut off at 240 minutes, the other two lost their runners first). Each
-    # leg builds only what its channel links and
-    # uploads one chunk file; reduce concatenates the chunks per channel
-    # before the merge.
+    # One leg per entry of the schedule assemble wrote (scripts/schedule.py):
+    # the plan's rows packed longest-first into legs by predicted cost, so no
+    # leg holds more than its share. The per-method plan replays every
+    # uncertainty method on every channel; a leg per channel does not fit (run
+    # 171, 2026-10-22: python and core were each still replaying at 240
+    # minutes), and a leg per object chunk does not either: the chunk holding
+    # 2020 CD3 (one row that costs 42 minutes per run, timed best of three)
+    # was modeled at 284 and 311 minutes for c and cli and both were cancelled
+    # at the limit (run 42506609035). Each leg replays only its rows: `make
+    # run-<channel> PLAN_PREBUILT=1 LEG=<leg>` asserts the full prebuilt plan
+    # (check-plan), narrows it to the leg's rows (scripts/channel-chunks.py
+    # select, into results/validation_plan.leg-<channel>.json) and hands the
+    # runner that plan, with the full plan as --context for the lookups that
+    # cross rows. Before the object filter, OBJECTS reached no runner and every
+    # leg replayed the whole plan (2026-10-28: all 30,033 rows on every leg).
+    # Each leg builds only what its channel links and uploads one leg file;
+    # reduce puts the legs back in plan order per channel before the merge.
     timeout-minutes: 240
     strategy:
       fail-fast: false
       matrix:
-        channel: [python, c, cli, core]
-        chunk: ${{ fromJson(needs.prep.outputs.chunks) }}
+        include: ${{ fromJson(needs.assemble.outputs.leg_matrix) }}
     steps:
       - name: Checkout empyrean-validation (default)
         uses: actions/checkout@v4
@@ -759,24 +787,23 @@ jobs:
       - name: Seal the job from JPL and the MPC
         working-directory: empyrean-validation
         run: ./scripts/seal-upstream.sh
-      # OBJECTS is this leg's chunk, so the run-* target replays the plan
-      # filtered to it (see the job comment); the log's "Plan chunk: N rows"
-      # line is the row count this leg replays.
-      - name: Replay plan — ${{ matrix.channel }}
+      # LEG is this leg's id in the schedule, so the run-* target replays only
+      # its rows (see the job comment); the log's "Plan leg: N rows" line is
+      # the row count this leg replays.
+      - name: Replay plan — ${{ matrix.channel }} leg ${{ matrix.leg }}
         working-directory: empyrean-validation
         env:
-          OBJECTS: ${{ matrix.chunk.objects }}
           DATA_DIR: ${{ env.EMPYREAN_DATA_DIR }}
         run: |
-          make run-${{ matrix.channel }} PLAN_PREBUILT=1 OBJECTS="${OBJECTS}" TIERS="${TIER}"
+          make run-${{ matrix.channel }} PLAN_PREBUILT=1 LEG="${{ matrix.leg }}" TIERS="${TIER}"
           mv results/validation_${{ matrix.channel }}.json \
-             results/validation_${{ matrix.channel }}.chunk${{ matrix.chunk.id }}.json
+             results/validation_${{ matrix.channel }}.leg${{ matrix.leg }}.json
 
-      - name: Upload ${{ matrix.channel }} chunk ${{ matrix.chunk.id }}
+      - name: Upload ${{ matrix.channel }} leg ${{ matrix.leg }}
         uses: actions/upload-artifact@v4
         with:
-          name: channel-${{ matrix.channel }}-${{ matrix.chunk.id }}
-          path: empyrean-validation/results/validation_${{ matrix.channel }}.chunk${{ matrix.chunk.id }}.json
+          name: channel-${{ matrix.channel }}-${{ matrix.leg }}
+          path: empyrean-validation/results/validation_${{ matrix.channel }}.leg${{ matrix.leg }}.json
           retention-days: 30
           if-no-files-found: error
 
@@ -1088,16 +1115,20 @@ jobs:
         working-directory: empyrean-validation
         run: ls -la results/
 
-      # Each channel arrives as one file per object chunk; put it back
-      # together before the merge, refusing a short channel.
-      - name: Assemble channel chunks
+      # Each channel arrives as one file per leg; put it back together in
+      # plan order before the merge, against the schedule that dealt the rows
+      # out, refusing a short channel, a duplicate row, and a row outside its
+      # leg's selection.
+      - name: Assemble channel legs
         working-directory: empyrean-validation
         run: |
           for ch in python c cli core; do
             python3 scripts/channel-chunks.py concat \
+              --plan results/validation_plan.json \
+              --schedule results/schedule.json \
+              --channel "${ch}" \
               --out "results/validation_${ch}.json" \
-              --expect "${{ needs.prep.outputs.chunk_count }}" \
-              results/validation_${ch}.chunk*.json
+              results/validation_${ch}.leg*.json
           done
 
       # Seal before the merge: merge-external reads only the pinned SBDB

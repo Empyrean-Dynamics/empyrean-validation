@@ -504,6 +504,34 @@ class _RowAccount:
         )
 
 
+def _harvest_ref_non_grav(rows: list) -> dict[str, tuple[float, float, float]]:
+    """Per-object SBDB reference non-grav (A1, A2, A3), for the objects whose
+    reference is not all zero."""
+    ref_non_grav: dict[str, tuple[float, float, float]] = {}
+    for r in rows:
+        a1 = r.get("ic_a1") or 0.0
+        a2 = r.get("ic_a2") or 0.0
+        a3 = r.get("ic_a3") or 0.0
+        if a1 != 0.0 or a2 != 0.0 or a3 != 0.0:
+            ref_non_grav[r["object"]] = (a1, a2, a3)
+    return ref_non_grav
+
+
+def _context_rows(context: Path | None, input_rows: list) -> list:
+    """The rows the cross-row lookups read: the full plan when ``--context`` is
+    given, the input itself otherwise. A context that lacks an object of the
+    input is refused by name, since its non-grav second pass would silently
+    vanish."""
+    if context is None:
+        return input_rows
+    rows = json.loads(context.read_text())
+    have = {r["object"] for r in rows}
+    missing = sorted({r["object"] for r in input_rows} - have)
+    if missing:
+        raise SystemExit(f"ERROR: --context {context} holds no rows for {', '.join(missing)}.")
+    return rows
+
+
 def main() -> int:
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument(
@@ -532,6 +560,13 @@ def main() -> int:
         help="empyrean data directory (defaults to ~/.empyrean/data/)",
     )
     p.add_argument(
+        "--context",
+        type=Path,
+        default=None,
+        help="the full plan, for the lookups that cross rows (the non-grav "
+        "reference); defaults to --input. A channel leg replays a subset of the plan.",
+    )
+    p.add_argument(
         "--fixtures-dir",
         type=Path,
         default=Path(__file__).parent.parent.parent / "fixtures" / "psv",
@@ -553,16 +588,12 @@ def main() -> int:
     # Per-object reference non-grav signal, keyed by object name. The
     # `orbit_determination` rows null out ic_a1/ic_a2/ic_a3, so read the
     # JPL SBDB reference off the object's `propagation` rows (which carry
-    # it). Mirrors the rust runner's per-object gate
-    # `data.a1 != 0 || data.a2 != 0 || data.a3 != 0` — only objects with a
-    # known non-grav signal get a second StateAndNonGrav fit.
-    ref_non_grav: dict[str, tuple[float, float, float]] = {}
-    for r in rust_rows:
-        a1 = r.get("ic_a1") or 0.0
-        a2 = r.get("ic_a2") or 0.0
-        a3 = r.get("ic_a3") or 0.0
-        if a1 != 0.0 or a2 != 0.0 or a3 != 0.0:
-            ref_non_grav[r["object"]] = (a1, a2, a3)
+    # it), from the CONTEXT: the full plan, or the input itself without
+    # --context (a channel leg replays a subset of the plan). Mirrors the rust
+    # runner's per-object gate `data.a1 != 0 || data.a2 != 0 || data.a3 != 0`
+    # — only objects with a known non-grav signal get a second
+    # StateAndNonGrav fit.
+    ref_non_grav = _harvest_ref_non_grav(_context_rows(args.context, rust_rows))
 
     cmd = [str(args.runner)]
     if args.data_dir:

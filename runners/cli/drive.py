@@ -568,6 +568,32 @@ class _RowAccount:
         )
 
 
+def _harvest_ref_nongrav(rows: list) -> dict:
+    """Per-object SBDB reference non-grav (A1, A2, A3), for the objects whose
+    reference is not all zero; the object's first such row wins."""
+    ref_nongrav: dict = {}
+    for r in rows:
+        a = (r.get("ic_a1"), r.get("ic_a2"), r.get("ic_a3"))
+        if any(v for v in a) and r["object"] not in ref_nongrav:
+            ref_nongrav[r["object"]] = a
+    return ref_nongrav
+
+
+def _context_rows(context: Path | None, input_rows: list) -> list:
+    """The rows the cross-row lookups read: the full plan when ``--context`` is
+    given, the input itself otherwise. A context that lacks an object of the
+    input is refused by name, since its non-grav second pass would silently
+    vanish."""
+    if context is None:
+        return input_rows
+    rows = json.loads(context.read_text())
+    have = {r["object"] for r in rows}
+    missing = sorted({r["object"] for r in input_rows} - have)
+    if missing:
+        raise SystemExit(f"ERROR: --context {context} holds no rows for {', '.join(missing)}.")
+    return rows
+
+
 def main() -> int:
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument(
@@ -596,6 +622,13 @@ def main() -> int:
         help="empyrean data directory (defaults to ~/.empyrean/data/)",
     )
     p.add_argument(
+        "--context",
+        type=Path,
+        default=None,
+        help="the full plan, for the lookups that cross rows (the non-grav "
+        "reference); defaults to --input. A channel leg replays a subset of the plan.",
+    )
+    p.add_argument(
         "--fixtures-dir",
         type=Path,
         default=Path(__file__).parent.parent.parent / "fixtures" / "psv",
@@ -619,15 +652,13 @@ def main() -> int:
 
     # Per-object SBDB reference non-grav signal (A1/A2/A3). OD rows carry
     # ic_a* = null, so the reference for an OD object is looked up from its
-    # propagation/ephemeris rows (which carry the SBDB-published A1/A2/A3).
-    # Mirrors the rust runner's per-object check `a1 != 0 || a2 != 0 || a3 != 0`
-    # — an object qualifies for the non_grav_recovery second pass when any of
-    # its reference coefficients is non-zero.
-    ref_nongrav = {}
-    for r in rust_rows:
-        a = (r.get("ic_a1"), r.get("ic_a2"), r.get("ic_a3"))
-        if any(v for v in a) and r["object"] not in ref_nongrav:
-            ref_nongrav[r["object"]] = a
+    # propagation/ephemeris rows (which carry the SBDB-published A1/A2/A3), in
+    # the CONTEXT: the full plan, or the input itself without --context (a
+    # channel leg replays a subset of the plan). Mirrors the rust runner's
+    # per-object check `a1 != 0 || a2 != 0 || a3 != 0` — an object qualifies
+    # for the non_grav_recovery second pass when any of its reference
+    # coefficients is non-zero.
+    ref_nongrav = _harvest_ref_nongrav(_context_rows(args.context, rust_rows))
 
     cmd = [str(args.runner), "--daemon"]
     if args.data_dir:

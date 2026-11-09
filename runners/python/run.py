@@ -1145,6 +1145,36 @@ def _read_fitted_non_grav(raw: dict) -> tuple[list[float | None], list[float | N
     return a_out, s_out
 
 
+def _harvest_ref_non_grav(rows: list) -> dict[str, tuple[float, float, float]]:
+    """Per-object SBDB reference non-grav (A1, A2, A3), for the objects whose
+    reference is not all zero. Mirrors the rust runner's
+    ``data.a1 != 0.0 || ...`` check."""
+    ref_non_grav: dict[str, tuple[float, float, float]] = {}
+    for r in rows:
+        a1, a2, a3 = r.get("ic_a1"), r.get("ic_a2"), r.get("ic_a3")
+        if a1 is None and a2 is None and a3 is None:
+            continue
+        a1, a2, a3 = a1 or 0.0, a2 or 0.0, a3 or 0.0
+        if a1 != 0.0 or a2 != 0.0 or a3 != 0.0:
+            ref_non_grav[r["object"]] = (a1, a2, a3)
+    return ref_non_grav
+
+
+def _context_rows(context: Path | None, input_rows: list) -> list:
+    """The rows the cross-row lookups read: the full plan when ``--context`` is
+    given (a leg replays a subset of it), the input itself otherwise. A context
+    that lacks an object of the input is refused by name, since its non-grav
+    second pass would silently vanish."""
+    if context is None:
+        return input_rows
+    rows = json.loads(context.read_text())
+    have = {r["object"] for r in rows}
+    missing = sorted({r["object"] for r in input_rows} - have)
+    if missing:
+        raise SystemExit(f"ERROR: --context {context} holds no rows for {', '.join(missing)}.")
+    return rows
+
+
 class _RowAccount:
     """The runner's own count line, honest by construction: every plan row
     ends as exactly one of written, declined (written, but the engine
@@ -1226,6 +1256,13 @@ def main() -> int:
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--input", required=True, type=Path, help="rust-channel JSON")
     p.add_argument(
+        "--context",
+        type=Path,
+        default=None,
+        help="the full plan, for the lookups that cross rows (the non-grav "
+        "reference); defaults to --input. A channel leg replays a subset of the plan.",
+    )
+    p.add_argument(
         "--output",
         type=Path,
         default=Path("results/validation_python.json"),
@@ -1258,17 +1295,12 @@ def main() -> int:
     # Per-object JPL SBDB reference non-grav, keyed by object name. The
     # optical-only orbit_determination rows carry ic_a1/a2/a3 = None, but the
     # propagation / ephemeris rows for the same object carry the SBDB
-    # reference (ic_a1/ic_a2/ic_a3). Harvest it here so the OD branch can run
-    # the non_grav_recovery second pass for objects with a known non-grav
-    # signal — mirroring the rust runner's `data.a1 != 0.0 || ...` check.
-    ref_non_grav: dict[str, tuple[float, float, float]] = {}
-    for r in rust_rows:
-        a1, a2, a3 = r.get("ic_a1"), r.get("ic_a2"), r.get("ic_a3")
-        if a1 is None and a2 is None and a3 is None:
-            continue
-        a1, a2, a3 = a1 or 0.0, a2 or 0.0, a3 or 0.0
-        if a1 != 0.0 or a2 != 0.0 or a3 != 0.0:
-            ref_non_grav[r["object"]] = (a1, a2, a3)
+    # reference (ic_a1/ic_a2/ic_a3). Harvest it from the CONTEXT (the full
+    # plan; the input itself when no --context is given) so the OD branch can
+    # run the non_grav_recovery second pass for objects with a known non-grav
+    # signal, even on a leg that holds the object's OD row but none of its
+    # propagation rows.
+    ref_non_grav = _harvest_ref_non_grav(_context_rows(args.context, rust_rows))
 
     out_rows = []
     acct = _RowAccount(len(rust_rows))
