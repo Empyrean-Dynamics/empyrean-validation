@@ -1157,8 +1157,10 @@ run-assist: $(PLAN) check-plan $(ASSIST_PY)
 # reduce then omits find_orb honestly.
 # fo asserts without ~/.find_orb (miscell.cpp); a cached build restores the
 # binary but not $HOME, so the config dir is installed here when missing.
-# find_orb's binary DE440 comes from its folder of the third-party tool set.
+# find_orb reads bc405.dat, bias.dat and its binary DE440 from the findorb
+# folder of the third-party tool set; it refuses to start without any of them.
 FINDORB_DATA_DIR ?= $(DATA_DIR)/third-party/findorb
+
 run-findorb: $(ASSIST_PY) check-plan fixtures
 	@test -f "$(HOME)/.find_orb/cospar.txt" || { \
 	    echo "──── Installing find_orb config directory (cached build) ───"; \

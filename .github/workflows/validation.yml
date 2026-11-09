@@ -1360,7 +1360,7 @@ jobs:
             layup)        dirs="layup";          need="layup/de440.bsp layup/debias_hires2018.tgz" ;;
             adam-core)    dirs="adam-core";      need="adam-core/de440.bsp adam-core/sb441-n16.bsp" ;;
             assist)       dirs="assist";         need="assist/linux_p1550p2650.440 assist/sb441-n16.bsp" ;;
-            findorb|oorb) dirs="findorb assist"; need="findorb/linux_p1550p2650.440 assist/linux_p1550p2650.440" ;;
+            findorb|oorb) dirs="findorb assist"; need="findorb/bc405.dat findorb/bias.dat findorb/linux_p1550p2650.440 assist/linux_p1550p2650.440" ;;
             grss)         dirs="grss";           need="grss/de440.bsp grss/pck00011.tpc grss/sb441-n16s.bsp" ;;
           esac
           for f in $need; do

@@ -103,11 +103,12 @@ What find_orb does and does not deliver here
   - ``mu1.txt`` — asteroid numbers and masses. Ships with find_orb.
   - ``bc405.dat`` — Baer & Chesley's BC-405 ephemeris: 300 asteroids, 6 elements,
     3654 40-day chunks spanning 1800–2200, as raw doubles. Exactly
-    52,617,600 bytes. Obtained by downloading the 131 MB
-    ``asteroid_ephemeris.txt`` linked from
-    https://www.projectpluto.com/ast_pert.htm and letting ``fo`` convert it once.
+    52,617,600 bytes. Staged from the registered set's ``findorb/`` folder
+    (find_orb's own conversion of Gray's ``asteroid_ephemeris.txt``, see
+    https://www.projectpluto.com/ast_pert.htm) into a private config directory
+    by ``findorb_common.stage_cfg_dir``; the walk refuses to start without it.
   - ``bc405pre.dat`` — memoized int16 asteroid positions (AU × 1000).
-    Auto-created, and the one config file find_orb *writes*; see ``_make_cfg_dir``.
+    Auto-created, and the one config file find_orb *writes*; see ``findorb_common.stage_cfg_dir``.
 
   The ``PERTURBERS`` mask asks for asteroids; only the data turns them on. A
   missing ``bc405.dat`` costs one line of find_orb output and silently changes
@@ -196,6 +197,9 @@ import sys
 import tempfile
 import time
 from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import findorb_common as FC  # noqa: E402
 
 # Tool tag on every emitted record (matches the §4.4 runner table).
 TOOL = "findorb"
@@ -349,85 +353,6 @@ def _findorb_version(fo_bin: Path) -> str:
     return sha or "unknown (empty git sha)"
 
 
-# find_orb's config directory: where every `fopen_ext(..., "c...")` file is
-# resolved from. `default_config_dir_name` probes ~, /software, /root and an alt
-# dir for cospar.txt; on this platform that is always ~/.find_orb.
-FO_CONFIG_DIR = Path.home() / ".find_orb"
-# The BC-405 asteroid ephemeris, converted to binary: 300 asteroids x 3654
-# 40-day chunks x 6 elements x 8 bytes. bc405.cpp fixes every one of those
-# numbers, so the size is an exact integrity check, not an approximation.
-BC405_DAT = "bc405.dat"
-BC405_DAT_BYTES = 6 * 300 * 3654 * 8  # 52_617_600
-# find_orb's memoized int16 asteroid positions (AU x 1000), 3 per asteroid per
-# chunk. Auto-created if absent, and the ONLY config file find_orb writes.
-BC405_PRE = "bc405pre.dat"
-
-
-def _bc405_status() -> tuple[Path | None, str]:
-    """Locate ``bc405.dat`` and report whether it is intact.
-
-    Returns (path or None, human-readable status). The size check matters: a
-    truncated or half-converted file does not make find_orb fail, it makes the
-    asteroid positions wrong somewhere in the middle of the file.
-    """
-    path = FO_CONFIG_DIR / BC405_DAT
-    if not path.exists():
-        return None, f"absent from {FO_CONFIG_DIR}"
-    size = path.stat().st_size
-    if size != BC405_DAT_BYTES:
-        return None, f"WRONG SIZE {size} bytes (expected {BC405_DAT_BYTES})"
-    return path, f"{path} ({size} bytes, intact)"
-
-
-def _make_cfg_dir(base: Path) -> Path:
-    """Create a private find_orb config directory for this process.
-
-    Only one file goes in it. ``bc405pre.dat`` is opened ``"cr+b"`` — read-WRITE
-    in the config directory — and `find_and_set_precomputed_data` fills in any
-    chunk it finds zeroed and writes it back. Several `fo` processes sharing one
-    copy would interleave those 1800-byte chunk writes, and while every writer
-    computes identical bytes (so a torn write cannot corrupt a *value*), a
-    reader can catch a chunk mid-write: the "already computed?" test reads only
-    the first asteroid's three int16s, so a partially-written chunk reads as
-    done and the remaining asteroids are used at position (0,0,0). That is a
-    silent physics error, so each process gets its own file instead.
-
-    Seeded by copying the shared cache when one exists, purely to skip
-    recomputation — the cache is pure memoization, and a private copy was
-    verified to reproduce shared-cache predictions byte for byte. When no shared
-    cache exists the file is deliberately NOT created: find_orb then makes one
-    here, correctly sized for whichever BC-405 variant is installed. Creating a
-    wrong-sized placeholder would be worse than creating none.
-
-    Everything else find_orb needs (`bc405.dat`, `mu1.txt`, `ObsCodes.htm`, the
-    other 50 config files) is absent here and falls back to ~/.find_orb, which
-    is read-only in this flow.
-    """
-    cfg = base / "cfg"
-    cfg.mkdir(parents=True, exist_ok=True)
-    master = FO_CONFIG_DIR / BC405_PRE
-    private = cfg / BC405_PRE
-    if master.exists() and not private.exists():
-        shutil.copy2(master, private)
-    return cfg
-
-
-def _jpl_ephemeris(explicit: str | None, repo: Path) -> Path | None:
-    """Locate Bill Gray's binary JPL DE file (``linux_p1550p2650.440``)."""
-    candidates: list[Path] = []
-    if explicit:
-        candidates.append(Path(explicit).expanduser())
-    candidates += [
-        Path.home() / ".empyrean" / "data" / "linux_p1550p2650.440",
-        Path.home() / ".find_orb" / "linux_p1550p2650.440",
-        repo.parent / "data" / "linux_p1550p2650.440",
-    ]
-    for c in candidates:
-        if c.is_file():
-            return c
-    return None
-
-
 # ── ADES fixture handling ───────────────────────────────────
 
 
@@ -522,48 +447,17 @@ def _write_environ(
     absolute path under a long scratch directory overflows them — harmlessly on
     macOS, fatally on a ``_FORTIFY_SOURCE`` Linux build.
     """
-    lines = [
-        # Symlinked into the working directory by the caller.
-        "LINUX_JPL_FILENAME=jpl_de.440",
-        # Mercury..Pluto + Moon (0x7fe) + asteroids (bit 20 = 0x100000, the
-        # `IDX_ASTEROIDS` runge.cpp tests before calling `detect_perturbers`).
-        f"PERTURBERS={perturbers}",
-        # ── BC-405 asteroid perturbations ────────────────────
-        # All three of these are find_orb's own documented defaults
-        # (`environ.def`), written explicitly so the configuration states what
-        # runs instead of relying on built-in fallbacks.
-        #
-        # BC405_ASTEROIDS: how many of BC-405's 300 asteroids are eligible. 300
-        # is find_orb's default and the full model.
-        "BC405_ASTEROIDS=300",
-        # ASTEROID_THRESH: include an asteroid when it is within this many AU of
-        # the target, scaled by sqrt(mass/Pallas). 10 is find_orb's default.
-        "ASTEROID_THRESH=10",
-        # ASTEROID_PERT_LIST: EMPTY is find_orb's default and means "consider all
-        # 300, culled by the proximity test above". A non-empty list is the
-        # opposite of what it looks like — `detect_perturbers` sets
-        # `possible_perturber = 0` whenever `n_fixed` is set, so naming asteroids
-        # RESTRICTS the model to exactly those and disables the other ~284.
-        # Hence the default stays empty; `--asteroid-pert-list` exists for
-        # deliberately replicating another integrator's fixed set.
-        f"ASTEROID_PERT_LIST={pert_list}",
-        # use_sigmas=1 (honour the ADES rmsRA/rmsDec), ephemeris_mag_limit=22
-        # (fo resets this to 999 before any ephemeris), sigmas_in_columns=0,
-        # forced_central_body=-2 (auto), apply_debiasing=0.
-        #
-        # The last field is the load-bearing one: find_orb's own EFCC/Farnocchia
-        # debiasing stays OFF, because this family applies catalog debiasing
-        # centrally from the manifest. Two debiasing passes would double-correct.
-        "SETTINGS2=1 22.00 0 -2 0",
-        # Encke's method for the integration.
-        "ENCKE=1",
-        # find_orb's stock 3-sigma outlier rejection.
-        "OUTLIER_REJECTION_LIMIT=3",
-        # Ephemeris epochs come from a file (leading 't' selects that mode); the
-        # times in it are TT and we want TT back out.
-        f"EPHEM_STEPS={n_times} t{times_name}",
-        "TT_EPHEMERIS=1",
-    ]
+    # The shared settings (findorb_common.environ_lines) with this walk's two
+    # differences: find_orb's own debiasing stays OFF, because this family applies
+    # catalog debiasing once, centrally, from the manifest (two passes would
+    # double-correct); and the ephemeris epochs come from a file (leading 't'
+    # selects that mode), the times in it TT and TT back out.
+    lines = FC.environ_lines(
+        debiasing=False,
+        perturbers=perturbers,
+        pert_list=pert_list,
+        extra=(f"EPHEM_STEPS={n_times} t{times_name}", "TT_EPHEMERIS=1"),
+    )
     (work / "environ.dat").write_text("\n".join(lines) + "\n")
 
 
@@ -737,7 +631,7 @@ def _run_fo(
         obs_name,
         "-c",  # combine every record in the file into one object
         "-q",  # quiet: no progress chatter from parallel workers
-        # Private config directory (see `_make_cfg_dir`). find_orb looks here
+        # Private config directory (see `findorb_common.stage_cfg_dir`). find_orb looks here
         # first and falls back to ~/.find_orb for everything absent, so this
         # costs one file and isolates the one config file fo WRITES.
         # The trailing separator is required: fopen_ext does `strcat` with no
@@ -1438,7 +1332,10 @@ def _walk_object(task: dict) -> tuple[list[dict], list[dict], dict]:
         # the asteroid-position cache it holds is worth carrying across an
         # object's windows, and it is what keeps parallel workers off each
         # other's writes.
-        cfg_dir = _make_cfg_dir(base)
+        cfg_dir = FC.stage_cfg_dir(
+            base, Path(task["data_dir"]), debiasing=False,
+            asteroids=bool(int(task["perturbers"], 16) & (1 << 20)),
+        )
         for w in windows:
             idx = int(w["index"])
             stats["windows"] += 1
@@ -1779,11 +1676,12 @@ def main() -> int:
         "runners/findorb/install/bin/fo, then ../tools/find_orb/fo, then $PATH.",
     )
     p.add_argument(
-        "--jpl-ephemeris",
+        "--data-dir",
         type=str,
         default=None,
-        help="Bill Gray's binary JPL DE file (linux_p1550p2650.440). Default: "
-        "~/.empyrean/data, then ~/.find_orb, then ../data.",
+        help="The registered find_orb data folder (third-party set, findorb/): "
+        "bc405.dat and linux_p1550p2650.440. Required; the run refuses to start "
+        "without them.",
     )
     p.add_argument(
         "--perturbers",
@@ -1857,31 +1755,16 @@ def main() -> int:
         )
         return 1
 
-    jpl = _jpl_ephemeris(args.jpl_ephemeris, repo)
-
     # Asteroid perturbations are requested by the PERTURBERS mask but ENABLED by
     # the presence of the data. Without bc405.dat find_orb prints one line about
-    # it and integrates on happily with planets only — a silent downgrade of the
-    # force model that would show up nowhere in the output. Refuse instead.
+    # it and integrates on happily with planets only, a silent downgrade of the
+    # force model. stage_cfg_dir refuses, naming the file.
     asteroids_on = bool(int(args.perturbers, 16) & (1 << 20))
-    bc405_path, bc405_status = _bc405_status()
-    if asteroids_on and bc405_path is None:
-        print(
-            f"ERROR: asteroid perturbations are requested (PERTURBERS={args.perturbers}, "
-            f"bit 20 set) but {BC405_DAT} is {bc405_status}.\n"
-            "       find_orb would print 'asteroid perturbations cannot be included' and "
-            "run with planets only —\n"
-            "       a quietly different force model that no output field records.\n"
-            "       Install it: download BC-405 (~131 MB ASCII, 6,577,200 lines) from the "
-            "link on\n"
-            "       https://www.projectpluto.com/ast_pert.htm, put it in "
-            f"{FO_CONFIG_DIR}/asteroid_ephemeris.txt,\n"
-            f"       and run one fo fit to convert it — {BC405_DAT} must end up exactly "
-            f"{BC405_DAT_BYTES} bytes.\n"
-            "       To run deliberately without asteroids, pass --perturbers 7fe.",
-            file=sys.stderr,
-        )
-        return 1
+    data_dir = Path(args.data_dir).expanduser().resolve() if args.data_dir else None
+    with tempfile.TemporaryDirectory(prefix="fo_walk_check_") as chk:
+        FC.stage_cfg_dir(Path(chk), data_dir, debiasing=False, asteroids=asteroids_on)
+    jpl = data_dir / FC.JPL_DE_FILE
+    bc405_status = f"{data_dir / FC.BC405_DAT} ({FC.BC405_DAT_BYTES} bytes, intact)"
 
     manifest_path = args.manifest.expanduser().resolve()
     if not manifest_path.exists():
@@ -1925,7 +1808,7 @@ def main() -> int:
     )
     print(
         f"  fo: {fo_bin} (find_orb {_findorb_version(fo_bin)})\n"
-        f"  JPL DE: {jpl if jpl else 'NOT FOUND — find_orb will fall back to its own search'}\n"
+        f"  JPL DE: {jpl}\n"
         f"  perturbers: {args.perturbers} "
         + (
             f"(Merc-Pluto + Moon + BC-405 asteroids: {bc405_status}, "
@@ -1949,7 +1832,8 @@ def main() -> int:
             "fixtures_dir": str(fixtures_dir),
             "profile": args.profile,
             "fo_bin": str(fo_bin),
-            "jpl": str(jpl) if jpl else None,
+            "jpl": str(jpl),
+            "data_dir": str(data_dir),
             "timeout": args.timeout,
             "perturbers": args.perturbers,
             "warm_start": args.warm_start,
