@@ -262,6 +262,12 @@ struct MergeExternalArgs {
     /// convergence) onto matching rows.
     #[arg(long)]
     layup: Option<PathBuf>,
+    /// adam-core per-channel JSON (from `runners/adam-core/run_adam_core.py`).
+    /// Folds propagation + ephemeris + OD fields (the released adam-core
+    /// 0.7.0 / adam-assist 0.6.0, CORE_OD_V1) onto matching rows, with its
+    /// version and settings.
+    #[arg(long)]
+    adam_core: Option<PathBuf>,
     /// kete per-channel JSON (from `runners/kete/run_kete.py`). Currently
     /// folds per-row wall-clock timing only (`kete_time_ms`) — kete is not
     /// yet a selectable comparison tool in the report registry.
@@ -897,6 +903,10 @@ fn merge_external(args: MergeExternalArgs) -> Result<(), Box<dyn std::error::Err
             Ok(n)
         });
     }
+    if let Some(path) = &args.adam_core {
+        let n = merge_adam_core(&mut rows, path)?;
+        eprintln!("Merged {n} adam-core rows");
+    }
     if let Some(path) = &args.kete {
         isolated_merge("kete", &mut rows, &mut outcomes, |rows| {
             let n = merge_tool_times(rows, path, "kete_time_ms", |r, v| r.kete_time_ms = v)?;
@@ -1462,6 +1472,125 @@ fn merge_layup(
         r.layup_n_obs_used = f["layup_n_obs_used"].as_u64().map(|v| v as u32);
         r.layup_converged = f["layup_converged"].as_bool();
         r.layup_time_ms = f["layup_time_ms"].as_f64();
+        n += 1;
+    }
+    Ok(n)
+}
+
+/// Record a tool's version and settings on a row, from the tool runner's own record.
+///
+/// `version_key` is a string field of the runner row; `settings_key` an object of
+/// settings. Values are stored exactly as the runner recorded them (non-string JSON
+/// values are rendered as JSON text); an absent record leaves the row untouched, so
+/// the report can say "not recorded" instead of inventing a value.
+fn record_tool_config(
+    r: &mut ValidationResult,
+    tool: &str,
+    o: &serde_json::Value,
+    version_key: &str,
+    settings_key: &str,
+) {
+    if let Some(v) = o[version_key].as_str() {
+        r.tool_versions
+            .get_or_insert_with(Default::default)
+            .insert(tool.to_string(), v.to_string());
+    }
+    if let Some(map) = o[settings_key].as_object() {
+        let entry = r
+            .tool_settings
+            .get_or_insert_with(Default::default)
+            .entry(tool.to_string())
+            .or_default();
+        for (k, v) in map {
+            let text = match v.as_str() {
+                Some(t) => t.to_string(),
+                None => v.to_string(),
+            };
+            entry.insert(k.clone(), text);
+        }
+    }
+}
+
+/// Fold adam-core per-channel JSON onto the reference rows.
+///
+/// adam-core (the released 0.7.0 with adam-assist 0.6.0) covers all three axes, so
+/// this merge routes by test type like [`merge_oorb`] and [`merge_grss`]:
+/// propagation by (object, dt), ephemeris by (object, dt, observer), OD by object.
+/// A row the runner could not compute (a self-perturber, a refused or failed fit)
+/// carries `adam_core_unsupported` with the tool's own reason; it is folded, never
+/// dropped. The runner's version and settings ride along on every folded row.
+fn merge_adam_core(
+    rows: &mut [ValidationResult],
+    path: &std::path::Path,
+) -> Result<usize, Box<dyn std::error::Error>> {
+    let txt = std::fs::read_to_string(path).map_err(|e| format!("read {}: {e}", path.display()))?;
+    let ac: Vec<serde_json::Value> = serde_json::from_str(&txt)?;
+    let mut prop_idx: std::collections::HashMap<(String, i64), &serde_json::Value> =
+        Default::default();
+    let mut eph_idx: std::collections::HashMap<(String, i64, String), &serde_json::Value> =
+        Default::default();
+    let mut od_idx: std::collections::HashMap<String, &serde_json::Value> = Default::default();
+    for o in &ac {
+        let Some(name) = o["object"].as_str() else {
+            continue;
+        };
+        match o["test_type"].as_str() {
+            Some("propagation") => {
+                if let Some(dt) = o["dt_days"].as_f64() {
+                    prop_idx.insert((name.to_string(), dt as i64), o);
+                }
+            }
+            Some("ephemeris") => {
+                if let (Some(dt), Some(obs)) = (o["dt_days"].as_f64(), o["observer"].as_str()) {
+                    eph_idx.insert((name.to_string(), dt as i64, obs.to_string()), o);
+                }
+            }
+            Some("orbit_determination") => {
+                od_idx.insert(name.to_string(), o);
+            }
+            _ => {}
+        }
+    }
+    let mut n = 0;
+    for r in rows.iter_mut() {
+        let o = match r.test_type.as_str() {
+            "propagation" => prop_idx.get(&(r.object.clone(), r.dt_days as i64)).copied(),
+            "ephemeris" => r.observer.as_deref().and_then(|obs| {
+                eph_idx
+                    .get(&(r.object.clone(), r.dt_days as i64, obs.to_string()))
+                    .copied()
+            }),
+            "orbit_determination" => od_idx.get(&r.object).copied(),
+            _ => None,
+        };
+        let Some(o) = o else { continue };
+        r.adam_core_time_ms = o["adam_core_time_ms"].as_f64();
+        r.adam_core_unsupported = o["adam_core_unsupported"].as_str().map(String::from);
+        match r.test_type.as_str() {
+            "propagation" => {
+                r.adam_core_vs_horizons_km = o["adam_core_vs_horizons_km"].as_f64();
+            }
+            "ephemeris" => {
+                r.adam_core_separation_arcsec = o["adam_core_separation_arcsec"].as_f64();
+                r.adam_core_d_ra_arcsec = o["adam_core_d_ra_arcsec"].as_f64();
+                r.adam_core_d_dec_arcsec = o["adam_core_d_dec_arcsec"].as_f64();
+                r.adam_core_d_rho_km = o["adam_core_d_rho_km"].as_f64();
+            }
+            _ => {
+                r.adam_core_chi2 = o["adam_core_chi2"].as_f64();
+                r.adam_core_reduced_chi2 = o["adam_core_reduced_chi2"].as_f64();
+                r.adam_core_n_obs_used = o["adam_core_n_obs_used"].as_u64().map(|v| v as u32);
+                r.adam_core_n_obs_rejected =
+                    o["adam_core_n_obs_rejected"].as_u64().map(|v| v as u32);
+                r.adam_core_converged = o["adam_core_converged"].as_bool();
+                r.adam_core_sigma_source = o["adam_core_sigma_source"].as_object().map(|m| {
+                    m.iter()
+                        .map(|(k, v)| (k.clone(), v.clone()))
+                        .collect::<std::collections::BTreeMap<_, _>>()
+                });
+            }
+        }
+        record_tool_config(r, "adam-core", o, "adam_core_version", "adam_core_settings");
         n += 1;
     }
     Ok(n)
@@ -2266,7 +2395,7 @@ fn catalog_row_floors() -> Vec<RowFloor> {
 /// The `channels` module constants plus the externally-merged comparators that
 /// only ever appear as their own result JSON. Validated against so a typo is
 /// "you typed it wrong", not "that channel produced nothing".
-const KNOWN_CHANNELS: [&str; 13] = [
+const KNOWN_CHANNELS: [&str; 14] = [
     channels::RUST,
     channels::PYTHON,
     channels::C,
@@ -2278,6 +2407,7 @@ const KNOWN_CHANNELS: [&str; 13] = [
     "oorb",
     "jorbit",
     "layup",
+    "adam-core",
     "orbfit",
     "grss",
 ];
@@ -3564,6 +3694,93 @@ mod tests {
         let n = merge_layup(&mut rows, f.path()).unwrap();
         assert_eq!(n, 0);
         assert_eq!(rows[0].layup_chi2, None);
+    }
+
+    #[test]
+    fn merge_adam_core_routes_by_test_type_and_carries_reasons_and_settings() {
+        let mut prop = ValidationResult::empty();
+        prop.object = "Eros".into();
+        prop.test_type = "propagation".into();
+        prop.dt_days = 30.0;
+        let mut eph = ValidationResult::empty();
+        eph.object = "Eros".into();
+        eph.test_type = "ephemeris".into();
+        eph.dt_days = 30.0;
+        eph.observer = Some("W84".into());
+        let mut rows = vec![prop, eph, od_row("Eros"), od_row("Vesta"), od_row("Bennu")];
+        let mut f = tempfile::NamedTempFile::new().unwrap();
+        write!(
+            f,
+            r#"[
+              {{"object":"Eros","test_type":"propagation","dt_days":30.0,
+                "adam_core_vs_horizons_km":0.27,"adam_core_time_ms":3.0,
+                "adam_core_version":"0.7.0",
+                "adam_core_settings":{{"epsilon":"1e-06","planets_kernel":"de440.bsp (sha256 a4ce)"}}}},
+              {{"object":"Eros","test_type":"ephemeris","dt_days":30.0,"observer":"W84",
+                "adam_core_separation_arcsec":0.0002,"adam_core_d_rho_km":-0.1}},
+              {{"object":"Eros","test_type":"orbit_determination",
+                "adam_core_chi2":10.5,"adam_core_reduced_chi2":0.9,"adam_core_n_obs_used":512,
+                "adam_core_n_obs_rejected":3,"adam_core_converged":true,
+                "adam_core_sigma_source":{{"reported":10,"filled":2,
+                  "filled_by_level":{{"station":1,"catalog":1}}}},
+                "adam_core_version":"0.7.0","adam_core_settings":{{"profile":"CORE_OD_V1"}}}},
+              {{"object":"Vesta","test_type":"orbit_determination","adam_core_converged":false,
+                "adam_core_unsupported":"self-perturber: adam-assist 0.6.0 offers no planets-only force model"}}
+            ]"#
+        )
+        .unwrap();
+        let n = merge_adam_core(&mut rows, f.path()).unwrap();
+        assert_eq!(n, 4, "prop + eph + two OD rows fold; Bennu has no record");
+        assert_eq!(rows[0].adam_core_vs_horizons_km, Some(0.27));
+        assert_eq!(
+            rows[0].adam_core_separation_arcsec, None,
+            "prop row takes no eph field"
+        );
+        assert_eq!(rows[1].adam_core_separation_arcsec, Some(0.0002));
+        assert_eq!(rows[1].adam_core_d_rho_km, Some(-0.1));
+        assert_eq!(rows[2].adam_core_reduced_chi2, Some(0.9));
+        assert_eq!(rows[2].adam_core_n_obs_rejected, Some(3));
+        assert_eq!(rows[2].adam_core_converged, Some(true));
+        let ss = rows[2].adam_core_sigma_source.as_ref().unwrap();
+        assert_eq!(ss["reported"], serde_json::json!(10));
+        // The unsupported reason survives with the tool's own words.
+        assert_eq!(rows[3].adam_core_converged, Some(false));
+        assert!(
+            rows[3]
+                .adam_core_unsupported
+                .as_deref()
+                .unwrap()
+                .contains("planets-only")
+        );
+        // Versions and settings ride along, exactly as recorded.
+        assert_eq!(
+            rows[0].tool_versions.as_ref().unwrap()["adam-core"],
+            "0.7.0"
+        );
+        assert_eq!(
+            rows[0].tool_settings.as_ref().unwrap()["adam-core"]["epsilon"],
+            "1e-06"
+        );
+        // An object with no adam-core record stays untouched.
+        assert_eq!(rows[4].adam_core_reduced_chi2, None);
+        assert!(rows[4].tool_versions.is_none() && rows[4].tool_settings.is_none());
+    }
+
+    #[test]
+    fn merge_adam_core_rows_round_trip_through_the_schema() {
+        let mut r = od_row("Eros");
+        r.adam_core_reduced_chi2 = Some(0.9);
+        r.tool_versions = Some([("adam-core".to_string(), "0.7.0".to_string())].into());
+        let s = serde_json::to_string(&r).unwrap();
+        assert!(s.contains("adam_core_reduced_chi2") && s.contains("tool_versions"));
+        let back: ValidationResult = serde_json::from_str(&s).unwrap();
+        assert_eq!(back, r);
+        // None fields stay out of the JSON (the schema omits them).
+        assert!(
+            !serde_json::to_string(&od_row("Bennu"))
+                .unwrap()
+                .contains("adam-core")
+        );
     }
 
     #[test]

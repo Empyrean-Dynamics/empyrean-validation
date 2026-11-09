@@ -1540,6 +1540,12 @@ fn od_tool_present(key: &str, results: &[ValidationResult]) -> bool {
                 || r.grss_time_ms.is_some()
         }
         "jorbit" => r.jorbit_time_ms.is_some(),
+        "adam-core" => {
+            r.adam_core_converged.is_some()
+                || r.adam_core_reduced_chi2.is_some()
+                || r.adam_core_unsupported.is_some()
+                || r.adam_core_time_ms.is_some()
+        }
         _ => false,
     })
 }
@@ -4318,9 +4324,10 @@ enum OdColumn<'a> {
 /// The external fitters the plan runs, in display order, with the label and
 /// header colour each uses elsewhere in the report. A small spec local to
 /// this panel — not the removed `OdToolSpec` registry.
-const OD_FITTERS: [(&str, &str, &str); 4] = [
+const OD_FITTERS: [(&str, &str, &str); 5] = [
     ("findorb", "find_orb", "#b5651d"),
     ("layup", "layup", "#6a8caf"),
+    ("adam-core", "adam-core", "#3f8f9b"),
     ("orbfit", "OrbFit", "#5a9e6f"),
     ("grss", "GRSS", "#9b6fb0"),
 ];
@@ -4421,6 +4428,43 @@ fn layup_convergence_cell(r: &ValidationResult) -> ConvergenceCell {
     }
 }
 
+/// adam-core's cell for one arc. A row the runner could not fit (a self-perturber,
+/// a refused or failed fit) is NOT "not attempted": it carries the tool's own reason
+/// in `adam_core_unsupported`, which the cell shows verbatim.
+fn adam_core_convergence_cell(r: &ValidationResult) -> ConvergenceCell {
+    match r.adam_core_converged {
+        Some(true) => ConvergenceCell::Converged { iterations: None },
+        Some(false) => ConvergenceCell::NotConverged {
+            reason: Some(
+                r.adam_core_unsupported
+                    .clone()
+                    .unwrap_or_else(|| "adam-core's fit did not converge".to_string()),
+            ),
+        },
+        None => {
+            let produced = r.adam_core_unsupported.is_some()
+                || r.adam_core_chi2.is_some()
+                || r.adam_core_reduced_chi2.is_some()
+                || r.adam_core_n_obs_used.is_some()
+                || r.adam_core_time_ms.is_some();
+            if produced {
+                ConvergenceCell::NotConverged {
+                    reason: Some(r.adam_core_unsupported.clone().unwrap_or_else(|| {
+                        "adam-core emitted a record for this object but no convergence flag"
+                            .to_string()
+                    })),
+                }
+            } else {
+                ConvergenceCell::NotAttempted {
+                    reason: "no adam-core record for this object in the merged input — outside \
+                             the fixture set adam-core was run over"
+                        .to_string(),
+                }
+            }
+        }
+    }
+}
+
 fn orbfit_convergence_cell(r: &ValidationResult) -> ConvergenceCell {
     if let Some(e) = &r.orbfit_error {
         return ConvergenceCell::NotConverged {
@@ -4477,6 +4521,7 @@ fn fitter_convergence_cell(
     match key {
         "findorb" => findorb_convergence_cell(r),
         "layup" => layup_convergence_cell(r),
+        "adam-core" => adam_core_convergence_cell(r),
         "orbfit" => orbfit_convergence_cell(r),
         "grss" => grss_convergence_cell(r),
         _ => ConvergenceCell::NotAttempted {
@@ -9176,8 +9221,7 @@ fn pw_run_label(total: usize, idx: usize) -> String {
 /// sidecar beside the dataset.
 // ── S5a: the "Configurations" appendix (A.3, `s05c`) ───────────────────────
 // One subsection per EXTERNAL tool that has rows in this run, in the Part 2
-// tool order. A tool with no rows emits nothing (adam-core has no `adamcore_*`
-// fields in the schema, so its path produces nothing). empyrean is not an
+// tool order. A tool with no rows emits nothing. empyrean is not an
 // external tool and has no subsection — its configuration stays in A.4
 // Provenance and in the §2.2 arms. Values come only from the rows (ASSIST's six
 // arms from each arm row's `config=` note; every other tool's version/settings
@@ -9192,7 +9236,7 @@ const CONFIG_TOOL_ORDER: [(&str, &str); 9] = [
     ("kete", "kete"),
     ("jorbit", "jorbit"),
     ("oorb", "OpenOrb"),
-    ("adamcore", "adam-core"),
+    ("adam-core", "adam-core"),
 ];
 
 /// The one null token a configuration table shows for a setting the run did not
@@ -9227,7 +9271,12 @@ fn config_tool_present(results: &[ValidationResult], key: &str) -> bool {
         "oorb" => results
             .iter()
             .any(|r| r.oorb_vs_horizons_km.is_some() || r.oorb_separation_arcsec.is_some()),
-        // adam-core has no `adamcore_*` fields in the schema, so it never renders.
+        "adam-core" => results.iter().any(|r| {
+            r.adam_core_reduced_chi2.is_some()
+                || r.adam_core_vs_horizons_km.is_some()
+                || r.adam_core_separation_arcsec.is_some()
+                || r.adam_core_unsupported.is_some()
+        }),
         _ => false,
     }
 }
@@ -9361,6 +9410,38 @@ fn config_generic_subsection(
     )
 }
 
+/// A Configurations subsection built from the version and settings that
+/// `merge-external` folded onto the rows (`tool_versions` / `tool_settings`). The
+/// table lists exactly the recorded settings (alphabetical); nothing is typed here,
+/// and a tool whose rows carry no record shows an empty table and no version.
+fn config_recorded_subsection(
+    results: &[ValidationResult],
+    key: &str,
+    display: &str,
+    method: &str,
+) -> String {
+    let version = results
+        .iter()
+        .find_map(|r| r.tool_versions.as_ref().and_then(|m| m.get(key)).cloned());
+    let settings = results
+        .iter()
+        .filter_map(|r| r.tool_settings.as_ref().and_then(|m| m.get(key)))
+        .max_by_key(|m| m.len());
+    let escaped: Vec<(String, String)> = settings
+        .map(|m| {
+            m.iter()
+                .map(|(k, v)| (attr_escape(k), attr_escape(v)))
+                .collect()
+        })
+        .unwrap_or_default();
+    let pairs: Vec<(&str, Option<&str>)> = escaped
+        .iter()
+        .map(|(k, v)| (k.as_str(), Some(v.as_str())))
+        .collect();
+    let version = version.map(|v| attr_escape(&v));
+    config_generic_subsection(key, display, version.as_deref(), &pairs, method)
+}
+
 /// The subsection for one external tool. Only recorded values appear; the setting
 /// names are the tool's known configuration dimensions (owner-specified in the
 /// S5a brief), their values the run's record or the null token.
@@ -9425,8 +9506,12 @@ fn config_tool_subsection(results: &[ValidationResult], key: &str) -> String {
             &[("version", None), ("perturbers", None)],
             "N-body propagation and ephemeris (Bulirsch&ndash;Stoer, planets + Moon + Pluto, relativity on; no asteroid perturbers). Plan SSB states are converted to OpenOrb's heliocentric convention and back.",
         ),
-        // adam-core has no `adamcore_*` fields in the schema: config_tool_present
-        // never reports it, and this arm never runs.
+        "adam-core" => config_recorded_subsection(
+            results,
+            "adam-core",
+            "adam-core",
+            "Propagation, ephemeris and orbit determination with the released adam-core and adam-assist (ASSIST). OD runs the public CORE_OD_V1 profile; it has no sigma-fill stage, so the suite fills missing per-observation sigma from the public Ver&eacute;s 2017 model before the fit. Every value below is what the runner recorded on the rows; the kernels are the registered set, passed to adam-assist explicitly.",
+        ),
         _ => String::new(),
     }
 }
@@ -9907,6 +9992,7 @@ pub fn generate_report(
                     && (r.findorb_rms_residual.is_some()
                         || r.orbfit_rms_arcsec.is_some()
                         || r.layup_reduced_chi2.is_some()
+                        || r.adam_core_reduced_chi2.is_some()
                         || r.grss_rms_arcsec.is_some()
                         || r.ref_od_reduced_chi2.is_some())
             })
@@ -10636,6 +10722,11 @@ pub fn generate_report(
         <td><b title="Used for: orbit determination from ADES; reference for reduced χ² (Veres-2017 weighting)">layup</b></td>
         <td>Holman / Smithsonian · MIT · ASSIST-backed</td>
         <td><a href="https://github.com/Empyrean-Dynamics/empyrean-validation/blob/main/runners/layup/run_layup.py" target="_blank" rel="noopener"><code>runners/layup/run_layup.py</code></a></td>
+      </tr>
+      <tr>
+        <td><b title="Used for: propagation, ephemeris and orbit determination with the released adam-core 0.7.0 and adam-assist 0.6.0. OD runs the public CORE_OD_V1 profile (EFCC18 debias, nightly de-weighting); missing per-observation sigma is filled by the suite's public Vereš 2017 model. Iris, Vesta, Pallas and Hygiea are reported unsupported: adam-assist cannot exclude a body from its own force model.">adam-core</b></td>
+        <td>Asteroid Institute &middot; adam-core 0.7.0 + adam-assist 0.6.0 (ASSIST)</td>
+        <td><a href="https://github.com/Empyrean-Dynamics/empyrean-validation/blob/main/runners/adam-core/run_adam_core.py" target="_blank" rel="noopener"><code>runners/adam-core/run_adam_core.py</code></a></td>
       </tr>
       <tr>
         <td><b>find_orb</b></td>
@@ -17201,6 +17292,91 @@ mod tests {
         }
     }
 
+    /// adam-core's subsection renders from the version and settings the merge
+    /// folded onto its rows, and shows nothing it was not told. Two rows carry
+    /// different settings counts; the fuller record wins.
+    #[test]
+    fn configurations_appendix_renders_adam_core_from_recorded_settings() {
+        let mut r = synthetic_rust_prop_row("Eros", 0.0);
+        r.channel = "core".into();
+        r.adam_core_vs_horizons_km = Some(0.27);
+        r.tool_versions = Some([("adam-core".to_string(), "0.7.0".to_string())].into());
+        r.tool_settings = Some(
+            [(
+                "adam-core".to_string(),
+                [
+                    ("epsilon".to_string(), "1e-06".to_string()),
+                    ("observation_pipeline".to_string(), "A -> B".to_string()),
+                    (
+                        "planets_kernel".to_string(),
+                        "de440.bsp (sha256 a4ce)".to_string(),
+                    ),
+                ]
+                .into(),
+            )]
+            .into(),
+        );
+        let html = render_rows(&[r]);
+        assert!(
+            html.contains("id=\"s05c-adam-core\""),
+            "adam-core subsection must render"
+        );
+        assert!(
+            html.contains("adam-core &middot; <code>0.7.0</code>"),
+            "head states the recorded version"
+        );
+        for recorded in [
+            "epsilon",
+            "1e-06",
+            "planets_kernel",
+            "de440.bsp (sha256 a4ce)",
+        ] {
+            assert!(
+                html.contains(recorded),
+                "recorded setting {recorded} must appear"
+            );
+        }
+        // Text is escaped, never injected as markup.
+        assert!(html.contains("A -&gt; B") && !html.contains("<code>A -> B</code>"));
+        // With no rows for adam-core there is no subsection (the sibling test also
+        // asserts this against the full multi-tool run).
+        let mut other = synthetic_rust_prop_row("Eros", 0.0);
+        other.channel = "core".into();
+        assert!(!render_rows(&[other]).contains("id=\"s05c-adam-core\""));
+    }
+
+    #[test]
+    fn adam_core_convergence_cell_shows_the_tools_own_reason() {
+        let mut r = synthetic_core_od_row("Vesta");
+        r.adam_core_converged = Some(false);
+        r.adam_core_unsupported =
+            Some("self-perturber: adam-assist 0.6.0 offers no planets-only force model".into());
+        match adam_core_convergence_cell(&r) {
+            ConvergenceCell::NotConverged { reason: Some(why) } => {
+                assert!(why.contains("planets-only"))
+            }
+            _ => panic!("an unsupported row must be NotConverged with the reason, not blank"),
+        }
+        let mut ok = synthetic_core_od_row("Eros");
+        ok.adam_core_converged = Some(true);
+        assert!(matches!(
+            adam_core_convergence_cell(&ok),
+            ConvergenceCell::Converged { .. }
+        ));
+        // No record at all is "not attempted", never a silent pass.
+        assert!(matches!(
+            adam_core_convergence_cell(&synthetic_core_od_row("Bennu")),
+            ConvergenceCell::NotAttempted { .. }
+        ));
+        // A record with data but no flag is a failure, not a pass.
+        let mut half = synthetic_core_od_row("Bennu");
+        half.adam_core_time_ms = Some(5.0);
+        assert!(matches!(
+            adam_core_convergence_cell(&half),
+            ConvergenceCell::NotConverged { .. }
+        ));
+    }
+
     /// S5a: the appendix "ASSIST configurations" (s05c) is now "Configurations"
     /// with one subsection per EXTERNAL tool that has rows in the run; empyrean
     /// is not a subsection and a tool with no rows emits nothing. Fails on the
@@ -17275,7 +17451,7 @@ mod tests {
             "s05c-orbfit",
             "s05c-grss",
             "s05c-oorb",
-            "s05c-adamcore",
+            "s05c-adam-core",
             "s05c-empyrean",
         ] {
             assert!(

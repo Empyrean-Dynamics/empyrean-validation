@@ -65,8 +65,9 @@ name: Validation Suite
 #              The rust channel is the reference and is produced by the
 #              `reference` matrix above.
 #   • external — one matrix leg per independent reference implementation
-#              (ASSIST, find_orb, OpenOrb, kete, jorbit, layup, OrbFit), or one
-#              per object leg for jorbit and OrbFit, each with its own timeout.
+#              (ASSIST, find_orb, OpenOrb, kete, jorbit, layup, adam-core, OrbFit),
+#              or one per object leg for jorbit and OrbFit, each with its own
+#              timeout.
 #              Each replays the *prebuilt* plan; needs no secrets and no
 #              private checkout. fail-fast:false so one dead comparator
 #              never sinks the others — its channel just goes missing
@@ -246,7 +247,7 @@ env:
   HEAVY_MIN_S: ${{ inputs.heavy_min_s || '' }}
   # The external tools that run (scripts/schedule.py pack-external cuts jorbit
   # and OrbFit into object legs). `oorb` is off: see the external job.
-  EXTERNAL_TOOLS: ${{ inputs.external_tools || 'assist,findorb,kete,jorbit,layup,orbfit,grss' }}
+  EXTERNAL_TOOLS: ${{ inputs.external_tools || 'assist,findorb,kete,jorbit,layup,adam-core,orbfit,grss' }}
   EXTERNAL_LEG_TARGET_MIN: ${{ inputs.external_leg_minutes || '' }}
   # The external tools whose setup or import still reaches JPL, NAIF or the MPC,
   # and so seal after setup instead of before it. No validation job may reach
@@ -1255,7 +1256,7 @@ jobs:
     # permissions (no id-token), and none of its legs authenticates or runs
     # gcloud. The legs build and run untrusted upstream code (find_orb, OrbFit,
     # jorbit, OpenOrb), so anything that could mint a bucket token stays in
-    # prep. The layup leg's data is synced by prep and only RESTORED here.
+    # prep. The layup and adam-core legs' data is synced by prep and only RESTORED here.
     strategy:
       fail-fast: false
       # About 16 legs (jorbit 9, OrbFit 2, five tools 1 each) of 25 minutes or
@@ -1329,16 +1330,16 @@ jobs:
           fi
           rm -rf data && mkdir -p data && cp -a "$src"/. data/
 
-      # layup, ASSIST, find_orb and GRSS read their data from the third-party
-      # tool set, folders `layup/`, `assist/`, `findorb/` and `grss/` (every file
-      # each opens, shared kernels included), not from the engine kernel set
-      # and never from JPL or NAIF. find_orb (and the disabled OpenOrb) run
+      # layup, adam-core, ASSIST, find_orb and GRSS read their data from the
+      # third-party tool set, folders `layup/`, `adam-core/`, `assist/`,
+      # `findorb/` and `grss/` (every file each opens, shared kernels included),
+      # not from the engine kernel set and never from JPL or NAIF. find_orb (and the disabled OpenOrb) run
       # under the ASSIST venv, whose setup checks the `assist/` folder too.
       # prep, the trusted job that already holds the bucket identity, syncs the
       # set and saves it to the cache below; this leg only restores it and
       # refuses a miss by name, with no token, no auth step and no gcloud.
       - name: Restore the third-party tool set
-        if: contains(fromJSON('["layup","assist","findorb","grss","oorb"]'), matrix.tool) && env.ACT != 'true'
+        if: contains(fromJSON('["layup","adam-core","assist","findorb","grss","oorb"]'), matrix.tool) && env.ACT != 'true'
         uses: actions/cache/restore@v4
         with:
           path: |
@@ -1351,12 +1352,13 @@ jobs:
       # ACT_THIRD_PARTY_DIR), beside the engine set's /host-data. Only the
       # folders this tool reads are copied.
       - name: Copy the third-party tool set from the host mount (act)
-        if: contains(fromJSON('["layup","assist","findorb","grss","oorb"]'), matrix.tool) && env.ACT == 'true'
+        if: contains(fromJSON('["layup","adam-core","assist","findorb","grss","oorb"]'), matrix.tool) && env.ACT == 'true'
         run: |
           src="${ACT_THIRD_PARTY_DIR:-/host-third-party}"
           # The sentinel files each folder must hold, and the folders each tool reads.
           case "${{ matrix.tool }}" in
             layup)        dirs="layup";          need="layup/de440.bsp layup/debias_hires2018.tgz" ;;
+            adam-core)    dirs="adam-core";      need="adam-core/de440.bsp adam-core/sb441-n16.bsp" ;;
             assist)       dirs="assist";         need="assist/linux_p1550p2650.440 assist/sb441-n16.bsp" ;;
             findorb|oorb) dirs="findorb assist"; need="findorb/linux_p1550p2650.440 assist/linux_p1550p2650.440" ;;
             grss)         dirs="grss";           need="grss/de440.bsp grss/pck00011.tpc grss/sb441-n16s.bsp" ;;
@@ -1809,7 +1811,7 @@ jobs:
             gcloud storage cp results/validation_report.predict.json "${{ env.GCS_BUCKET }}/latest/validation_report.predict.json"
           fi
           gcloud storage cp results/validation_summary.json    ${{ env.GCS_BUCKET }}/latest/validation_summary.json
-          for ch in rust python c cli core assist findorb oorb kete jorbit layup orbfit; do
+          for ch in rust python c cli core assist findorb oorb kete jorbit layup adam-core orbfit; do
             f="results/validation_${ch}.json"
             [ -f "$f" ] && gcloud storage cp "$f" "${{ env.GCS_BUCKET }}/latest/channels/${ch}.json"
           done
@@ -1824,7 +1826,7 @@ jobs:
             gcloud storage cp results/validation_report.predict.json "${{ env.GCS_BUCKET }}/archive/${TIMESTAMP}/validation_report.predict.json"
           fi
           gcloud storage cp results/validation_summary.json    ${{ env.GCS_BUCKET }}/archive/${TIMESTAMP}/validation_summary.json
-          for ch in rust python c cli core assist findorb oorb kete jorbit layup orbfit; do
+          for ch in rust python c cli core assist findorb oorb kete jorbit layup adam-core orbfit; do
             f="results/validation_${ch}.json"
             [ -f "$f" ] && gcloud storage cp "$f" "${{ env.GCS_BUCKET }}/archive/${TIMESTAMP}/channels/${ch}.json"
           done

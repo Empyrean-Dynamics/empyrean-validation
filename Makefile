@@ -224,6 +224,9 @@ JORBIT_OUT := $(RESULTS_DIR)/validation_jorbit.json
 # layup external OD reference (opt-in, WITH_LAYUP=1); its rows attach to the
 # `orbit_determination` OD rows in the merge, alongside find_orb + OrbFit.
 LAYUP_OUT := $(RESULTS_DIR)/validation_layup.json
+# adam-core external reference (propagation + ephemeris + OD): the released
+# adam-core 0.7.0 / adam-assist 0.6.0. Its rows attach to the prop / eph / OD rows.
+ADAM_CORE_OUT := $(RESULTS_DIR)/validation_adam-core.json
 # Merged-with-external version of the rust unified file. ASSIST and find_orb
 # references attach onto the rust prop+eph and OD rows in a single pass.
 RUST_MERGED := $(RESULTS_DIR)/validation_rust_merged.json
@@ -252,11 +255,11 @@ REPORT_INPUTS := $(if $(WITH_CORE),$(RUST)$(comma)$(PYTHON)$(comma)$(C_OUT)$(com
 
 # ── Targets ────────────────────────────────────────────────
 .PHONY: all setup build run report clean clean-results clean-all archive help fixtures check-fixtures \
-        setup-assist setup-findorb setup-oorb setup-orbfit setup-kete setup-jorbit setup-layup \
+        setup-assist setup-findorb setup-oorb setup-orbfit setup-kete setup-jorbit setup-layup setup-adam-core \
         setup-grss run-grss \
         build-empyrean-c build-rust build-c build-cli build-wheel build-core build-empyrean-validation \
         run-rust run-python run-c run-cli run-assist run-findorb run-oorb run-orbfit \
-        run-core run-kete run-jorbit run-layup \
+        run-core run-kete run-jorbit run-layup run-adam-core \
         merge-external plan check-plan reduce
 
 help:
@@ -310,7 +313,7 @@ check-fixtures: fixtures
 # when it will actually run — otherwise `make setup` pulls a Docker image
 # for a comparator that never executes (and fails the setup if Docker is
 # unavailable).
-setup: setup-assist setup-findorb setup-kete setup-jorbit setup-grss $(if $(WITH_OORB),setup-oorb,) $(if $(WITH_ORBFIT),setup-orbfit,) $(if $(WITH_LAYUP),setup-layup,)
+setup: setup-assist setup-findorb setup-kete setup-jorbit setup-grss $(if $(WITH_OORB),setup-oorb,) $(if $(WITH_ORBFIT),setup-orbfit,) $(if $(WITH_LAYUP),setup-layup,) $(if $(WITH_ADAM_CORE),setup-adam-core,)
 	@echo
 	@echo "External dependencies installed."
 
@@ -534,12 +537,16 @@ WITH_ORBFIT ?= 1
 # Default-on; set WITH_LAYUP= (empty) to skip on hosts where its heavy
 # C-extension venv is unavailable.
 WITH_LAYUP ?= 1
+# adam-core: the released adam-core / adam-assist (PyPI wheels, no private data).
+# Default-on; set WITH_ADAM_CORE= (empty) to skip.
+WITH_ADAM_CORE ?= 1
 # OpenOrb is gated on WITH_OORB, defined above with the reason it is off.
 run: run-rust run-python run-c run-cli run-assist run-findorb \
      run-kete run-jorbit run-grss \
      $(if $(WITH_OORB),run-oorb,) \
      $(if $(WITH_ORBFIT),run-orbfit,) \
      $(if $(WITH_LAYUP),run-layup,) \
+     $(if $(WITH_ADAM_CORE),run-adam-core,) \
      $(if $(WITH_CORE),run-core,)
 
 # Rust channel: two binary subcommands (`validate run` for prop+eph,
@@ -1397,6 +1404,37 @@ $(LAYUP_OUT): | fixtures
 	    --ar-data-path "$(LAYUP_DATA)" --output $(LAYUP_OUT) \
 	    $(if $(OBJECTS),--only "$(OBJECTS)",)
 
+# ── adam-core (external propagation + ephemeris + OD reference) ─
+# The released adam-core 0.7.0 with adam-assist 0.6.0 (PyPI wheels, own venv).
+# OD runs the public CORE_OD_V1 profile; its missing per-observation sigma comes
+# from the suite's shared public Veres 2017 model (runners/sigmafill). It reads
+# DE440 and SB441-N16 from the adam-core folder of the third-party tool set
+# (dataset third-party-tools-2026-11-08, synced under $(DATA_DIR)/third-party)
+# and passes them to adam-assist explicitly; it never falls back to the
+# install-time PyPI kernels and fetches nothing at run time.
+ADAM_CORE_VENV := $(EMP_VAL_RUNNERS)/adam-core/.venv
+ADAM_CORE_PY := $(ADAM_CORE_VENV)/bin/python
+ADAM_CORE_DATA_DIR ?= $(DATA_DIR)/third-party/adam-core
+
+setup-adam-core: $(ADAM_CORE_PY)
+$(ADAM_CORE_PY):
+	@echo "──── Setting up adam-core venv (adam-core 0.7.0 + adam-assist 0.6.0) ─"
+	@cd $(EMP_VAL_RUNNERS)/adam-core && ./setup.sh
+
+run-adam-core: $(ADAM_CORE_OUT)
+$(ADAM_CORE_OUT): $(PLAN) | check-plan fixtures
+	@test -x "$(ADAM_CORE_PY)" || { \
+	    echo "ERROR: adam-core venv not built: $(ADAM_CORE_PY)"; \
+	    echo "       Build it with: make setup-adam-core, or opt out with WITH_ADAM_CORE="; \
+	    exit 1; }
+	@echo "──── adam-core: external prop + eph + OD reference ─────"
+	@mkdir -p $(RESULTS_DIR)
+	@$(ADAM_CORE_PY) $(EMP_VAL_RUNNERS)/adam-core/run_adam_core.py \
+	    --input $(PLAN) --output $(ADAM_CORE_OUT) \
+	    --fixtures-dir $(FIXTURES_PSV) --data-dir "$(ADAM_CORE_DATA_DIR)" \
+	    --registered-obscodes "$(DATA_DIR)/obscodes_extended.json" \
+	    $(if $(OBJECTS),--objects "$(OBJECTS)",)
+
 # ── Merge external + report ────────────────────────────────
 # Channel-agnostic meta operations live in this repo's CLI binary. It
 # owns the schema, so its merge / report / ci-check stays in lockstep
@@ -1417,8 +1455,8 @@ INCLUDE_OPTIONAL ?=
 merge-external: $(if $(WITH_CORE),$(CORE_MERGED),$(RUST_MERGED))
 $(CORE_MERGED): $(CORE_OUT) $(ASSIST_OUT) $(FINDORB_OUT) $(FINDORB_RADAR_OUT) $(if $(WITH_OORB),$(OORB_OUT),) \
                 $(KETE_OUT) $(JORBIT_OUT) $(GRSS_OUT) \
-                $(if $(WITH_ORBFIT),$(ORBFIT_OUT),) $(if $(WITH_LAYUP),$(LAYUP_OUT),) $(EMP_VAL_BIN)
-	@echo "──── Merge ASSIST + find_orb$(if $(WITH_OORB), + OpenOrb,) + kete + jorbit + GRSS$(if $(WITH_ORBFIT), + OrbFit,)$(if $(WITH_LAYUP), + layup,) into core ──"
+                $(if $(WITH_ORBFIT),$(ORBFIT_OUT),) $(if $(WITH_LAYUP),$(LAYUP_OUT),) $(if $(WITH_ADAM_CORE),$(ADAM_CORE_OUT),) $(EMP_VAL_BIN)
+	@echo "──── Merge ASSIST + find_orb$(if $(WITH_OORB), + OpenOrb,) + kete + jorbit + GRSS$(if $(WITH_ORBFIT), + OrbFit,)$(if $(WITH_LAYUP), + layup,)$(if $(WITH_ADAM_CORE), + adam-core,) into core ──"
 	@$(EMP_VAL_BIN) merge-external -i $(CORE_OUT) -o $(CORE_MERGED) \
 	    --assist $(ASSIST_OUT) --findorb $(FINDORB_OUT) \
 	    --findorb-radar $(FINDORB_RADAR_OUT) \
@@ -1427,11 +1465,12 @@ $(CORE_MERGED): $(CORE_OUT) $(ASSIST_OUT) $(FINDORB_OUT) $(FINDORB_RADAR_OUT) $(
 	    --grss $(GRSS_OUT) --grss-radar $(GRSS_RADAR_OUT) \
 	    --jpl-sbdb-cache $(CACHE_DIR)/sbdb \
 	    $(if $(WITH_ORBFIT),--orbfit $(ORBFIT_OUT),) \
-	    $(if $(WITH_LAYUP),--layup $(LAYUP_OUT),)
+	    $(if $(WITH_LAYUP),--layup $(LAYUP_OUT),) \
+	    $(if $(WITH_ADAM_CORE),--adam-core $(ADAM_CORE_OUT),)
 $(RUST_MERGED): $(RUST) $(ASSIST_OUT) $(FINDORB_OUT) $(FINDORB_RADAR_OUT) $(if $(WITH_OORB),$(OORB_OUT),) \
                 $(KETE_OUT) $(JORBIT_OUT) $(GRSS_OUT) \
-                $(if $(WITH_ORBFIT),$(ORBFIT_OUT),) $(if $(WITH_LAYUP),$(LAYUP_OUT),) $(EMP_VAL_BIN)
-	@echo "──── Merge ASSIST + find_orb$(if $(WITH_OORB), + OpenOrb,) + kete + jorbit + GRSS$(if $(WITH_ORBFIT), + OrbFit,)$(if $(WITH_LAYUP), + layup,) into rust (fallback) ──"
+                $(if $(WITH_ORBFIT),$(ORBFIT_OUT),) $(if $(WITH_LAYUP),$(LAYUP_OUT),) $(if $(WITH_ADAM_CORE),$(ADAM_CORE_OUT),) $(EMP_VAL_BIN)
+	@echo "──── Merge ASSIST + find_orb$(if $(WITH_OORB), + OpenOrb,) + kete + jorbit + GRSS$(if $(WITH_ORBFIT), + OrbFit,)$(if $(WITH_LAYUP), + layup,)$(if $(WITH_ADAM_CORE), + adam-core,) into rust (fallback) ──"
 	@$(EMP_VAL_BIN) merge-external -i $(RUST) -o $(RUST_MERGED) \
 	    --assist $(ASSIST_OUT) --findorb $(FINDORB_OUT) \
 	    --findorb-radar $(FINDORB_RADAR_OUT) \
@@ -1440,7 +1479,8 @@ $(RUST_MERGED): $(RUST) $(ASSIST_OUT) $(FINDORB_OUT) $(FINDORB_RADAR_OUT) $(if $
 	    --grss $(GRSS_OUT) --grss-radar $(GRSS_RADAR_OUT) \
 	    --jpl-sbdb-cache $(CACHE_DIR)/sbdb \
 	    $(if $(WITH_ORBFIT),--orbfit $(ORBFIT_OUT),) \
-	    $(if $(WITH_LAYUP),--layup $(LAYUP_OUT),)
+	    $(if $(WITH_LAYUP),--layup $(LAYUP_OUT),) \
+	    $(if $(WITH_ADAM_CORE),--adam-core $(ADAM_CORE_OUT),)
 
 report: $(RUST) $(PYTHON) $(C_OUT) $(CLI_OUT) $(if $(WITH_CORE),$(CORE_MERGED),$(RUST_MERGED)) $(EMP_VAL_BIN)
 	@echo "──── Generating combined HTML report ───────────────────"
@@ -1507,6 +1547,7 @@ reduce: build-empyrean-validation
 	add --grss-radar    "$(GRSS_RADAR_OUT)"       ""; \
 	add --orbfit        "$(ORBFIT_OUT)"          ""; \
 	add --layup         "$(LAYUP_OUT)"           ""; \
+	add --adam-core      "$(ADAM_CORE_OUT)"        ""; \
 	if [ -d "$(CACHE_DIR)/sbdb" ]; then flags="$$flags --jpl-sbdb-cache $(CACHE_DIR)/sbdb"; fi; \
 	if [ -s "$(RESULTS_DIR)/comparators-absent.txt" ]; then flags="$$flags --comparator-absent-file $(RESULTS_DIR)/comparators-absent.txt"; fi; \
 	$(EMP_VAL_BIN) merge-external -i "$$ref" -o "$$merged" $$flags
