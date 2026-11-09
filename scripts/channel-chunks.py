@@ -1,37 +1,40 @@
 #!/usr/bin/env python3
-"""Chunk the per-object matrix for the channel legs, and reassemble their outputs.
+"""Deal the plan to the channel legs row by row, and put their outputs back.
 
 The per-method plan replays every uncertainty method on every channel, so one
-channel over the full catalog outruns any job budget (run 171, 2026-10-22: the
-python and core legs were each still replaying at 240 minutes). The channel
-job therefore fans out over object chunks the way the reference job fans out
-over objects, each leg replays the plan filtered to its chunk, and the reduce
-job concatenates each channel's chunks back into the one file the merge reads.
+channel over the full catalog outruns any job budget, and an object-level leg
+cannot hold the one row that costs 42 minutes per run (run 42506609035: the c
+and cli legs holding 2020 CD3 hit the 240-minute limit). Legs therefore take
+ROWS: scripts/schedule.py packs the plan's scheduling units longest-first into
+legs from the committed cost table and writes results/schedule.json; each
+channel leg runs `select` for its rows, and reduce runs `concat` to put the
+leg outputs back, in plan order, into the one file per channel the merge reads.
+
+    channel-chunks.py select --plan results/validation_plan.json \
+        --schedule results/schedule.json --channel python --leg 03 \
+        --output results/validation_plan.leg-python.json
+        writes the leg's plan rows in plan order. It refuses a schedule built
+        for a different plan (hash mismatch), an unknown channel or leg, and a
+        leg that selects no rows: a leg handed the wrong rows replays the
+        wrong work (2026-10-28: every chunk leg replayed all 30,033 plan rows
+        and 38 of 40 hit the 240-minute wall).
+
+    channel-chunks.py concat --plan results/validation_plan.json \
+        --schedule results/schedule.json --channel python \
+        --out results/validation_python.json results/validation_python.leg*.json
+        maps every output row to its plan row by row key, checks the row
+        belongs to the leg that produced it, and writes the rows in plan
+        order (what an unchunked run produces). It refuses a missing or
+        unexpected leg, a duplicate leg id, a non-list file, a row whose key is
+        not in the plan, a row outside its leg's selection, and a row delivered
+        twice: a silently short channel would read downstream as "compared and
+        agreed". Rows a channel does not produce (skipped transports) are not
+        an error; the channel's own count line accounts for them.
 
     channel-chunks.py split  --objects results/objects.json --count 10
-        prints a JSON list of {"id": "01", "objects": "A,B,C"}; objects are
-        dealt round-robin in matrix order so heavy neighbours spread out; the
-        count is capped at the number of objects, so a subset dispatch never
-        yields an empty chunk.
-
-    channel-chunks.py filter --plan results/validation_plan.json \
-        --objects "A,B,C" --output results/validation_plan.chunk.json
-        writes the plan rows whose "object" is one of the named objects, in
-        plan order, and prints each object's row count and the total. Names
-        are matched exactly, in the plan's own spelling, comma-separated like
-        split's "objects" field. An empty list, an empty or repeated entry,
-        or a name with no plan rows is a hard stop: a leg handed the wrong
-        rows replays the wrong work, and one handed the whole plan replays
-        every object and outruns its budget (2026-10-28: every chunk leg
-        replayed all 30,033 plan rows; 38 of the 40 hit the 240-minute
-        wall and the other two lost their runners first).
-
-    channel-chunks.py concat --out results/validation_python.json --expect 10 \
-        results/validation_python.chunk*.json
-        requires exactly --expect files, each a JSON list, and writes their
-        rows in chunk order. A missing chunk, a duplicate id or a non-list
-        file is a hard stop: a silently short channel would read downstream
-        as "compared and agreed".
+        prints a JSON list of {"id": "01", "objects": "A,B,C"}, objects dealt
+        round-robin in matrix order. The channel legs no longer use it; it is
+        kept for the external legs' object chunks.
 """
 
 from __future__ import annotations
@@ -42,7 +45,10 @@ import re
 import sys
 from pathlib import Path
 
-CHUNK_RE = re.compile(r"\.chunk(\d+)\.json$")
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import schedule as sched  # the sibling script, found beside this file
+
+LEG_RE = re.compile(r"\.leg([0-9A-Za-z]+)\.json$")
 
 
 def split(objects: list, count: int) -> list[dict]:
@@ -61,43 +67,6 @@ def split(objects: list, count: int) -> list[dict]:
     return [{"id": f"{k + 1:0{width}d}", "objects": ",".join(b)} for k, b in enumerate(buckets)]
 
 
-def parse_objects(spec: str) -> list[str]:
-    names = [n.strip() for n in spec.split(",")]
-    if not any(names):
-        raise SystemExit("ERROR: --objects is empty; a plan chunk names at least one object.")
-    if not all(names):
-        raise SystemExit(f"ERROR: --objects {spec!r} has an empty entry; OBJECTS is comma-separated.")
-    repeated = sorted({n for n in names if names.count(n) > 1})
-    if repeated:
-        raise SystemExit("ERROR: --objects names " + ", ".join(repeated) + " more than once.")
-    return names
-
-
-def filter_plan(rows: list, objects: list[str]) -> tuple[list, dict[str, int]]:
-    if not isinstance(rows, list):
-        raise SystemExit("ERROR: the plan is not a JSON list of rows.")
-    counts = dict.fromkeys(objects, 0)
-    kept: list = []
-    for i, row in enumerate(rows):
-        name = row.get("object") if isinstance(row, dict) else None
-        if not isinstance(name, str):
-            raise SystemExit(f'ERROR: plan row {i} carries no "object" name.')
-        if name in counts:
-            counts[name] += 1
-            kept.append(row)
-    missing = [n for n, c in counts.items() if c == 0]
-    if missing:
-        held = sorted({r["object"] for r in rows})
-        raise SystemExit(
-            "ERROR: the plan holds no rows for "
-            + ", ".join(repr(n) for n in missing)
-            + f". Names match the plan's spelling exactly; it holds {len(held)} objects: "
-            + ", ".join(held)
-            + "."
-        )
-    return kept, counts
-
-
 def write_rows(rows: list, out: Path) -> None:
     """Write through a sibling temp file, so a failed write leaves no partial file."""
     out.parent.mkdir(parents=True, exist_ok=True)
@@ -111,29 +80,92 @@ def write_rows(rows: list, out: Path) -> None:
     tmp.replace(out)
 
 
-def concat(paths: list[Path], expect: int, out: Path) -> int:
-    ids = []
-    for p in paths:
-        m = CHUNK_RE.search(p.name)
-        if not m:
-            raise SystemExit(f"ERROR: {p} is not a chunk file (expected *.chunkNN.json).")
-        ids.append((int(m.group(1)), p))
-    if len(ids) != expect:
+def load_schedule(schedule_path: Path, plan_path: Path, channel: str) -> tuple[dict, dict]:
+    """The schedule and the named channel's body, refusing a schedule that was
+    not built for this plan."""
+    with open(schedule_path) as f:
+        schedule = json.load(f)
+    if schedule.get("schema") != sched.SCHEMA:
+        raise SystemExit(f"ERROR: {schedule_path} has schema {schedule.get('schema')!r}, expected {sched.SCHEMA}.")
+    plan_sha = sched.file_sha256(plan_path)
+    if schedule["plan_sha256"] != plan_sha:
         raise SystemExit(
-            f"ERROR: expected {expect} chunk files for {out.name}, found {len(ids)}: "
-            + ", ".join(p.name for _, p in sorted(ids))
-            + ". A channel leg did not deliver; refusing to assemble a short channel."
+            f"ERROR: {schedule_path} was built for a different plan (its plan_sha256 is "
+            f"{schedule['plan_sha256'][:12]}, {plan_path.name} hashes to {plan_sha[:12]}). "
+            "Refusing to deal rows from a stale schedule."
         )
-    seen = {k for k, _ in ids}
-    if len(seen) != len(ids):
-        raise SystemExit(f"ERROR: duplicate chunk ids for {out.name}.")
-    rows: list = []
-    for _, p in sorted(ids):
-        with open(p) as f:
+    body = schedule["channels"].get(channel)
+    if body is None:
+        raise SystemExit(f"ERROR: the schedule has no channel {channel!r}; it has {', '.join(schedule['channels'])}.")
+    return schedule, body
+
+
+def select(plan: list, body: dict, channel: str, leg: str) -> list:
+    """The leg's plan rows, in plan order."""
+    legs = {x["leg"]: x for x in body["legs"]}
+    if leg not in legs:
+        raise SystemExit(f"ERROR: {channel} has no leg {leg!r}; its legs are {', '.join(sorted(legs))}.")
+    rows = legs[leg]["rows"]
+    if not rows:
+        raise SystemExit(f"ERROR: {channel} leg {leg} selects no rows.")
+    if rows != sorted(rows) or len(set(rows)) != len(rows) or rows[0] < 0 or rows[-1] >= len(plan):
+        raise SystemExit(f"ERROR: {channel} leg {leg} lists rows that are unsorted, repeated or outside the plan.")
+    return [plan[i] for i in rows]
+
+
+def plan_index(plan: list) -> dict[str, int]:
+    """Row key -> plan index, refusing a plan whose keys are not unique."""
+    idx: dict[str, int] = {}
+    for i, r in enumerate(plan):
+        k = sched.key_str(sched.row_key(r))
+        if k in idx:
+            raise SystemExit(f"ERROR: plan rows {idx[k]} and {i} share the row key {k}.")
+        idx[k] = i
+    return idx
+
+
+def concat(plan: list, body: dict, channel: str, paths: list[Path], out: Path) -> int:
+    """Join the leg outputs in plan order, refusing every shape of wrong."""
+    expected = {x["leg"]: x for x in body["legs"]}
+    got: dict[str, Path] = {}
+    for p in paths:
+        m = LEG_RE.search(p.name)
+        if not m:
+            raise SystemExit(f"ERROR: {p} is not a leg file (expected *.leg<ID>.json).")
+        if m.group(1) in got:
+            raise SystemExit(f"ERROR: duplicate leg id {m.group(1)} for {out.name}: {got[m.group(1)].name} and {p.name}.")
+        got[m.group(1)] = p
+    missing = sorted(set(expected) - set(got))
+    if missing:
+        raise SystemExit(
+            f"ERROR: {channel} is missing leg(s) {', '.join(missing)} of {len(expected)} for {out.name}. "
+            "A channel leg did not deliver; refusing to assemble a short channel."
+        )
+    extra = sorted(set(got) - set(expected))
+    if extra:
+        raise SystemExit(f"ERROR: {channel} has leg file(s) {', '.join(extra)} that the schedule does not hold.")
+    idx = plan_index(plan)
+    seen: dict[int, str] = {}
+    keep: list[tuple[int, dict]] = []
+    for leg_id in sorted(got):
+        with open(got[leg_id]) as f:
             part = json.load(f)
         if not isinstance(part, list):
-            raise SystemExit(f"ERROR: {p} is not a JSON list of rows.")
-        rows.extend(part)
+            raise SystemExit(f"ERROR: {got[leg_id]} is not a JSON list of rows.")
+        allowed = set(expected[leg_id]["rows"])
+        for r in part:
+            k = sched.key_str(sched.row_key(r))
+            i = idx.get(k)
+            if i is None:
+                raise SystemExit(f"ERROR: {got[leg_id].name} holds a row that is not in the plan: {k}.")
+            if i not in allowed:
+                raise SystemExit(f"ERROR: {got[leg_id].name} holds plan row {i} ({k}), which the schedule gave to another leg.")
+            if i in seen:
+                raise SystemExit(f"ERROR: plan row {i} ({k}) is delivered twice (legs {seen[i]} and {leg_id}).")
+            seen[i] = leg_id
+            keep.append((i, r))
+    keep.sort(key=lambda t: t[0])
+    rows = [r for _, r in keep]
     write_rows(rows, out)
     return len(rows)
 
@@ -144,37 +176,39 @@ def main(argv: list[str] | None = None) -> int:
     s = sub.add_parser("split")
     s.add_argument("--objects", required=True, type=Path, help="results/objects.json from `make list-objects`")
     s.add_argument("--count", required=True, type=int)
-    f = sub.add_parser("filter")
-    f.add_argument("--plan", required=True, type=Path, help="the full plan, results/validation_plan.json")
-    f.add_argument("--objects", required=True, help='comma-separated object names, as split\'s "objects" field')
-    f.add_argument("--output", required=True, type=Path)
-    c = sub.add_parser("concat")
-    c.add_argument("--out", required=True, type=Path)
-    c.add_argument("--expect", required=True, type=int)
-    c.add_argument("chunks", nargs="*", type=Path)
+    for name in ("select", "concat"):
+        c = sub.add_parser(name)
+        c.add_argument("--plan", required=True, type=Path, help="the full plan, results/validation_plan.json")
+        c.add_argument("--schedule", required=True, type=Path, help="results/schedule.json from scripts/schedule.py")
+        c.add_argument("--channel", required=True)
+        if name == "select":
+            c.add_argument("--leg", required=True)
+            c.add_argument("--output", required=True, type=Path)
+        else:
+            c.add_argument("--out", required=True, type=Path)
+            c.add_argument("legs", nargs="*", type=Path)
     args = ap.parse_args(argv)
     if args.cmd == "split":
         with open(args.objects) as f:
             objects = json.load(f)
         print(json.dumps(split(objects, args.count), separators=(",", ":")))
         return 0
-    if args.cmd == "filter":
-        # The list is checked before the plan is read: a bad OBJECTS fails in
-        # milliseconds, not after parsing the full plan.
-        objects = parse_objects(args.objects)
-        with open(args.plan) as fh:
-            rows = json.load(fh)
-        kept, counts = filter_plan(rows, objects)
-        write_rows(kept, args.output)
-        for name, n in counts.items():
-            print(f"  {name}: {n} rows")
+    _schedule, body = load_schedule(args.schedule, args.plan, args.channel)
+    with open(args.plan) as fh:
+        plan = json.load(fh)
+    if not isinstance(plan, list):
+        raise SystemExit("ERROR: the plan is not a JSON list of rows.")
+    if args.cmd == "select":
+        rows = select(plan, body, args.channel, args.leg)
+        write_rows(rows, args.output)
+        predicted = next(x["predicted_min"] for x in body["legs"] if x["leg"] == args.leg)
         print(
-            f"Plan chunk: {len(kept)} rows for OBJECTS={','.join(objects)} "
-            f"(of {len(rows)} rows in {args.plan.name}) -> {args.output}"
+            f"Plan leg: {len(rows)} rows for {args.channel} leg {args.leg} of {len(body['legs'])} "
+            f"(of {len(plan)} rows in {args.plan.name}; predicted {predicted:.1f} min) -> {args.output}"
         )
         return 0
-    n = concat(list(args.chunks), args.expect, args.out)
-    print(f"{args.out}: {n} rows from {args.expect} chunks")
+    n = concat(plan, body, args.channel, list(args.legs), args.out)
+    print(f"{args.out}: {n} rows from {len(body['legs'])} {args.channel} legs, in plan order")
     return 0
 
 

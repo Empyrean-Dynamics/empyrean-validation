@@ -504,6 +504,46 @@ class _RowAccount:
         )
 
 
+def _plan_non_grav_refs(rows: list) -> dict:
+    """The legacy fits whose non-grav second pass writes a plan row:
+    ``(object, force_model)`` -> the SBDB reference (A1, A2, A3) carried by
+    that plan ``non_grav_recovery`` row. Mirrored in the python / cli drivers.
+
+    The plan is the contract. The rust runner writes the row only where its own
+    gate passes (SBDB A2 != 0), so re-deriving the gate here from the
+    propagation rows' A1/A2/A3 ran the pass on an object the plan holds no row
+    for (2020 CD3, A1 only): a surplus row whenever that fit converges. A plan
+    row without its reference, or one listed twice, is refused by name.
+    """
+    refs: dict = {}
+    for r in rows:
+        if r.get("test_type") != "non_grav_recovery":
+            continue
+        key = (r["object"], r.get("force_model"))
+        a = (r.get("ic_a1"), r.get("ic_a2"), r.get("ic_a3"))
+        if any(v is None for v in a):
+            raise SystemExit(f"ERROR: the plan's non_grav_recovery row for {key[0]} ({key[1]}) carries no SBDB reference A1/A2/A3.")
+        if key in refs:
+            raise SystemExit(f"ERROR: the plan holds two non_grav_recovery rows for {key[0]} ({key[1]}).")
+        refs[key] = a
+    return refs
+
+
+def _context_rows(context: Path | None, input_rows: list) -> list:
+    """The rows the cross-row lookups read: the full plan when ``--context`` is
+    given, the input itself otherwise. A context that lacks an object of the
+    input is refused by name, since its non-grav second pass would silently
+    vanish."""
+    if context is None:
+        return input_rows
+    rows = json.loads(context.read_text())
+    have = {r["object"] for r in rows}
+    missing = sorted({r["object"] for r in input_rows} - have)
+    if missing:
+        raise SystemExit(f"ERROR: --context {context} holds no rows for {', '.join(missing)}.")
+    return rows
+
+
 def main() -> int:
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument(
@@ -532,6 +572,13 @@ def main() -> int:
         help="empyrean data directory (defaults to ~/.empyrean/data/)",
     )
     p.add_argument(
+        "--context",
+        type=Path,
+        default=None,
+        help="the full plan, for the lookups that cross rows (the non-grav "
+        "reference); defaults to --input. A channel leg replays a subset of the plan.",
+    )
+    p.add_argument(
         "--fixtures-dir",
         type=Path,
         default=Path(__file__).parent.parent.parent / "fixtures" / "psv",
@@ -550,19 +597,13 @@ def main() -> int:
         print("input JSON(s) empty", file=sys.stderr)
         return 1
 
-    # Per-object reference non-grav signal, keyed by object name. The
-    # `orbit_determination` rows null out ic_a1/ic_a2/ic_a3, so read the
-    # JPL SBDB reference off the object's `propagation` rows (which carry
-    # it). Mirrors the rust runner's per-object gate
-    # `data.a1 != 0 || data.a2 != 0 || data.a3 != 0` — only objects with a
-    # known non-grav signal get a second StateAndNonGrav fit.
-    ref_non_grav: dict[str, tuple[float, float, float]] = {}
-    for r in rust_rows:
-        a1 = r.get("ic_a1") or 0.0
-        a2 = r.get("ic_a2") or 0.0
-        a3 = r.get("ic_a3") or 0.0
-        if a1 != 0.0 or a2 != 0.0 or a3 != 0.0:
-            ref_non_grav[r["object"]] = (a1, a2, a3)
+    # The legacy fits whose non-grav second pass writes a plan row, read off
+    # the plan's own non_grav_recovery rows in the CONTEXT: the full plan, or
+    # the input itself without --context. Reading the full plan keeps the
+    # account strict: a leg that held an object's legacy fit without its plan
+    # non-grav row (a split scheduling unit) writes the pass's row as a
+    # surplus instead of losing it.
+    ng_refs = _plan_non_grav_refs(_context_rows(args.context, rust_rows))
 
     cmd = [str(args.runner)]
     if args.data_dir:
@@ -842,17 +883,18 @@ def main() -> int:
             out_rows.append(new)
 
             # ── Second OD: non-grav recovery ──────────────────────────────
-            # For objects with a known SBDB non-grav signal (a1/a2/a3 != 0,
-            # the same gate the rust runner applies), run a second determine
-            # with solve_for = StateAndNonGrav on the SAME optical fixture and
-            # emit a `non_grav_recovery` row carrying the FITTED A1/A2/A3 + 1σ
+            # For a fit whose plan holds a `non_grav_recovery` row (the plan
+            # carries the rust runner's gate, see _plan_non_grav_refs), run a
+            # second determine with solve_for = StateAndNonGrav on the SAME
+            # optical fixture and emit a `non_grav_recovery` row carrying the
+            # FITTED A1/A2/A3 + 1σ
             # (od_a*/od_a*_sigma) so the report can compare fitted-vs-JPL in σ.
             # The runner emits "null" for both a coefficient and its σ when
             # non-grav was not actually recovered (9×9 covariance absent — the
             # current engine bug where StateAndNonGrav silently falls back to a
             # 6-param state-only fit — or a non-finite value); those map to
             # None here, never 0/NaN.
-            if r["object"] in ref_non_grav:
+            if (r["object"], r.get("force_model")) in ng_refs:
                 proc.stdin.write(f"odng {tier} {exclude_naif} {psv}\n")
                 proc.stdin.flush()
                 ng_line = _read_line(proc)
