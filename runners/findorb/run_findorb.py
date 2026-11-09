@@ -37,6 +37,10 @@ from typing import Any, Dict, Optional
 # radar natively but cannot parse the ADES <radar> table at all.
 from radar_mpc80 import RadarConversionError, convert_radar_psv
 
+# Settings and staged data shared with the walk runner, so the two cannot drift.
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
+import findorb_common as FC  # noqa: E402
+
 # ── Constants ───────────────────────────────────────────
 
 MJD_TO_JD = 2_400_000.5
@@ -148,36 +152,20 @@ def populate_fo_directory(working_dir: str, data_dir: Optional[pathlib.Path] = N
     # JPL ephemeris. Linked into the working directory and named RELATIVELY,
     # never by absolute path: find_orb copies this string into a 94-byte buffer,
     # and CI's workspace nests the checkout three deep, so the absolute path is
-    #   /home/runner/work/empyrean-validation/empyrean-validation/empyrean-validation/data/linux_p1550p2650.440
-    # — 103 characters, 9 over. On macOS that strlcpy overflow prints a warning
-    # and continues; on Linux, where the binary is built with _FORTIFY_SOURCE,
-    # it ABORTS, so `fo` died with SIGABRT (rc=134) on every single object and
-    # the channel fitted nothing. The runner already uses bare relative names
-    # elsewhere for exactly this reason; this was the last absolute path left.
-    #
-    # A symlink rather than a copy: the DE file is ~100 MB and this runs once
-    # per object.
-    jpl_path = data_dir / "linux_p1550p2650.440" if data_dir else None
-    if jpl_path and jpl_path.exists():
-        link = os.path.join(working_dir, "jpl_de.440")
-        if not os.path.lexists(link):
-            os.symlink(jpl_path.absolute(), link)
-        lines.append("LINUX_JPL_FILENAME=jpl_de.440")
+    # 103 characters, 9 over. On Linux (_FORTIFY_SOURCE) that overflow ABORTS fo
+    # (SIGABRT, rc=134) on every object. A symlink rather than a copy: the file
+    # is ~100 MB and this runs once per object. A missing file is a refusal
+    # (stage_cfg_dir checks it first), never a silent skip.
+    if data_dir is None:
+        raise SystemExit("ERROR: populate_fo_directory needs the find_orb data directory")
+    link = os.path.join(working_dir, "jpl_de.440")
+    if not os.path.lexists(link):
+        os.symlink((data_dir / FC.JPL_DE_FILE).absolute(), link)
 
-    # Perturbers: all planets + Pluto + Moon + asteroid perturbers (hex)
-    lines.append('PERTURBERS=1007fe')
-
-    # Asteroid perturbers: SB441-N16 set (matches empyrean/ASSIST)
-    lines.append('ASTEROID_PERT_LIST=1,3,4,7,10,15,16,31,52,65,70,87,88,107,511,704')
-
-    # Observation weighting on, auto central object, no EFCC18 debiasing
-    lines.append('SETTINGS2=1 22.00 0 -2 0')
-
-    # Use Encke's method
-    lines.append('ENCKE=1')
-
-    # 3-sigma outlier rejection
-    lines.append('OUTLIER_REJECTION_LIMIT=3')
+    # Every setting, with find_orb's own reason for it, lives in findorb_common:
+    # Cowell integrator, EFCC18 debiasing on, BC-405 asteroids with find_orb's own
+    # proximity culling (empty ASTEROID_PERT_LIST), 3-sigma rejection.
+    lines = FC.environ_lines(debiasing=True)
 
     with open(os.path.join(working_dir, "environ.dat"), "w") as f:
         f.write('\n'.join(lines) + '\n')
@@ -260,6 +248,7 @@ def run_findorb(
     data_dir: Optional[pathlib.Path] = None,
     fo_binary: Optional[pathlib.Path] = None,
     ephem_spec: Optional[Dict[str, Any]] = None,
+    cfg_dir: Optional[pathlib.Path] = None,
 ) -> Optional[Dict[str, Any]]:
     """Run find_orb on ADES PSV observations.
 
@@ -283,7 +272,11 @@ def run_findorb(
             f.write(psv_string)
 
         # Run find_orb: -c = command line mode
-        cmd = f"{fo_bin} {obs_file} -c -d 2 -D {tmp_dir}/environ.dat -O {tmp_dir}"
+        if cfg_dir is None:
+            raise ValueError("run_findorb needs the staged private config dir (findorb_common.stage_cfg_dir)")
+        # -x: private config dir (registered bc405.dat and bias.dat); the trailing
+        # separator is required because fopen_ext concatenates with no separator.
+        cmd = f"{fo_bin} {obs_file} -c -d 2 -x {cfg_dir}{os.sep} -D {tmp_dir}/environ.dat -O {tmp_dir}"
         t_fit0 = time.perf_counter()
         result = subprocess.run(
             cmd, shell=True, cwd=tmp_dir,
@@ -432,7 +425,8 @@ def main() -> int:
     )
     parser.add_argument(
         "--data-dir", type=str, default=None,
-        help="Data directory with JPL ephemeris. Default: ~/.empyrean/data",
+        help="The registered find_orb data folder (third-party set, findorb/): "
+             "bc405.dat, bias.dat and linux_p1550p2650.440. Required.",
     )
     parser.add_argument(
         "--fo-binary", type=str, default=None,
@@ -474,7 +468,15 @@ def main() -> int:
         plan_dts = {k: sorted(v) for k, v in plan_dts.items()}
         print(f"  Plan: {len(plan_dts)} objects, observers: {plan_obs_codes}")
 
-    data_dir = pathlib.Path(args.data_dir) if args.data_dir else pathlib.Path.home() / ".empyrean" / "data"
+    data_dir = pathlib.Path(args.data_dir) if args.data_dir else None
+    # Refuse to start without the registered bc405.dat and bias.dat (and the DE
+    # file): find_orb would otherwise fall back to ~/.find_orb or run undebiased,
+    # a quietly different model. One private config dir for this process.
+    cfg_dir = FC.stage_cfg_dir(pathlib.Path(tempfile.mkdtemp(prefix="fo_cfg_")), data_dir, debiasing=True)
+    tool_meta = {
+        "fo_version": None,  # filled below once source_version is known
+        "fo_settings": FC.settings_record(data_dir, debiasing=True),
+    }
     fo_binary = pathlib.Path(args.fo_binary) if args.fo_binary else FO_BINARY
     psv_dir = pathlib.Path(args.psv_dir)
 
@@ -503,6 +505,7 @@ def main() -> int:
 
     timestamp = datetime.now(timezone.utc).isoformat()
     source_version = resolve_source_version()
+    tool_meta["fo_version"] = source_version
     results = []
     n_failed = 0
 
@@ -563,7 +566,7 @@ def main() -> int:
 
         # Run find_orb
         print("  Running find_orb...")
-        fo_result = run_findorb(psv, data_dir, fo_binary, ephem_spec)
+        fo_result = run_findorb(psv, data_dir, fo_binary, ephem_spec, cfg_dir)
 
         if fo_result is None:
             # Failure ROW, following the OrbFit runner's pattern: the reason
@@ -582,6 +585,7 @@ def main() -> int:
                 "source_version": source_version,
                 "fo_error": "find_orb produced no solution (see log above)",
                 "fo_n_obs_total": n_obs,
+                **tool_meta,
             })
             continue
 
@@ -608,6 +612,7 @@ def main() -> int:
             "fo_n_obs_rejected": fo_result["n_obs_rejected"],
             "fo_time_ms": fo_result.get("fo_time_ms"),
             "fo_residuals": fo_result["residuals"],
+            **tool_meta,
         }
         results.append(result)
 
@@ -633,6 +638,7 @@ def main() -> int:
                     "dt_days": dt, "timestamp": timestamp,
                     "source_version": source_version,
                     "fo_geo_pos_au": v["pos"], "fo_geo_vel_au_d": v["vel"],
+                    **tool_meta,
                 })
                 n_vec += 1
             for code, obs_rows in (fo_result.get("observables") or {}).items():
@@ -646,6 +652,7 @@ def main() -> int:
                         "source_version": source_version,
                         "fo_ra_deg": o["ra_deg"], "fo_dec_deg": o["dec_deg"],
                         "fo_delta_au": o["delta_au"],
+                        **tool_meta,
                     })
                     n_obs_rows += 1
             print(f"  ephemerides: {n_vec} state vectors, {n_obs_rows} RA/Dec rows")
