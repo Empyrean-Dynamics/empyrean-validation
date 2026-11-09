@@ -1044,15 +1044,16 @@ def heavy_leg_matrix(sched: dict) -> list[dict]:
 # ── external legs (S7) ──────────────────────────────────────────────────────
 #
 # Each external tool runs as one or more legs. A tool the external cost table
-# prices per object (jorbit, OrbFit) is cut by object, longest object first, so
-# no leg replays the whole catalog: jorbit died of memory after 41 to 71 min on
-# two hosted runs and OrbFit took 44 to 51. Every other tool runs as one leg.
+# prices per object (jorbit, OrbFit, adam-core) is cut by object, longest object
+# first, so no leg replays the whole catalog: jorbit died of memory after 41 to
+# 71 min on two hosted runs, OrbFit took 44 to 51, and adam-core's fits outran
+# its 150-minute leg. Every other tool runs as one leg.
 # Each leg's timeout is a multiple of its predicted wall, never a flat budget.
 # reduce puts a tool's legs back into its one comparator file
 # (channel-chunks.py concat-external) before the merge.
 
 EXTERNAL_SCHEMA = 1
-EXTERNAL_TOOLS = ("assist", "findorb", "kete", "jorbit", "layup", "orbfit", "grss")
+EXTERNAL_TOOLS = ("assist", "findorb", "kete", "jorbit", "layup", "orbfit", "grss", "adam-core")
 # The comparator files a tool's leg writes, by stem (validation_<stem>.json).
 EXTERNAL_STEMS = {"findorb": ["findorb", "findorb_radar"], "grss": ["grss", "grss_radar"]}
 # A tool whose run exits nonzero only when every object failed: in a chunked run

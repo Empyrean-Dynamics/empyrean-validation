@@ -4,14 +4,15 @@ comparator file before the merge, in the order one unchunked run writes, with
 comparator isolation intact.
 
 Covers scripts/schedule.py (pack-external, validate-external),
-scripts/channel-chunks.py (external-objects, concat-external) and the two
-runner flags the object legs use (run_jorbit.py --only, run_orbfit.py
---only / --defer-all-failed)."""
+scripts/channel-chunks.py (external-objects, concat-external), the two runner
+flags the object legs use (run_jorbit.py --only, run_orbfit.py --only /
+--defer-all-failed) and `make run-adam-core EXT_LEG=`."""
 
 import importlib.util
 import json
 import math
 import pathlib
+import shutil
 import subprocess
 import sys
 
@@ -330,3 +331,55 @@ def test_an_orbfit_leg_defers_the_every_object_failed_verdict_to_the_merge(orbfi
     assert rc == 0 and [r["object"] for r in json.loads(out.read_text())] == ["A", "B"]
     rc, _ = run_orbfit(orbfit, monkeypatch, world, "--only", "A,Nope", "--defer-all-failed")
     assert rc == 2
+
+
+# A stand-in for a tool's python that records the argv make handed it.
+ARGV_STUB = """#!{py}
+import json, sys
+a = sys.argv[1:]
+json.dump(a, open(a[a.index("--output") + 1], "w"))
+"""
+
+
+@pytest.mark.skipif(shutil.which("make") is None, reason="make unavailable")
+@pytest.mark.parametrize("leg", ["01", "02", ""])
+def test_make_run_adam_core_replays_only_its_legs_objects_under_the_cap(sc, world, leg):
+    """An object leg hands run_adam_core.py its objects as --objects, and every run
+    passes the per-object cap; with no EXT_LEG the whole plan runs."""
+    costs = json.loads(world["cp"].read_text())
+    costs["tools"]["adam-core"] = {"setup_min": 1.0, "leg_overhead_min": 0.5, "default_object_min": 3.0, "object_min": {"A": 9.0}}
+    world["cp"].write_text(json.dumps(costs))
+    s, sp = sched(sc, world, tools=("adam-core",))
+    assert len(s["tools"]["adam-core"]["legs"]) >= 2
+    results = world["dir"] / "results"
+    results.mkdir()
+    (results / "validation_plan.json").write_text(world["pp"].read_text())
+    s["plan_sha256"] = sc.file_sha256(results / "validation_plan.json")
+    sp.write_text(json.dumps(s))
+    stub = world["dir"] / "adam-core-python"
+    stub.write_text(ARGV_STUB.format(py=sys.executable))
+    stub.chmod(0o755)
+    r = subprocess.run(
+        ["make", "-o", "fixtures", "run-adam-core", "PLAN_PREBUILT=1", f"EXT_LEG={leg}", f"RESULTS_DIR={results}",
+         f"EXTERNAL_SCHEDULE={sp}", f"ADAM_CORE_PY={stub}"],
+        cwd=ROOT,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert r.returncode == 0, r.stdout + r.stderr
+    argv = json.loads((results / "validation_adam-core.json").read_text())
+    assert argv[argv.index("--timeout-min") + 1] == "30"
+    want = {leg_["leg"]: leg_["objects"] for leg_ in s["tools"]["adam-core"]["legs"]}
+    if leg:
+        assert argv[argv.index("--objects") + 1] == ",".join(want[leg])
+    else:
+        assert "--objects" not in argv
+
+
+def test_the_committed_table_prices_adam_core_per_object_at_most_its_cap():
+    """A fit is killed at the 30-minute cap, so no object is priced above it, and
+    every object the table names is priced (a capped one at the cap)."""
+    t = json.loads((ROOT / "fixtures" / "external-costs.json").read_text())["tools"]["adam-core"]
+    assert len(t["object_min"]) >= 50
+    assert all(0.0 <= v <= 30.0 for v in t["object_min"].values())
