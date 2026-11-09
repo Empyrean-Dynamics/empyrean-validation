@@ -182,6 +182,10 @@ env:
   # when the underlying artifact set changes.
   # The registered kernel set every empyrean repo pins (lang/workflow/gcp-project.md).
   EMPYREAN_DATASET: kernels-full-2026-10-13
+  # The third-party tool set (lang/workflow/gcp-project.md): one folder per
+  # suite tool, each listing every file that tool reads. The layup external
+  # leg syncs it; the other tools move to it with the runner-fixes PR.
+  THIRD_PARTY_DATASET: third-party-tools-2026-11-08
   EMPYREAN_OFFLINE: "1"
 
 jobs:
@@ -289,6 +293,40 @@ jobs:
           role: writer
           install-python-tooling: "true"
 
+      # The third-party tool set (layup's folder today; the other tools move to
+      # it with the runner-fixes PR). prep holds the bucket identity (engine-setup
+      # authenticated above), so it is the only job that syncs; the external
+      # legs restore the cache and hold no credential. One local pool on the
+      # workspace filesystem serves both sets: the engine set is synced first
+      # (its files are adopted into the pool by hash, nothing downloaded), then
+      # the third-party set links the shared kernels and fetches only what the
+      # engine set lacks. The pool is cached with the data directory and the key
+      # carries both slugs (lang/workflow/gcp-project.md, "Rule for CI wiring").
+      - name: Restore the third-party tool set
+        id: cache-third-party
+        if: env.ACT != 'true'
+        uses: actions/cache/restore@v4
+        with:
+          path: |
+            data/third-party
+            pool
+          key: empyrean-third-party-${{ env.EMPYREAN_DATASET }}-${{ env.THIRD_PARTY_DATASET }}
+      - name: Sync the third-party tool set
+        if: env.ACT != 'true' && steps.cache-third-party.outputs.cache-hit != 'true'
+        run: |
+          export EMPYREAN_DATA_POOL="$GITHUB_WORKSPACE/pool"
+          gcloud storage cp gs://empyrean-data/tools/empyrean-data.py "$RUNNER_TEMP/empyrean-data.py"
+          python3 "$RUNNER_TEMP/empyrean-data.py" sync "$EMPYREAN_DATASET" "$EMPYREAN_DATA_DIR"
+          python3 "$RUNNER_TEMP/empyrean-data.py" sync "$THIRD_PARTY_DATASET" "$EMPYREAN_DATA_DIR/third-party"
+      - name: Save the third-party tool set
+        if: env.ACT != 'true' && steps.cache-third-party.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            data/third-party
+            pool
+          key: empyrean-third-party-${{ env.EMPYREAN_DATASET }}-${{ env.THIRD_PARTY_DATASET }}
+
       # ── Build the engine + warm the shared caches ──────────────
       # prep no longer RUNS the reference — it only builds the binaries and
       # populates the caches (2 GB kernels, JPL responses, cargo) that the
@@ -348,9 +386,11 @@ jobs:
     # The heaviest object (2020 CD3, a minimoon with Monte Carlo rows) took 37
     # and 51 minutes, then ran past a 90-minute budget, on three runs of the
     # same code, and took 96 minutes on 2026-10-28: runner variance, not a
-    # regression. Budget from the measured spread: 180 minutes is nearly twice
-    # the slowest leg measured to completion.
-    timeout-minutes: 180
+    # regression. 2020 CD3 then took 101.3 minutes on run 40612958887
+    # (2026-10-28) and 175.6 minutes on run 42506609035 (2026-11-08), against
+    # the 180-minute budget this line held (bead empyrean-apgbt). 300 minutes
+    # leaves a margin of 1.7x over that slowest leg measured to completion.
+    timeout-minutes: 300
     strategy:
       fail-fast: false
       # 25 rather than all 50 is free here, and deliberate. Wall-clock is set by
@@ -760,6 +800,11 @@ jobs:
     # leg was jorbit at 73 min; orbfit, back to one fit per object, is about
     # 80 min at its 1.6 min/fit.
     timeout-minutes: 240
+    # No credentials here: this job inherits the workflow's read-only
+    # permissions (no id-token), and none of its legs authenticates or runs
+    # gcloud. The legs build and run untrusted upstream code (find_orb, OrbFit,
+    # jorbit, OpenOrb), so anything that could mint a bucket token stays in
+    # prep. The layup leg's data is synced by prep and only RESTORED here.
     strategy:
       fail-fast: false
       matrix:
@@ -819,6 +864,37 @@ jobs:
             exit 1
           fi
           rm -rf data && mkdir -p data && cp -a "$src"/. data/
+
+      # layup reads its data from the third-party tool set, folder `layup/`
+      # (every file it opens, shared kernels included), not from the engine
+      # kernel set. Other tools keep their current staging. prep, the trusted
+      # job that already holds the bucket identity, syncs the set and saves it
+      # to the cache below; this leg only restores it and refuses a miss by
+      # name, with no token, no auth step and no gcloud.
+      - name: Restore the third-party tool set (layup)
+        if: matrix.tool == 'layup' && env.ACT != 'true'
+        uses: actions/cache/restore@v4
+        with:
+          path: |
+            data/third-party
+            pool
+          key: empyrean-third-party-${{ env.EMPYREAN_DATASET }}-${{ env.THIRD_PARTY_DATASET }}
+          fail-on-cache-miss: true
+      # Under act there is no cache from prep: the host bind-mounts its
+      # synced copy of the third-party set at /host-third-party (override with
+      # ACT_THIRD_PARTY_DIR), beside the engine set's /host-data.
+      - name: Copy the third-party tool set from the host mount (act, layup)
+        if: matrix.tool == 'layup' && env.ACT == 'true'
+        run: |
+          src="${ACT_THIRD_PARTY_DIR:-/host-third-party}"
+          if [ ! -f "$src/layup/de440.bsp" ] || [ ! -f "$src/layup/debias_hires2018.tgz" ]; then
+            echo "ERROR: running under act, but no third-party tool set is mounted at $src." >&2
+            echo "       Mount the locally synced '$THIRD_PARTY_DATASET' directory, e.g." >&2
+            echo "       --container-options '--mount type=bind,source=<local copy>,target=/host-third-party,readonly'" >&2
+            exit 1
+          fi
+          rm -rf data/third-party && mkdir -p data/third-party && cp -a "$src"/. data/third-party/
+          echo "act: copied $(find data/third-party -type f | wc -l) files of $THIRD_PARTY_DATASET from $src"
 
       # One cache per tool build tree. The path list is a superset (venv /
       # install / build + find_orb's ~/include ~/lib); absent members are

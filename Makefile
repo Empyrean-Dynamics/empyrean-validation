@@ -1194,14 +1194,18 @@ $(JORBIT_OUT): $(PLAN) $(JORBIT_PY) | check-plan
 LAYUP_VENV := $(EMP_VAL_RUNNERS)/layup/.venv
 LAYUP_PY := $(LAYUP_VENV)/bin/python
 # layup's data directory (its --ar): every kernel, the observatory codes and
-# the debiasing table under layup's own names, staged from $(DATA_DIR) by
-# stage_data.py. layup never downloads at run time.
+# the debiasing table under layup's own names, staged by stage_data.py from
+# the layup folder of the third-party tool set (dataset
+# third-party-tools-2026-11-08, synced under $(DATA_DIR)/third-party): the
+# folder lists every file layup reads, shared kernels included, so layup needs
+# nothing from the engine kernel set. layup never downloads at run time.
+LAYUP_DATA_DIR ?= $(DATA_DIR)/third-party/layup
 LAYUP_DATA := $(EMP_VAL_RUNNERS)/layup/data
 
 setup-layup: $(LAYUP_PY)
 $(LAYUP_PY):
 	@echo "──── Setting up layup venv (pinned release + staged data) ─"
-	@cd $(EMP_VAL_RUNNERS)/layup && DATA_DIR="$(DATA_DIR)" ./setup.sh
+	@cd $(EMP_VAL_RUNNERS)/layup && DATA_DIR="$(LAYUP_DATA_DIR)" ./setup.sh
 
 run-layup: $(LAYUP_OUT)
 # layup's venv is an optional, heavy BUILD (see layup/setup.sh), but it is
@@ -1218,10 +1222,11 @@ $(LAYUP_OUT): | fixtures
 	@# Re-staged on every run: a venv restored from the tool cache skips
 	@# setup.sh, and the data must be the set this run synced.
 	@$(LAYUP_PY) $(EMP_VAL_RUNNERS)/layup/stage_data.py \
-	    --data-dir "$(DATA_DIR)" --dest "$(LAYUP_DATA)"
+	    --data-dir "$(LAYUP_DATA_DIR)" --dest "$(LAYUP_DATA)"
 	@mkdir -p $(RESULTS_DIR)
 	@$(LAYUP_PY) $(EMP_VAL_RUNNERS)/layup/run_layup.py $(FIXTURES_PSV) \
-	    --ar-data-path "$(LAYUP_DATA)" --output $(LAYUP_OUT)
+	    --ar-data-path "$(LAYUP_DATA)" --output $(LAYUP_OUT) \
+	    $(if $(OBJECTS),--only "$(OBJECTS)",)
 
 # ── Merge external + report ────────────────────────────────
 # Channel-agnostic meta operations live in this repo's CLI binary. It

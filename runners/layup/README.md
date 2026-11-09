@@ -118,12 +118,12 @@ the install compiles the extension), then stages layup's data directory.
 
 ```bash
 ./setup.sh                        # pinned release (LAYUP_VERSION to override)
-DATA_DIR=/path/to/set ./setup.sh  # stage from another synced kernel set
+DATA_DIR=/path/to/layup-folder ./setup.sh  # stage from another data folder
 ```
 
 Prerequisites: python ≥3.11, a C compiler, cmake.
 
-### Data: staged from the registered kernel set, never downloaded
+### Data: staged from the third-party tool set, never downloaded
 
 layup reads every kernel, the observatory codes and its debiasing table
 from one directory (`--ar`), under the names its own `layup bootstrap`
@@ -131,15 +131,20 @@ downloads, and its fit path downloads any name that is missing, from the
 address the release names. Those addresses move: NAIF's renaming of its
 dated Earth-orientation kernels made every fit fail with a 404. So the
 suite never bootstraps. `stage_data.py` builds the directory (`data/`
-here) from the engine data directory — the registered kernel set the suite
-syncs (`DATA_DIR`, default `~/.empyrean/data`) — taking layup's file names
-from the installed layup itself:
+here) from the `layup/` folder of the published third-party tool set
+(`third-party-tools-2026-11-08` in `gs://empyrean-data`), which lists every
+file layup opens (10 files, shared kernels included), so layup needs nothing
+from the engine kernel set. Sync it with the bucket's `empyrean-data.py`
+(`sync third-party-tools-2026-11-08 $DATA_DIR/third-party`); the Makefile
+variable `LAYUP_DATA_DIR` (default `$(DATA_DIR)/third-party/layup`) names the
+folder `stage_data.py --data-dir` reads. It takes layup's file names from the
+installed layup itself:
 
-| layup reads | staged from the data directory |
+| layup reads | staged from the folder |
 |---|---|
 | `de440s.bsp` | `de440.bsp` (full DE440, a superset of the short file) |
 | Earth orientation: historical, predicted, high precision | `earth_620120_*.bpc`, `earth_*_predict.bpc`, `earth_latest_high_prec.bpc` |
-| `linux_p1550p2650.440`, `sb441-n16.bsp` (ASSIST) | same names (the binary DE440 is the suite's find_orb file) |
+| `linux_p1550p2650.440`, `sb441-n16.bsp` (ASSIST) | same names |
 | `naif0012.tls`, `pck00010.pck` | `naif0012.tls`, `pck00010.tpc` |
 | `ObsCodes.json` (+ `.gz`) | `obscodes_extended.json` (and its gzip) |
 | `debias_hires2018.tgz`, `bias.dat` | `debias_hires2018.tgz` (and the table extracted from it) |
@@ -150,14 +155,20 @@ matches (a set synced without `--prune`) or an empty file stops staging
 with every such file named. The set's own `bias.dat` is the
 low-resolution debiasing table and is never staged under layup's name,
 which indexes the high-resolution one. `make run-layup` re-stages before
-every run, and `run_layup.py` refuses to start when any file layup checks
+every run (layup removes the staged archive after extracting the table),
+and `make run-layup OBJECTS=A,B` fits only those objects. `--ar` moves only
+the ASSIST data: layup 1.1 reads `naif0012.tls` and the other SPICE kernels
+from its cache directory in several fit paths, so `run_layup.py` also sets
+`LAYUP_CACHE_DIR` to the staged directory (a run on a machine whose per-user
+cache is empty, such as a CI runner, otherwise fails with "SPICE kernel file
+'naif0012.tls' not found"). `run_layup.py` refuses to start when any file layup checks
 for is missing from its data directory.
 
 ## Usage
 
 ```bash
 # Fit every optical OD fixture through layup.
-./.venv/bin/python stage_data.py --data-dir ~/.empyrean/data --dest data
+./.venv/bin/python stage_data.py --data-dir "$DATA_DIR/third-party/layup" --dest data
 ./.venv/bin/python run_layup.py ../../fixtures/psv \
     --ar-data-path data --output ../../results/validation_layup.json
 

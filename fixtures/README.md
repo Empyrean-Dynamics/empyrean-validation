@@ -97,6 +97,13 @@ The inputs snapshot follows the same cache discipline as the kernel set:
 - **every other job** restores that exact key and refuses to run on a miss,
   with no credential, then re-verifies the snapshot offline. The external
   comparator legs therefore keep carrying no secret and no identity.
+- **the layup external leg** is the one exception for kernel data (not for
+  inputs): it syncs the published third-party tool set
+  (`THIRD_PARTY_DATASET`, `gs://empyrean-data`) with the bucket's tool into
+  `$DATA_DIR/third-party`, sharing one content pool with the engine set, and
+  stages its data from the `layup/` folder (`LAYUP_DATA_DIR` in the Makefile).
+  The seal still precedes the run step. Under `gh act` the set comes from a
+  `/host-third-party` bind mount (`ACT_THIRD_PARTY_DIR` overrides).
 
 ## Only ever from there — the seal
 

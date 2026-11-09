@@ -85,6 +85,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import shutil
 import statistics
 import subprocess
@@ -194,6 +195,23 @@ def _read_orbitfit_csv(csv_path: Path) -> dict | None:
     return df.iloc[0].to_dict()
 
 
+def layup_env(ar_data_path: str | None) -> dict[str, str]:
+    """The environment layup runs in: its cache directory IS the staged data directory.
+
+    ``--ar`` moves only the ASSIST data. layup 1.1 still reads ``naif0012.tls``
+    (and the other SPICE kernels) from its per-user cache in several fit-path
+    functions, so a run that passes ``--ar`` alone fits on a machine whose
+    user cache happens to hold the files and fails with "SPICE kernel file
+    'naif0012.tls' not found" on one that does not (a CI runner). ``LAYUP_CACHE_DIR``
+    is layup's own override for that directory; pointing it at the staged
+    directory makes the run read the staged files and nothing else.
+    """
+    env = dict(os.environ)
+    if ar_data_path:
+        env["LAYUP_CACHE_DIR"] = str(ar_data_path)
+    return env
+
+
 def _fit_one(
     psv_path: Path,
     obj_token: str,
@@ -239,6 +257,7 @@ def _fit_one(
                 text=True,
                 timeout=timeout_s,
                 cwd=work,
+                env=layup_env(ar_data_path),
             )
         except subprocess.TimeoutExpired:
             print(f"  {obj_token}: TIMEOUT after {timeout_s:.0f}s", file=sys.stderr)
