@@ -1290,6 +1290,7 @@ fn reference_rows_by_object(results: &[ValidationResult]) -> BTreeMap<String, us
 fn write_summary(
     rollups: &[ChannelRollup],
     results: &[ValidationResult],
+    comparators: &[crate::comparators::ComparatorOutcome],
     path: &Path,
 ) -> Result<(), String> {
     let arr: Vec<serde_json::Value> = rollups
@@ -1391,6 +1392,7 @@ fn write_summary(
         "by_method": method_summary_json(results),
         "reference_channel": crate::schema::channels::CORE,
         "reference_rows_by_object": reference_rows_by_object(results),
+        "comparators": comparators,
     });
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).map_err(|e| format!("create {}: {e}", parent.display()))?;
@@ -9431,20 +9433,44 @@ fn config_tool_subsection(results: &[ValidationResult], key: &str) -> String {
 
 /// The whole "Configurations" appendix (A.3, `s05c`): one subsection per present
 /// external tool, in the Part 2 tool order.
-fn render_configurations_section(results: &[ValidationResult]) -> String {
+fn render_configurations_section(
+    results: &[ValidationResult],
+    comparators: &[crate::comparators::ComparatorOutcome],
+) -> String {
     let mut subs = String::new();
     for (key, _display) in CONFIG_TOOL_ORDER {
         if config_tool_present(results, key) {
             subs.push_str(&config_tool_subsection(results, key));
         }
     }
-    let body = if subs.is_empty() {
+    let failed = render_failed_comparators(comparators);
+    let body = if subs.is_empty() && failed.is_empty() {
         "  <div class=\"cfg-empty\" style=\"color:var(--ed-text-muted);font-size:12px;margin-top:8px;\">No external tool ran in this run.</div>\n".to_string()
     } else {
-        subs
+        format!("{subs}{failed}")
     };
     format!(
         "<div class=\"section\" id=\"s05c\" data-page=\"empyrean\">\n  <div class=\"section-num\">A.3</div>\n  <div class=\"section-title\" title=\"Configuration of each external reference tool in this run\">Configurations</div>\n{body}</div>"
+    )
+}
+
+/// The comparators `merge-external` skipped, one line each as `<tool>: failed:
+/// <reason>`. Empty when every comparator merged. A failed comparator is a
+/// finding of the run, so it is on the page, not only in the job log.
+fn render_failed_comparators(comparators: &[crate::comparators::ComparatorOutcome]) -> String {
+    let mut lines = String::new();
+    for c in comparators.iter().filter(|c| c.is_failed()) {
+        lines.push_str(&format!(
+            "    <li class=\"cfg-failed\"><code>{}</code>: {}</li>\n",
+            attr_escape(&c.tool),
+            attr_escape(&c.failure_line().unwrap_or_else(|| "failed".to_string()))
+        ));
+    }
+    if lines.is_empty() {
+        return String::new();
+    }
+    format!(
+        "  <div class=\"cfg-failed-comparators\" style=\"margin-top:8px;font-size:12px;\">\n    <div class=\"cfg-failed-head\">Comparators that did not merge into this report</div>\n    <ul>\n{lines}    </ul>\n  </div>\n"
     )
 }
 
@@ -9455,6 +9481,7 @@ pub fn generate_report(
     summary: Option<&Path>,
     predict_agg: Option<&crate::predict_schema::PredictAggregates>,
     predict_runs: &[crate::predict_schema::PredictAggregates],
+    comparators: &[crate::comparators::ComparatorOutcome],
 ) -> Result<(), String> {
     let core_results: Vec<&ValidationResult> =
         results.iter().filter(|r| r.channel == "core").collect();
@@ -9604,7 +9631,7 @@ pub fn generate_report(
 
     // S5a: the "Configurations" appendix (A.3). One subsection per external
     // tool with rows, server-rendered from the rows (empyrean is not one).
-    let configurations_section = render_configurations_section(results);
+    let configurations_section = render_configurations_section(results, comparators);
 
     // The dataset ships beside the page as "<output stem>.data.json" and the page
     // fetches it — the name derives from the output path so two reports written to
@@ -9720,7 +9747,7 @@ pub fn generate_report(
         })
         .count();
     if let Some(path) = summary {
-        write_summary(&rollups, results, path)?;
+        write_summary(&rollups, results, comparators, path)?;
     }
     // Redesign (empyrean-k2rkx): server-side Part-1 agreement grids + H3.
     let h1_prop_grid_html = build_prop_agreement_grid(results);
@@ -12636,7 +12663,7 @@ mod tests {
         let rows = vec![synthetic_rust_prop_row("Apophis", 0.0)];
         let dir = tempfile::tempdir().unwrap();
         let out = dir.path().join("report.html");
-        generate_report(&rows, &[], &out, None, None, &[]).unwrap();
+        generate_report(&rows, &[], &out, None, None, &[], &[]).unwrap();
         let html = std::fs::read_to_string(&out).unwrap();
 
         // The light page ground the finding measured against.
@@ -12732,7 +12759,7 @@ mod tests {
         let (rows, cmps) = radar_scenario();
         let dir = tempfile::tempdir().unwrap();
         let out = dir.path().join("report.html");
-        generate_report(&rows, &cmps, &out, None, None, &[]).unwrap();
+        generate_report(&rows, &cmps, &out, None, None, &[], &[]).unwrap();
         let raw = std::fs::read_to_string(&out).unwrap();
         // Excise <script>/<style> so `<th>` literals in the client JS source
         // (headers the browser builds at runtime) are not scanned as markup.
@@ -12791,7 +12818,7 @@ mod tests {
         ];
         let dir = tempfile::tempdir().unwrap();
         let out = dir.path().join("report.html");
-        let result = generate_report(&rows, &[], &out, None, None, &[]);
+        let result = generate_report(&rows, &[], &out, None, None, &[], &[]);
         assert!(result.is_ok(), "generate_report failed: {result:?}");
         let html = std::fs::read_to_string(&out).unwrap();
         assert!(html.contains("EMPYREAN"), "missing brand title");
@@ -12807,7 +12834,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let html = dir.path().join("report.html");
         let summary = dir.path().join("summary.json");
-        let result = generate_report(&rows, &[], &html, Some(&summary), None, &[]);
+        let result = generate_report(&rows, &[], &html, Some(&summary), None, &[], &[]);
         assert!(result.is_ok());
         let summary_json = std::fs::read_to_string(&summary).unwrap();
         let v: serde_json::Value = serde_json::from_str(&summary_json).unwrap();
@@ -12845,7 +12872,7 @@ mod tests {
         }];
         let dir = tempfile::tempdir().unwrap();
         let out = dir.path().join("report.html");
-        generate_report(&rows, &comps, &out, None, None, &[]).unwrap();
+        generate_report(&rows, &comps, &out, None, None, &[], &[]).unwrap();
         let html = std::fs::read_to_string(&out).unwrap();
         assert!(
             html.contains("Covariance realism"),
@@ -12949,7 +12976,7 @@ mod tests {
         ];
         let dir = tempfile::tempdir().unwrap();
         let out = dir.path().join("report.html");
-        generate_report(&rows, &[], &out, None, None, &[]).unwrap();
+        generate_report(&rows, &[], &out, None, None, &[], &[]).unwrap();
         std::fs::read_to_string(&out).unwrap()
     }
 
@@ -13081,7 +13108,7 @@ mod tests {
         let agg = synthetic_predict_aggregates("snap");
         let dir = tempfile::tempdir().unwrap();
         let out = dir.path().join("report.html");
-        generate_report(&rows, &[], &out, None, Some(&agg), &[]).unwrap();
+        generate_report(&rows, &[], &out, None, Some(&agg), &[], &[]).unwrap();
         let raw = std::fs::read_to_string(&out).unwrap();
         let html = strip_tag(&strip_tag(&raw, "script"), "style");
         if let Some((tok, sid, ctx)) = scan(&html) {
@@ -13671,7 +13698,7 @@ mod tests {
         ];
         let dir = tempfile::tempdir().unwrap();
         let out = dir.path().join("report.html");
-        generate_report(&rows, &[], &out, None, None, &[]).unwrap();
+        generate_report(&rows, &[], &out, None, None, &[], &[]).unwrap();
         let html = std::fs::read_to_string(&out).unwrap();
 
         // (1) the sibling dataset holds the verbatim serialization.
@@ -13803,8 +13830,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let a = dir.path().join("report_a.html");
         let b = dir.path().join("report_b.html");
-        generate_report(&rows, &[], &a, None, None, &[]).unwrap();
-        generate_report(&rows, &[], &b, None, None, &[]).unwrap();
+        generate_report(&rows, &[], &a, None, None, &[], &[]).unwrap();
+        generate_report(&rows, &[], &b, None, None, &[], &[]).unwrap();
         assert!(dir.path().join("report_a.data.json").exists());
         assert!(dir.path().join("report_b.data.json").exists());
         assert!(
@@ -13836,8 +13863,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let out1 = dir.path().join("r1.html");
         let out2 = dir.path().join("r2.html");
-        generate_report(&rows, &[], &out1, None, None, &[]).unwrap();
-        generate_report(&rows, &[], &out2, None, None, &[]).unwrap();
+        generate_report(&rows, &[], &out1, None, None, &[], &[]).unwrap();
+        generate_report(&rows, &[], &out2, None, None, &[], &[]).unwrap();
         // The ONLY intended difference is the dataset file name each page cites.
         let s1 = std::fs::read_to_string(&out1)
             .unwrap()
@@ -13892,7 +13919,7 @@ mod tests {
         }
         let dir = tempfile::tempdir().unwrap();
         let out = dir.path().join("report.html");
-        generate_report(&rows, &[], &out, None, None, &[]).unwrap();
+        generate_report(&rows, &[], &out, None, None, &[], &[]).unwrap();
         let html = std::fs::read_to_string(&out).unwrap();
 
         // Exactly one hatch definition, everywhere on the page.
@@ -14689,7 +14716,7 @@ mod tests {
         let rows = timing_fixture();
         let dir = tempfile::tempdir().unwrap();
         let out = dir.path().join("report.html");
-        generate_report(&rows, &[], &out, None, None, &[]).unwrap();
+        generate_report(&rows, &[], &out, None, None, &[], &[]).unwrap();
         let html = std::fs::read_to_string(&out).unwrap();
 
         let all = ["empyrean", "assist", "findorb", "jpl", "kete", "jorbit"];
@@ -14942,7 +14969,7 @@ mod tests {
     fn run_summary_is_ordered_into_the_appendix_and_the_page_opens_on_part_one() {
         let dir = tempfile::tempdir().unwrap();
         let out = dir.path().join("report.html");
-        generate_report(&timing_fixture(), &[], &out, None, None, &[]).unwrap();
+        generate_report(&timing_fixture(), &[], &out, None, None, &[], &[]).unwrap();
         let html = std::fs::read_to_string(&out).unwrap();
         // S7 item 3: DOM order == visual order — no flex `order` reorders the
         // column, so byte position IS the on-page order. The page opens on Part 1
@@ -14973,7 +15000,7 @@ mod tests {
     fn part_two_hatched_cells_carry_their_reason_on_hover_only() {
         let dir = tempfile::tempdir().unwrap();
         let out = dir.path().join("report.html");
-        generate_report(&timing_fixture(), &[], &out, None, None, &[]).unwrap();
+        generate_report(&timing_fixture(), &[], &out, None, None, &[], &[]).unwrap();
         let html = std::fs::read_to_string(&out).unwrap();
         // S7: Part 2 is the three sections between the part2 and part3 heads.
         let start = html.find("id=\"part2\"").expect("Part 2 head");
@@ -15050,7 +15077,7 @@ mod tests {
 
         let dir = tempfile::tempdir().unwrap();
         let out = dir.path().join("report.html");
-        generate_report(&timing_fixture(), &[], &out, None, None, &[]).unwrap();
+        generate_report(&timing_fixture(), &[], &out, None, None, &[], &[]).unwrap();
         let html = std::fs::read_to_string(&out).unwrap();
         // S7: the rail names 2.1 by its axis (Propagation), never a "side by
         // side" ranking label.
@@ -15163,7 +15190,7 @@ mod tests {
         // console stays clean on the owner's local server.
         let dir = tempfile::tempdir().unwrap();
         let out = dir.path().join("report.html");
-        generate_report(&timing_fixture(), &[], &out, None, None, &[]).unwrap();
+        generate_report(&timing_fixture(), &[], &out, None, None, &[], &[]).unwrap();
         let html = std::fs::read_to_string(&out).unwrap();
         let head = &html[..html.find("</head>").expect("head present")];
         assert!(
@@ -15177,7 +15204,7 @@ mod tests {
         let rows = timing_fixture();
         let dir = tempfile::tempdir().unwrap();
         let out = dir.path().join("report.html");
-        generate_report(&rows, &[], &out, None, None, &[]).unwrap();
+        generate_report(&rows, &[], &out, None, None, &[], &[]).unwrap();
         let html = std::fs::read_to_string(&out).unwrap();
 
         let p2 = html.find("id=\"part2\"").expect("part2 anchor");
@@ -15231,7 +15258,7 @@ mod tests {
         assert_eq!(emp_eph_channel(&rows), ("core", true));
         let dir = tempfile::tempdir().unwrap();
         let out = dir.path().join("report.html");
-        generate_report(&rows, &[], &out, None, None, &[]).unwrap();
+        generate_report(&rows, &[], &out, None, None, &[], &[]).unwrap();
         let html = std::fs::read_to_string(&out).unwrap();
         assert!(
             html.contains("core channel</span>"),
@@ -15260,7 +15287,7 @@ mod tests {
         assert_eq!(picked, vec![5.0], "the rust ephemeris value must be used");
         let dir2 = tempfile::tempdir().unwrap();
         let out2 = dir2.path().join("report.html");
-        generate_report(&rows2, &[], &out2, None, None, &[]).unwrap();
+        generate_report(&rows2, &[], &out2, None, None, &[], &[]).unwrap();
         let html2 = std::fs::read_to_string(&out2).unwrap();
         assert!(
             !html2.contains("core channel</span>"),
@@ -15352,6 +15379,7 @@ mod tests {
             &out,
             None,
             None,
+            &[],
             &[],
         )
         .unwrap();
@@ -15563,7 +15591,7 @@ mod tests {
     fn render_rows(rows: &[ValidationResult]) -> String {
         let dir = tempfile::tempdir().unwrap();
         let out = dir.path().join("report.html");
-        generate_report(rows, &[], &out, None, None, &[]).unwrap();
+        generate_report(rows, &[], &out, None, None, &[], &[]).unwrap();
         std::fs::read_to_string(&out).unwrap()
     }
 
@@ -15905,7 +15933,7 @@ mod tests {
         let agg = synthetic_predict_aggregates("snap");
         let dir = tempfile::tempdir().unwrap();
         let out = dir.path().join("report.html");
-        generate_report(&rows, &[], &out, None, Some(&agg), &[]).unwrap();
+        generate_report(&rows, &[], &out, None, Some(&agg), &[], &[]).unwrap();
         let html = std::fs::read_to_string(&out).unwrap();
         let f = html
             .find("function drawWalkTimeline(")
@@ -15941,7 +15969,7 @@ mod tests {
         let agg = synthetic_predict_aggregates("snap");
         let dir = tempfile::tempdir().unwrap();
         let out = dir.path().join("report.html");
-        generate_report(&rows, &[], &out, None, Some(&agg), &[]).unwrap();
+        generate_report(&rows, &[], &out, None, Some(&agg), &[], &[]).unwrap();
         let html = std::fs::read_to_string(&out).unwrap();
         let mut n_tables = 0usize;
         let mut idx = 0usize;
@@ -16160,7 +16188,7 @@ mod tests {
         // inside the merged 1.2 section (s06), between the B and C slot anchors.
         let dir = tempfile::tempdir().unwrap();
         let out = dir.path().join("report.html");
-        generate_report(&timing_fixture(), &[], &out, None, None, &[]).unwrap();
+        generate_report(&timing_fixture(), &[], &out, None, None, &[], &[]).unwrap();
         let html = std::fs::read_to_string(&out).unwrap();
 
         // The old split sections no longer exist as section anchors.
@@ -16213,7 +16241,7 @@ mod tests {
         // section.
         let dir = tempfile::tempdir().unwrap();
         let out = dir.path().join("report.html");
-        generate_report(&timing_fixture(), &[], &out, None, None, &[]).unwrap();
+        generate_report(&timing_fixture(), &[], &out, None, None, &[], &[]).unwrap();
         let html = std::fs::read_to_string(&out).unwrap();
         let num = |sid: &str| -> String {
             let at = html
@@ -16266,7 +16294,7 @@ mod tests {
         // read from the rows, in the eyebrow role under the title.
         let dir = tempfile::tempdir().unwrap();
         let out = dir.path().join("report.html");
-        generate_report(&timing_fixture(), &[], &out, None, None, &[]).unwrap();
+        generate_report(&timing_fixture(), &[], &out, None, None, &[], &[]).unwrap();
         let html = std::fs::read_to_string(&out).unwrap();
         let bar = html.find("id=\"part1-bar\"").expect("part1-bar");
         let p2 = html[bar..].find("id=\"part2\"").map(|e| bar + e).unwrap();
@@ -16301,7 +16329,7 @@ mod tests {
         // · error growth / · cost / · outliers entries are gone.
         let dir = tempfile::tempdir().unwrap();
         let out = dir.path().join("report.html");
-        generate_report(&timing_fixture(), &[], &out, None, None, &[]).unwrap();
+        generate_report(&timing_fixture(), &[], &out, None, None, &[], &[]).unwrap();
         let html = std::fs::read_to_string(&out).unwrap();
         let rail_at = html.find("<nav class=\"rail\"").expect("rail");
         let rail_end = html[rail_at..].find("</nav>").map(|e| rail_at + e).unwrap();
@@ -16343,7 +16371,7 @@ mod tests {
         // also keeps the ▸outliers itemised runaway list.
         let dir = tempfile::tempdir().unwrap();
         let out = dir.path().join("report.html");
-        generate_report(&timing_fixture(), &[], &out, None, None, &[]).unwrap();
+        generate_report(&timing_fixture(), &[], &out, None, None, &[], &[]).unwrap();
         let html = std::fs::read_to_string(&out).unwrap();
         let count_methods = |a: &str, b: &str| -> usize {
             let lo = html.find(a).unwrap();
@@ -16384,7 +16412,7 @@ mod tests {
         let (rows, cmp) = radar_scenario();
         let dir = tempfile::tempdir().unwrap();
         let out = dir.path().join("report.html");
-        generate_report(&rows, &cmp, &out, None, None, &[]).unwrap();
+        generate_report(&rows, &cmp, &out, None, None, &[], &[]).unwrap();
         let html = std::fs::read_to_string(&out).unwrap();
         assert!(
             !html.contains("Δr @epoch") && !html.contains("not in the sidecar schema yet"),
@@ -16417,7 +16445,7 @@ mod tests {
         // per-chart drawers and the divergent gMed estimator are gone.
         let dir = tempfile::tempdir().unwrap();
         let out = dir.path().join("report.html");
-        generate_report(&timing_fixture(), &[], &out, None, None, &[]).unwrap();
+        generate_report(&timing_fixture(), &[], &out, None, None, &[], &[]).unwrap();
         let html = std::fs::read_to_string(&out).unwrap();
         assert_eq!(
             html.matches("function drawGrowthChart(").count(),
@@ -16464,7 +16492,7 @@ mod tests {
         // ephemeris canonical, 520px). The card class is defined exactly once.
         let dir = tempfile::tempdir().unwrap();
         let out = dir.path().join("report.html");
-        generate_report(&timing_fixture(), &[], &out, None, None, &[]).unwrap();
+        generate_report(&timing_fixture(), &[], &out, None, None, &[], &[]).unwrap();
         let html = std::fs::read_to_string(&out).unwrap();
         assert_eq!(
             html.matches(".chart-container {").count(),
@@ -16495,7 +16523,7 @@ mod tests {
         // token, re-theme on a flip, and keep the legend clear of the title band.
         let dir = tempfile::tempdir().unwrap();
         let out = dir.path().join("report.html");
-        generate_report(&timing_fixture(), &[], &out, None, None, &[]).unwrap();
+        generate_report(&timing_fixture(), &[], &out, None, None, &[], &[]).unwrap();
         let html = std::fs::read_to_string(&out).unwrap();
 
         // The invisible ghost-grey literal is gone everywhere.
@@ -16816,7 +16844,7 @@ mod tests {
         let agg = synthetic_predict_aggregates("snap");
         let dir = tempfile::tempdir().unwrap();
         let out = dir.path().join("report.html");
-        generate_report(&rows, &[], &out, None, Some(&agg), &[]).unwrap();
+        generate_report(&rows, &[], &out, None, Some(&agg), &[], &[]).unwrap();
         let html = std::fs::read_to_string(&out).unwrap();
         // The 4.2 panel titles carry no hover caption (fails on the old structure).
         assert!(
@@ -18056,6 +18084,7 @@ mod tests {
             None,
             Some(&agg),
             std::slice::from_ref(&run),
+            &[],
         )
         .unwrap();
         let html = std::fs::read_to_string(&out).unwrap();
@@ -18150,6 +18179,7 @@ mod tests {
             None,
             Some(&agg),
             std::slice::from_ref(&run),
+            &[],
         )
         .unwrap();
         let html = std::fs::read_to_string(&out).unwrap();
@@ -18197,7 +18227,7 @@ mod tests {
         let agg = synthetic_predict_aggregates("2026-07-29-snap");
         let dir = tempfile::tempdir().unwrap();
         let out = dir.path().join("report.html");
-        generate_report(&rows, &[], &out, None, Some(&agg), &[]).unwrap();
+        generate_report(&rows, &[], &out, None, Some(&agg), &[], &[]).unwrap();
         let html = std::fs::read_to_string(&out).unwrap();
         assert!(html.contains("id=\"s15\""), "missing 4.2 anchor");
         assert!(html.contains("class=\"agrid pw-grid\""), "no 4.2 grids");
@@ -18234,7 +18264,7 @@ mod tests {
         let agg = synthetic_predict_aggregates("snap");
         let dir = tempfile::tempdir().unwrap();
         let out = dir.path().join("report.html");
-        generate_report(&rows, &[], &out, None, Some(&agg), &[]).unwrap();
+        generate_report(&rows, &[], &out, None, Some(&agg), &[], &[]).unwrap();
         let html = std::fs::read_to_string(&out).unwrap();
 
         // Count the numeric value spans (`<span class="cn">…`) inside one panel's
@@ -18299,7 +18329,7 @@ mod tests {
         let agg = synthetic_predict_aggregates("snap");
         let dir = tempfile::tempdir().unwrap();
         let out = dir.path().join("report.html");
-        generate_report(&rows, &[], &out, None, Some(&agg), &[]).unwrap();
+        generate_report(&rows, &[], &out, None, Some(&agg), &[], &[]).unwrap();
         let html = std::fs::read_to_string(&out).unwrap();
 
         let cs = html.find(">Coverage</div>").expect("4.2A Coverage panel");
@@ -18379,7 +18409,7 @@ mod tests {
         let agg = synthetic_predict_aggregates("snap");
         let dir = tempfile::tempdir().unwrap();
         let out = dir.path().join("report.html");
-        generate_report(&rows, &[], &out, None, Some(&agg), &[]).unwrap();
+        generate_report(&rows, &[], &out, None, Some(&agg), &[], &[]).unwrap();
         let html = std::fs::read_to_string(&out).unwrap();
         let cs = html.find(">Coverage</div>").expect("4.2A Coverage panel");
         let ce = html[cs..].find("Surfaces</div>").map(|i| cs + i).unwrap();
@@ -18445,7 +18475,7 @@ mod tests {
         ));
         let dir = tempfile::tempdir().unwrap();
         let out = dir.path().join("report.html");
-        generate_report(&rows, &[], &out, None, Some(&agg), &[]).unwrap();
+        generate_report(&rows, &[], &out, None, Some(&agg), &[], &[]).unwrap();
         let html = std::fs::read_to_string(&out).unwrap();
         let cs = html.find(">Coverage</div>").expect("4.2A Coverage panel");
         let ce = html[cs..].find("Surfaces</div>").map(|i| cs + i).unwrap();
@@ -18510,7 +18540,7 @@ mod tests {
         let agg = synthetic_predict_aggregates("snap");
         let dir = tempfile::tempdir().unwrap();
         let out = dir.path().join("report.html");
-        generate_report(&rows, &[], &out, None, Some(&agg), &[]).unwrap();
+        generate_report(&rows, &[], &out, None, Some(&agg), &[], &[]).unwrap();
         let html = std::fs::read_to_string(&out).unwrap();
         assert!(
             html.contains("σ_pred-dominated 75% of rows"),
@@ -18651,7 +18681,7 @@ mod tests {
         let rows = vec![synthetic_rust_prop_row("Apophis", 0.0)];
         let dir = tempfile::tempdir().unwrap();
         let out = dir.path().join("report.html");
-        generate_report(&rows, &[], &out, None, None, &[]).unwrap();
+        generate_report(&rows, &[], &out, None, None, &[], &[]).unwrap();
         let html = std::fs::read_to_string(&out).unwrap();
         assert!(html.contains("id=\"s15\""), "the 4.2 shell always renders");
         assert!(
@@ -18678,7 +18708,7 @@ mod tests {
         let agg = synthetic_predict_aggregates("snap");
         let dir = tempfile::tempdir().unwrap();
         let out = dir.path().join("report.html");
-        generate_report(&rows, &[], &out, None, Some(&agg), &[]).unwrap();
+        generate_report(&rows, &[], &out, None, Some(&agg), &[], &[]).unwrap();
         let html = std::fs::read_to_string(&out).unwrap();
         // The n=2 thin cell renders hatched with its count + reason, never as a
         // coloured value (its 0.3 realism / 0.5 sep must not appear as a cell).
@@ -18694,7 +18724,7 @@ mod tests {
         let agg = synthetic_predict_aggregates("snap"); // calibration is empty
         let dir = tempfile::tempdir().unwrap();
         let out = dir.path().join("report.html");
-        generate_report(&rows, &[], &out, None, Some(&agg), &[]).unwrap();
+        generate_report(&rows, &[], &out, None, Some(&agg), &[], &[]).unwrap();
         let html = std::fs::read_to_string(&out).unwrap();
         assert!(
             html.contains("awaiting Student-t chain"),
@@ -18708,7 +18738,7 @@ mod tests {
         let agg = synthetic_predict_aggregates("snap");
         let dir = tempfile::tempdir().unwrap();
         let out = dir.path().join("report.html");
-        generate_report(&rows, &[], &out, None, Some(&agg), &[]).unwrap();
+        generate_report(&rows, &[], &out, None, Some(&agg), &[], &[]).unwrap();
         let html = std::fs::read_to_string(&out).unwrap();
         // The large per-object family must not ride inline on the page.
         assert!(
@@ -18741,8 +18771,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let a = dir.path().join("a.html");
         let b = dir.path().join("b.html");
-        generate_report(&rows, &[], &a, None, Some(&agg), &[]).unwrap();
-        generate_report(&rows, &[], &b, None, Some(&agg), &[]).unwrap();
+        generate_report(&rows, &[], &a, None, Some(&agg), &[], &[]).unwrap();
+        generate_report(&rows, &[], &b, None, Some(&agg), &[], &[]).unwrap();
         let sa = std::fs::read(predict_path_for(&a)).unwrap();
         let sb = std::fs::read(predict_path_for(&b)).unwrap();
         assert_eq!(sa, sb, "the predict sidecar must be byte-reproducible");
@@ -19067,7 +19097,7 @@ mod tests {
         let agg = synthetic_predict_aggregates("snap");
         let dir = tempfile::tempdir().unwrap();
         let out = dir.path().join("report.html");
-        generate_report(&rows, &[], &out, None, Some(&agg), &[]).unwrap();
+        generate_report(&rows, &[], &out, None, Some(&agg), &[], &[]).unwrap();
         let html = std::fs::read_to_string(&out).unwrap();
         // One merged section: no separate Calibration panel-title.
         assert!(
@@ -19178,7 +19208,7 @@ mod tests {
         let (rows, cmp) = radar_scenario();
         let dir = tempfile::tempdir().unwrap();
         let out = dir.path().join("report.html");
-        generate_report(&rows, &cmp, &out, None, None, &[]).unwrap();
+        generate_report(&rows, &cmp, &out, None, None, &[], &[]).unwrap();
         let html = std::fs::read_to_string(&out).unwrap();
 
         // 2.1 "By object and fitter": the empyrean σ_eq column is dropped (1.3A
@@ -19221,7 +19251,7 @@ mod tests {
         let agg = synthetic_predict_aggregates("snap");
         let dir = tempfile::tempdir().unwrap();
         let out = dir.path().join("report.html");
-        generate_report(&rows, &[], &out, None, Some(&agg), &[]).unwrap();
+        generate_report(&rows, &[], &out, None, Some(&agg), &[], &[]).unwrap();
         let html = std::fs::read_to_string(&out).unwrap();
         assert!(
             html.contains(">empyrean <span class=\"pwarm\" title=\"arm efcc.adap.nonight\">EFCC · adaptive · per-obs · linear</span>"),
@@ -19389,7 +19419,7 @@ mod tests {
     fn s5_item6_timing_key_line_and_a2_absent_line_is_data_driven() {
         let dir = tempfile::tempdir().unwrap();
         let out = dir.path().join("report.html");
-        generate_report(&timing_fixture(), &[], &out, None, None, &[]).unwrap();
+        generate_report(&timing_fixture(), &[], &out, None, None, &[], &[]).unwrap();
         let html = std::fs::read_to_string(&out).unwrap();
         // The 2.2 timing tables carry ONE visible key line; the header-row hover
         // sentence is gone from the speed matrix. Delta 9: the key line is a terse
@@ -19471,7 +19501,7 @@ mod tests {
 
         let dir = tempfile::tempdir().unwrap();
         let out = dir.path().join("report.html");
-        generate_report(&timing_fixture(), &[], &out, None, None, &[]).unwrap();
+        generate_report(&timing_fixture(), &[], &out, None, None, &[], &[]).unwrap();
         let html = std::fs::read_to_string(&out).unwrap();
         // The key lines this delta governs are the Part 1 and Part 2 unit keys
         // (the C·cost timing keys and the Part-2 readout keys km/mas/σ_eq); scan
@@ -19499,7 +19529,7 @@ mod tests {
     fn delta9_masthead_has_no_rust_channel_under_test() {
         let dir = tempfile::tempdir().unwrap();
         let out = dir.path().join("report.html");
-        generate_report(&timing_fixture(), &[], &out, None, None, &[]).unwrap();
+        generate_report(&timing_fixture(), &[], &out, None, None, &[], &[]).unwrap();
         let html = std::fs::read_to_string(&out).unwrap();
         let mstart = html.find("<div class=\"masthead\">").expect("masthead");
         let mend = mstart
@@ -19872,7 +19902,7 @@ mod tests {
         ];
         let dir = tempfile::tempdir().unwrap();
         let out = dir.path().join("report.html");
-        generate_report(&rows, &[], &out, None, None, &[]).unwrap();
+        generate_report(&rows, &[], &out, None, None, &[], &[]).unwrap();
         let html = std::fs::read_to_string(&out).unwrap();
         let data_bytes = std::fs::read(dir.path().join("report.data.json")).unwrap();
         // The new fields reached the sidecar.

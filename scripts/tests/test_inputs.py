@@ -10,6 +10,8 @@ import importlib.util
 import json
 import pathlib
 import shutil
+import threading
+import time
 import urllib.parse
 
 import pytest
@@ -391,6 +393,95 @@ def _publish(ip, tmp_path):
     fake = FakeGcloud(tmp_path / "root")
     assert ip.upload(src, ip.DEFAULT_BUCKET, yes=True, gcloud=fake) == 0
     return manifest, pin, pin_path, fake, FakeHttp(ip, tmp_path / "root")
+
+
+# ── parallel fetch ────────────────────────────────────────────────────────────
+
+
+def _publish_many(ip, tmp_path, n):
+    """A snapshot of the small tree plus n extra psv files, published to a fake
+    bucket. Returns (pin_path, http, expected {relpath: text})."""
+    src = make_tree(tmp_path / "src")
+    for i in range(n):
+        (src / "psv" / f"Obj{i:03d}.psv").write_text(OPTICAL_PSV + f"# obj {i}\n")
+    mint(ip, src)
+    pin_path = src.parent / "pin.json"
+    fake = FakeGcloud(tmp_path / "root")
+    assert ip.upload(src, ip.DEFAULT_BUCKET, yes=True, gcloud=fake) == 0
+    expected = {
+        p.relative_to(src).as_posix(): p.read_text()
+        for d in ("psv", "psv-radar", "horizons", "sbdb")
+        for p in (src / d).iterdir()
+    }
+    return pin_path, FakeHttp(ip, tmp_path / "root"), expected
+
+
+class _CountingHttp:
+    """Wraps a reader to record the peak number of simultaneous calls; `hold`
+    keeps each call in flight long enough for a concurrent pool to overlap."""
+
+    def __init__(self, inner, hold=0.0):
+        self.inner, self.hold = inner, hold
+        self.lock = threading.Lock()
+        self.active = self.peak = 0
+        self.urls = []
+
+    def get(self, url):
+        with self.lock:
+            self.active += 1
+            self.peak = max(self.peak, self.active)
+            self.urls.append(url)
+        try:
+            if self.hold:
+                time.sleep(self.hold)
+            return self.inner.get(url)
+        finally:
+            with self.lock:
+                self.active -= 1
+
+
+def test_parallel_fetch_fetches_each_file_once_and_verifies_every_hash(ip, tmp_path):
+    pin_path, http, expected = _publish_many(ip, tmp_path, 40)
+    counting = _CountingHttp(http)
+    dest = tmp_path / "dest"
+    assert ip.fetch(pin_path, dest, prune=False, offline=False, http_get=counting.get, workers=8) == 0
+    file_urls = [u for u in counting.urls if not u.endswith("/MANIFEST.json")]
+    assert len(file_urls) == len(set(file_urls)) == len(expected), "each file exactly once"
+    for rel, text in expected.items():
+        assert (dest / rel).read_text() == text
+    assert list(dest.rglob("*.part*")) == []
+
+
+def test_parallel_fetch_refuses_a_corrupted_file_among_many(ip, tmp_path):
+    pin_path, http, _ = _publish_many(ip, tmp_path, 40)
+    pin = json.loads(pin_path.read_text())
+    bad = tmp_path / "root" / "empyrean-validation" / "inputs" / pin["snapshot_id"] / "psv" / "Obj017.psv"
+    bad.write_text("corrupted in the bucket\n")
+    dest = tmp_path / "dest"
+    with pytest.raises(ip.ContentError) as exc:
+        ip.fetch(pin_path, dest, prune=False, offline=False, http_get=http.get, workers=8)
+    msgs = exc.value.messages
+    assert len(msgs) == 1 and "psv/Obj017.psv" in msgs[0] and "sha256 expected" in msgs[0]
+    assert not (dest / "psv" / "Obj017.psv").exists()
+    assert (dest / "psv" / "Obj016.psv").exists(), "the good files still landed"
+
+
+def test_parallel_fetch_concurrency_stays_within_the_bound_and_is_real(ip, tmp_path):
+    pin_path, http, _ = _publish_many(ip, tmp_path, 40)
+    counting = _CountingHttp(http, hold=0.02)
+    ip.fetch(pin_path, tmp_path / "dest", prune=False, offline=False, http_get=counting.get, workers=4)
+    assert counting.peak <= 4, f"bound exceeded: {counting.peak} concurrent"
+    assert counting.peak >= 2, "the fetch did not run concurrently at all"
+    one = _CountingHttp(http, hold=0.0)
+    ip.fetch(pin_path, tmp_path / "dest1", prune=False, offline=False, http_get=one.get, workers=1)
+    assert one.peak == 1
+
+
+def test_parallel_fetch_default_is_sixteen_workers_and_zero_is_refused(ip, tmp_path):
+    assert ip.FETCH_WORKERS == 16
+    pin_path, http, _ = _publish_many(ip, tmp_path, 2)
+    with pytest.raises(ip.ContentError, match="--jobs must be at least 1"):
+        ip.fetch(pin_path, tmp_path / "d", prune=False, offline=False, http_get=http.get, workers=0)
 
 
 def test_fetch_offline_roundtrip_all_kept(ip, tmp_path):
