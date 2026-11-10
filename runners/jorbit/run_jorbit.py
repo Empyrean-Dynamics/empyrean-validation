@@ -40,6 +40,9 @@ jorbit-specific fields:
     jorbit_time_ms             — wall-clock per row
     jorbit_error               — why an object's worker produced nothing
                                  (crash, timeout); its rows carry no result
+    jorbit_unsupported         — why jorbit does not run this row at all: the
+                                 object is one of the SB441-N16 perturbers its
+                                 force model integrates (named, never run)
 
 Ephemeris rows run for the geocentric observer (500) only, with the
 observer at jorbit's own DE440 geocentre. jorbit's only observer model
@@ -97,8 +100,8 @@ GEOCENTER = "500"
 # it to the report's Configurations appendix).
 JORBIT_SETTINGS = {
     "gravity": "'default solar system': DE440 + SB441-N16 (the jorbit folder)",
-    "self_perturbers": "Iris, Vesta, Pallas, Hygiea run 'gr planets' (planets only; "
-    "jorbit has no per-body exclusion)",
+    "self_perturbers": "an object that is one of the SB441-N16 perturbers (Iris, Vesta, "
+    "Pallas, Hygiea) is a named unsupported row: jorbit has no per-body exclusion",
     "non_grav": "none: jorbit models gravity only",
     "observers": "geocentre (500) only, from jorbit's DE440 Earth; ground sites are "
     "not attempted (one explicit row per object)",
@@ -205,22 +208,30 @@ def _build_particle(
     )
 
 
-def _row_gravity(row: dict) -> str:
-    """Pick jorbit's gravity preset for one plan row.
+# The plan names an object that is itself one of the SB441-N16 perturbers by
+# NAIF id 2000000+n in excluded_perturbers_naif. jorbit's one force model
+# ("default solar system") integrates all sixteen and has no per-body
+# exclusion, so such an object would perturb itself: each of its rows is a named
+# unsupported row, never run, and no row switches force model.
+SB441_N16 = (1, 2, 3, 4, 7, 10, 15, 16, 31, 52, 65, 87, 88, 107, 511, 704)
+SELF_PERTURBER_NAIF = frozenset(2_000_000 + n for n in SB441_N16)
+SELF_PERTURBER_UNSUPPORTED = (
+    "self-perturber: jorbit's force model integrates the sixteen SB441-N16 "
+    "perturbers and has no per-body exclusion, so the object would perturb itself"
+)
 
-    The default ("default solar system") includes the SB441-N16 asteroid
-    set — which contains Iris/Vesta/Pallas/Hygiea, four objects this suite
-    propagates AS test particles. jorbit has no per-body exclusion, so the
-    particle would sit inside its own 1/r² singularity; use the PPN
-    planets-only preset ("gr planets") for them, stated loudly.
-    """
-    if row.get("population") == "Self-Perturber":
-        print(
-            f"  {row.get('object')}: jorbit runs 'gr planets' (planets-only) — "
-            "the default asteroid set would include the object itself",
-            file=sys.stderr,
-        )
-        return "gr planets"
+
+def jorbit_unsupported_reason(row: dict) -> str | None:
+    """Why jorbit does not run this row, or None."""
+    if SELF_PERTURBER_NAIF & set(row.get("excluded_perturbers_naif") or ()):
+        return SELF_PERTURBER_UNSUPPORTED
+    return None
+
+
+def _row_gravity(row: dict) -> str:
+    """jorbit's gravity preset: the one force model, "default solar system"
+    (DE440 + SB441-N16), on every row it runs. A self-perturber never reaches
+    here (see jorbit_unsupported_reason)."""
     if (row.get("ic_a1") or row.get("ic_a2") or row.get("ic_a3")) and row.get("dt_days") == 0.0:
         print(
             f"  {row.get('object')}: NOTE — jorbit models gravity only; the "
@@ -678,6 +689,12 @@ def main() -> int:
         new["source_version"] = source_version
         new["jorbit_version"] = source_version
         new["jorbit_settings"] = JORBIT_SETTINGS
+        unsupported = jorbit_unsupported_reason(r)
+        if unsupported is not None and tt in ("propagation", "ephemeris"):
+            # A named unsupported row: emitted with its reason, never run.
+            new["jorbit_unsupported"] = unsupported
+            out_rows.append(new)
+            continue
         out_rows.append(new)
         if tt in ("propagation", "ephemeris"):
             jobs.setdefault(r["object"], []).append([len(out_rows) - 1, r])

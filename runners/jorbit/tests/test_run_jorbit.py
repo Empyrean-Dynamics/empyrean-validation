@@ -138,6 +138,43 @@ def test_each_object_replays_in_its_own_worker_and_rows_keep_plan_order(runner, 
     assert out[5]["jorbit_not_attempted_rows"] == 1
 
 
+def test_a_self_perturber_is_a_named_unsupported_row_never_handed_to_a_worker(runner, monkeypatch, tmp_path):
+    """Iris (the plan excludes NAIF 2000007 from its own forces) is one of the
+    sixteen perturbers jorbit integrates: its rows carry the reason and no worker
+    runs them; no row switches to another force model."""
+    import json
+    import sys
+
+    rows = [
+        {"object": "Iris", "test_type": "propagation", "propagation_uncertainty": "none_detection_on",
+         "dt_days": 10.0, "t_mjd_tdb": 61210.0, "excluded_perturbers_naif": [2000007]},
+        {"object": "Iris", "test_type": "ephemeris", "propagation_uncertainty": "none_detection_on",
+         "dt_days": 10.0, "t_mjd_tdb": 61210.0, "observer": "500", "excluded_perturbers_naif": [2000007]},
+        {"object": "Eros", "test_type": "propagation", "propagation_uncertainty": "none_detection_on",
+         "dt_days": 10.0, "t_mjd_tdb": 61210.0},
+    ]
+    plan = tmp_path / "plan.json"
+    plan.write_text(json.dumps(rows))
+    out = tmp_path / "out.json"
+    calls = []
+
+    def spy(name, items, geo_span, data_dir, timeout_s):
+        calls.append(name)
+        return {str(i): {"jorbit_time_ms": 1.0} for i, _ in items}, 100.0, None
+
+    monkeypatch.setattr(runner, "_run_object", spy)
+    monkeypatch.setattr(sys, "argv", ["run_jorbit.py", "--input", str(plan), "--output", str(out),
+                                      "--data-dir", str(tmp_path)])
+    assert runner.main() == 0
+    got = json.loads(out.read_text())
+    assert calls == ["Eros"]
+    iris = [r for r in got if r["object"] == "Iris"]
+    assert len(iris) == 2 and all(r["jorbit_unsupported"] == runner.SELF_PERTURBER_UNSUPPORTED for r in iris)
+    assert all("jorbit_time_ms" not in r for r in iris)
+    assert "jorbit_unsupported" not in [r for r in got if r["object"] == "Eros"][0]
+    assert runner._row_gravity(rows[0]) == runner._row_gravity(rows[2]) == "default solar system"
+
+
 def test_a_failed_worker_marks_only_its_own_objects_rows(runner, monkeypatch, tmp_path):
     def fake(name, items):
         if name == "A":
