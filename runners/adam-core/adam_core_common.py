@@ -123,7 +123,7 @@ def finite(*vals) -> bool:
 # Four catalog objects — Iris, Vesta, Pallas, Hygiea — are themselves in ASSIST's
 # SB441-n16 massive-asteroid perturber set, so the full force model makes the object
 # perturb ITSELF (a 1/r^2 self-singularity: ~1e9 km error at 1 yr). The suite's own
-# ASSIST runner handles this by dropping asteroid forces (a planets-only Ephem).
+# ASSIST runner names these rows unsupported too.
 #
 # adam-assist 0.6.0 (public release) exposes NO planets-only switch:
 #   * its new ``adam_assist.perturbers`` module only DETECTS self-perturbers so a

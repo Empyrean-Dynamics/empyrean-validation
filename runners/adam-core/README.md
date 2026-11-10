@@ -92,8 +92,8 @@ these onto the merged rows and the report's Configurations appendix prints them.
 Four catalog objects — **Iris, Vesta, Pallas, Hygiea** — are themselves in
 ASSIST's SB441-n16 massive-asteroid perturber set, so the full force model makes
 the object perturb *itself* (a 1/r² self-singularity, ~1e9 km at 1 yr). The
-suite's own ASSIST runner avoids this by dropping asteroid forces (a planets-only
-`Ephem`). **adam-assist 0.6.0 exposes no equivalent**:
+suite's own ASSIST runner names these rows unsupported too, and **adam-assist
+0.6.0 exposes no way to leave a body out either**:
 
 - its `adam_assist.perturbers` module only *detects* self-perturbers (to attach a
   warning); it does not change the force model;
@@ -107,9 +107,9 @@ suite's own ASSIST runner avoids this by dropping asteroid forces (a planets-onl
 So these four objects **cannot** be given a planets-only force model through the
 public wrapper. Their propagation, ephemeris and OD rows are emitted as a NAMED
 unsupported row (`adam_core_unsupported`, `adam_core_force_model` naming the
-reason), never a self-singular state. **This is an open owner decision** (the
-options — accept the gap, build a self-excluded SB441 kernel, or ask upstream for
-a force mask — are in the builder report), not a settled runner behaviour.
+reason), never a self-singular state. This is the suite's rule for every tool:
+an object a tool cannot leave out of its own forces is a named unsupported row,
+never a per-object switch of force model.
 
 ## No hidden fallbacks
 

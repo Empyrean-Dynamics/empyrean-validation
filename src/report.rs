@@ -1756,8 +1756,8 @@ fn maha2(d: &[f64; 2], m: &[[f64; 2]; 2]) -> Option<f64> {
 
 /// The objects a marker applies to.
 struct GridMarks<'a> {
-    /// Objects with a Marsden ΔT and the self-perturbers: the model gap the
-    /// ASSIST sub-rows are daggered for.
+    /// Objects with a Marsden ΔT: the model gap the ASSIST sub-rows are daggered
+    /// for (see [`assist_model_gap`]).
     model_gap: &'a BTreeSet<&'a str>,
     /// Impactor objects: their forward horizons do not exist (arc ends).
     impactors: &'a BTreeSet<&'a str>,
@@ -2008,20 +2008,27 @@ fn prop_like_axes(results: &[ValidationResult]) -> PropLikeAxes<'_> {
         .collect();
     dts.sort();
 
-    let mut model_gap: BTreeSet<&str> = BTreeSet::new();
+    let model_gap = assist_model_gap(results);
     let mut impactors: BTreeSet<&str> = BTreeSet::new();
     for r in results {
-        if r.ic_non_grav_dt.is_some() {
-            model_gap.insert(r.object.as_str());
-        }
-        if r.population == "Self-Perturber" {
-            model_gap.insert(r.object.as_str());
-        }
         if r.population == "Impactor" {
             impactors.insert(r.object.as_str());
         }
     }
     (objects, dts, model_gap, impactors)
+}
+
+/// The ASSIST model gap: the objects whose plan IC carries a Marsden ΔT, a term
+/// ASSIST does not model, so their ASSIST numbers are daggered and a second
+/// median leaves them out. A self-perturber is not in it: ASSIST names its rows
+/// unsupported (it cannot leave the object out of its own forces), so there is
+/// no ASSIST number to dagger, only a hatched cell with the reason.
+fn assist_model_gap(results: &[ValidationResult]) -> BTreeSet<&str> {
+    results
+        .iter()
+        .filter(|r| r.ic_non_grav_dt.is_some())
+        .map(|r| r.object.as_str())
+        .collect()
 }
 
 /// The right-margin summary column a prop-like grid ends each row with: the
@@ -2334,8 +2341,8 @@ fn render_agreement_grid(
         h.push_str(&format!(
             "<div class=\"grid-summary\" id=\"{table_id}-summary\" title=\"{summary_title}\">{summary_line}{rw_suffix}</div>"
         ));
-        // ASSIST omits force terms (Marsden ΔT, self-perturbers) some objects
-        // need, so mark the model gap whenever ASSIST is on either side.
+        // ASSIST omits the Marsden ΔT term some objects need, so mark the model
+        // gap whenever ASSIST is on either side.
         let tool_is_assist = tool_slug == "assist" || ref_slug == "assist";
 
         // Pair-scoped model-gap caveat: emitted only inside the panels whose
@@ -2347,7 +2354,7 @@ fn render_agreement_grid(
                 .iter()
                 .any(|(_, m)| m.iter().any(|o| marks.model_gap.contains(o)))
         {
-            h.push_str("<div class=\"pair-caveat\">&dagger; model gap: ASSIST omits a force term (Marsden ΔT, self-perturbers) some objects need; those rows are marked and a second footer median excludes them.</div>");
+            h.push_str("<div class=\"pair-caveat\">&dagger; model gap: ASSIST omits the Marsden ΔT term some objects need; those rows are marked and a second footer median excludes them.</div>");
         }
 
         h.push_str(&render_grid_table(
@@ -2437,7 +2444,7 @@ fn worst_cell(axis: GridAxis, worst: f64) -> String {
 fn obj_label(obj: &str, marks: &GridMarks, show_gap: bool) -> String {
     let mut s = attr_escape(obj);
     if show_gap && marks.model_gap.contains(obj) {
-        s.push_str(" <span class=\"tag-gap\" title=\"model gap: ASSIST omits a force term this object needs (Marsden delta-T or a self-perturber); the excl. model-gap footer median drops these rows\">&dagger;</span>");
+        s.push_str(" <span class=\"tag-gap\" title=\"model gap: ASSIST omits the Marsden delta-T term this object needs; the excl. model-gap footer median drops these rows\">&dagger;</span>");
     }
     s
 }
@@ -5004,14 +5011,9 @@ fn build_part2_sections(
     // Ephemeris sky separation vs JPL Horizons per tool (mas).
     let (emp_eph, fo_eph) = eph_vs_jpl_mas(results);
 
-    // Model-gap objects (Marsden ΔT comets + self-perturbers): ASSIST lacks a
-    // force term they need, so the dagger marks the ASSIST cell for these.
-    let mut model_gap: BTreeSet<&str> = BTreeSet::new();
-    for r in results {
-        if r.ic_non_grav_dt.is_some() || r.population == "Self-Perturber" {
-            model_gap.insert(r.object.as_str());
-        }
-    }
+    // Model-gap objects (the Marsden ΔT comets): ASSIST lacks a force term they
+    // need, so the dagger marks the ASSIST cell for these.
+    let model_gap = assist_model_gap(results);
 
     // Object → population.
     let mut obj2pop: HashMap<&str, &str> = HashMap::new();
@@ -5519,7 +5521,7 @@ fn build_part2_sections(
     );
 
     // ── Method folds (one per section; the former §2.1 disclosure, by axis) ──
-    let method_prop = "<div class=\"disclosures\"><details><summary>Method</summary><div class=\"disc-body\">Each tool states its own numbers against JPL on the one decade ladder. Propagation cells: median and p90 offset from Horizons (km). A tool omitting the Marsden &Delta;T term and the self-perturber forces the daggered objects need shows a force-model gap there (with-gap and excl-gap medians both). Timing: p50 wall clock at its own boundary &mdash; integrate-only (ASSIST), whole-call (tool under test), per-fit (find_orb) &mdash; read down a row; the capped (loud-FAIL) rows count in the n column, never substituted. kete and jorbit emit timing only; find_orb is fit-then-propagate; OpenOrb, GRSS, OrbFit, layup have no rows and stay hatched. In the cost tables, compare arms only within a boundary and read each population column down.</div></details></div>";
+    let method_prop = "<div class=\"disclosures\"><details><summary>Method</summary><div class=\"disc-body\">Each tool states its own numbers against JPL on the one decade ladder. Propagation cells: median and p90 offset from Horizons (km). A tool omitting the Marsden &Delta;T term the daggered objects need shows a force-model gap there (with-gap and excl-gap medians both). Timing: p50 wall clock at its own boundary &mdash; integrate-only (ASSIST), whole-call (tool under test), per-fit (find_orb) &mdash; read down a row; the capped (loud-FAIL) rows count in the n column, never substituted. kete and jorbit emit timing only; find_orb is fit-then-propagate; OpenOrb, GRSS, OrbFit, layup have no rows and stay hatched. In the cost tables, compare arms only within a boundary and read each population column down.</div></details></div>";
     let method_eph = "<div class=\"disclosures\"><details><summary>Method</summary><div class=\"disc-body\">Ephemeris cells: median and p90 sky separation from JPL Horizons (mas), averaged over the observing sites. Timing: p50 wall clock at the whole-call boundary; the empyrean column names its channel when the rust channel carries no wall clock for an arm in this run. In the cost table, read each population column down.</div></details></div>";
     let method_od = "<div class=\"disclosures\"><details><summary>Method</summary><div class=\"disc-body\">OD cell: fits converged of attempted and median &sigma;-equivalent distance to JPL; empyrean's per-object &sigma;_eq lives in &sect;1.3A. find_orb publishes no covariance, so it shows only whether it fit the arc. Objects whose JPL solution used radar are out of the &sigma;_eq statistic, counted, never dropped. The cost table is per-fit wall clock; read each population column down.</div></details></div>";
 
@@ -10711,7 +10713,7 @@ pub fn generate_report(
   <div class="chart-container">
     <div id="stm-agree-chart" style="height:{chart_h}px;"></div>
   </div>
-  <div class="disclosures"><details><summary>{disc_summary}</summary><div class="disc-body">Relative Frobenius difference vs |dt| (log-y): empyrean's first-order partials against the corrected ASSIST variational partials over all first-order rows (median solid, 95th-percentile dashed), and against an ASSIST single-particle finite difference on a representative subset (measured step-size floor 1e-8, dotted). The two analytic methods agree to machine precision on the bulk; the tail is the self-perturber rows and deep encounters; the finite difference anchors both to truth at its own floor.</div></details></div>
+  <div class="disclosures"><details><summary>{disc_summary}</summary><div class="disc-body">Relative Frobenius difference vs |dt| (log-y): empyrean's first-order partials against the corrected ASSIST variational partials over all first-order rows (median solid, 95th-percentile dashed), and against an ASSIST single-particle finite difference on a representative subset (measured step-size floor 1e-8, dotted). The two analytic methods agree to machine precision on the bulk; the tail is the deep encounters; the finite difference anchors both to truth at its own floor.</div></details></div>
 </div>
 
 <div class="section" id="s09b">
@@ -11585,10 +11587,10 @@ const propBase = (() => {{
 // One line per population: the median |tool − reference| position offset at
 // each horizon, log y, driven by the tool-pair selector above. When the tool
 // is ASSIST, a labelled dashed series traces the objects ASSIST cannot model
-// (the Marsden-ΔT comets and the self-perturbers), because that gap is a
-// force-model difference, not an integrator one.
+// (the Marsden-ΔT comets), because that gap is a force-model difference, not an
+// integrator one. A self-perturber has no ASSIST row to trace: ASSIST names it
+// unsupported.
 const GROWTH_GAP_OBJS = new Set([...DT_OBJECTS.keys()]);
-for (const r of results) {{ if (r.population === 'Self-Perturber') GROWTH_GAP_OBJS.add(r.object); }}
 // ─────────── shared error-growth chart drawer ───────────
 // ONE function draws BOTH error-growth charts (propagation and ephemeris) so
 // their look cannot drift: per population, a filled 25-75 percent band under a
@@ -16312,6 +16314,58 @@ mod tests {
         assert!(
             !panel_slice(&html, "h1-prop", "empyrean", "jpl").contains("model gap"),
             "the empyrean/jpl panel must not carry the model-gap caveat"
+        );
+    }
+
+    /// The ASSIST model gap is the Marsden ΔT objects only. A self-perturber is
+    /// not in it: ASSIST names its rows unsupported, so it has no ASSIST number
+    /// to dagger. Holds for the shared grid axes (Section 1 and Part 2 read the
+    /// one set), the ASSIST panel's labels and caveat, and the growth chart's
+    /// gap series.
+    #[test]
+    fn assist_model_gap_is_the_marsden_dt_objects_without_the_self_perturbers() {
+        let mut rows = pair_test_rows();
+        for dt in [0.0_f64, 30.0] {
+            let mut rr = synthetic_rust_prop_row("Vesta", dt);
+            rr.population = "Self-Perturber".to_string();
+            rr.propagation_uncertainty = Some("first_order_detection_on".to_string());
+            rows.push(rr);
+            let mut cr = synthetic_core_prop_row("Vesta", "Self-Perturber", dt);
+            cr.assist_vs_horizons_km = None;
+            cr.emp_vs_assist_km = None;
+            cr.tool_unsupported = Some(
+                [(
+                    "assist".to_string(),
+                    "self-perturber: ASSIST has no per-body exclusion".to_string(),
+                )]
+                .into(),
+            );
+            rows.push(cr);
+        }
+        assert_eq!(
+            assist_model_gap(&rows).into_iter().collect::<Vec<_>>(),
+            vec!["67P"]
+        );
+        let (_, _, axes_gap, _) = prop_like_axes(&rows);
+        assert!(axes_gap.contains("67P") && !axes_gap.contains("Vesta"));
+        let html = render_rows(&rows);
+        let ea = panel_slice(&html, "h1-prop", "empyrean", "assist");
+        assert!(
+            ea.contains("67P <span class=\"tag-gap\""),
+            "67P is daggered"
+        );
+        assert!(
+            !ea.contains("Vesta <span class=\"tag-gap\""),
+            "Vesta is not daggered"
+        );
+        assert!(
+            ea.contains("title=\"unsupported by this tool: self-perturber: ASSIST has no per-body exclusion\""),
+            "Vesta's ASSIST cell is hatched with the reason"
+        );
+        assert!(!ea.to_lowercase().contains("self-perturbers"));
+        assert!(
+            !html.contains("GROWTH_GAP_OBJS.add"),
+            "the growth chart's gap series is the ΔT objects only"
         );
     }
 

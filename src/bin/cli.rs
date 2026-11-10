@@ -1143,6 +1143,11 @@ type CoreF64Snapshot = ([f64; 3], Option<f64>, String);
 ///    per-arm STM agreement. `emp_vs_assist_km` and `speed_ratio` are computed
 ///    here. The resolved integrator settings ride in `notes`.
 ///
+/// A record ASSIST named unsupported (`assist_unsupported`, a self-perturber)
+/// carries no number: step 1 folds its reason into `tool_unsupported` on the
+/// reference rows through [`record_tool_config`], and step 2 appends no arm row
+/// for it, since an arm row without a time reads as a capped FAIL.
+///
 /// Returns the number of rows folded onto the core reference (the backward-compat
 /// count); the standalone-append count is logged separately by the caller path.
 fn merge_assist(
@@ -1241,6 +1246,10 @@ fn merge_assist(
         ) else {
             continue;
         };
+        if a["assist_unsupported"].is_string() {
+            // Not run: its reason is on the reference rows (step 1), not an arm row.
+            continue;
+        }
         let key = (object.to_string(), dt as i64);
         let variational = a["variational"].as_bool().unwrap_or(arm.ends_with("_on"));
         let mut row = ValidationResult::empty();
@@ -3933,6 +3942,104 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// ASSIST's named unsupported rows (a self-perturber: one record per arm with
+    /// `assist_unsupported` and no number, as run_assist.py writes them) fold the
+    /// reason onto every reference row of the object, append no standalone arm
+    /// row (one without a time would count as a capped FAIL), and reach the
+    /// report's Configurations appendix with the object. The object ASSIST ran
+    /// keeps its numbers and its six arm rows.
+    #[test]
+    fn merge_assist_folds_a_self_perturbers_reason_and_appends_no_arm_row() {
+        const ARMS: [&str; 6] = [
+            "assist_default_variational_off",
+            "assist_default_variational_on",
+            "assist_layup_variational_off",
+            "assist_layup_variational_on",
+            "assist_asteroid_institute_variational_off",
+            "assist_asteroid_institute_variational_on",
+        ];
+        let why = "self-perturber: ASSIST integrates the sixteen SB441-N16 perturbers of \
+                   sb441-n16.bsp and has no per-body exclusion, so the object would sit on \
+                   its own 1/r² singularity";
+        let mut rows = Vec::new();
+        for (object, population) in [("Vesta", "Self-Perturber"), ("Eros", "NEO")] {
+            for channel in ["rust", "core"] {
+                for arm in ["none_detection_on", "first_order_detection_on"] {
+                    let mut r = ValidationResult::empty();
+                    r.object = object.into();
+                    r.population = population.into();
+                    r.channel = channel.into();
+                    r.test_type = "propagation".into();
+                    r.dt_days = 30.0;
+                    r.propagation_uncertainty = Some(arm.into());
+                    r.emp_pos_au = Some([1.0, 0.0, 0.0]);
+                    rows.push(r);
+                }
+            }
+        }
+        let mut records = Vec::new();
+        for arm in ARMS {
+            let variational = arm.ends_with("_on");
+            records.push(serde_json::json!({
+                "object": "Vesta", "population": "Self-Perturber", "dt_days": 30.0,
+                "test_type": "assist", "propagation_uncertainty": arm,
+                "variational": variational, "assist_unsupported": why,
+                "assist_version": "1.2.3",
+            }));
+            records.push(serde_json::json!({
+                "object": "Eros", "population": "NEO", "dt_days": 30.0,
+                "test_type": "assist", "propagation_uncertainty": arm,
+                "variational": variational, "assist_vs_horizons_km": 0.001,
+                "assist_time_ms": 2.0, "assist_pos_au": [1.0, 0.0, 0.0],
+                "assist_version": "1.2.3",
+            }));
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("validation_assist.json");
+        std::fs::write(&path, serde_json::to_string(&records).unwrap()).unwrap();
+
+        assert_eq!(
+            merge_assist(&mut rows, &path).unwrap(),
+            8,
+            "four reference rows per object"
+        );
+        for r in rows.iter().filter(|r| r.channel != "assist") {
+            if r.object == "Vesta" {
+                assert_eq!(r.unsupported_by("assist"), Some(why), "{}", r.channel);
+                assert!(r.assist_time_ms.is_none() && r.emp_vs_assist_km.is_none());
+            } else {
+                assert!(r.tool_unsupported.is_none());
+                assert_eq!(r.assist_time_ms, Some(2.0));
+            }
+        }
+        let arm_rows: Vec<&ValidationResult> =
+            rows.iter().filter(|r| r.channel == "assist").collect();
+        assert_eq!(arm_rows.len(), 6, "the six arms of Eros only");
+        assert!(arm_rows.iter().all(|r| r.object == "Eros"));
+
+        let results = write_results(dir.path(), "validation_core_merged.json", &rows);
+        let out = dir.path().join("report.html");
+        report(ReportArgs {
+            results: vec![results],
+            output: out.clone(),
+            summary: None,
+            predict_agg: vec![],
+            predict_run: vec![],
+        })
+        .unwrap();
+        let html = std::fs::read_to_string(&out).unwrap();
+        let cfg = &html[html.find("id=\"s05c\"").expect("Configurations section")..];
+        let block = cfg
+            .split("<div class=\"cfg-unsupported\" data-tool=\"assist\">")
+            .nth(1)
+            .expect("ASSIST's unsupported rows in Configurations");
+        let block = block.split("</table>").next().unwrap();
+        assert!(
+            block.contains(why) && block.contains("Vesta") && !block.contains("Eros"),
+            "the reason with its object"
+        );
     }
 
     #[test]
