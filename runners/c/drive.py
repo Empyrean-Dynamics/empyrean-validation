@@ -7,10 +7,22 @@ and emits a c-channel JSON in the same schema. Output `emp_pos_au`,
 the C runner's stdout.
 
 The runner protocol is one row per stdin line, prefixed with mode:
-- "prop EPOCH IC[6] A1-3 G[5] FORCE TARGET DT [METHOD]"
-- "eph  EPOCH IC[6] A1-3 G[5] FORCE TARGET DT OBS_CODE [METHOD]"
+- "prop EPOCH IC[6] A1-3 G[5] FORCE TARGET DT EXCL [METHOD]"
+- "eph  EPOCH IC[6] A1-3 G[5] FORCE TARGET DT OBS_CODE EXCL [METHOD]"
 - "od   FORCE EXCLUDE_NAIF METHOD ADES_PATH"
 - "odng FORCE EXCLUDE_NAIF ADES_PATH"
+
+EXCL is the row's ``excluded_perturbers_naif`` (``-`` for none, else the NAIF
+ids comma-separated), bound to the propagation config exactly as the core
+channel applies it: on a self-perturber row it keeps the body out of its own
+force model, where without it the engine serves the body's SPK instead of
+integrating (a different request than the reference's).
+
+A prop / eph orbit the engine declines comes back as ``refused
+failed:<variant> <engine text>``; the row is written with
+``orbit_delivered = false``, that status and the engine's text, and no
+residual. An ``ok`` line carrying a non-finite position is never turned into
+residuals.
 
 This mirrors the CLI runner's protocol (validation/runners/cli/drive.py),
 so both channels use the same fork-once-stream-many model.
@@ -23,9 +35,11 @@ replayed through the C ABI's uncertainty surface, parsing what the engine
 ``resolved_method``, ``cov_kind``, ``cov_joint_width``, ``cov_tri``,
 ``orbit_delivered``, ``orbit_status`` and the six ``mix_*``.
 
-- **Propagation rows** send the tag as the optional 19th ``prop`` token (all
-  tags but ``none`` / the untagged legacy row, which send the bare 18-field
-  line). The binary attaches the synthetic input covariance, runs the rung and
+- **Propagation rows** send the tag as the trailing ``prop`` token (every
+  tag, ``none`` included; only the untagged legacy row sends none). ``none``
+  attaches no covariance, so its products carry only the per-orbit outcome.
+  For every other tag the binary attaches the synthetic input covariance,
+  runs the rung and
   appends 12 product tokens read off the delivered packed joint (``orbit_cov``),
   the per-orbit outcome (``outcomes[0]``) and — for a mixture — ``mixture_tally``.
   A token-less response leaves all 12 fields null, byte-identical to the
@@ -157,14 +171,14 @@ def _reset_per_method(row: dict) -> None:
 
 
 def _method_token(r: dict) -> str | None:
-    """The optional 19th ``prop`` token for a plan row: its
-    ``propagation_uncertainty`` composite tag, or ``None`` for the
-    covariance-free ``none`` method / untagged legacy row (which sends the bare
-    18-field line). The method is read off the tag's prefix, so every arm of
-    ``none`` sends the bare line.
+    """The trailing method token for a plan row: its ``propagation_uncertainty``
+    composite tag, or ``None`` for the untagged legacy row only. The ``none``
+    method sends its tag too: the binary attaches no covariance for it, but
+    reports the per-orbit outcome, so a ``none`` row reads ``orbit_delivered`` /
+    ``orbit_status`` off the engine like every other method (the rust
+    reference's rule; the python channel's too).
     """
-    m = r.get("propagation_uncertainty")
-    return None if m is None or _method_of(m) == "none" else m
+    return r.get("propagation_uncertainty")
 
 
 def _product_bool(v: str) -> bool | None:
@@ -287,19 +301,80 @@ def _ic_line(r):
     )
 
 
+def _excl_token(r) -> str:
+    """The EXCL token for a plan row: its ``excluded_perturbers_naif`` as
+    comma-separated NAIF ids, or ``-`` when it excludes none."""
+    excl = r.get("excluded_perturbers_naif") or []
+    return ",".join(str(int(n)) for n in excl) if excl else "-"
+
+
 def _prop_daemon_line(r) -> str | None:
-    """The runner ``prop`` line for a plan row: the 18 fixed fields plus, for a
-    covariance-bearing method, the optional 19th method token. Returns ``None``
-    when the row has no usable IC (the caller skips it). The ``none`` / untagged
-    row yields the bare 18-field line — byte-identical to the pre-widening
-    driver — so its response stays the 8-field ``ok`` line. Mirrors the cli
-    driver's ``_prop_daemon_line``.
+    """The runner ``prop`` line for a plan row: the 18 fixed fields, the EXCL
+    token, and the trailing method token (every tag, ``none`` included).
+    Returns ``None`` when the row has no usable IC (the caller skips it). The
+    untagged legacy row sends no method token, so its response stays the
+    8-field ``ok`` line. Mirrors the cli driver's ``_prop_daemon_line``.
     """
     ic = _ic_line(r)
     if ic is None:
         return None
     method = _method_token(r)
-    return f"prop {ic}" + (f" {method}" if method else "")
+    return f"prop {ic} {_excl_token(r)}" + (f" {method}" if method else "")
+
+
+def _eph_daemon_line(r) -> str | None:
+    """The runner ``eph`` line for a plan row: the 18 fixed fields, the
+    observer, the EXCL token, and the trailing method token (every tag,
+    ``none`` included). ``None`` when the row has no usable IC or no
+    observer. Mirrors the cli driver's ``_eph_daemon_line``.
+    """
+    ic = _ic_line(r)
+    obs = r.get("observer")
+    if ic is None or not obs:
+        return None
+    method = _method_token(r)
+    return f"eph {ic} {obs} {_excl_token(r)}" + (f" {method}" if method else "")
+
+
+# The measured fields a prop / eph row carries. A refused row carries none of
+# them: there is no position to measure.
+_MEASURED_FIELDS = (
+    "emp_pos_au",
+    "emp_vs_horizons_km",
+    "emp_time_ms",
+    "separation_arcsec",
+    "d_ra_arcsec",
+    "d_dec_arcsec",
+    "d_rho_km",
+    "d_light_time_s",
+)
+
+
+def _refused_row(r, out_line, timestamp, source_version) -> dict:
+    """The row for a prop / eph orbit the engine declined: the runner's
+    ``refused failed:<variant> <engine text>`` line becomes
+    ``orbit_delivered = false``, ``orbit_status = failed:<variant>`` and the
+    engine's text in ``notes``, with every measured field null. Never a skip:
+    the reference row it pairs with is then judged as a refusal mismatch.
+    Mirrors the cli driver's ``_refused_row``.
+    """
+    _, _, rest = out_line.partition(" ")
+    status, _, message = rest.strip().partition(" ")
+    if not status.startswith("failed:"):
+        raise ValueError(f"malformed refused line (no failed:<variant>): {out_line!r}")
+    new = dict(r)
+    new["channel"] = "c"
+    new["timestamp"] = timestamp
+    new["source_version"] = source_version
+    _reset_per_method(new)
+    for k in _MEASURED_FIELDS:
+        new[k] = None
+    new["orbit_delivered"] = False
+    new["orbit_status"] = status
+    base = new.get("notes") or ""
+    note = f"engine declined the orbit: {message.strip()}"
+    new["notes"] = note if not base else f"{base}; {note}"
+    return new
 
 
 def _build_prop_row(r, parts, method, timestamp, source_version) -> dict:
@@ -352,6 +427,153 @@ def _float_or_none(tok):
     return None if math.isnan(v) else v
 
 
+class _RowAccount:
+    """The runner's own count line, honest by construction: every plan row
+    ends as exactly one of written, declined (written, but the engine
+    declined it: ``orbit_delivered = false`` or a FAIL note carrying the
+    engine's error) or skipped (no row), so W + D + S = N. A plan
+    ``non_grav_recovery`` row is written by its object's legacy fit (the
+    second pass), so the row that pass generates stands for it. Mirrored in
+    the python / c / cli drivers.
+    """
+
+    def __init__(self, n_loaded: int) -> None:
+        self.n = n_loaded
+        self.written = 0
+        self.declined = 0
+        self.skipped = 0
+        self.ng_plan = 0
+        self.ng_generated = 0
+        self.surplus = 0
+        self._declined_ids: set[int] = set()
+        self._row: dict | None = None
+        self._start = 0
+
+    def declined_row(self, row: dict) -> dict:
+        """Mark ``row`` as a declined row, and return it for the append."""
+        self._declined_ids.add(id(row))
+        return row
+
+    def begin(self, r: dict, out_rows: list) -> None:
+        """Settle the previous plan row, then start ``r``."""
+        self._settle(out_rows)
+        self._row, self._start = r, len(out_rows)
+
+    def _settle(self, out_rows: list) -> None:
+        r, produced = self._row, out_rows[self._start :]
+        self._row = None
+        if r is None:
+            return
+        tt = r.get("test_type")
+        if not produced:
+            if tt == "non_grav_recovery":
+                self.ng_plan += 1
+            else:
+                self.skipped += 1
+            return
+        main = next((x for x in produced if x.get("test_type") == tt), produced[0])
+        if id(main) in self._declined_ids:
+            self.declined += 1
+        else:
+            self.written += 1
+        for x in produced:
+            if x is main:
+                continue
+            if x.get("test_type") == "non_grav_recovery":
+                self.ng_generated += 1
+            else:
+                self.surplus += 1
+
+    def finish(self, out_rows: list) -> tuple[int, int, int, bool]:
+        """Settle the last row and return ``(written, declined, skipped, ok)``;
+        ``ok`` is false when the rows do not account for the plan exactly."""
+        self._settle(out_rows)
+        written = self.written + min(self.ng_generated, self.ng_plan)
+        skipped = self.skipped + max(0, self.ng_plan - self.ng_generated)
+        surplus = self.surplus + max(0, self.ng_generated - self.ng_plan)
+        ok = surplus == 0 and written + self.declined + skipped == self.n
+        return written, self.declined, skipped, ok
+
+    def line(self, out_rows: list, channel: str, path) -> tuple[str, bool]:
+        """The count line: ``Loaded N rows; wrote W, declined D, skipped S``."""
+        w, d, s, ok = self.finish(out_rows)
+        return (
+            f"Loaded {self.n} rows; wrote {w}, declined {d}, skipped {s} "
+            f"({w} + {d} + {s} = {w + d + s}); {len(out_rows)} {channel} rows to {path}",
+            ok,
+        )
+
+
+def _harvest_ref_non_grav(rows: list) -> dict[str, tuple[float, float, float]]:
+    """Per-object SBDB reference non-grav (A1, A2, A3), for the objects whose
+    reference is not all zero."""
+    ref_non_grav: dict[str, tuple[float, float, float]] = {}
+    for r in rows:
+        a1 = r.get("ic_a1") or 0.0
+        a2 = r.get("ic_a2") or 0.0
+        a3 = r.get("ic_a3") or 0.0
+        if a1 != 0.0 or a2 != 0.0 or a3 != 0.0:
+            ref_non_grav[r["object"]] = (a1, a2, a3)
+    return ref_non_grav
+
+
+def _reps_key(r: dict) -> tuple:
+    """A row's identity for the repetition override: the harness-wide key
+    (object, test_type, propagation_uncertainty, dt, observer, force_model)."""
+    return (
+        r["object"],
+        r["test_type"],
+        r.get("propagation_uncertainty"),
+        float(r["dt_days"]),
+        r.get("observer"),
+        r.get("force_model"),
+    )
+
+
+def _load_reps_override(path: Path | None) -> dict:
+    """The per-row timing repetitions from ``--reps-override`` (a JSON list of
+    row identities, each with ``reps``): the heavy row's three timing
+    repetitions run on three legs, one each. The driver sends a ``reps N`` line
+    ahead of the row's prop / eph line, and the daemon applies it to that line
+    alone. A side file, never a plan key, because a plan key would flow into
+    the output through the row copy. Fewer than one repetition is refused."""
+    if path is None:
+        return {}
+    out: dict = {}
+    for e in json.loads(path.read_text()):
+        n = e["reps"]
+        if not isinstance(n, int) or n < 1:
+            raise SystemExit(f"ERROR: --reps-override {path}: row {_reps_key(e)} asks for {n!r} repetitions.")
+        k = _reps_key(e)
+        if k in out:
+            raise SystemExit(f"ERROR: --reps-override {path}: row {k} is listed twice.")
+        out[k] = n
+    return out
+
+
+def _send_reps(proc, reps_override: dict, r: dict) -> None:
+    """Tell the daemon how many timing repetitions the next prop / eph line runs
+    when the row carries an override; the daemon replies to nothing."""
+    n = reps_override.get(_reps_key(r))
+    if n is not None:
+        proc.stdin.write(f"reps {n}\n")
+
+
+def _context_rows(context: Path | None, input_rows: list) -> list:
+    """The rows the cross-row lookups read: the full plan when ``--context`` is
+    given, the input itself otherwise. A context that lacks an object of the
+    input is refused by name, since its non-grav second pass would silently
+    vanish."""
+    if context is None:
+        return input_rows
+    rows = json.loads(context.read_text())
+    have = {r["object"] for r in rows}
+    missing = sorted({r["object"] for r in input_rows} - have)
+    if missing:
+        raise SystemExit(f"ERROR: --context {context} holds no rows for {', '.join(missing)}.")
+    return rows
+
+
 def main() -> int:
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument(
@@ -380,6 +602,20 @@ def main() -> int:
         help="empyrean data directory (defaults to ~/.empyrean/data/)",
     )
     p.add_argument(
+        "--context",
+        type=Path,
+        default=None,
+        help="the full plan, for the lookups that cross rows (the non-grav "
+        "reference); defaults to --input. A channel leg replays a subset of the plan.",
+    )
+    p.add_argument(
+        "--reps-override",
+        type=Path,
+        default=None,
+        help="JSON list of row identities with `reps`: the timing repetitions those "
+        "rows run instead of the default best-of-3 (a replica leg of the heavy row runs it once).",
+    )
+    p.add_argument(
         "--fixtures-dir",
         type=Path,
         default=Path(__file__).parent.parent.parent / "fixtures" / "psv",
@@ -401,16 +637,18 @@ def main() -> int:
     # Per-object reference non-grav signal, keyed by object name. The
     # `orbit_determination` rows null out ic_a1/ic_a2/ic_a3, so read the
     # JPL SBDB reference off the object's `propagation` rows (which carry
-    # it). Mirrors the rust runner's per-object gate
-    # `data.a1 != 0 || data.a2 != 0 || data.a3 != 0` — only objects with a
-    # known non-grav signal get a second StateAndNonGrav fit.
-    ref_non_grav: dict[str, tuple[float, float, float]] = {}
-    for r in rust_rows:
-        a1 = r.get("ic_a1") or 0.0
-        a2 = r.get("ic_a2") or 0.0
-        a3 = r.get("ic_a3") or 0.0
-        if a1 != 0.0 or a2 != 0.0 or a3 != 0.0:
-            ref_non_grav[r["object"]] = (a1, a2, a3)
+    # it), from the CONTEXT: the full plan, or the input itself without
+    # --context (a channel leg replays a subset of the plan). Mirrors the rust
+    # runner's per-object gate `data.a1 != 0 || data.a2 != 0 || data.a3 != 0`
+    # — only objects with a known non-grav signal get a second
+    # StateAndNonGrav fit.
+    ref_non_grav = _harvest_ref_non_grav(_context_rows(args.context, rust_rows))
+    reps_override = _load_reps_override(args.reps_override)
+    if reps_override:
+        unknown = sorted(set(reps_override) - {_reps_key(r) for r in rust_rows})
+        if unknown:
+            raise SystemExit(f"ERROR: --reps-override names a row that is not in the input: {unknown[0]}")
+        print(f"Repetition override on {len(reps_override)} row(s).", file=sys.stderr)
 
     cmd = [str(args.runner)]
     if args.data_dir:
@@ -441,17 +679,17 @@ def main() -> int:
     timestamp = datetime.now(timezone.utc).isoformat()
     source_version = _driver_source_version()
     out_rows = []
-    n_skipped = 0
+    acct = _RowAccount(len(rust_rows))
     n_missing_fixture = 0
 
     for r in rust_rows:
+        acct.begin(r, out_rows)
         tt = r.get("test_type")
         # Per-method OD transport rows are `not produced` on this channel at
         # this pin (the core channel produces them); skipping them leaves their
         # cell reading `not produced` in the report — never a blank row.
         # Mirrors the rust / python / cli channels.
         if tt == "orbit_determination_transport":
-            n_skipped += 1
             continue
         if tt == "propagation":
             # The daemon line: 18 fixed fields + optional method token. Every
@@ -460,50 +698,58 @@ def main() -> int:
             # untagged legacy row send the bare line.
             line = _prop_daemon_line(r)
             if line is None:
-                n_skipped += 1
                 continue
             method = _method_token(r)
+            _send_reps(proc, reps_override, r)
             proc.stdin.write(f"{line}\n")
             proc.stdin.flush()
             out_line = _read_line(proc)
+            if out_line.startswith("refused"):
+                out_rows.append(acct.declined_row(_refused_row(r, out_line, timestamp, source_version)))
+                continue
             if not out_line or out_line.startswith("fail"):
                 print(
                     f"  {r['object']} dt={r['dt_days']:+.0f}d prop FAIL: {out_line}",
                     file=sys.stderr,
                 )
-                n_skipped += 1
                 continue
             parts = out_line.split()
             # A method row carries the 12 product tokens after the 8 fixed
-            # fields; a token-less (none / legacy) row is the 8-field line.
+            # fields; a token-less (untagged legacy) row is the 8-field line.
             expected = 20 if method is not None else 8
             if len(parts) != expected or parts[0] != "ok":
                 print(f"  unexpected prop output: {out_line!r}", file=sys.stderr)
-                n_skipped += 1
+                continue
+            if not all(math.isfinite(float(v)) for v in parts[1:4]):
+                print(
+                    f"  {r['object']} dt={r['dt_days']:+.0f}d prop: non-finite position "
+                    f"on an ok line, no residual computed: {out_line!r}",
+                    file=sys.stderr,
+                )
                 continue
             out_rows.append(_build_prop_row(r, parts, method, timestamp, source_version))
 
         elif tt == "ephemeris":
-            ic = _ic_line(r)
-            obs = r.get("observer")
-            if ic is None or not obs:
-                n_skipped += 1
-                continue
-            # The optional method token rides after the observer, exactly like
-            # the prop line's 19th token: every method but `none` attaches the
+            # The observer, the EXCL token, then the optional method token,
+            # exactly like the prop line: every method but `none` attaches the
             # synthetic covariance so the entry delivers a joint; `none` / the
-            # untagged row sends the bare line, byte-identical to before.
+            # untagged row sends no method token.
+            eph_line = _eph_daemon_line(r)
+            if eph_line is None:
+                continue
             method = _method_token(r)
-            eph_line = f"eph {ic} {obs}" + (f" {method}" if method else "")
+            _send_reps(proc, reps_override, r)
             proc.stdin.write(f"{eph_line}\n")
             proc.stdin.flush()
             out_line = _read_line(proc)
+            if out_line.startswith("refused"):
+                out_rows.append(acct.declined_row(_refused_row(r, out_line, timestamp, source_version)))
+                continue
             if not out_line or out_line.startswith("fail"):
                 print(
                     f"  {r['object']} dt={r['dt_days']:+.0f}d eph FAIL: {out_line}",
                     file=sys.stderr,
                 )
-                n_skipped += 1
                 continue
             parts = out_line.split()
             # A method row carries the 12 product tokens after the 5 fixed eph
@@ -511,9 +757,15 @@ def main() -> int:
             expected = 18 if method is not None else 6
             if len(parts) != expected or parts[0] != "ok":
                 print(f"  unexpected eph output: {out_line!r}", file=sys.stderr)
-                n_skipped += 1
                 continue
             ra_deg, dec_deg, rho_au, lt_d, ms = map(float, parts[1:6])
+            if not all(math.isfinite(v) for v in (ra_deg, dec_deg, rho_au)):
+                print(
+                    f"  {r['object']} dt={r['dt_days']:+.0f}d eph: non-finite position "
+                    f"on an ok line, no residual computed: {out_line!r}",
+                    file=sys.stderr,
+                )
+                continue
             new = dict(r)
             new["channel"] = "c"
             new["timestamp"] = timestamp
@@ -580,11 +832,9 @@ def main() -> int:
                     file=sys.stderr,
                 )
                 n_missing_fixture += 1
-                n_skipped += 1
                 continue
             tier = _TIER_TO_INT.get(r["force_model"])
             if tier is None:
-                n_skipped += 1
                 continue
             # Pick first excluded NAIF id (currently at most one — the
             # body itself for SB441-N16 self-perturbers); 0 = no exclusion.
@@ -618,11 +868,10 @@ def main() -> int:
                 base = new.get("notes") or ""
                 refused = f"uncertainty method {method_name} refused by the engine"
                 new["notes"] = refused if not base else f"{base}; {refused}"
-                out_rows.append(new)
+                out_rows.append(acct.declined_row(new))
                 continue
             if not out_line or out_line.startswith("fail"):
                 print(f"  {r['object']} OD FAIL: {out_line}", file=sys.stderr)
-                n_skipped += 1
                 continue
             parts = out_line.split()
 
@@ -633,7 +882,6 @@ def main() -> int:
                 # rides the legacy untagged fit, once per object.
                 if parts[0] != "ok" or len(parts) < 9:
                     print(f"  unexpected od output: {out_line!r}", file=sys.stderr)
-                    n_skipped += 1
                     continue
                 x, y, z = map(float, parts[1:4])
                 iters = int(parts[7])
@@ -662,7 +910,6 @@ def main() -> int:
             # ok + state[6] + iters + ms + rms_combined = 10 fields.
             if len(parts) != 10 or parts[0] != "ok":
                 print(f"  unexpected od output: {out_line!r}", file=sys.stderr)
-                n_skipped += 1
                 continue
             x, y, z = map(float, parts[1:4])
             iters = int(parts[7])
@@ -701,13 +948,11 @@ def main() -> int:
                     print(
                         f"  {r['object']} non-grav OD FAIL: {ng_line}", file=sys.stderr
                     )
-                    n_skipped += 1
                 else:
                     ng_parts = ng_line.split()
                     # ok + a[3] + sigma[3] + iters + ms + rms + pos[3] = 13.
                     if len(ng_parts) != 13 or ng_parts[0] != "ok":
                         print(f"  unexpected odng output: {ng_line!r}", file=sys.stderr)
-                        n_skipped += 1
                     else:
                         od_a1 = _float_or_none(ng_parts[1])
                         od_a2 = _float_or_none(ng_parts[2])
@@ -743,7 +988,10 @@ def main() -> int:
                         out_rows.append(ng_row)
 
         else:
-            n_skipped += 1
+            # A test type this channel has no arm for (and the plan's
+            # non_grav_recovery row, which the legacy fit's second pass
+            # writes): no row here; the row account settles it.
+            continue
 
     proc.stdin.close()
     proc.wait(timeout=5)
@@ -761,10 +1009,15 @@ def main() -> int:
         )
         raise
     args.output.write_text(_payload)
-    print(
-        f"Wrote {len(out_rows)} c rows to {args.output} (skipped {n_skipped})",
-        file=sys.stderr,
-    )
+    line, accounted = acct.line(out_rows, "c", args.output)
+    print(line, file=sys.stderr)
+    if not accounted:
+        print(
+            "ERROR: the rows written do not account for the plan rows loaded "
+            "(written + declined + skipped must equal loaded, with no surplus row).",
+            file=sys.stderr,
+        )
+        return 1
     if n_missing_fixture:
         print(
             f"ERROR: {n_missing_fixture} OD row(s) had no PSV fixture under "

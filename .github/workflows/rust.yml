@@ -92,7 +92,7 @@ jobs:
             fixtures/psv-radar
             fixtures/horizons
             fixtures/sbdb
-            fixtures/MANIFEST.json
+            fixtures/snapshot-manifest.json
           key: inputs-${{ steps.inputs-id.outputs.id }}
       - name: Fetch + verify the pinned inputs snapshot
         run: make fixtures
@@ -105,7 +105,7 @@ jobs:
             fixtures/psv-radar
             fixtures/horizons
             fixtures/sbdb
-            fixtures/MANIFEST.json
+            fixtures/snapshot-manifest.json
           key: inputs-${{ steps.inputs-id.outputs.id }}
 
       - name: Unit tests

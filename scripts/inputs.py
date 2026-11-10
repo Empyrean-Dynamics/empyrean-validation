@@ -36,6 +36,10 @@ Verbs (see the contract for the authoritative spec)::
     inputs.py fetch    --pin fixtures/manifest.json --dest fixtures
                        [--prune] [--offline] [--allow-partial]
 
+`fetch` keeps the snapshot's MANIFEST.json beside the data as
+<dest>/snapshot-manifest.json, never as <dest>/MANIFEST.json: the dest holds
+the pin (fixtures/manifest.json), and the two names differ only in case.
+
 Exit codes: 0 ok, 1 content/verification failure, 2 usage. Content failures
 are listed one per line on stderr, each naming the path and the
 expected/actual value. Nothing is ever written partially: a temp file is
@@ -70,11 +74,13 @@ import re
 import shutil
 import subprocess
 import sys
+import threading
 import time
 import urllib.error
 import urllib.parse
 import urllib.request
 from collections.abc import Callable
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -85,10 +91,19 @@ PSV_PRODUCTS = ("psv", "psv-radar")
 # a README.md, a dotfile, or a subdirectory is never extra and never pruned.
 PRODUCT_EXT = {"psv": ".psv", "psv-radar": ".psv", "horizons": ".json", "sbdb": ".json"}
 DEFAULT_BUCKET = "gs://empyrean-validation/inputs"
+# `fetch` materializes the snapshot's MANIFEST.json beside the data under this
+# name. It must not be MANIFEST.json: the fetch dest is fixtures/, which holds
+# the tracked pin fixtures/manifest.json, and on a case-insensitive filesystem
+# (macOS) the two names are one file, so the manifest read returned the pin
+# (no files[]) and the manifest write replaced it.
+LOCAL_MANIFEST = "snapshot-manifest.json"
 # The snapshot bucket is public-read; a gs:// URI maps to this HTTPS origin.
 PUBLIC_ORIGIN = "https://storage.googleapis.com/"
 HTTP_TIMEOUT = 30.0
 HTTP_RETRIES = 5
+# Concurrent downloads in `fetch`: enough to hide round-trip latency on a cold
+# snapshot of a few thousand small files, few enough not to hammer the bucket.
+FETCH_WORKERS = 16
 SCHEMA = 1
 
 # A PSV header line is a `|`-joined line whose fields are all bare column-name
@@ -590,14 +605,19 @@ def _verified(path: Path, entry: dict) -> bool:
 
 def _resolve_manifest(pin: dict, dest: Path, base: str, offline: bool, http_get: HttpGet) -> dict:
     sid = pin["snapshot_id"]
-    local = dest / "MANIFEST.json"
+    local = dest / LOCAL_MANIFEST
     if local.is_file():
         m = load_json(local)
         if m.get("snapshot_id") == sid and m.get("tree_hash") == pin["tree_hash"]:
+            if not isinstance(m.get("files"), list):
+                raise ContentError(
+                    f"{local}: has the pin's snapshot_id and tree_hash but no files[]; "
+                    f"it is a pin, not the snapshot's per-file manifest."
+                )
             return m
     if offline:
         raise ContentError(
-            f"MANIFEST.json for {sid} is absent or does not match the pin, and --offline was given."
+            f"{LOCAL_MANIFEST} for {sid} is absent or does not match the pin, and --offline was given."
         )
     url = f"{public_url(base)}/MANIFEST.json"
     try:
@@ -630,6 +650,7 @@ def fetch(
     offline: bool,
     http_get: HttpGet | None = None,
     allow_partial: bool = False,
+    workers: int = FETCH_WORKERS,
 ) -> int:
     http_get = http_get or http_get_public
     pin = load_json(pin_path)
@@ -649,31 +670,48 @@ def fetch(
 
     errors: list[str] = []
     kept = fetched = pruned = 0
+    todo: list[dict] = []
     for entry in manifest["files"]:
-        p = dest / entry["path"]
-        if _verified(p, entry):
+        if _verified(dest / entry["path"], entry):
             kept += 1
-            continue
-        if offline:
+        elif offline:
             errors.append(f"{entry['path']}: missing or stale and --offline was given")
-            continue
+        else:
+            todo.append(entry)
+
+    def pull(entry: dict) -> str | None:
+        """Download, verify and place one file; return the error, or None on success."""
+        p = dest / entry["path"]
         url = f"{base_url}/{urllib.parse.quote(entry['path'], safe='/')}"
         try:
             data = http_get(url)
         except HttpError as e:
-            errors.append(f"{entry['path']}: download failed — {e}")
-            continue
+            return f"{entry['path']}: download failed — {e}"
         # Verify the bytes before anything touches the tree: on a mismatch no
         # .part and no target are written, so a bad download leaves no trace.
         actual = hashlib.sha256(data).hexdigest()
         if actual != entry["sha256"]:
-            errors.append(f"{entry['path']}: sha256 expected {entry['sha256']} actual {actual}")
-            continue
+            return f"{entry['path']}: sha256 expected {entry['sha256']} actual {actual}"
         p.parent.mkdir(parents=True, exist_ok=True)
-        tmp = p.with_name(p.name + f".part.{os.getpid()}")
+        tmp = p.with_name(p.name + f".part.{os.getpid()}.{threading.get_ident()}")
         tmp.write_bytes(data)
         os.replace(tmp, p)
-        fetched += 1
+        return None
+
+    # The snapshot is a few thousand small files; one at a time the cold fetch is
+    # dominated by round trips. A bounded pool (FETCH_WORKERS by default) pulls
+    # them concurrently, each file still fetched exactly once and verified
+    # against its own hash before it is placed. Results come back in manifest
+    # order, so the error list is deterministic.
+    if workers < 1:
+        raise ContentError(f"--jobs must be at least 1, got {workers}")
+    if todo:
+        with ThreadPoolExecutor(max_workers=min(workers, len(todo))) as pool:
+            for err in pool.map(pull, todo):
+                if err is None:
+                    fetched += 1
+                else:
+                    errors.append(err)
 
     listed = {entry["path"] for entry in manifest["files"]}
     extra_psv: list[str] = []
@@ -714,6 +752,7 @@ def cmd_fetch(args: argparse.Namespace) -> int:
         args.offline,
         http_get_public,
         args.allow_partial,
+        args.jobs,
     )
 
 
@@ -768,6 +807,7 @@ def build_parser() -> argparse.ArgumentParser:
     fe.add_argument("--prune", action="store_true")
     fe.add_argument("--offline", action="store_true")
     fe.add_argument("--allow-partial", action="store_true")
+    fe.add_argument("--jobs", type=int, default=FETCH_WORKERS, help=f"concurrent downloads (default {FETCH_WORKERS})")
     fe.set_defaults(func=cmd_fetch)
 
     return ap

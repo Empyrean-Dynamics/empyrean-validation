@@ -23,7 +23,8 @@
 //! - [`ci-check`](CiCheckArgs) — read the CI summary JSON written by
 //!   `report --summary` and exit non-zero if any channel in
 //!   `--strict-channels` is absent from the summary, failed binding
-//!   fidelity at 1e-10, or fell below a `--min-rows` per-axis floor.
+//!   fidelity at 1e-10, or fell below a `--min-rows` per-axis floor, or
+//!   if any object `--plan` names has no reference-channel row.
 //!
 //! Per-channel runners (the binaries that actually execute
 //! propagation / ephemeris / OD against a specific empyrean
@@ -39,7 +40,8 @@ use empyrean_validation::{
     catalog::{
         RADAR_FIXTURE_OBJECTS, ValidationObject, all_objects, filter_by_name, filter_by_population,
     },
-    inputs::{InputProduct, missing_input},
+    comparators::{self, ComparatorOutcome, read_tool_records},
+    inputs::{InputProduct, cache_file_name, missing_input},
     plan::{PlanConfig, build_plan},
     report::{SUMMARY_TEST_TYPES, generate_report},
     schema::{OrbitComparison, ValidationResult, channels, test_types},
@@ -287,6 +289,12 @@ struct MergeExternalArgs {
     /// reference — making JPL a full OD tool alongside find_orb / layup.
     #[arg(long)]
     jpl_sbdb_cache: Option<PathBuf>,
+    /// A file of `TOOL=REASON` lines, one per comparator whose file never
+    /// arrived (its leg failed and staged nothing). Each is recorded as
+    /// `failed: <reason>` in the comparator sidecar so the report names it,
+    /// exactly like a comparator whose file was present but malformed.
+    #[arg(long = "comparator-absent-file")]
+    comparator_absent_file: Option<PathBuf>,
 }
 
 #[derive(Parser, Debug)]
@@ -375,6 +383,18 @@ struct CiCheckArgs {
     /// [`empyrean_validation::catalog`], so the two cannot drift.
     #[arg(long)]
     catalog_floors: bool,
+    /// The plan the run replayed (`results/validation_plan.json`). Every
+    /// object it names must have at least one reference-channel row in the
+    /// summary (`reference_rows_by_object`, written by `report --summary`);
+    /// objects with none fail the gate by name.
+    ///
+    /// The per-axis NOTE for unreferenced rows stays a note: an axis the
+    /// reference does not run is a known gap. An object with no reference
+    /// rows at all is not: the reference leg that should have replayed it
+    /// delivered nothing, every other channel's rows for it went
+    /// unreferenced, and the strict-channel check passed on the rest.
+    #[arg(long)]
+    plan: Option<PathBuf>,
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -746,103 +766,204 @@ fn arm_plan(args: ArmPlanArgs) -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
+/// Run one comparator's load and merge on its own.
+///
+/// The fold either lands whole or not at all: rows are snapshotted first and
+/// restored when it fails, so a comparator that dies halfway (a bad record, an
+/// engine error in the middle of a multi-pass fold) leaves nothing of itself on
+/// the rows. The failure is named with its reason on stderr and recorded in the
+/// outcome list that becomes the sidecar the report reads; the merge goes on to
+/// the next comparator.
+fn isolated_merge(
+    tool: &str,
+    rows: &mut Vec<ValidationResult>,
+    outcomes: &mut Vec<ComparatorOutcome>,
+    fold: impl FnOnce(&mut Vec<ValidationResult>) -> Result<usize, Box<dyn std::error::Error>>,
+) {
+    let snapshot = rows.clone();
+    match fold(rows) {
+        Ok(n) => outcomes.push(ComparatorOutcome::merged(tool, n)),
+        Err(e) => {
+            *rows = snapshot;
+            let outcome = ComparatorOutcome::failed(tool, e.to_string());
+            eprintln!(
+                "  COMPARATOR FAILED --{tool}: {} -- skipped; the merge, the report and ci-check go on.",
+                outcome.reason.as_deref().unwrap_or_default()
+            );
+            outcomes.push(outcome);
+        }
+    }
+}
+
 fn merge_external(args: MergeExternalArgs) -> Result<(), Box<dyn std::error::Error>> {
     let raw = std::fs::read_to_string(&args.input)
         .map_err(|e| format!("read {}: {e}", args.input.display()))?;
     let mut rows: Vec<ValidationResult> = serde_json::from_str(&raw)?;
+    let mut outcomes: Vec<ComparatorOutcome> = Vec::new();
+
+    // A comparator the caller already knows did not deliver (its leg failed and
+    // staged nothing) is recorded the same way as one whose file is bad, so the
+    // published page names it.
+    let absent_specs = match &args.comparator_absent_file {
+        Some(path) => std::fs::read_to_string(path)
+            .map_err(|e| format!("read {}: {e}", path.display()))?
+            .lines()
+            .filter(|l| !l.trim().is_empty())
+            .map(str::to_string)
+            .collect(),
+        None => Vec::<String>::new(),
+    };
+    for spec in &absent_specs {
+        let (tool, reason) = spec.split_once('=').ok_or_else(|| {
+            format!("--comparator-absent-file expects TOOL=REASON lines, got `{spec}`")
+        })?;
+        eprintln!("  COMPARATOR FAILED --{tool}: {reason} -- skipped.");
+        outcomes.push(ComparatorOutcome::failed(tool, reason));
+    }
 
     if let Some(path) = &args.core_stm {
-        let n = merge_core_stm(&mut rows, path)?;
-        eprintln!("Merged {n} core first-order STM rows (emp_stm)");
+        isolated_merge("core-stm", &mut rows, &mut outcomes, |rows| {
+            let n = merge_core_stm(rows, path)?;
+            eprintln!("Merged {n} core first-order STM rows (emp_stm)");
+            Ok(n)
+        });
     }
     if let Some(path) = &args.core_fd_stm {
-        let n = merge_core_fd_stm(&mut rows, path)?;
-        eprintln!("Merged {n} finite-difference STM reference rows (fd_stm)");
+        isolated_merge("core-fd-stm", &mut rows, &mut outcomes, |rows| {
+            let n = merge_core_fd_stm(rows, path)?;
+            eprintln!("Merged {n} finite-difference STM reference rows (fd_stm)");
+            Ok(n)
+        });
     }
     if let Some(path) = &args.assist {
-        let n = merge_assist(&mut rows, path)?;
-        eprintln!("Merged {n} ASSIST rows");
+        isolated_merge("assist", &mut rows, &mut outcomes, |rows| {
+            let n = merge_assist(rows, path)?;
+            eprintln!("Merged {n} ASSIST rows");
+            Ok(n)
+        });
     }
     if let Some(path) = &args.findorb {
-        let n = merge_findorb(&mut rows, path)?;
-        eprintln!("Merged {n} find_orb rows");
-        let (np, ne) = merge_findorb_ephem(&mut rows, path)?;
-        if np + ne > 0 {
-            eprintln!("Merged {np} find_orb propagation + {ne} ephemeris reference rows");
-        }
+        isolated_merge("findorb", &mut rows, &mut outcomes, |rows| {
+            let n = merge_findorb(rows, path)?;
+            eprintln!("Merged {n} find_orb rows");
+            let (np, ne) = merge_findorb_ephem(rows, path)?;
+            if np + ne > 0 {
+                eprintln!("Merged {np} find_orb propagation + {ne} ephemeris reference rows");
+            }
+            Ok(n)
+        });
     }
     if let Some(path) = &args.findorb_radar {
-        let n = merge_findorb(&mut rows, path)?;
-        eprintln!("Merged {n} find_orb radar rows");
-        // The reference channel now carries orbit_determination_radar rows
-        // (every channel replays the radar arc), so find_orb's radar fits
-        // should fold onto them. Zero folds out of a non-empty input file is
-        // therefore an anomaly, not the by-design outcome it once was — say it
-        // out loud rather than let it hide behind an otherwise-silent success.
-        if n == 0 {
-            eprintln!(
-                "  NOTE: find_orb ran its radar pass but no reference row accepted it. \
-                 The reference channel was expected to carry orbit_determination_radar \
-                 rows for the radar objects; none matched. Check that the radar OD rows \
-                 were replayed into the reference channel. find_orb's radar fits are \
-                 preserved verbatim in {}.",
-                path.display()
-            );
-        }
+        isolated_merge("findorb-radar", &mut rows, &mut outcomes, |rows| {
+            let n = merge_findorb(rows, path)?;
+            eprintln!("Merged {n} find_orb radar rows");
+            // The reference channel now carries orbit_determination_radar rows
+            // (every channel replays the radar arc), so find_orb's radar fits
+            // should fold onto them. Zero folds out of a non-empty input file is
+            // therefore an anomaly, not the by-design outcome it once was -- say
+            // it out loud rather than let it hide behind an otherwise-silent
+            // success.
+            if n == 0 {
+                eprintln!(
+                    "  NOTE: find_orb ran its radar pass but no reference row accepted it. \
+                     The reference channel was expected to carry orbit_determination_radar \
+                     rows for the radar objects; none matched. Check that the radar OD rows \
+                     were replayed into the reference channel. find_orb's radar fits are \
+                     preserved verbatim in {}.",
+                    path.display()
+                );
+            }
+            Ok(n)
+        });
     }
     if let Some(path) = &args.oorb {
-        let n = merge_oorb(&mut rows, path)?;
-        eprintln!("Merged {n} OpenOrb rows");
+        isolated_merge("oorb", &mut rows, &mut outcomes, |rows| {
+            let n = merge_oorb(rows, path)?;
+            eprintln!("Merged {n} OpenOrb rows");
+            Ok(n)
+        });
     }
     if let Some(path) = &args.orbfit {
-        let n = merge_orbfit(&mut rows, path)?;
-        eprintln!("Merged {n} OrbFit rows");
+        isolated_merge("orbfit", &mut rows, &mut outcomes, |rows| {
+            let n = merge_orbfit(rows, path)?;
+            eprintln!("Merged {n} OrbFit rows");
+            Ok(n)
+        });
     }
     if let Some(path) = &args.layup {
-        let n = merge_layup(&mut rows, path)?;
-        eprintln!("Merged {n} layup rows");
+        isolated_merge("layup", &mut rows, &mut outcomes, |rows| {
+            let n = merge_layup(rows, path)?;
+            eprintln!("Merged {n} layup rows");
+            Ok(n)
+        });
     }
     if let Some(path) = &args.kete {
-        let n = merge_tool_times(&mut rows, path, "kete_time_ms", |r, v| r.kete_time_ms = v)?;
-        eprintln!("Merged {n} kete timing rows");
+        isolated_merge("kete", &mut rows, &mut outcomes, |rows| {
+            let n = merge_tool_times(rows, path, "kete_time_ms", |r, v| r.kete_time_ms = v)?;
+            eprintln!("Merged {n} kete timing rows");
+            Ok(n)
+        });
     }
     if let Some(path) = &args.jorbit {
-        let n = merge_tool_times(&mut rows, path, "jorbit_time_ms", |r, v| {
-            r.jorbit_time_ms = v
-        })?;
-        eprintln!("Merged {n} jorbit timing rows");
+        isolated_merge("jorbit", &mut rows, &mut outcomes, |rows| {
+            let n = merge_tool_times(rows, path, "jorbit_time_ms", |r, v| r.jorbit_time_ms = v)?;
+            eprintln!("Merged {n} jorbit timing rows");
+            Ok(n)
+        });
     }
     if let Some(path) = &args.grss {
-        let n = merge_grss(&mut rows, path)?;
-        eprintln!("Merged {n} GRSS rows");
+        isolated_merge("grss", &mut rows, &mut outcomes, |rows| {
+            let n = merge_grss(rows, path)?;
+            eprintln!("Merged {n} GRSS rows");
+            Ok(n)
+        });
     }
     if let Some(path) = &args.grss_radar {
-        let n = merge_grss(&mut rows, path)?;
-        eprintln!("Merged {n} GRSS radar rows");
-        // Same as `--findorb-radar`: the reference channel now carries
-        // orbit_determination_radar rows, so GRSS's radar fits should fold
-        // onto them. Zero folds out of a non-empty input file is an anomaly,
-        // not a by-design outcome — say it out loud.
-        if n == 0 {
-            eprintln!(
-                "  NOTE: GRSS ran its radar pass but no reference row accepted it. \
-                 The reference channel was expected to carry orbit_determination_radar \
-                 rows for the radar objects; none matched. Check that the radar OD rows \
-                 were replayed into the reference channel. GRSS's radar fits — including \
-                 its delay/Doppler residual RMS, an axis no other channel measures — are \
-                 preserved verbatim in {}.",
-                path.display()
-            );
-        }
+        isolated_merge("grss-radar", &mut rows, &mut outcomes, |rows| {
+            let n = merge_grss(rows, path)?;
+            eprintln!("Merged {n} GRSS radar rows");
+            // Same as `--findorb-radar`: the reference channel now carries
+            // orbit_determination_radar rows, so GRSS's radar fits should fold
+            // onto them. Zero folds out of a non-empty input file is an anomaly,
+            // not a by-design outcome -- say it out loud.
+            if n == 0 {
+                eprintln!(
+                    "  NOTE: GRSS ran its radar pass but no reference row accepted it. \
+                     The reference channel was expected to carry orbit_determination_radar \
+                     rows for the radar objects; none matched. Check that the radar OD rows \
+                     were replayed into the reference channel. GRSS's radar fits -- including \
+                     its delay/Doppler residual RMS, an axis no other channel measures -- are \
+                     preserved verbatim in {}.",
+                    path.display()
+                );
+            }
+            Ok(n)
+        });
     }
     if let Some(dir) = &args.jpl_sbdb_cache {
-        let n = merge_jpl(&mut rows, dir)?;
-        eprintln!("Merged {n} JPL SBDB OD-reference rows");
+        isolated_merge("jpl-sbdb", &mut rows, &mut outcomes, |rows| {
+            let n = merge_jpl(rows, dir)?;
+            eprintln!("Merged {n} JPL SBDB OD-reference rows");
+            Ok(n)
+        });
     }
 
     let out_path = args.output.unwrap_or(args.input);
     std::fs::write(&out_path, serde_json::to_string_pretty(&rows)?)?;
+    comparators::write_sidecar(&out_path, &outcomes)?;
     eprintln!("Wrote merged results to {}", out_path.display());
+    let failed: Vec<&ComparatorOutcome> = outcomes.iter().filter(|o| o.is_failed()).collect();
+    if !failed.is_empty() {
+        eprintln!(
+            "{} comparator(s) failed and were skipped: {}",
+            failed.len(),
+            failed
+                .iter()
+                .map(|o| format!("{} ({})", o.tool, o.failure_line().unwrap_or_default()))
+                .collect::<Vec<_>>()
+                .join("; ")
+        );
+    }
     Ok(())
 }
 
@@ -883,8 +1004,7 @@ fn merge_core_stm(
     rows: &mut [ValidationResult],
     path: &std::path::Path,
 ) -> Result<usize, Box<dyn std::error::Error>> {
-    let txt = std::fs::read_to_string(path).map_err(|e| format!("read {}: {e}", path.display()))?;
-    let recs: Vec<serde_json::Value> = serde_json::from_str(&txt)?;
+    let recs = read_tool_records(path)?;
     let mut idx: std::collections::HashMap<(String, i64, Option<String>), &serde_json::Value> =
         Default::default();
     for a in &recs {
@@ -921,8 +1041,7 @@ fn merge_core_fd_stm(
     rows: &mut [ValidationResult],
     path: &std::path::Path,
 ) -> Result<usize, Box<dyn std::error::Error>> {
-    let txt = std::fs::read_to_string(path).map_err(|e| format!("read {}: {e}", path.display()))?;
-    let recs: Vec<serde_json::Value> = serde_json::from_str(&txt)?;
+    let recs = read_tool_records(path)?;
     let mut idx: std::collections::HashMap<(String, i64, Option<String>), &serde_json::Value> =
         Default::default();
     for a in &recs {
@@ -1016,8 +1135,7 @@ fn merge_assist(
     rows: &mut Vec<ValidationResult>,
     path: &std::path::Path,
 ) -> Result<usize, Box<dyn std::error::Error>> {
-    let txt = std::fs::read_to_string(path).map_err(|e| format!("read {}: {e}", path.display()))?;
-    let assist: Vec<serde_json::Value> = serde_json::from_str(&txt)?;
+    let assist = read_tool_records(path)?;
     let au_km = empyrean_validation::compare::AU_KM;
 
     // Snapshot the core empyrean outputs BEFORE any mutation: the propagated
@@ -1167,8 +1285,7 @@ fn merge_findorb(
     rows: &mut [ValidationResult],
     path: &std::path::Path,
 ) -> Result<usize, Box<dyn std::error::Error>> {
-    let txt = std::fs::read_to_string(path).map_err(|e| format!("read {}: {e}", path.display()))?;
-    let fo: Vec<serde_json::Value> = serde_json::from_str(&txt)?;
+    let fo = read_tool_records(path)?;
     // Key on (object, test_type) so the optical find_orb fit attaches to the
     // `orbit_determination` row and the radar-augmented fit (find_orb run over
     // the fixtures/psv-radar/ files, which carry the ADES <radar> table)
@@ -1213,8 +1330,7 @@ fn merge_oorb(
     rows: &mut [ValidationResult],
     path: &std::path::Path,
 ) -> Result<usize, Box<dyn std::error::Error>> {
-    let txt = std::fs::read_to_string(path).map_err(|e| format!("read {}: {e}", path.display()))?;
-    let oo: Vec<serde_json::Value> = serde_json::from_str(&txt)?;
+    let oo = read_tool_records(path)?;
     let mut prop_idx: std::collections::HashMap<(String, i64), &serde_json::Value> =
         Default::default();
     let mut eph_idx: std::collections::HashMap<(String, i64, String), &serde_json::Value> =
@@ -1290,8 +1406,7 @@ fn merge_orbfit(
     rows: &mut [ValidationResult],
     path: &std::path::Path,
 ) -> Result<usize, Box<dyn std::error::Error>> {
-    let txt = std::fs::read_to_string(path).map_err(|e| format!("read {}: {e}", path.display()))?;
-    let of: Vec<serde_json::Value> = serde_json::from_str(&txt)?;
+    let of = read_tool_records(path)?;
     let mut idx: std::collections::HashMap<String, &serde_json::Value> = Default::default();
     for f in &of {
         if let Some(o) = f["object"].as_str() {
@@ -1327,8 +1442,7 @@ fn merge_layup(
     rows: &mut [ValidationResult],
     path: &std::path::Path,
 ) -> Result<usize, Box<dyn std::error::Error>> {
-    let txt = std::fs::read_to_string(path).map_err(|e| format!("read {}: {e}", path.display()))?;
-    let lu: Vec<serde_json::Value> = serde_json::from_str(&txt)?;
+    let lu = read_tool_records(path)?;
     let mut idx: std::collections::HashMap<String, &serde_json::Value> = Default::default();
     for f in &lu {
         if let Some(o) = f["object"].as_str() {
@@ -1374,8 +1488,7 @@ fn merge_grss(
     rows: &mut [ValidationResult],
     path: &std::path::Path,
 ) -> Result<usize, Box<dyn std::error::Error>> {
-    let txt = std::fs::read_to_string(path).map_err(|e| format!("read {}: {e}", path.display()))?;
-    let gr: Vec<serde_json::Value> = serde_json::from_str(&txt)?;
+    let gr = read_tool_records(path)?;
     let mut prop_idx: std::collections::HashMap<(String, i64), &serde_json::Value> =
         Default::default();
     let mut eph_idx: std::collections::HashMap<(String, i64, String), &serde_json::Value> =
@@ -1489,8 +1602,7 @@ fn merge_tool_times(
     field: &str,
     set: impl Fn(&mut ValidationResult, Option<f64>),
 ) -> Result<usize, Box<dyn std::error::Error>> {
-    let txt = std::fs::read_to_string(path).map_err(|e| format!("read {}: {e}", path.display()))?;
-    let ext: Vec<serde_json::Value> = serde_json::from_str(&txt)?;
+    let ext = read_tool_records(path)?;
     let mut idx: std::collections::HashMap<(String, String, i64, String), f64> = Default::default();
     for o in &ext {
         let (Some(name), Some(tt)) = (o["object"].as_str(), o["test_type"].as_str()) else {
@@ -1533,8 +1645,7 @@ fn merge_findorb_ephem(
     rows: &mut [ValidationResult],
     path: &std::path::Path,
 ) -> Result<(usize, usize), Box<dyn std::error::Error>> {
-    let txt = std::fs::read_to_string(path).map_err(|e| format!("read {}: {e}", path.display()))?;
-    let fo: Vec<serde_json::Value> = serde_json::from_str(&txt)?;
+    let fo = read_tool_records(path)?;
     let vec3 = |v: &serde_json::Value| -> Option<[f64; 3]> {
         let a = v.as_array()?;
         if a.len() != 3 {
@@ -1709,8 +1820,9 @@ fn read_sbdb_od_ref(
     sbdb_cache_dir: &std::path::Path,
     sbdb_query: &str,
 ) -> Result<Option<SbdbOdRef>, String> {
-    let fname = format!("{}.json", sbdb_query.replace(' ', "_"));
-    let path = sbdb_cache_dir.join(fname);
+    // The snapshot file is named by the engine's disk-cache rule, never a
+    // reader-local spelling of it (see `cache_file_name`).
+    let path = sbdb_cache_dir.join(cache_file_name(sbdb_query));
     let txt = std::fs::read_to_string(&path).map_err(|e| {
         missing_input(
             sbdb_query,
@@ -1812,7 +1924,18 @@ fn report(args: ReportArgs) -> Result<(), Box<dyn std::error::Error>> {
     // be reported with the names that were actually tried.
     let mut sidecars_tried: Vec<PathBuf> = Vec::new();
     let mut sidecar_found: Option<PathBuf> = None;
+    // The comparators `merge-external` skipped, read from the sidecar it writes
+    // beside its merged output, so the page names every one.
+    let mut comparator_outcomes: Vec<ComparatorOutcome> = Vec::new();
     for path in &args.results {
+        if let Some(found) = comparators::read_sidecar(path)? {
+            for c in &found {
+                if let Some(line) = c.failure_line() {
+                    eprintln!("  COMPARATOR FAILED --{}: {line}", c.tool);
+                }
+            }
+            comparator_outcomes.extend(found);
+        }
         let raw =
             std::fs::read_to_string(path).map_err(|e| format!("read {}: {e}", path.display()))?;
         let rows: Vec<ValidationResult> =
@@ -1957,6 +2080,7 @@ fn report(args: ReportArgs) -> Result<(), Box<dyn std::error::Error>> {
         args.summary.as_deref(),
         predict_agg.as_ref(),
         &predict_runs,
+        &comparator_outcomes,
     )
     .map_err(|e| format!("report: {e}"))?;
     eprintln!("Wrote report to {}", args.output.display());
@@ -2214,8 +2338,21 @@ fn ci_check_failures(
                     let tt = m["test_type"].as_str().unwrap_or("?");
                     let method = m["method"].as_str().unwrap_or("?");
                     let side = m["delivered_side"].as_str().unwrap_or("?");
+                    // The row's offset and observer, as the unjudged and
+                    // missing lines name them: a propagation / ephemeris
+                    // mismatch is one of many rows per object and method.
+                    let at = match m["dt_days"].as_f64() {
+                        Some(dt) => {
+                            let obs = m["observer"]
+                                .as_str()
+                                .map(|o| format!(" / {o}"))
+                                .unwrap_or_default();
+                            format!(" / dt {dt:+.0} d{obs}")
+                        }
+                        None => String::new(),
+                    };
                     failures.push(format!(
-                        "{want}: refusal mismatch — {obj} / {tt} / {method}: \
+                        "{want}: refusal mismatch — {obj} / {tt}{at} / {method}: \
                          {side} delivered, the other refused"
                     ));
                 }
@@ -2240,6 +2377,40 @@ fn ci_check_failures(
                     ));
                 }
             }
+        }
+
+        // Reference rows the channel emitted nothing for. `passing == total`
+        // counts only the pairs the channel's own rows formed, so a skipped
+        // reference row was invisible and a channel could skip any row and
+        // still pass. Every reference row of a test type the channel produces
+        // must have the channel's row; the summary excuses only the test types
+        // the channel does not produce at this pin, and names the rest.
+        match ch["missing_rows"].as_array() {
+            None => failures.push(format!(
+                "{want}: the summary carries no missing_rows; it predates the \
+                 reference row coverage check, so regenerate it with this build of `report`"
+            )),
+            Some(missing) if !missing.is_empty() => {
+                failures.push(format!(
+                    "{want}: {} reference row(s) of a test type {want} produces have no {want} row",
+                    missing.len()
+                ));
+                for m in missing {
+                    let obj = m["object"].as_str().unwrap_or("?");
+                    let tt = m["test_type"].as_str().unwrap_or("?");
+                    let dt = m["dt_days"].as_f64().unwrap_or(f64::NAN);
+                    let obs = m["observer"]
+                        .as_str()
+                        .map(|o| format!(" / {o}"))
+                        .unwrap_or_default();
+                    let method = m["method"].as_str().unwrap_or("?");
+                    failures.push(format!(
+                        "{want}: missing — {obj} / {tt} / dt {dt:+.0} d{obs} / {method}: \
+                         the reference row has no {want} row"
+                    ));
+                }
+            }
+            Some(_) => {}
         }
 
         // Unscoped per-axis floors apply to every strict channel. Scoped
@@ -2276,6 +2447,68 @@ fn ci_check_failures(
         failures.extend(floor_failures(ch, want, f, strict));
     }
     failures
+}
+
+/// The distinct objects a plan names, in plan order.
+///
+/// Only the `object` key is read; serde skips the rest of each row, so the
+/// full plan parses without building its rows.
+fn planned_objects(path: &std::path::Path) -> Result<Vec<String>, String> {
+    #[derive(serde::Deserialize)]
+    struct PlanRow {
+        object: String,
+    }
+    let raw = std::fs::read_to_string(path).map_err(|e| format!("read {}: {e}", path.display()))?;
+    let rows: Vec<PlanRow> =
+        serde_json::from_str(&raw).map_err(|e| format!("parse {}: {e}", path.display()))?;
+    let mut seen = std::collections::HashSet::new();
+    Ok(rows
+        .into_iter()
+        .filter_map(|r| seen.insert(r.object.clone()).then_some(r.object))
+        .collect())
+}
+
+/// Why the summary fails the `--plan` check: planned objects with no
+/// reference-channel row, named in plan order.
+///
+/// Split out from [`ci_check`] for the same reason as [`ci_check_failures`]:
+/// the gate's logic is testable without a process exit.
+fn reference_coverage_failures(summary: &serde_json::Value, planned: &[String]) -> Vec<String> {
+    if planned.is_empty() {
+        return vec![
+            "the plan names no objects; there is nothing to check reference coverage against"
+                .to_string(),
+        ];
+    }
+    let Some(by_object) = summary["reference_rows_by_object"].as_object() else {
+        return vec![
+            "the summary carries no reference_rows_by_object; it predates per-object \
+             reference counts, so regenerate it with this build of `report`"
+                .to_string(),
+        ];
+    };
+    let channel = summary["reference_channel"].as_str().unwrap_or("core");
+    let missing: Vec<&str> = planned
+        .iter()
+        .map(String::as_str)
+        .filter(|o| {
+            by_object
+                .get(*o)
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(0)
+                == 0
+        })
+        .collect();
+    if missing.is_empty() {
+        return Vec::new();
+    }
+    vec![format!(
+        "reference leg missing: {}; {} of {} planned objects have no {channel} rows, \
+         so no other channel's rows for them were compared",
+        missing.join(", "),
+        missing.len(),
+        planned.len()
+    )]
 }
 
 /// Evaluate one row floor against one summary channel entry.
@@ -2378,7 +2611,31 @@ fn ci_check(args: CiCheckArgs) -> Result<(), Box<dyn std::error::Error>> {
     if args.catalog_floors {
         min_rows.extend(catalog_row_floors());
     }
-    let failures = ci_check_failures(channels, &args.strict_channels, &min_rows, &args.summary);
+    let mut failures = ci_check_failures(channels, &args.strict_channels, &min_rows, &args.summary);
+    let planned = match &args.plan {
+        Some(plan) => Some(planned_objects(plan)?),
+        None => None,
+    };
+    if let Some(planned) = &planned {
+        failures.extend(reference_coverage_failures(&summary, planned));
+    }
+
+    // A comparator `merge-external` skipped is never a gate failure (an external
+    // reference that did not deliver does not make the engine wrong), but it is
+    // named here beside the verdict so the gate's green is not read as "every
+    // comparator ran".
+    if let Some(comparators) = summary["comparators"].as_array() {
+        for c in comparators
+            .iter()
+            .filter(|c| c["status"].as_str() == Some("failed"))
+        {
+            eprintln!(
+                "ci-check: NOTE comparator {} failed and is absent from the report: {}",
+                c["tool"].as_str().unwrap_or("?"),
+                c["reason"].as_str().unwrap_or("no reason recorded")
+            );
+        }
+    }
 
     if failures.is_empty() {
         // One pass line per strict channel, carrying the refused-identically
@@ -2418,12 +2675,40 @@ fn ci_check(args: CiCheckArgs) -> Result<(), Box<dyn std::error::Error>> {
                         per_axis.join(", ")
                     );
                 }
+                eprintln!(
+                    "ci-check: {want}: every reference row of a test type {want} produces \
+                     has a {want} row"
+                );
+                // Reference rows of a test type the channel does not produce at
+                // this pin are excused, not compared; say so, per type.
+                let not_produced: Vec<String> = ch["not_produced_by_test_type"]
+                    .as_object()
+                    .map(|m| {
+                        m.iter()
+                            .filter_map(|(tt, n)| n.as_u64().map(|n| format!("{tt}: {n}")))
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                if !not_produced.is_empty() {
+                    eprintln!(
+                        "ci-check: {want}: NOTE reference row(s) of a test type {want} does not \
+                         produce at this pin were not required [{}]",
+                        not_produced.join(", ")
+                    );
+                }
             }
         }
         eprintln!(
             "ci-check: all strict channels [{}] passed binding fidelity at 1e-10",
             args.strict_channels.join(", ")
         );
+        if let (Some(planned), Some(plan)) = (&planned, &args.plan) {
+            eprintln!(
+                "ci-check: every object in {} ({}) has reference rows",
+                plan.display(),
+                planned.len()
+            );
+        }
         if min_rows.is_empty() {
             eprintln!(
                 "ci-check: no per-axis row floors were requested \
@@ -2525,6 +2810,8 @@ mod tests {
             "n_rows": total,
             "n_passing": total,
             "n_total_compared": total,
+            "missing_rows": [],
+            "not_produced_by_test_type": {},
             "by_test_type": by_test_type,
         })
     }
@@ -2585,6 +2872,137 @@ mod tests {
                 "unjudged — Apophis / orbit_determination_radar / dt +0 d / —: \
                  the reference row carries neither a comparable metric nor a delivery signal"
             ),
+            "{failures:?}"
+        );
+    }
+
+    /// A reference row a strict channel emitted nothing for fails the gate by
+    /// name, after a count line, even though every pair the channel did form
+    /// passed (the shape that read "python: 1238/1238 rows passed").
+    #[test]
+    fn ci_check_names_every_missing_reference_row() {
+        let mut ch = summary_channel("python", &[("ephemeris", 10)]);
+        ch["missing_rows"] = serde_json::json!([{
+            "object": "Vesta",
+            "test_type": "ephemeris",
+            "dt_days": -5475.0,
+            "observer": "W84",
+            "method": "second order",
+        }]);
+        let failures = check(&[ch.clone()], &["python"], &[]);
+        assert_eq!(failures.len(), 2, "{failures:?}");
+        assert_eq!(
+            failures[0],
+            "python: 1 reference row(s) of a test type python produces have no python row"
+        );
+        assert_eq!(
+            failures[1],
+            "python: missing — Vesta / ephemeris / dt -5475 d / W84 / second order: \
+             the reference row has no python row"
+        );
+        // Only strict channels are held to it.
+        assert!(check(&[ch], &[], &[]).is_empty());
+    }
+
+    /// A refusal mismatch on an ephemeris row names the row's offset and
+    /// observer, as the unjudged and missing lines do.
+    #[test]
+    fn ci_check_names_the_row_of_a_refusal_mismatch() {
+        let mut ch = summary_channel("python", &[("ephemeris", 1)]);
+        ch["n_passing"] = serde_json::json!(0);
+        ch["refusal_mismatches"] = serde_json::json!([{
+            "object": "Vesta",
+            "test_type": "ephemeris",
+            "dt_days": 365.0,
+            "observer": "F51",
+            "method": "sigma-point",
+            "delivered_side": "reference",
+        }]);
+        let failures = check(&[ch], &["python"], &[]);
+        assert_eq!(failures.len(), 2, "{failures:?}");
+        assert_eq!(
+            failures[1],
+            "python: refusal mismatch — Vesta / ephemeris / dt +365 d / F51 / sigma-point: \
+             reference delivered, the other refused"
+        );
+    }
+
+    /// A summary written before the coverage check existed carries no
+    /// missing_rows; it must not pass by having nothing to read.
+    #[test]
+    fn ci_check_refuses_a_summary_without_missing_rows() {
+        let mut ch = summary_channel("python", &[("ephemeris", 10)]);
+        ch.as_object_mut().unwrap().remove("missing_rows");
+        let failures = check(&[ch], &["python"], &[]);
+        assert_eq!(failures.len(), 1, "{failures:?}");
+        assert!(
+            failures[0].contains("carries no missing_rows"),
+            "{failures:?}"
+        );
+    }
+
+    /// End to end through the renderer: a strict channel that skipped a
+    /// reference row it produces fails naming it; the transport rows the
+    /// channel does not produce at this pin do not fail it.
+    #[test]
+    fn report_summary_feeds_the_missing_row_gate() {
+        let dir = tempfile::tempdir().unwrap();
+        let row = |channel: &str, test_type: &str, dt: f64| {
+            let mut r = ValidationResult::empty();
+            r.channel = channel.into();
+            r.object = "Bennu".into();
+            r.test_type = test_type.into();
+            r.dt_days = dt;
+            // An identical position on both sides: a pair that passes.
+            r.emp_pos_au = Some([1.0, 0.0, 0.0]);
+            r
+        };
+        let run = |python: &[ValidationResult]| {
+            let results = vec![
+                // The renderer requires the rust reference file; rust is not
+                // strict here.
+                write_results(
+                    dir.path(),
+                    "validation_rust.json",
+                    &[row("rust", "propagation", 30.0)],
+                ),
+                write_results(
+                    dir.path(),
+                    "validation_core.json",
+                    &[
+                        row("core", "propagation", 30.0),
+                        row("core", "propagation", 90.0),
+                        row("core", test_types::ORBIT_DETERMINATION_TRANSPORT, 0.0),
+                    ],
+                ),
+                write_results(dir.path(), "validation_python.json", python),
+            ];
+            let summary_path = dir.path().join("validation_summary.json");
+            report(ReportArgs {
+                results,
+                output: dir.path().join("report.html"),
+                summary: Some(summary_path.clone()),
+                predict_agg: vec![],
+                predict_run: vec![],
+            })
+            .expect("report");
+            let summary: serde_json::Value =
+                serde_json::from_str(&std::fs::read_to_string(&summary_path).unwrap()).unwrap();
+            let channels = summary["channels"].as_array().unwrap().clone();
+            check(&channels, &["python", "core"], &[])
+        };
+        // Every propagation row present; the transport row is not produced.
+        let full = [
+            row("python", "propagation", 30.0),
+            row("python", "propagation", 90.0),
+        ];
+        let failures = run(&full);
+        assert!(failures.is_empty(), "{failures:?}");
+        // One propagation row skipped: named.
+        let failures = run(&full[..1]);
+        assert_eq!(failures.len(), 2, "{failures:?}");
+        assert!(
+            failures[1].starts_with("python: missing — Bennu / propagation / dt +90 d / —:"),
             "{failures:?}"
         );
     }
@@ -2893,6 +3311,132 @@ mod tests {
             failures[0].contains("rust:orbit_determination_radar>=5"),
             "names the floor that could not be evaluated: {failures:?}"
         );
+    }
+
+    // ── ci-check --plan: reference rows per planned object ───────────
+
+    fn summary_with_reference(counts: &[(&str, u64)]) -> serde_json::Value {
+        let by_object: serde_json::Map<String, serde_json::Value> = counts
+            .iter()
+            .map(|(o, n)| ((*o).to_string(), serde_json::json!(n)))
+            .collect();
+        serde_json::json!({
+            "channels": [],
+            "reference_channel": "core",
+            "reference_rows_by_object": by_object,
+        })
+    }
+
+    #[test]
+    fn reference_coverage_passes_when_every_planned_object_has_reference_rows() {
+        let summary = summary_with_reference(&[("Bennu", 730), ("Eris", 625), ("Vesta", 625)]);
+        let failures = reference_coverage_failures(&summary, &strict(&["Bennu", "Eris"]));
+        assert!(failures.is_empty(), "{failures:?}");
+    }
+
+    #[test]
+    fn reference_coverage_fails_naming_every_planned_object_without_reference_rows() {
+        // A zero count and an absent key are the same failure: the reference
+        // delivered nothing for the object.
+        let summary = summary_with_reference(&[("Bennu", 730), ("Eris", 0)]);
+        let failures =
+            reference_coverage_failures(&summary, &strict(&["Bennu", "Eris", "2024 PT5"]));
+        assert_eq!(failures.len(), 1, "{failures:?}");
+        assert!(
+            failures[0].starts_with("reference leg missing: Eris, 2024 PT5;"),
+            "{failures:?}"
+        );
+        assert!(
+            failures[0].contains("2 of 3 planned objects have no core rows"),
+            "{failures:?}"
+        );
+    }
+
+    #[test]
+    fn reference_coverage_refuses_a_stale_summary_and_an_empty_plan() {
+        // A summary written before the per-object counts existed must not
+        // pass the check by having nothing to read.
+        let stale = serde_json::json!({ "channels": [] });
+        let failures = reference_coverage_failures(&stale, &strict(&["Bennu"]));
+        assert_eq!(failures.len(), 1, "{failures:?}");
+        assert!(
+            failures[0].contains("no reference_rows_by_object"),
+            "{failures:?}"
+        );
+        let summary = summary_with_reference(&[("Bennu", 730)]);
+        let failures = reference_coverage_failures(&summary, &[]);
+        assert_eq!(failures.len(), 1, "{failures:?}");
+        assert!(failures[0].contains("names no objects"), "{failures:?}");
+    }
+
+    #[test]
+    fn planned_objects_are_distinct_and_in_plan_order() {
+        let dir = tempfile::tempdir().unwrap();
+        let plan = dir.path().join("validation_plan.json");
+        std::fs::write(
+            &plan,
+            r#"[{"object":"Eris","test_type":"propagation","dt_days":1.0},
+                {"object":"1I/'Oumuamua","test_type":"ephemeris","observer":"500"},
+                {"object":"Eris","test_type":"orbit_determination"}]"#,
+        )
+        .unwrap();
+        assert_eq!(
+            planned_objects(&plan).unwrap(),
+            strict(&["Eris", "1I/'Oumuamua"])
+        );
+        let err = planned_objects(&dir.path().join("absent.json")).unwrap_err();
+        assert!(err.contains("absent.json"), "{err}");
+    }
+
+    /// End to end through the renderer: the summary `report` writes carries
+    /// the per-object reference counts, and the gate fails naming the object
+    /// whose reference rows never arrived while the replay channel's rows for
+    /// it sat unreferenced.
+    #[test]
+    fn report_summary_feeds_the_reference_coverage_gate() {
+        let dir = tempfile::tempdir().unwrap();
+        let row = |channel: &str, object: &str| {
+            let mut r = ValidationResult::empty();
+            r.channel = channel.into();
+            r.object = object.into();
+            r.test_type = "propagation".into();
+            r
+        };
+        let results = vec![
+            write_results(
+                dir.path(),
+                "validation_rust.json",
+                &[row("rust", "Bennu"), row("rust", "Eris")],
+            ),
+            write_results(
+                dir.path(),
+                "validation_python.json",
+                &[row("python", "Bennu"), row("python", "Eris")],
+            ),
+            write_results(dir.path(), "validation_core.json", &[row("core", "Bennu")]),
+        ];
+        let summary_path = dir.path().join("validation_summary.json");
+        report(ReportArgs {
+            results,
+            output: dir.path().join("report.html"),
+            summary: Some(summary_path.clone()),
+            predict_agg: vec![],
+            predict_run: vec![],
+        })
+        .expect("report");
+        let summary: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&summary_path).unwrap()).unwrap();
+        assert_eq!(
+            summary["reference_rows_by_object"],
+            serde_json::json!({ "Bennu": 1 })
+        );
+        let failures = reference_coverage_failures(&summary, &strict(&["Bennu", "Eris"]));
+        assert_eq!(failures.len(), 1, "{failures:?}");
+        assert!(
+            failures[0].starts_with("reference leg missing: Eris;"),
+            "{failures:?}"
+        );
+        assert!(reference_coverage_failures(&summary, &strict(&["Bennu"])).is_empty());
     }
 
     // ── orbit-comparison sidecar ─────────────────────────────────────
@@ -3281,11 +3825,35 @@ mod tests {
 
     /// Write a mock SBDB cache file under `dir/{query}.json` for `merge_jpl`.
     fn write_sbdb(dir: &std::path::Path, query: &str, orbit_json: &str) {
+        write_sbdb_file(dir, &cache_file_name(query), orbit_json);
+    }
+
+    /// Write an SBDB snapshot file under a literal file name, so a test pins
+    /// the name the snapshot uses instead of re-deriving it.
+    fn write_sbdb_file(dir: &std::path::Path, file_name: &str, orbit_json: &str) {
         std::fs::write(
-            dir.join(format!("{}.json", query.replace(' ', "_"))),
+            dir.join(file_name),
             format!(r#"{{"response":{{"orbit":{orbit_json}}}}}"#),
         )
         .unwrap();
+    }
+
+    #[test]
+    fn merge_jpl_resolves_a_comet_query_to_the_snapshot_file_name() {
+        // The snapshot holds C/2023 A3's SBDB response as C_2023_A3.json (the
+        // engine's disk-cache name). Replacing only spaces looked for
+        // C/2023_A3.json and failed the full-catalog merge on a file the
+        // snapshot carries.
+        let dir = tempfile::tempdir().unwrap();
+        write_sbdb_file(
+            dir.path(),
+            "C_2023_A3.json",
+            r#"{"rms":".5","n_obs_used":402}"#,
+        );
+        let mut rows = vec![od_row("C/2023 A3")];
+        let n = merge_jpl(&mut rows, dir.path()).unwrap();
+        assert_eq!(n, 1);
+        assert_eq!(rows[0].ref_od_n_obs_used, Some(402));
     }
 
     #[test]
@@ -3444,5 +4012,253 @@ mod tests {
         // an empty filter that quietly resolved to an empty set would fan out
         // zero legs and produce an empty-but-green run.
         assert_eq!(select_objects(&[], &[]).unwrap().len(), all_objects().len());
+    }
+
+    // ── per-comparator isolation (merge-external) ──────────────────────────
+
+    /// Every merge flag that takes a per-row JSON file, with a well-formed file
+    /// for it. A malformed or empty file on any ONE of them must fail that
+    /// comparator only.
+    const FILE_COMPARATOR_FLAGS: [&str; 12] = [
+        "core-stm",
+        "core-fd-stm",
+        "assist",
+        "findorb",
+        "findorb-radar",
+        "oorb",
+        "orbfit",
+        "layup",
+        "kete",
+        "jorbit",
+        "grss",
+        "grss-radar",
+    ];
+
+    fn merge_args(dir: &std::path::Path, flags: &[(&str, &std::path::Path)]) -> MergeExternalArgs {
+        let base = write_results(dir, "base.json", &[od_row("Eros")]);
+        let mut argv: Vec<String> = vec![
+            "merge-external".into(),
+            "-i".into(),
+            base.display().to_string(),
+            "-o".into(),
+            dir.join("merged.json").display().to_string(),
+        ];
+        for (flag, path) in flags {
+            argv.push(format!("--{flag}"));
+            argv.push(path.display().to_string());
+        }
+        MergeExternalArgs::parse_from(argv)
+    }
+
+    fn good_layup(dir: &std::path::Path) -> PathBuf {
+        let p = dir.join("good-layup.json");
+        std::fs::write(
+            &p,
+            r#"[{"object":"Eros","test_type":"orbit_determination","layup_chi2":10.5}]"#,
+        )
+        .unwrap();
+        p
+    }
+
+    fn outcome<'a>(outcomes: &'a [ComparatorOutcome], tool: &str) -> &'a ComparatorOutcome {
+        outcomes
+            .iter()
+            .find(|o| o.tool == tool)
+            .unwrap_or_else(|| panic!("no outcome for {tool}: {outcomes:?}"))
+    }
+
+    #[test]
+    fn a_bad_file_fails_only_its_own_comparator_for_every_comparator_class() {
+        // One malformed and one empty file per comparator flag, each alongside a
+        // good layup file: the merge must still succeed, still fold layup, name
+        // the bad tool with its parse error, and leave every other row alone.
+        for flag in FILE_COMPARATOR_FLAGS {
+            for (kind, body, reason_has) in [
+                ("malformed", r#"[{"object":"Eros","test_ty"#, "parse"),
+                ("empty", "", "file is empty"),
+            ] {
+                let dir = tempfile::tempdir().unwrap();
+                let bad = dir.path().join(format!("{flag}.json"));
+                std::fs::write(&bad, body).unwrap();
+                let layup = good_layup(dir.path());
+                let kete = dir.path().join("good-kete.json");
+                std::fs::write(
+                    &kete,
+                    r#"[{"object":"Eros","test_type":"orbit_determination","kete_time_ms":3.0}]"#,
+                )
+                .unwrap();
+                // The layup comparator itself is the bad one in one case; a good
+                // kete file then proves the rest of the merge went on.
+                let (flags, good_name): (Vec<(&str, &std::path::Path)>, &str) = if flag == "layup" {
+                    (
+                        vec![("layup", bad.as_path()), ("kete", kete.as_path())],
+                        "kete",
+                    )
+                } else {
+                    (
+                        vec![("layup", layup.as_path()), (flag, bad.as_path())],
+                        "layup",
+                    )
+                };
+                let bad_path = bad.clone();
+                let args = merge_args(dir.path(), &flags);
+                merge_external(args).unwrap_or_else(|e| {
+                    panic!("--{flag} {kind} file aborted the whole merge: {e}")
+                });
+
+                let outcomes = comparators::read_sidecar(&dir.path().join("merged.json"))
+                    .unwrap()
+                    .expect("sidecar written");
+                let o = outcome(&outcomes, flag);
+                assert!(o.is_failed(), "--{flag} {kind}: {o:?}");
+                let reason = o.reason.as_deref().unwrap();
+                assert!(reason.contains(reason_has), "--{flag} {kind}: {reason}");
+                assert!(
+                    reason.contains(&bad_path.display().to_string()),
+                    "the reason must name the file: {reason}"
+                );
+                assert!(!outcome(&outcomes, good_name).is_failed());
+
+                let merged: Vec<ValidationResult> = serde_json::from_str(
+                    &std::fs::read_to_string(dir.path().join("merged.json")).unwrap(),
+                )
+                .unwrap();
+                if good_name == "layup" {
+                    assert_eq!(merged[0].layup_chi2, Some(10.5), "--{flag}");
+                } else {
+                    assert_eq!(merged[0].kete_time_ms, Some(3.0), "--{flag}");
+                    assert_eq!(merged[0].layup_chi2, None, "failed layup left no trace");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_failed_comparator_that_changed_rows_first_leaves_nothing_behind() {
+        let mut rows = vec![od_row("Eros")];
+        let before = rows.clone();
+        let mut outcomes = Vec::new();
+        isolated_merge("layup", &mut rows, &mut outcomes, |rows| {
+            rows[0].layup_chi2 = Some(1.0);
+            rows.push(od_row("Bennu"));
+            Err("died halfway".into())
+        });
+        assert_eq!(rows, before, "the half-applied fold must be undone");
+        assert_eq!(outcomes.len(), 1);
+        assert!(outcomes[0].is_failed());
+        assert_eq!(outcomes[0].failure_line().unwrap(), "failed: died halfway");
+    }
+
+    #[test]
+    fn an_absent_comparator_is_recorded_and_named() {
+        let dir = tempfile::tempdir().unwrap();
+        let absent = dir.path().join("absent.txt");
+        std::fs::write(&absent, "orbfit=leg did not deliver\n\n").unwrap();
+        let mut args = merge_args(dir.path(), &[]);
+        args.comparator_absent_file = Some(absent);
+        merge_external(args).unwrap();
+        let outcomes = comparators::read_sidecar(&dir.path().join("merged.json"))
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            outcome(&outcomes, "orbfit").failure_line().unwrap(),
+            "failed: leg did not deliver"
+        );
+        std::fs::write(dir.path().join("bad.txt"), "no-equals-sign\n").unwrap();
+        let mut bad = merge_args(dir.path(), &[]);
+        bad.comparator_absent_file = Some(dir.path().join("bad.txt"));
+        assert!(
+            merge_external(bad).is_err(),
+            "a malformed spec is a usage error"
+        );
+    }
+
+    #[test]
+    fn a_clean_merge_writes_an_all_merged_sidecar_replacing_a_stale_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let merged = dir.path().join("merged.json");
+        comparators::write_sidecar(&merged, &[ComparatorOutcome::failed("kete", "stale")]).unwrap();
+        let layup = good_layup(dir.path());
+        merge_external(merge_args(dir.path(), &[("layup", layup.as_path())])).unwrap();
+        let outcomes = comparators::read_sidecar(&merged).unwrap().unwrap();
+        assert_eq!(outcomes, vec![ComparatorOutcome::merged("layup", 1)]);
+    }
+
+    #[test]
+    fn a_missing_sbdb_snapshot_fails_only_the_jpl_comparator() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut args = merge_args(dir.path(), &[]);
+        args.jpl_sbdb_cache = Some(dir.path().join("no-such-sbdb"));
+        merge_external(args).unwrap();
+        let outcomes = comparators::read_sidecar(&dir.path().join("merged.json"))
+            .unwrap()
+            .unwrap();
+        assert!(outcome(&outcomes, "jpl-sbdb").is_failed());
+    }
+
+    #[test]
+    fn the_report_names_a_failed_comparator_on_the_page_and_in_the_summary() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut prop = ValidationResult::empty();
+        prop.object = "Eros".into();
+        prop.channel = "rust".into();
+        prop.test_type = "propagation".into();
+        let results = write_results(dir.path(), "validation_core_merged.json", &[prop]);
+        comparators::write_sidecar(
+            &results,
+            &[
+                ComparatorOutcome::merged("assist", 4),
+                ComparatorOutcome::failed("kete", "parse /x/kete.json: EOF while parsing"),
+            ],
+        )
+        .unwrap();
+        let out = dir.path().join("report.html");
+        let summary = dir.path().join("summary.json");
+        report(ReportArgs {
+            results: vec![results],
+            output: out.clone(),
+            summary: Some(summary.clone()),
+            predict_agg: vec![],
+            predict_run: vec![],
+        })
+        .unwrap();
+        let html = std::fs::read_to_string(&out).unwrap();
+        let cfg = &html[html.find("id=\"s05c\"").expect("Configurations section")..];
+        assert!(
+            cfg.contains("<code>kete</code>: failed: parse /x/kete.json: EOF while parsing"),
+            "the failed comparator must read on the page"
+        );
+        assert!(
+            !cfg.contains("<code>assist</code>"),
+            "a merged comparator is not a failure line"
+        );
+        let sum: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&summary).unwrap()).unwrap();
+        let listed = sum["comparators"].as_array().unwrap();
+        assert_eq!(listed.len(), 2);
+        assert_eq!(listed[1]["status"], "failed");
+        assert_eq!(listed[1]["reason"], "parse /x/kete.json: EOF while parsing");
+    }
+
+    #[test]
+    fn the_report_without_a_sidecar_carries_an_empty_comparator_list() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut prop = ValidationResult::empty();
+        prop.object = "Eros".into();
+        prop.channel = "rust".into();
+        prop.test_type = "propagation".into();
+        let results = write_results(dir.path(), "validation_rust.json", &[prop]);
+        let summary = dir.path().join("summary.json");
+        report(ReportArgs {
+            results: vec![results],
+            output: dir.path().join("r.html"),
+            summary: Some(summary.clone()),
+            predict_agg: vec![],
+            predict_run: vec![],
+        })
+        .unwrap();
+        let sum: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&summary).unwrap()).unwrap();
+        assert_eq!(sum["comparators"].as_array().unwrap().len(), 0);
     }
 }

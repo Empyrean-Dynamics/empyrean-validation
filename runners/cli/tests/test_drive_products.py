@@ -29,8 +29,11 @@ report; here the assertions are the green side.
 
 from __future__ import annotations
 
+import json
+import math
 import os
 import subprocess
+import sys
 from pathlib import Path
 
 import drive
@@ -176,8 +179,8 @@ def test_legacy_prop_row_keeps_per_method_null_and_resets_leak() -> None:
     exactly as before, and an inherited foreign product is cleared (no leak).
     Mutation: default a per-method field to 0 instead of null, or set-to-null
     (adding a key) instead of delete → red here or in the byte diff."""
-    r = _prop_row("none_detection_on", leak=True)
-    assert drive._method_token(r) is None  # the none method sends no token
+    r = _prop_row(None, leak=True)
+    assert drive._method_token(r) is None  # only the untagged legacy row sends no token
     parts = _LEGACY_LINE.split()
     assert len(parts) == 8
     row = drive._build_prop_row(r, parts, None, "TS", "VER")
@@ -225,13 +228,13 @@ def test_second_order_prop_row_populates_products() -> None:
 
 
 def test_method_token_sent_for_non_f64_absent_for_f64() -> None:
-    """The daemon line carries the 19th method token for every non-f64 method
+    """The daemon line carries the trailing method token (after EXCL) for every non-f64 method
     and omits it for f64 / the untagged row. Mutation: a ``_method_token`` that
     always returned None → the SecondOrder line loses its tag → red (and the
     SecondOrder binary response would report linear end-to-end)."""
     so_line = drive._prop_daemon_line(_prop_row("second_order_detection_on"))
     assert so_line.endswith(" second_order_detection_on")
-    assert len(so_line.split()) == 20  # "prop" + 18 fields + method token
+    assert len(so_line.split()) == 21  # "prop" + 18 fields + EXCL + method token
 
     for tag in (
         "first_order_detection_on",
@@ -242,12 +245,15 @@ def test_method_token_sent_for_non_f64_absent_for_f64() -> None:
     ):
         line = drive._prop_daemon_line(_prop_row(tag))
         assert line.endswith(f" {tag}"), tag
-        assert len(line.split()) == 20, tag
+        assert len(line.split()) == 21, tag
 
     f64_line = drive._prop_daemon_line(_prop_row("none_detection_on"))
-    # The covariance-free none tag is never appended as a token.
-    assert not f64_line.endswith(" none_detection_on")
-    assert len(f64_line.split()) == 19  # "prop" + 18 fields, no method token
+    # The none tag is sent too, so the binary reports the row's per-orbit
+    # outcome (the rust reference's rule); only the untagged row sends none.
+    assert f64_line.endswith(" none_detection_on")
+    assert len(f64_line.split()) == 21  # "prop" + 18 fields + EXCL + method token
+    untagged = drive._prop_daemon_line(_prop_row(None))
+    assert len(untagged.split()) == 20  # "prop" + 18 fields + EXCL, no method token
 
 
 # ── End-to-end through the built binary (offline; skipped if unavailable) ─────
@@ -444,6 +450,27 @@ def test_end_to_end_ephemeris_file_written_and_read(tmp_path) -> None:
     _binary() is None or not _DATA_DIR.exists(),
     reason="cli binary or data dir unavailable",
 )
+def test_end_to_end_none_row_reports_its_outcome_without_a_covariance() -> None:
+    """A `none` prop row through the binary reports its per-orbit outcome —
+    ``orbit_delivered`` true, ``orbit_status`` ``delivered``, read off the
+    engine like every other method (the rust reference's rule) — and no
+    covariance. Mutation: stop sending the none tag → the bare 8-field line →
+    no outcome → red."""
+    r = _prop_row("none_detection_on")
+    out_line = _daemon_once(_binary(), drive._prop_daemon_line(r))
+    parts = out_line.split()
+    assert parts[0] == "ok" and len(parts) == 20, out_line
+    row = drive._build_prop_row(r, parts, drive._method_token(r), "TS", "VER")
+    assert row["orbit_delivered"] is True
+    assert row["orbit_status"] == "delivered"
+    for f in ("resolved_method", "cov_kind", "cov_joint_width", "cov_tri"):
+        assert row[f] is None, f
+
+
+@pytest.mark.skipif(
+    _binary() is None or not _DATA_DIR.exists(),
+    reason="cli binary or data dir unavailable",
+)
 def test_end_to_end_ephemeris_line_second_order_products() -> None:
     """From-engine: a second_order ephemeris LINE through the built binary
     carries the delivered sky joint read off the entry's own ``joint`` —
@@ -455,8 +482,7 @@ def test_end_to_end_ephemeris_line_second_order_products() -> None:
     the method token on the eph line → the binary returns the 6-field
     covariance-free line → the len==18 / cov_kind assertions go red."""
     eph_row = _eph_row("second_order_detection_on")
-    ic = drive._ic_line(eph_row)
-    line = f"eph {ic} {eph_row['observer']} second_order_detection_on"
+    line = drive._eph_daemon_line(eph_row)
     out_line = _daemon_once(_binary(), line)
     parts = out_line.split()
     assert parts[0] == "ok", out_line
@@ -472,6 +498,202 @@ def test_end_to_end_ephemeris_line_second_order_products() -> None:
     assert prod["mix_weight_delivered"] is None
     assert prod["mix_n_failed"] is None
     assert prod["mix_n_sky_linearization_refused"] is None
+
+
+# ── Perturber exclusions and declined orbits ─────────────────────────────────
+
+_PLAN = _REPO / "results" / "validation_plan.json"
+
+
+def _vesta_eph_row(tag: str) -> dict | None:
+    """Vesta's F51 dt=+365 ephemeris plan row under ``tag`` (a self-perturber
+    row: ``excluded_perturbers_naif`` names Vesta itself), read off the staged
+    plan; ``None`` when no plan is staged."""
+    if not _PLAN.exists():
+        return None
+    for r in json.loads(_PLAN.read_text()):
+        if (
+            r.get("object") == "Vesta"
+            and r.get("test_type") == "ephemeris"
+            and r.get("observer") == "F51"
+            and r.get("dt_days") == 365.0
+            and r.get("propagation_uncertainty") == tag
+        ):
+            return r
+    return None
+
+
+def test_excl_token_rides_every_prop_and_eph_line() -> None:
+    """The row's ``excluded_perturbers_naif`` is the EXCL token on both lines,
+    ahead of the method token (``-`` for none, else the NAIF ids
+    comma-separated). Dropping it is what sent the self-perturber rows a
+    different request than the reference's."""
+    prop = _prop_row("second_order_detection_on")
+    prop["excluded_perturbers_naif"] = [2000004]
+    toks = drive._prop_daemon_line(prop).split()
+    assert len(toks) == 21 and toks[19] == "2000004", toks
+    assert toks[20] == "second_order_detection_on"
+    assert drive._prop_daemon_line(_prop_row(None)).split()[19:] == ["-"]
+    eph = _eph_row("sigma_point_detection_on")
+    eph["excluded_perturbers_naif"] = [2000004, 2000002]
+    toks = drive._eph_daemon_line(eph).split()
+    assert toks[19:] == ["500", "2000004,2000002", "sigma_point_detection_on"], toks
+    assert drive._eph_daemon_line(_eph_row("none_detection_on")).split()[19:] == [
+        "500",
+        "-",
+        "none_detection_on",
+    ]
+
+
+def test_refused_line_becomes_a_declined_row_never_a_skip() -> None:
+    """A ``refused failed:<variant> <engine text>`` line becomes one row:
+    ``orbit_delivered`` false, the ``failed:<variant>`` status, the engine's
+    text in ``notes``, and no measured field (no residual from a position that
+    was never delivered)."""
+    r = _eph_row("sigma_point_detection_on")
+    r["d_ra_arcsec"] = 9.9  # an inherited value the refused row must not keep
+    line = (
+        "refused failed:other orbit orbit_0: sampled sky delivery refused — the "
+        "state coincides with Asteroid 4 (Vesta)'s own ephemeris"
+    )
+    row = drive._refused_row(r, line, "TS", "VER")
+    assert row["channel"] == "cli"
+    assert row["orbit_delivered"] is False
+    assert row["orbit_status"] == "failed:other"
+    assert "sampled sky delivery refused" in row["notes"]
+    for f in drive._MEASURED_FIELDS:
+        assert row[f] is None, f
+    with pytest.raises(ValueError):
+        drive._refused_row(r, "refused something else", "TS", "VER")
+
+
+# A stand-in runner for the driver's own handling, offline: it signals `ready`,
+# then answers each line by its observer code — `NAN` gets an `ok` line of NaN
+# (what the runner printed for a zero-entry ephemeris before it read outcomes),
+# `REF` gets a `refused failed:other …` line.
+_STUB_RUNNER = """
+import sys
+sys.stderr.write("ready\\n")
+sys.stderr.flush()
+for line in sys.stdin:
+    toks = line.split()
+    if "NAN" in toks:
+        print("ok nan nan nan nan 1.0", flush=True)
+    elif "REF" in toks:
+        print("refused failed:other stub engine text for a declined orbit", flush=True)
+    else:
+        print("fail stub: unexpected line", flush=True)
+"""
+
+
+def test_nan_ok_line_never_reaches_residuals_and_a_refusal_is_a_row(tmp_path, capsys) -> None:
+    """Through the driver's ``main`` with a stand-in runner: an ``ok`` line of
+    NaN never becomes residuals (the row is left out, loudly, and no NaN reaches
+    the output), and a ``refused`` line becomes one declined row."""
+    stub = tmp_path / "stub_runner"
+    stub.write_text(f"#!{sys.executable}\n{_STUB_RUNNER}")
+    stub.chmod(0o755)
+    nan_row = dict(
+        _eph_row("none_detection_on"),
+        observer="NAN",
+        ref_ra_rad=1.0,
+        ref_dec_rad=0.3,
+        ref_rho_au=2.0,
+    )
+    ref_row = dict(_eph_row("none_detection_on"), observer="REF")
+    inp = tmp_path / "plan.json"
+    out = tmp_path / "out.json"
+    inp.write_text(json.dumps([nan_row, ref_row]))
+    old = sys.argv
+    sys.argv = [
+        "drive.py",
+        "--input",
+        str(inp),
+        "--output",
+        str(out),
+        "--runner",
+        str(stub),
+        "--fixtures-dir",
+        str(tmp_path),
+    ]
+    try:
+        assert drive.main() == 0
+    finally:
+        sys.argv = old
+    raw = out.read_text()
+    assert "NaN" not in raw
+    rows = json.loads(raw)
+    assert [r["observer"] for r in rows] == ["REF"], rows
+    assert rows[0]["orbit_delivered"] is False
+    assert rows[0]["orbit_status"] == "failed:other"
+    assert "stub engine text" in rows[0]["notes"]
+    err = capsys.readouterr().err
+    assert "Loaded 2 rows; wrote 0, declined 1, skipped 1 (0 + 1 + 1 = 2)" in err, err
+
+
+@pytest.mark.skipif(
+    _binary() is None or not _DATA_DIR.exists() or _vesta_eph_row("sigma_point_detection_on") is None,
+    reason="cli runner, data dir or staged plan unavailable",
+)
+def test_end_to_end_vesta_exclusion_delivers_and_its_absence_is_refused() -> None:
+    """From-engine, on Vesta's own self-perturber row: with the plan's exclusion
+    the sigma-point ephemeris DELIVERS its sampled sky covariance (the core
+    channel's request); with the exclusion forced off, the engine declines the
+    orbit and the binary writes a ``refused failed:other …`` line naming why,
+    which becomes a declined row (never an ``ok`` line of NaN)."""
+    r = _vesta_eph_row("sigma_point_detection_on")
+    out_line = _daemon_once(_binary(), drive._eph_daemon_line(r))
+    parts = out_line.split()
+    assert parts[0] == "ok" and len(parts) == 18, out_line
+    assert all(math.isfinite(float(v)) for v in parts[1:4]), out_line
+    prod = drive._parse_products(parts[6:])
+    assert prod["orbit_delivered"] is True
+    assert prod["orbit_status"] == "delivered"
+    assert prod["resolved_method"] == "sigma_point"
+
+    forced = dict(r, excluded_perturbers_naif=[])
+    out_line = _daemon_once(_binary(), drive._eph_daemon_line(forced))
+    assert out_line.startswith("refused failed:other "), out_line
+    assert "nan" not in out_line.lower().split()
+    row = drive._refused_row(forced, out_line, "TS", "VER")
+    assert row["orbit_delivered"] is False
+    assert "sampled sky delivery refused" in row["notes"], row["notes"]
+
+
+def test_row_account_line_is_honest() -> None:
+    """Every plan row is counted once — written, declined or skipped — so
+    W + D + S = N; a declined row is not also counted as skipped, and the
+    non-grav row the legacy fit's second pass generates stands for the plan's
+    non_grav_recovery row. A surplus row fails the account."""
+    acct = drive._RowAccount(5)
+    out: list = []
+    plan = [
+        {"test_type": "propagation"},
+        {"test_type": "ephemeris"},
+        {"test_type": "orbit_determination_transport"},
+        {"test_type": "orbit_determination"},
+        {"test_type": "non_grav_recovery"},
+    ]
+    acct.begin(plan[0], out)
+    out.append({"test_type": "propagation"})
+    acct.begin(plan[1], out)
+    out.append(acct.declined_row({"test_type": "ephemeris", "orbit_delivered": False}))
+    acct.begin(plan[2], out)  # transport: not produced, no row
+    acct.begin(plan[3], out)
+    out.append({"test_type": "non_grav_recovery"})  # the second pass's row
+    out.append({"test_type": "orbit_determination"})
+    acct.begin(plan[4], out)  # the plan's non-grav row: written by the pass above
+    line, ok = acct.line(out, "CH", "out.json")
+    assert ok, line
+    assert line.startswith("Loaded 5 rows; wrote 3, declined 1, skipped 1 (3 + 1 + 1 = 5); 4 CH rows")
+    # A plan non-grav row with no generated row is skipped; a surplus row fails.
+    acct = drive._RowAccount(2)
+    out = []
+    acct.begin({"test_type": "non_grav_recovery"}, out)
+    acct.begin({"test_type": "propagation"}, out)
+    out.extend([{"test_type": "propagation"}, {"test_type": "propagation"}])
+    w, d, s, ok = acct.finish(out)
+    assert (w, d, s, ok) == (1, 0, 1, False)
 
 
 if __name__ == "__main__":

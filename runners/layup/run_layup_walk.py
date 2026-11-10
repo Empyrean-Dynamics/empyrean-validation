@@ -99,6 +99,7 @@ import argparse
 import bisect
 import json
 import math
+import os
 import shutil
 import subprocess
 import sys
@@ -533,6 +534,9 @@ def _fit_window(
             text=True,
             timeout=opts.timeout,
             cwd=work,
+            # layup reads its SPICE kernels from LAYUP_CACHE_DIR whatever --ar says
+            # (see run_layup.layup_env); the staged directory is that cache.
+            env={**os.environ, **({"LAYUP_CACHE_DIR": str(opts.ar_data_path)} if opts.ar_data_path else {})},
             check=False,  # a nonzero exit is a named failure record, not an exception
         )
     except subprocess.TimeoutExpired:
