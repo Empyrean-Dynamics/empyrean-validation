@@ -1342,12 +1342,15 @@ $(GRSS_OUT): $(PLAN) | check-plan fixtures
 JORBIT_VENV := $(EMP_VAL_RUNNERS)/jorbit/.venv
 JORBIT_PY := $(JORBIT_VENV)/bin/python
 
-# Offline: jorbit's DE440 and SB441-N16 are staged from the registered kernel
-# set in DATA_DIR (runners/jorbit/jorbit_offline.py), never downloaded.
+# Offline: jorbit's DE440 and SB441-N16 come from the jorbit folder of the
+# third-party tool set (synced under $(DATA_DIR)/third-party; the engine set's
+# own bytes), staged by runners/jorbit/jorbit_offline.py, never downloaded. Each
+# object replays in a worker process of its own, which bounds the leg's memory.
+JORBIT_DATA_DIR ?= $(DATA_DIR)/third-party/jorbit
 setup-jorbit: $(JORBIT_PY)
 $(JORBIT_PY):
 	@echo "──── Setting up jorbit venv ────────────────────────────"
-	@cd $(EMP_VAL_RUNNERS)/jorbit && DATA_DIR="$(DATA_DIR)" ./setup.sh
+	@cd $(EMP_VAL_RUNNERS)/jorbit && DATA_DIR="$(JORBIT_DATA_DIR)" ./setup.sh
 
 run-jorbit: $(JORBIT_OUT)
 # EXT_LEG runs one object leg of the external schedule (`--only` its objects);
@@ -1362,7 +1365,7 @@ $(JORBIT_OUT): $(PLAN) $(JORBIT_PY) | check-plan
 	    if [ -n "$$only" ]; then echo "  leg $(EXT_LEG): $$only"; set -- --only "$$only"; fi; \
 	fi; \
 	$(JORBIT_PY) $(EMP_VAL_RUNNERS)/jorbit/run_jorbit.py \
-	    --input $(PLAN) --output $(JORBIT_OUT) --data-dir $(DATA_DIR) "$$@"
+	    --input $(PLAN) --output $(JORBIT_OUT) --data-dir $(JORBIT_DATA_DIR) "$$@"
 
 # ── layup (external OD reference) ───────────────────────────
 # MIT-licensed, ASSIST-backed orbit fitter (Smithsonian / CfA; Matthew

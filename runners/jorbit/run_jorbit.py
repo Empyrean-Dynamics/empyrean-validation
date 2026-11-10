@@ -10,10 +10,24 @@ jorbit is GPL-licensed and never linked into empyrean. This script
 runs independently in its own virtual environment.
 
 Runs with no network access. jorbit's two SPICE kernels (DE440 and
-SB441-N16) come from the registered kernel set in DATA_DIR, staged into
-a runner-private astropy cache under jorbit's own URL keys, with
-astropy's internet access off; a missing kernel is a hard stop, never a
-download (see `jorbit_offline.py`).
+SB441-N16) come from the `jorbit/` folder of the third-party tool set
+(`--data-dir`; the engine set's own bytes), staged into a runner-private
+astropy cache under jorbit's own URL keys, with astropy's internet
+access off; a missing kernel is a hard stop, never a download (see
+`jorbit_offline.py`).
+
+Bounded memory: each object's rows replay in a worker process of their
+own (this script with `--worker-job`), and the parent never imports
+jorbit. A single process keeps what JAX compiles as it integrates the
+rows and grew without bound (measured on eight objects: 1.2 GB to 6.4 GB
+of RSS over 17 minutes, still rising), which is how the full catalog
+ended on hosted runners in "LLVM ERROR: Unable to allocate section
+memory". A worker frees all of it when its object is done, so the leg's
+peak is the largest single object's, whatever the catalog size (the same
+eight objects: 2.6 GB at most, the parent 44 MB); the summary prints it.
+The rows are unchanged, field for field. A worker that crashes or times
+out turns that object's rows into rows carrying `jorbit_error`; every
+other object is unaffected.
 
 Schema mirrors the ValidationResult shape used by every other channel.
 jorbit-specific fields:
@@ -24,6 +38,8 @@ jorbit-specific fields:
     jorbit_d_dec_arcsec        — dDec vs Horizons (eph rows)
     jorbit_d_rho_km            — range diff vs Horizons (eph rows)
     jorbit_time_ms             — wall-clock per row
+    jorbit_error               — why an object's worker produced nothing
+                                 (crash, timeout); its rows carry no result
 
 Ephemeris rows run for the geocentric observer (500) only, with the
 observer at jorbit's own DE440 geocentre. jorbit's only observer model
@@ -43,8 +59,11 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import resource
 import statistics
+import subprocess
 import sys
+import tempfile
 import time
 from datetime import datetime, timezone
 from importlib.metadata import PackageNotFoundError, version
@@ -63,8 +82,14 @@ RUNNER_DIR = Path(__file__).resolve().parent
 # Runner-private astropy download cache holding the registered set's kernels
 # under jorbit's URL keys (gitignored; restaged and byte-verified every run).
 ASTROPY_CACHE_DIR = RUNNER_DIR / ".astropy-cache"
-# The suite's documented default data directory (the Makefile's DATA_DIR).
-DEFAULT_DATA_DIR = Path.home() / ".empyrean" / "data"
+# The jorbit folder of the third-party tool set, synced under the suite's
+# DATA_DIR (the Makefile's JORBIT_DATA_DIR).
+DEFAULT_DATA_DIR = Path.home() / ".empyrean" / "data" / "third-party" / "jorbit"
+# Exit code of a worker (or --check) whose offline kernel setup failed: the whole
+# run stops, because every other object would fail the same way.
+OFFLINE_SETUP_EXIT = 3
+# One object's worker; the largest object replays in minutes.
+OBJECT_TIMEOUT_S = 3600.0
 
 GEOCENTER = "500"
 SITE_NOT_ATTEMPTED_REASON = (
@@ -103,17 +128,19 @@ def _jorbit_source_version() -> str:
 def _load_jorbit_offline(data_dir: Path) -> None:
     """Stage the registered kernels, cut astropy off the network, import jorbit.
 
-    Exits with the reason when jorbit cannot run from local files alone.
+    Exits with ``OFFLINE_SETUP_EXIT`` and the reason when jorbit cannot run
+    from local files alone.
     """
     global jnp, np, jorbit
     sys.path.insert(0, str(RUNNER_DIR))
     from jorbit_offline import OfflineSetupError, import_jorbit_offline
 
-    print(f"jorbit: kernels from the registered set in {data_dir}", file=sys.stderr)
+    print(f"jorbit: kernels from {data_dir}", file=sys.stderr)
     try:
         jorbit, lines, suppressed = import_jorbit_offline(data_dir, ASTROPY_CACHE_DIR)
     except OfflineSetupError as e:
-        sys.exit(f"ERROR: jorbit cannot run offline: {e}")
+        print(f"ERROR: jorbit cannot run offline: {e}", file=sys.stderr)
+        raise SystemExit(OFFLINE_SETUP_EXIT) from e
     for line in lines:
         print(f"  {line}", file=sys.stderr)
     if suppressed:
@@ -377,6 +404,70 @@ def _ephemeris_with_jorbit(row: dict, geocenter: _Geocenter) -> dict | None:
     return res
 
 
+def _peak_rss_mb(who: int) -> float:
+    """Peak resident set size in MB (``ru_maxrss`` is bytes on macOS, KiB on Linux)."""
+    rss = resource.getrusage(who).ru_maxrss
+    return rss / 2**20 if sys.platform == "darwin" else rss / 2**10
+
+
+def _replay_object(items: list, geo_span: list | None) -> dict[str, dict | None]:
+    """Worker body: replay one object's ``[index, row]`` pairs in this process."""
+    geocenter = None
+    if geo_span is not None and any(r.get("test_type") == "ephemeris" for _, r in items):
+        geocenter = _Geocenter(geo_span[0], geo_span[1])
+    updates: dict[str, dict | None] = {}
+    for idx, r in items:
+        if r.get("test_type") == "propagation":
+            updates[str(idx)] = _propagate_with_jorbit(r)
+        else:
+            updates[str(idx)] = _ephemeris_with_jorbit(r, geocenter)
+    return updates
+
+
+def _worker(job: Path, result: Path, data_dir: Path) -> int:
+    """``--worker-job``: replay the job's rows and write their updates."""
+    spec = json.loads(job.read_text())
+    _load_jorbit_offline(data_dir)
+    updates = _replay_object(spec["rows"], spec["geo_span"])
+    payload = {"updates": updates, "peak_rss_mb": _peak_rss_mb(resource.RUSAGE_SELF)}
+    result.write_text(json.dumps(payload, allow_nan=False))
+    return 0
+
+
+class OfflineSetupFailed(RuntimeError):
+    """A worker could not set jorbit up offline; the run cannot continue."""
+
+
+def _run_object(
+    name: str, items: list, geo_span: list | None, data_dir: Path, timeout_s: float
+) -> tuple[dict[str, dict | None], float | None, str | None]:
+    """Replay one object's rows in a fresh process.
+
+    Returns ``(updates by row index, worker peak RSS in MB, failure)``; on a crash
+    or timeout the updates are empty and the failure names the cause.
+    """
+    with tempfile.TemporaryDirectory(prefix="jorbit_") as td:
+        job, result = Path(td) / "job.json", Path(td) / "result.json"
+        job.write_text(json.dumps({"geo_span": geo_span, "rows": items}))
+        cmd = [
+            sys.executable, str(Path(__file__).resolve()),
+            "--worker-job", str(job), "--worker-result", str(result),
+            "--data-dir", str(data_dir),
+        ]
+        try:
+            proc = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout_s)
+        except subprocess.TimeoutExpired:
+            return {}, None, f"jorbit worker for {name} timed out after {timeout_s:.0f}s"
+        sys.stderr.write(proc.stderr)
+        if proc.returncode == OFFLINE_SETUP_EXIT:
+            raise OfflineSetupFailed(proc.stderr.strip().splitlines()[-1] if proc.stderr else "")
+        if proc.returncode != 0 or not result.exists():
+            tail = " | ".join((proc.stderr or "").strip().splitlines()[-2:])
+            return {}, None, f"jorbit worker for {name} exited {proc.returncode}: {tail}"[:500]
+        out = json.loads(result.read_text())
+        return out["updates"], out["peak_rss_mb"], None
+
+
 def _executive_summary(rows: list[dict], not_attempted: SiteRowsNotAttempted) -> str:
     prop = [
         r
@@ -475,9 +566,17 @@ def main() -> int:
         "--data-dir",
         type=Path,
         default=DEFAULT_DATA_DIR,
-        help="registered kernel set (the suite's DATA_DIR); jorbit's DE440 and "
+        help="the jorbit folder of the third-party tool set; jorbit's DE440 and "
         "SB441-N16 are read from here, never downloaded",
     )
+    p.add_argument(
+        "--object-timeout",
+        type=float,
+        default=OBJECT_TIMEOUT_S,
+        help="seconds one object's worker may run before its rows carry jorbit_error",
+    )
+    p.add_argument("--worker-job", type=Path, help=argparse.SUPPRESS)
+    p.add_argument("--worker-result", type=Path, help=argparse.SUPPRESS)
     p.add_argument(
         "--check",
         action="store_true",
@@ -493,6 +592,8 @@ def main() -> int:
 
     if args.check:
         return _check(args.data_dir)
+    if args.worker_job is not None:
+        return _worker(args.worker_job, args.worker_result, args.data_dir)
     if args.input is None:
         p.error("--input is required (unless --check)")
 
@@ -513,9 +614,9 @@ def main() -> int:
             )
             return 2
 
-    _load_jorbit_offline(args.data_dir)
     print(
-        f"Loaded {len(plan)} plan rows; running through jorbit...", file=sys.stderr
+        f"Loaded {len(plan)} plan rows; running through jorbit, one process per object...",
+        file=sys.stderr,
     )
 
     timestamp = datetime.now(timezone.utc).isoformat()
@@ -523,7 +624,6 @@ def main() -> int:
     out_rows: list[dict] = []
     n_skipped = 0
     not_attempted = SiteRowsNotAttempted(SITE_NOT_ATTEMPTED_REASON)
-    geocenter: _Geocenter | None = None
 
     def replayed(r: dict) -> bool:
         # Uncertainty axis: skip covariance-bearing rows. jorbit can produce
@@ -542,26 +642,16 @@ def main() -> int:
         if replayed(r) and r.get("test_type") == "ephemeris"
         and r.get("observer") == GEOCENTER and r.get("t_mjd_tdb") is not None
     ]
-    if geo_times:
-        geocenter = _Geocenter(min(geo_times), max(geo_times))
+    # One span for every worker: each builds the same geocentre ephemeris the
+    # single-process run built.
+    geo_span = [min(geo_times), max(geo_times)] if geo_times else None
 
-    import jax
-
-    previous_object = None
+    # Rows in plan order; each object's propagation and geocentric ephemeris rows
+    # go to that object's worker, keyed by their place in out_rows.
+    jobs: dict[str, list] = {}
     for r in plan:
         if only is not None and r.get("object") not in only:
             continue
-        # Each row compiles its own integration, and JAX keeps every compiled
-        # executable: one process grew by about 3 GB of RSS per object (9.8 GB
-        # over three objects, measured 2026-11-09), which is how the whole
-        # catalog died of memory after 41 to 72 minutes on hosted runners.
-        # Dropping the caches when the object changes holds it at one
-        # object's worth (4.0 GB over the same three objects) and changes no
-        # number: the rows are identical, field for field.
-        if r.get("object") != previous_object:
-            if previous_object is not None:
-                jax.clear_caches()
-            previous_object = r.get("object")
         if not replayed(r):
             n_skipped += 1
             continue
@@ -573,21 +663,46 @@ def main() -> int:
         new["channel"] = "jorbit"
         new["timestamp"] = timestamp
         new["source_version"] = source_version
-        if tt == "propagation":
-            update = _propagate_with_jorbit(r)
-        elif tt == "ephemeris":
-            update = _ephemeris_with_jorbit(r, geocenter)
+        out_rows.append(new)
+        if tt in ("propagation", "ephemeris"):
+            jobs.setdefault(r["object"], []).append([len(out_rows) - 1, r])
         else:
             # OD rows: jorbit's gradient-based fitting needs a custom
             # likelihood per fit (different state representation,
             # observation Jacobian). Cross-tool OD comparison is covered
             # by find_orb. Mark skipped.
-            update = None
-        if update is None:
             n_skipped += 1
-        else:
-            new.update(update)
-        out_rows.append(new)
+
+    peaks: list[float] = []
+    n_failed_objects = 0
+    for name, items in jobs.items():
+        print(f"{name}: {len(items)} rows", file=sys.stderr)
+        try:
+            updates, peak, failure = _run_object(
+                name, items, geo_span, args.data_dir, args.object_timeout
+            )
+        except OfflineSetupFailed as e:
+            print(f"ERROR: jorbit cannot run offline, so no object can: {e}", file=sys.stderr)
+            return 1
+        if peak is not None:
+            peaks.append(peak)
+        if failure is not None:
+            n_failed_objects += 1
+            print(f"  {failure}", file=sys.stderr)
+        for idx, _r in items:
+            update = updates.get(str(idx))
+            if update is None:
+                n_skipped += 1
+                if failure is not None:
+                    out_rows[idx]["jorbit_error"] = failure
+            else:
+                out_rows[idx].update(update)
+    if peaks:
+        print(
+            f"jorbit workers: {len(jobs)} objects, peak RSS max {max(peaks):.0f} MB, "
+            f"median {statistics.median(peaks):.0f} MB; {n_failed_objects} objects failed",
+            file=sys.stderr,
+        )
 
     for line in not_attempted.report_lines():
         print(line, file=sys.stderr)
