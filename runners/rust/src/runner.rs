@@ -127,6 +127,8 @@ use empyrean_validation::schema::{
     CapturedOrbit, OrbitComparison, ValidationResult, orbit_sources,
 };
 
+use crate::rows::{DroppedRow, RepsOverride, RowId, RowSelection};
+
 /// Runner config.
 pub struct ValidateConfig {
     pub tiers: Vec<String>,
@@ -137,6 +139,20 @@ pub struct ValidateConfig {
     /// exercise the f64-only path (useful for head-to-head timing vs
     /// external propagators that don't propagate uncertainty).
     pub attach_covariance: bool,
+    /// Compute only these rows (a CI reference leg). `None` computes every
+    /// candidate row of the selected objects.
+    pub select: Option<RowSelection>,
+    /// Per-row timing repetitions that replace the default (the heavy row's
+    /// three timing repetitions run on three legs, one each).
+    pub reps_override: RepsOverride,
+}
+
+impl ValidateConfig {
+    /// The timing repetitions a row runs: its override when the leg has one,
+    /// else `default` (the method's own count, or `n_timing_runs`).
+    pub fn timing_runs(&self, id: &RowId, default: usize) -> usize {
+        self.reps_override.get(id).unwrap_or(default)
+    }
 }
 
 impl Default for ValidateConfig {
@@ -145,6 +161,8 @@ impl Default for ValidateConfig {
             tiers: FORCE_MODEL_TIERS.iter().map(|s| s.to_string()).collect(),
             n_timing_runs: 3,
             attach_covariance: true,
+            select: None,
+            reps_override: RepsOverride::default(),
         }
     }
 }
@@ -696,6 +714,45 @@ fn build_uncertainty_axes(
     axes
 }
 
+/// Every propagation and ephemeris row the sweep can emit for these objects,
+/// in the order [`run_propagation_validation`] emits them: per object, each
+/// method of [`build_uncertainty_axes`], and under each method the propagation
+/// rows (tier, then dt) followed by the ephemeris rows (site, then dt).
+///
+/// A candidate is a row the sweep REQUESTS. The engine may still refuse it
+/// (the run records the refusal in its dropped-row file), so the emitted rows
+/// are a subsequence of this list, and the run refuses to write when they are
+/// not. It needs no engine call, so CI prep can list the rows and schedule the
+/// reference legs before any leg runs.
+pub fn candidate_rows(objs: &[&ValidationObject], config: &ValidateConfig) -> Vec<RowId> {
+    use empyrean_validation::schema::uncertainty_modes as um;
+    let mut out = Vec::new();
+    for obj in objs {
+        let dt_list = obj.dt_days.unwrap_or(DEFAULT_DT_DAYS);
+        for axis in build_uncertainty_axes(config.attach_covariance, is_close_approach(obj.name)) {
+            let tag = um::compose(axis.tag, um::DETECTION_ON).to_string();
+            for tier in &config.tiers {
+                for &dt in dt_list {
+                    out.push(RowId::propagation(obj.name, &tag, tier, dt));
+                }
+            }
+            for &obs in empyrean_validation::catalog::OBSERVER_CODES {
+                for &dt in dt_list {
+                    out.push(RowId::ephemeris(obj.name, &tag, obs, dt));
+                }
+            }
+        }
+    }
+    out
+}
+
+/// What [`run_propagation_validation`] produced: the result rows, and every
+/// selected row that produced none, with the engine's reason.
+pub struct PropagationRun {
+    pub rows: Vec<ValidationResult>,
+    pub dropped: Vec<DroppedRow>,
+}
+
 /// Build the ephemeris observers for one site at `target`, byte-for-byte as
 /// the python and core channels build them.
 ///
@@ -770,7 +827,7 @@ pub fn run_propagation_validation(
     horizons_cache_dir: &std::path::Path,
     sbdb_cache_dir: &std::path::Path,
     num_threads: Option<usize>,
-) -> Result<Vec<ValidationResult>, String> {
+) -> Result<PropagationRun, String> {
     use empyrean_validation::inputs::{InputProduct, ephemeris_key, missing_input, vectors_key};
 
     let timestamp = chrono::Utc::now().to_rfc3339();
@@ -1001,12 +1058,15 @@ pub fn run_propagation_validation(
     //
     // Built per object: a close-approach object additionally carries the
     // Gaussian-mixture arm (see `build_uncertainty_axes`).
-    let all_results: Vec<Vec<ValidationResult>> = pool.install(|| {
+    let all_results: Vec<(Vec<ValidationResult>, Vec<DroppedRow>)> = pool.install(|| {
         obj_data
             .par_iter()
             .map(|data| {
                 use empyrean_validation::schema::uncertainty_modes as um;
                 let mut results: Vec<ValidationResult> = Vec::new();
+                // Selected rows that produced no result, with the reason.
+                let mut dropped: Vec<DroppedRow> = Vec::new();
+                let wanted = |id: &RowId| config.select.as_ref().is_none_or(|s| s.contains(id));
                 let modes = build_uncertainty_axes(
                     config.attach_covariance,
                     is_close_approach(&data.name),
@@ -1073,7 +1133,17 @@ pub fn run_propagation_validation(
                     let tier = tier_from_str(tier_str);
 
                     for &dt in data.dt_list {
+                        let row_id =
+                            RowId::propagation(&data.name, &uncertainty_tag, tier_str, dt);
+                        if !wanted(&row_id) {
+                            continue;
+                        }
                         let Some(&hor) = data.horizons_vectors.get(&(dt as i64)) else {
+                            dropped.push(DroppedRow {
+                                id: row_id,
+                                reason: "no Horizons vector at this epoch in the pinned snapshot"
+                                    .to_string(),
+                            });
                             continue;
                         };
                         let target = Epoch::from_mjd_tdb(data.epoch + dt);
@@ -1087,6 +1157,10 @@ pub fn run_propagation_validation(
                             Ok(o) => o,
                             Err(e) => {
                                 eprintln!("  {}: {tier_str} SKIP ({e})", data.name);
+                                dropped.push(DroppedRow {
+                                    id: row_id,
+                                    reason: format!("SKIP ({e})"),
+                                });
                                 continue;
                             }
                         };
@@ -1116,12 +1190,16 @@ pub fn run_propagation_validation(
                             Vec::new();
                         let mut emp_state: Option<[f64; 3]> = None;
                         let mut failed = false;
+                        let mut fail_reason: Option<String> = None;
 
-                        let runs = if axis.timing_runs > 0 {
-                            axis.timing_runs
-                        } else {
-                            config.n_timing_runs
-                        };
+                        let runs = config.timing_runs(
+                            &row_id,
+                            if axis.timing_runs > 0 {
+                                axis.timing_runs
+                            } else {
+                                config.n_timing_runs
+                            },
+                        );
                         for _ in 0..runs {
                             let t0 = Instant::now();
                             match ctx.propagate(&[orbit.clone()], &[target], &prop_config) {
@@ -1159,11 +1237,19 @@ pub fn run_propagation_validation(
                                         data.name, axis.tag,
                                     );
                                     failed = true;
+                                    fail_reason = Some(format!("empyrean FAIL ({e})"));
                                     break;
                                 }
                             }
                         }
                         if failed || emp_state.is_none() {
+                            dropped.push(DroppedRow {
+                                id: row_id,
+                                reason: fail_reason.unwrap_or_else(|| {
+                                    "empyrean Ok but states.len()=0 (likely AGM mixture-only return)"
+                                        .to_string()
+                                }),
+                            });
                             continue;
                         }
                         let emp_pos = emp_state.unwrap();
@@ -1375,7 +1461,16 @@ pub fn run_propagation_validation(
                 // per-method sky covariance is read off the delivered entry.
                 for &obs_code in obs_codes {
                 for &dt in data.dt_list {
+                    let row_id = RowId::ephemeris(&data.name, &uncertainty_tag, obs_code, dt);
+                    if !wanted(&row_id) {
+                        continue;
+                    }
                     let Some(hor) = data.horizons_ephemeris.get(&(obs_code, dt as i64)) else {
+                        dropped.push(DroppedRow {
+                            id: row_id,
+                            reason: "no Horizons ephemeris at this site and epoch in the pinned snapshot"
+                                .to_string(),
+                        });
                         continue;
                     };
                     // Reference entries carry degrees over the wrapper
@@ -1397,10 +1492,18 @@ pub fn run_propagation_validation(
                         Ok(o) => o,
                         Err(e) => {
                             eprintln!("  {} dt={dt:+.0}d SKIP (observer: {e})", data.name);
+                            dropped.push(DroppedRow {
+                                id: row_id,
+                                reason: format!("SKIP (observer: {e})"),
+                            });
                             continue;
                         }
                     };
                     if observers.is_empty() {
+                        dropped.push(DroppedRow {
+                            id: row_id,
+                            reason: "the observer lookup returned no observer".to_string(),
+                        });
                         continue;
                     }
 
@@ -1423,6 +1526,10 @@ pub fn run_propagation_validation(
                             Ok(o) => o,
                             Err(e) => {
                                 eprintln!("  {} dt={dt:+.0}d SKIP ({e})", data.name);
+                                dropped.push(DroppedRow {
+                                    id: row_id,
+                                    reason: format!("SKIP ({e})"),
+                                });
                                 continue;
                             }
                         };
@@ -1441,14 +1548,18 @@ pub fn run_propagation_validation(
                     // identical). `generate_ephemeris` is deterministic run to run,
                     // so the delivered sky position is bit-identical to the
                     // pre-timing single call.
-                    let eph_runs = if axis.timing_runs > 0 {
-                        axis.timing_runs
-                    } else {
-                        config.n_timing_runs
-                    };
+                    let eph_runs = config.timing_runs(
+                        &row_id,
+                        if axis.timing_runs > 0 {
+                            axis.timing_runs
+                        } else {
+                            config.n_timing_runs
+                        },
+                    );
                     let mut eph_times = Vec::new();
                     let mut eph_out = None;
                     let mut eph_failed = false;
+                    let mut eph_fail_reason: Option<String> = None;
                     for _ in 0..eph_runs {
                         let t0 = Instant::now();
                         match ctx.generate_ephemeris(
@@ -1463,17 +1574,26 @@ pub fn run_propagation_validation(
                             Err(e) => {
                                 eprintln!("  {} dt={dt:+.0}d FAIL ({e})", data.name);
                                 eph_failed = true;
+                                eph_fail_reason = Some(format!("FAIL ({e})"));
                                 break;
                             }
                         }
                     }
                     if eph_failed {
+                        dropped.push(DroppedRow {
+                            id: row_id,
+                            reason: eph_fail_reason.unwrap_or_default(),
+                        });
                         continue;
                     }
                     let emp_eph_ms = eph_times.iter().copied().fold(f64::INFINITY, f64::min);
                     match eph_out {
                         Some(eph) => {
                             let Some(entry) = eph.entries.first() else {
+                                dropped.push(DroppedRow {
+                                    id: row_id,
+                                    reason: "the ephemeris returned no entry".to_string(),
+                                });
                                 continue;
                             };
                             // Per-orbit delivery outcome for the ephemeris row,
@@ -1732,18 +1852,48 @@ pub fn run_propagation_validation(
                                 notes: eph_notes,
                             });
                         }
-                        None => continue,
+                        None => {
+                            dropped.push(DroppedRow {
+                                id: row_id,
+                                reason: "no ephemeris timing run executed".to_string(),
+                            });
+                            continue;
+                        }
                     }
                 }
                 } // end for &obs_code (observing sites)
                 } // end for &attach
 
-                results
+                (results, dropped)
             })
             .collect()
     });
 
-    Ok(all_results.into_iter().flatten().collect())
+    let mut rows = Vec::new();
+    let mut dropped = Vec::new();
+    for (r, d) in all_results {
+        rows.extend(r);
+        dropped.extend(d);
+    }
+    // The candidate list and the run must agree on what a row is and in what
+    // order the run emits them, or a leg could lose or invent rows unseen.
+    let candidates = candidate_rows(objs, config);
+    let emitted: Vec<String> = rows
+        .iter()
+        .map(|r| {
+            RowId {
+                object: r.object.clone(),
+                test_type: r.test_type.clone(),
+                propagation_uncertainty: r.propagation_uncertainty.clone().unwrap_or_default(),
+                dt_days: r.dt_days,
+                observer: r.observer.clone(),
+                force_model: r.force_model.clone(),
+            }
+            .key()
+        })
+        .collect();
+    crate::rows::check_accounted(&candidates, config.select.as_ref(), &emitted, &dropped)?;
+    Ok(PropagationRun { rows, dropped })
 }
 
 /// Result of [`run_od_validation`] — the existing per-row metric records
@@ -4940,5 +5090,236 @@ mod tests {
         let delta = (old_d_ra_arcsec - d_ra_arcsec).abs();
         assert!(delta > 0.0, "the RA wrap perturbs d_ra on a negative Δα");
         assert!(delta < 1e-9, "but only at the ULP of 2π");
+    }
+
+    // ── Row selection (reference legs) ──────────────────────────────────────
+
+    /// The pinned inputs snapshot the integration tests read, or `None` to
+    /// skip (the same gate as the data tier).
+    fn snapshot_dirs() -> Option<(std::path::PathBuf, std::path::PathBuf)> {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../fixtures");
+        let (h, s) = (root.join("horizons"), root.join("sbdb"));
+        (h.is_dir() && s.is_dir()).then_some((h, s))
+    }
+
+    fn object(name: &str) -> &'static empyrean_validation::catalog::ValidationObject {
+        empyrean_validation::catalog::all_objects()
+            .into_iter()
+            .find(|o| o.name == name)
+            .unwrap_or_else(|| panic!("{name} is not in the catalog"))
+    }
+
+    fn run_rows(ctx: &Context, name: &str, select: Option<Vec<RowId>>) -> PropagationRun {
+        let (h, s) = snapshot_dirs().expect("snapshot");
+        let config = ValidateConfig {
+            n_timing_runs: 1,
+            select: select.as_deref().map(RowSelection::from_rows),
+            ..ValidateConfig::default()
+        };
+        run_propagation_validation(ctx, &[object(name)], &config, &h, &s, Some(1))
+            .unwrap_or_else(|e| panic!("run failed: {e}"))
+    }
+
+    fn key_of(r: &ValidationResult) -> String {
+        RowId {
+            object: r.object.clone(),
+            test_type: r.test_type.clone(),
+            propagation_uncertainty: r.propagation_uncertainty.clone().unwrap_or_default(),
+            dt_days: r.dt_days,
+            observer: r.observer.clone(),
+            force_model: r.force_model.clone(),
+        }
+        .key()
+    }
+
+    /// A row with the wall-clock fields blanked, as JSON, for bit comparison.
+    fn without_volatile(r: &ValidationResult) -> serde_json::Value {
+        let mut v = serde_json::to_value(r).unwrap();
+        for k in ["timestamp", "emp_time_ms"] {
+            v[k] = serde_json::Value::Null;
+        }
+        v
+    }
+
+    #[test]
+    fn candidate_rows_list_what_the_run_emits_in_the_order_it_emits_it() {
+        let Some(ctx) = test_ctx() else { return };
+        if snapshot_dirs().is_none() {
+            eprintln!("SKIP: pinned inputs snapshot unavailable");
+            return;
+        }
+        let name = "2008 TC3";
+        let candidates = candidate_rows(&[object(name)], &ValidateConfig::default());
+        let run = run_rows(&ctx, name, None);
+        let emitted: Vec<String> = run.rows.iter().map(key_of).collect();
+        // Every candidate is a result or a named drop, and the results keep the
+        // candidate order: the candidate list IS the emission order.
+        let dropped: std::collections::HashSet<String> =
+            run.dropped.iter().map(|d| d.id.key()).collect();
+        let expected: Vec<String> = candidates
+            .iter()
+            .map(RowId::key)
+            .filter(|k| !dropped.contains(k))
+            .collect();
+        assert_eq!(emitted, expected);
+        assert!(emitted.len() > 100, "a real object emits rows");
+    }
+
+    #[test]
+    fn a_selected_subset_is_bit_identical_to_the_same_rows_of_a_full_run() {
+        let Some(ctx) = test_ctx() else { return };
+        if snapshot_dirs().is_none() {
+            eprintln!("SKIP: pinned inputs snapshot unavailable");
+            return;
+        }
+        let name = "2008 TC3";
+        let candidates = candidate_rows(&[object(name)], &ValidateConfig::default());
+        let full = run_rows(&ctx, name, None);
+        // Every seventh candidate: cuts every method and both row types.
+        let pick: Vec<RowId> = candidates.iter().cloned().step_by(7).collect();
+        let sub = run_rows(&ctx, name, Some(pick.clone()));
+        let want: std::collections::HashSet<String> = pick.iter().map(RowId::key).collect();
+        let from_full: Vec<_> = full
+            .rows
+            .iter()
+            .filter(|r| want.contains(&key_of(r)))
+            .map(without_volatile)
+            .collect();
+        let from_sub: Vec<_> = sub.rows.iter().map(without_volatile).collect();
+        assert!(from_sub.len() > 20);
+        assert_eq!(
+            from_sub, from_full,
+            "a subset computes the rows a full run does, bit for bit"
+        );
+        assert!(sub.dropped.is_empty());
+    }
+
+    #[test]
+    fn a_refused_row_lands_in_the_dropped_file_with_the_engines_reason() {
+        let Some(ctx) = test_ctx() else { return };
+        if snapshot_dirs().is_none() {
+            eprintln!("SKIP: pinned inputs snapshot unavailable");
+            return;
+        }
+        // 2020 CD3's sigma_point ephemeris at dt = -3650 d is refused: the
+        // sampled sky ensemble disperses 2.1 rad (run 42506609035).
+        let row = RowId::ephemeris("2020 CD3", "sigma_point_detection_on", "W84", -3650.0);
+        let run = run_rows(&ctx, "2020 CD3", Some(vec![row.clone()]));
+        assert!(run.rows.is_empty());
+        assert_eq!(run.dropped.len(), 1);
+        assert_eq!(run.dropped[0].id, row);
+        assert!(
+            run.dropped[0].reason.contains("dispersed"),
+            "{}",
+            run.dropped[0].reason
+        );
+    }
+
+    #[test]
+    fn a_repetition_override_changes_how_often_a_row_runs_and_not_what_it_computes() {
+        let Some(ctx) = test_ctx() else { return };
+        if snapshot_dirs().is_none() {
+            eprintln!("SKIP: pinned inputs snapshot unavailable");
+            return;
+        }
+        let (h, s) = snapshot_dirs().unwrap();
+        let name = "2008 TC3";
+        let id = RowId::propagation(name, "second_order_detection_on", "full", -365.0);
+        let candidates = candidate_rows(&[object(name)], &ValidateConfig::default());
+        assert!(candidates.contains(&id), "the test row is a candidate");
+        let mk = |reps: Option<usize>| {
+            let dir = std::env::temp_dir().join(format!("reps-{}-{:?}", std::process::id(), reps));
+            std::fs::create_dir_all(&dir).unwrap();
+            let f = dir.join("reps.json");
+            let mut e = serde_json::to_value(&id).unwrap();
+            e["reps"] = serde_json::json!(reps.unwrap_or(1));
+            std::fs::write(&f, serde_json::to_string(&vec![e]).unwrap()).unwrap();
+            let config = ValidateConfig {
+                n_timing_runs: 3,
+                select: Some(RowSelection::from_rows(std::slice::from_ref(&id))),
+                reps_override: if reps.is_some() {
+                    crate::rows::load_reps_override(&f).unwrap()
+                } else {
+                    RepsOverride::default()
+                },
+                ..ValidateConfig::default()
+            };
+            run_propagation_validation(&ctx, &[object(name)], &config, &h, &s, Some(1))
+                .unwrap()
+                .rows
+        };
+        let three = mk(None);
+        let one = mk(Some(1));
+        assert_eq!((three.len(), one.len()), (1, 1));
+        assert_eq!(without_volatile(&three[0]), without_volatile(&one[0]));
+    }
+
+    #[test]
+    fn a_rows_timing_runs_are_its_override_else_the_default() {
+        let dir = std::env::temp_dir().join(format!("reps-unit-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let f = dir.join("reps.json");
+        let heavy = RowId::propagation("2020 CD3", "auto_detection_on", "standard", -5475.0);
+        let other = RowId::propagation("2020 CD3", "auto_detection_on", "standard", -3650.0);
+        let mut e = serde_json::to_value(&heavy).unwrap();
+        e["reps"] = serde_json::json!(1);
+        std::fs::write(&f, serde_json::to_string(&vec![e]).unwrap()).unwrap();
+        let config = ValidateConfig {
+            n_timing_runs: 3,
+            reps_override: crate::rows::load_reps_override(&f).unwrap(),
+            ..ValidateConfig::default()
+        };
+        assert_eq!(
+            config.timing_runs(&heavy, 3),
+            1,
+            "the overridden row runs once"
+        );
+        assert_eq!(
+            config.timing_runs(&other, 3),
+            3,
+            "every other row keeps its default"
+        );
+        assert_eq!(
+            config.timing_runs(&other, 1),
+            1,
+            "including a sampling row's own count"
+        );
+    }
+
+    #[test]
+    fn candidate_rows_cover_every_method_tier_site_and_epoch_of_an_object() {
+        // A close-approach object carries the mixture arm; the others do not.
+        let cfg = ValidateConfig::default();
+        let plain = candidate_rows(&[object("Eros")], &cfg);
+        let ca = candidate_rows(&[object("Bennu")], &cfg);
+        let tags = |rows: &[RowId]| {
+            rows.iter()
+                .map(|r| r.propagation_uncertainty.clone())
+                .collect::<std::collections::BTreeSet<_>>()
+        };
+        assert!(!tags(&plain).contains("gaussian_mixture_detection_on"));
+        assert!(tags(&ca).contains("gaussian_mixture_detection_on"));
+        // Keys are unique, and propagation rows precede ephemeris rows within a method.
+        let keys: std::collections::HashSet<String> = ca.iter().map(RowId::key).collect();
+        assert_eq!(keys.len(), ca.len());
+        let first_method = &ca[0].propagation_uncertainty;
+        let block: Vec<&RowId> = ca
+            .iter()
+            .take_while(|r| &r.propagation_uncertainty == first_method)
+            .collect();
+        let first_eph = block
+            .iter()
+            .position(|r| r.test_type == "ephemeris")
+            .unwrap();
+        assert!(
+            block[..first_eph]
+                .iter()
+                .all(|r| r.test_type == "propagation")
+        );
+        assert!(
+            block[first_eph..]
+                .iter()
+                .all(|r| r.test_type == "ephemeris")
+        );
     }
 }

@@ -13112,6 +13112,13 @@
  },
  "engine_pin": "empyrean 0.11.0-rc.1; empyrean-core v0.11.1; villeneuve 72dc426 (v1.26.5)",
  "explicit_min_s": 1.0,
+ "heavy": {
+  "min_single_run_s": 600.0,
+  "note": "rows whose single timing run costs at least min_single_run_s in some channel; their timing repetitions fan out to distinct legs (scripts/schedule.py, scripts/replicas.py)",
+  "rows": [
+   "2020 CD3|propagation|auto_detection_on|-5475.0||standard"
+  ]
+ },
  "known_rows": {
   "103P/Hartley 2|ephemeris|auto_detection_on|500|standard": [
    -5475.0,

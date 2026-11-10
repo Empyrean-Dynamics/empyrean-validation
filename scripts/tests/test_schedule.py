@@ -81,7 +81,7 @@ def keyof(sc, r):
 
 
 def sched_for(sc, plan, table, channel, n_legs):
-    legs, estimated, _, _ = sc.pack(channel, plan, table, n_legs)
+    legs, estimated, _, _, _ = sc.pack(channel, plan, table, n_legs)
     return {
         "schema": sc.SCHEMA,
         "plan_sha256": "p",
@@ -106,7 +106,7 @@ def test_every_unit_lands_in_exactly_one_leg(sc):
     plan = make_plan("A", "B", "C", ng=("A", "C"))
     table = make_table(sc, plan)
     for ch in ("python", "c", "cli", "core", "rust"):
-        legs, _, _, _ = sc.pack(ch, plan, table, 4)
+        legs, _, _, _, _ = sc.pack(ch, plan, table, 4)
         rows = [i for leg in legs for i in leg["rows"]]
         assert sorted(rows) == list(range(len(plan))), ch
         assert sum(leg["units"] for leg in legs) == len(sc.units(ch, plan)), ch
@@ -117,7 +117,7 @@ def test_legacy_fit_and_ng_row_never_split_for_python_c_cli(sc):
     table = make_table(sc, plan)
     for ch in ("python", "c", "cli"):
         for n_legs in range(1, 9):
-            legs, _, _, _ = sc.pack(ch, plan, table, n_legs)
+            legs, _, _, _, _ = sc.pack(ch, plan, table, n_legs)
             where = {i: leg["leg"] for leg in legs for i in leg["rows"]}
             for obj in ("A", "B"):
                 legacy = next(i for i, r in enumerate(plan) if r["object"] == obj and r["test_type"] == "orbit_determination" and r["propagation_uncertainty"] is None)
@@ -265,7 +265,7 @@ def test_a_row_missing_from_the_table_is_priced_and_listed(sc):
     plan = make_plan("A")
     table = make_table(sc, plan, default=0.5)
     plan2 = plan + make_plan("NEW")  # an object the table has never seen
-    legs, estimated, _, _ = sc.pack("core", plan2, table, 2)
+    legs, estimated, _, _, _ = sc.pack("core", plan2, table, 2)
     assert len(estimated) == len(make_plan("NEW"))
     assert all(keyof(sc, r) in " ".join(estimated) for r in make_plan("NEW")[:3])
     new_rows = [i for i, r in enumerate(plan2) if r["object"] == "NEW"]
@@ -296,7 +296,7 @@ def test_an_unknown_class_is_still_not_free(sc):
 def test_rows_the_table_knows_are_not_estimates(sc):
     plan = make_plan("A")
     table = make_table(sc, plan, default=0.001)
-    _, estimated, _, _ = sc.pack("python", plan, table, 2)
+    _, estimated, _, _, _ = sc.pack("python", plan, table, 2)
     assert estimated == []
 
 
@@ -376,20 +376,12 @@ def test_validator_refuses_a_stale_plan_and_a_stale_cost_table(sc):
     assert any("different cost table" in b for b in sc.validate(plan, "p", schedule, table2))
 
 
-def test_validator_requires_a_timing_fold_to_use_distinct_legs(sc):
-    plan, table, schedule = good(sc)
-    schedule["replicas"] = [{"channel": "python", "group": "g", "legs": ["01", "01", "02"]}]
-    assert any("share a leg" in b for b in sc.validate(plan, "p", schedule, table))
-    schedule["replicas"] = [{"channel": "python", "group": "g", "legs": ["01", "02", "03"]}]
-    assert sc.validate(plan, "p", schedule, table) == []
-
-
 def test_leg_matrix_lists_every_leg_once(sc):
     plan = make_plan("A", "B")
     table = make_table(sc, plan)
     schedule = {"channels": {}}
     for ch, n in (("python", 2), ("core", 3)):
-        legs, _, _, _ = sc.pack(ch, plan, table, n)
+        legs, _, _, _, _ = sc.pack(ch, plan, table, n)
         schedule["channels"][ch] = {"legs": legs}
     assert sc.leg_matrix(schedule) == [
         {"channel": "python", "leg": "01"},
@@ -398,3 +390,304 @@ def test_leg_matrix_lists_every_leg_once(sc):
         {"channel": "core", "leg": "02"},
         {"channel": "core", "leg": "03"},
     ]
+
+
+# ── heavy rows: the timing repetitions fan out (S4) ──────────────────────────
+
+
+def heavy_plan():
+    """Three objects; C's propagation at dt 20 is the heavy row (15 min a run,
+    three timed runs in every channel that times it three times)."""
+    plan = make_plan("A", "B", "C", ng=("A",))
+    # Late in the plan, as 2020 CD3's row is: c and cli need three light
+    # propagation rows ahead of it to lead the three replica legs.
+    heavy = next(i for i, r in enumerate(plan) if r["object"] == "C" and r["test_type"] == "propagation" and r["dt_days"] == 20.0)
+    return plan, heavy
+
+
+def heavy_table(sc, plan, heavy, mark=True, minutes=45.0):
+    table = make_table(sc, plan, {keyof(sc, plan[heavy]): minutes})
+    if mark:
+        table.heavy_rows = {keyof(sc, plan[heavy])}
+    return table
+
+
+def test_a_heavy_row_runs_once_in_each_of_its_replica_legs_priced_at_one_run(sc):
+    plan, heavy = heavy_plan()
+    table = heavy_table(sc, plan, heavy)
+    for ch in ("python", "c", "cli", "core", "rust"):
+        legs, _, _, _, replicas = sc.pack(ch, plan, table, 5)
+        holding = [leg for leg in legs if heavy in leg["rows"]]
+        assert len(holding) == 3, ch  # the channel times it three times
+        assert len({leg["leg"] for leg in holding}) == 3, ch
+        for leg in holding:
+            assert leg["reps"] == {str(heavy): 1}, ch
+            assert leg["predicted_min"] >= 15.0 - 1e-6, ch  # 45 min over three runs
+        assert [leg for leg in legs if heavy not in leg["rows"] and "reps" in leg] == [], ch
+        assert replicas == [
+            {"channel": ch, "group": keyof(sc, plan[heavy]), "row": heavy, "legs": [x["leg"] for x in holding], "reps": 1}
+        ], ch
+        # every other row is still in exactly one leg
+        others = [i for leg in legs for i in leg["rows"] if i != heavy]
+        assert sorted(others) == [i for i in range(len(plan)) if i != heavy], ch
+
+
+def test_a_row_the_table_does_not_mark_does_not_fan_out(sc):
+    plan, heavy = heavy_plan()
+    table = heavy_table(sc, plan, heavy, mark=False)
+    legs, _, _, _, replicas = sc.pack("python", plan, table, 5)
+    assert replicas == [] and all("reps" not in leg for leg in legs)
+    assert sum(heavy in leg["rows"] for leg in legs) == 1
+
+
+def test_heavy_min_s_fans_out_a_cheap_row_for_a_rehearsal(sc):
+    plan, heavy = heavy_plan()
+    table = heavy_table(sc, plan, heavy, mark=False, minutes=0.3)  # 6 s a run
+    _, _, _, _, none = sc.pack("python", plan, table, 5, heavy_min_s=None)
+    assert none == []
+    _, _, _, _, some = sc.pack("python", plan, table, 5, heavy_min_s=5.0)
+    assert [r["row"] for r in some] == [heavy]
+    _, _, _, _, high = sc.pack("python", plan, table, 5, heavy_min_s=60.0)
+    assert high == []
+
+
+def test_a_row_the_channel_times_once_has_no_repetitions_to_fan_out(sc):
+    plan, _ = heavy_plan()
+    eph = next(i for i, r in enumerate(plan) if r["object"] == "C" and r["test_type"] == "ephemeris" and r["dt_days"] == 20.0)
+    table = heavy_table(sc, plan, eph, minutes=45.0)  # core times an ephemeris row once
+    _, _, _, _, core = sc.pack("core", plan, table, 5)
+    assert core == []
+    _, _, _, _, py = sc.pack("python", plan, table, 5)  # python times it three times
+    assert [r["row"] for r in py] == [eph]
+
+
+def test_replica_legs_of_c_and_cli_each_open_on_a_light_propagation_row(sc):
+    plan, heavy = heavy_plan()
+    table = heavy_table(sc, plan, heavy)
+    for ch in ("c", "cli"):
+        legs, _, _, _, _ = sc.pack(ch, plan, table, 5)
+        for leg in legs:
+            if heavy in leg["rows"]:
+                first = next(i for i in leg["rows"] if plan[i]["test_type"] == "propagation")
+                assert first < heavy and first != heavy, ch
+        sched = {"schema": sc.SCHEMA, "plan_sha256": "p", "cost_table_sha256": table.sha256, "channels": {ch: {"legs": legs}}, "replicas": sc.pack(ch, plan, table, 5)[4]}
+        assert sc.validate(plan, "p", sched, table) == [], ch
+
+
+def test_too_few_legs_for_the_fan_out_is_refused_by_name(sc):
+    plan, heavy = heavy_plan()
+    table = heavy_table(sc, plan, heavy)
+    with pytest.raises(SystemExit, match="fans out to 3 distinct legs"):
+        sc.pack("python", plan, table, 2)
+
+
+def replica_schedule(sc, ch="python"):
+    plan, heavy = heavy_plan()
+    table = heavy_table(sc, plan, heavy)
+    legs, _, _, _, replicas = sc.pack(ch, plan, table, 5)
+    sched = {"schema": sc.SCHEMA, "plan_sha256": "p", "cost_table_sha256": table.sha256, "channels": {ch: {"legs": legs}}, "replicas": replicas}
+    return plan, heavy, table, sched
+
+
+def test_validator_accepts_a_replicated_schedule(sc):
+    plan, _, table, sched = replica_schedule(sc)
+    assert sc.validate(plan, "p", sched, table) == []
+
+
+def test_validator_refuses_replicas_that_share_a_leg(sc):
+    plan, heavy, table, sched = replica_schedule(sc)
+    sched["replicas"][0]["legs"] = [sched["replicas"][0]["legs"][0]] * 3
+    assert any("share a leg" in b for b in sc.validate(plan, "p", sched, table))
+
+
+def test_validator_refuses_a_replica_row_missing_from_a_declared_leg_and_a_fan_out_count_that_is_wrong(sc):
+    plan, heavy, table, sched = replica_schedule(sc)
+    holding = [leg for leg in sched["channels"]["python"]["legs"] if heavy in leg["rows"]]
+    holding[0]["rows"].remove(heavy)
+    holding[0]["reps"].pop(str(heavy))
+    bad = sc.validate(plan, "p", sched, table)
+    assert any("declared in legs" in b for b in bad)
+    holding[0]["rows"].append(heavy)
+    holding[0]["rows"].sort()
+    holding[0]["reps"][str(heavy)] = 1
+    sched["replicas"][0]["legs"] = sched["replicas"][0]["legs"][:2]
+    assert any("fans out to 2 legs, but the channel times it 3 times" in b for b in sc.validate(plan, "p", sched, table))
+
+
+def test_validator_refuses_a_replica_leg_without_its_override_and_an_override_without_a_replica(sc):
+    plan, heavy, table, sched = replica_schedule(sc)
+    legs = sched["channels"]["python"]["legs"]
+    holding = [leg for leg in legs if heavy in leg["rows"]]
+    holding[0]["reps"] = {}
+    assert any("without its repetition override" in b for b in sc.validate(plan, "p", sched, table))
+    holding[0]["reps"] = {str(heavy): 1}
+    other = next(leg for leg in legs if heavy not in leg["rows"])
+    other["reps"] = {str(other["rows"][0]): 1}
+    assert any("not a declared replica of this leg" in b for b in sc.validate(plan, "p", sched, table))
+
+
+def test_an_unreplicated_row_in_two_legs_is_still_refused(sc):
+    plan, heavy, table, sched = replica_schedule(sc)
+    legs = sched["channels"]["python"]["legs"]
+    other = next(i for leg in legs for i in leg["rows"] if i != heavy and plan[i]["test_type"] == "propagation")
+    dst = next(leg for leg in legs if other not in leg["rows"])
+    dst["rows"] = sorted(dst["rows"] + [other])
+    assert any("is in legs" in b for b in sc.validate(plan, "p", sched, table))
+
+
+def test_refresh_costs_marks_the_heavy_row_by_name(sc, tmp_path):
+    plan, heavy = heavy_plan()
+    key = keyof(sc, plan[heavy])
+    (tmp_path / "validation_plan.json").write_text(json.dumps(plan))
+    emp = {key: 45 * 60_000.0 / 3}
+    for ch in ("rust", "python", "c", "cli", "core"):
+        rows = [dict(r, emp_time_ms=emp.get(keyof(sc, r), 10.0)) for r in plan]
+        (tmp_path / ("validation_rust.json" if ch == "rust" else f"validation_{ch}.json")).write_text(json.dumps(rows))
+    table = sc.refresh_costs(tmp_path, "run", "pin")
+    assert table["heavy"]["rows"] == [key]
+    assert table["heavy"]["min_single_run_s"] == sc.HEAVY_MIN_S
+    assert sc.CostTable(table, "x").heavy_rows == {key}
+
+
+# ── the reference (rust) schedule (S3) ───────────────────────────────────────
+
+
+def ref_candidates(*objs):
+    out = []
+    for o in objs:
+        for m in ("first_order_detection_on", "auto_detection_on"):
+            for dt in (10.0, 20.0, 30.0):
+                out.append(row(o, "propagation", m, dt))
+                out.append(row(o, "ephemeris", m, dt, "500"))
+    return out
+
+
+def ref_world(sc, tmp_path, objs=("A", "B", "C"), minutes=None):
+    cands = ref_candidates(*objs)
+    plan = make_plan(*objs)  # the plan the table came from: carries the OD rows
+    table_data = make_table(sc, plan + cands, minutes or {}).data
+    costs = tmp_path / "costs.json"
+    costs.write_text(json.dumps(table_data))
+    cp = tmp_path / "cands.json"
+    cp.write_text(json.dumps(cands))
+    op = tmp_path / "objects.json"
+    op.write_text(json.dumps([{"name": o, "slug": o} for o in objs]))
+    return cands, cp, op, costs
+
+
+def test_every_candidate_row_lands_in_exactly_one_reference_leg_and_every_od_in_one(sc, tmp_path):
+    cands, cp, op, costs = ref_world(sc, tmp_path)
+    for n in (1, 2, 4, 7):
+        sched, _, table = sc.build_reference_schedule(cp, op, costs, n)
+        rows = [i for leg in sched["legs"] for i in leg["rows"]]
+        assert sorted(rows) == list(range(len(cands))), n
+        objs = [o for leg in sched["legs"] for o in leg["od_objects"]]
+        assert sorted(objs) == ["A", "B", "C"], n
+        assert sc.validate_reference(cands, ["A", "B", "C"], sched["candidates_sha256"], sched, table) == [], n
+
+
+def test_the_reference_schedule_is_a_pure_function_of_its_inputs(sc, tmp_path):
+    cands, cp, op, costs = ref_world(sc, tmp_path)
+    one, _, _ = sc.build_reference_schedule(cp, op, costs, 5)
+    two, _, _ = sc.build_reference_schedule(cp, op, costs, 5)
+    assert json.dumps(one, sort_keys=True) == json.dumps(two, sort_keys=True)
+
+
+def test_an_od_unit_priced_from_the_table_goes_to_a_leg_by_cost(sc, tmp_path):
+    key = None
+    plan = make_plan("A", "B", "C")
+    key = keyof(sc, row("B", "orbit_determination_radar"))
+    cands, cp, op, costs = ref_world(sc, tmp_path, minutes={key: 30.0})
+    sched, _, _ = sc.build_reference_schedule(cp, op, costs, 3)
+    leg_b = next(leg for leg in sched["legs"] if "B" in leg["od_objects"])
+    assert leg_b["predicted_min"] >= 30.0
+    assert plan  # the OD rows came from the table's known rows, not the candidates
+
+
+def test_an_object_the_table_has_never_seen_gets_a_placeholder_od_unit_named_as_an_estimate(sc, tmp_path):
+    cands, cp, op, costs = ref_world(sc, tmp_path)
+    op.write_text(json.dumps([{"name": o, "slug": o} for o in ("A", "B", "C", "NEW")]))
+    cp.write_text(json.dumps(cands + ref_candidates("NEW")))
+    sched, _, _ = sc.build_reference_schedule(cp, op, costs, 3)
+    assert any("NEW" in line for line in sched["estimated_rows"])
+    assert sum("NEW" in leg["od_objects"] for leg in sched["legs"]) == 1
+
+
+def test_the_reference_heavy_row_fans_out_to_distinct_legs_with_overrides(sc, tmp_path):
+    cands, cp, op, costs = ref_world(sc, tmp_path)
+    heavy = next(i for i, r in enumerate(cands) if r["object"] == "A" and r["test_type"] == "propagation" and r["propagation_uncertainty"] == "auto_detection_on" and r["dt_days"] == 20.0)
+    data = json.loads(costs.read_text())
+    key = keyof(sc, cands[heavy])
+    data["channels"]["rust"]["rows"][key] = 45.0
+    data["heavy"] = {"rows": [key]}
+    costs.write_text(json.dumps(data))
+    sched, _, table = sc.build_reference_schedule(cp, op, costs, 5)
+    holding = [leg for leg in sched["legs"] if heavy in leg["rows"]]
+    assert len(holding) == 3 and all(leg["reps"] == {str(heavy): 1} for leg in holding)
+    assert sched["replicas"][0]["legs"] == [leg["leg"] for leg in holding]
+    assert sc.validate_reference(cands, ["A", "B", "C"], sched["candidates_sha256"], sched, table) == []
+
+
+def test_validate_reference_names_a_dropped_row_a_doubled_od_and_a_stale_candidate_list(sc, tmp_path):
+    cands, cp, op, costs = ref_world(sc, tmp_path)
+    sched, _, table = sc.build_reference_schedule(cp, op, costs, 3)
+    objs = ["A", "B", "C"]
+    h = sched["candidates_sha256"]
+    sched["legs"][0]["rows"] = sched["legs"][0]["rows"][1:]
+    assert any("plan rows are in no leg" in b for b in sc.validate_reference(cands, objs, h, sched, table))
+    sched, _, table = sc.build_reference_schedule(cp, op, costs, 3)
+    sched["legs"][1]["od_objects"] = sched["legs"][0]["od_objects"] + sched["legs"][1]["od_objects"]
+    assert any("must be in exactly one" in b for b in sc.validate_reference(cands, objs, h, sched, table))
+    assert any("different candidate list" in b for b in sc.validate_reference(cands, objs, "0" * 64, sched, table))
+
+
+def test_a_small_leg_budget_still_gives_a_heavy_channel_its_replica_legs(sc, tmp_path):
+    plan, heavy = heavy_plan()
+    table = heavy_table(sc, plan, heavy)
+    plan_path = tmp_path / "plan.json"
+    plan_path.write_text(json.dumps(plan))
+    costs = tmp_path / "costs.json"
+    costs.write_text(json.dumps(dict(table.data, heavy={"rows": [keyof(sc, plan[heavy])]})))
+    # A budget of 4 gives each of the four channels one leg; the heavy row needs three.
+    sched, _, _ = sc.build_schedule(plan_path, costs, ["python", "c", "cli", "core"], 4, None)
+    for ch in ("python", "c", "cli", "core"):
+        assert len(sched["channels"][ch]["legs"]) >= 3, ch
+    assert len(sched["replicas"]) == 4
+
+
+def test_a_small_reference_leg_count_still_gives_the_heavy_row_its_replica_legs(sc, tmp_path):
+    cands, cp, op, costs = ref_world(sc, tmp_path)
+    heavy = next(i for i, r in enumerate(cands) if r["object"] == "A" and r["test_type"] == "propagation" and r["propagation_uncertainty"] == "auto_detection_on" and r["dt_days"] == 20.0)
+    data = json.loads(costs.read_text())
+    key = keyof(sc, cands[heavy])
+    data["channels"]["rust"]["rows"][key] = 45.0
+    data["heavy"] = {"rows": [key]}
+    costs.write_text(json.dumps(data))
+    sched, _, table = sc.build_reference_schedule(cp, op, costs, 1)
+    assert len(sched["legs"]) == 3
+    assert sc.validate_reference(cands, ["A", "B", "C"], sched["candidates_sha256"], sched, table) == []
+
+
+def test_replicas_of_one_row_land_on_distinct_legs_even_when_another_leg_stays_the_lightest(sc):
+    """Three 100-minute units fill three legs; a fourth leg stays the lightest
+    after taking one replica. The next replica must still go elsewhere."""
+    plan = make_plan("A", "B", "C", "D", "E")
+    big = [i for i, r in enumerate(plan) if r["test_type"] == "propagation" and r["dt_days"] == 30.0][:3]
+    heavy = next(i for i, r in enumerate(plan) if r["object"] == "E" and r["test_type"] == "propagation" and r["dt_days"] == 20.0)
+    minutes = {keyof(sc, plan[i]): 100.0 for i in big}
+    minutes[keyof(sc, plan[heavy])] = 45.0
+    table = make_table(sc, plan, minutes)
+    table.heavy_rows = {keyof(sc, plan[heavy])}
+    legs, _, _, _, replicas = sc.pack("python", plan, table, 4)
+    holding = [leg["leg"] for leg in legs if heavy in leg["rows"]]
+    assert len(holding) == 3 and replicas[0]["legs"] == holding
+
+
+def test_a_replica_is_priced_at_one_run_not_the_whole_best_of_three(sc):
+    plan, heavy = heavy_plan()
+    table = heavy_table(sc, plan, heavy, minutes=45.0)
+    legs, _, _, _, _ = sc.pack("python", plan, table, 3)
+    for leg in legs:
+        assert heavy in leg["rows"]
+        # one 15-minute run plus the leg's share of the 0.001-minute rows
+        assert 15.0 <= leg["predicted_min"] < 15.2, leg

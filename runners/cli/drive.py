@@ -579,6 +579,48 @@ def _harvest_ref_nongrav(rows: list) -> dict:
     return ref_nongrav
 
 
+def _reps_key(r: dict) -> tuple:
+    """A row's identity for the repetition override: the harness-wide key
+    (object, test_type, propagation_uncertainty, dt, observer, force_model)."""
+    return (
+        r["object"],
+        r["test_type"],
+        r.get("propagation_uncertainty"),
+        float(r["dt_days"]),
+        r.get("observer"),
+        r.get("force_model"),
+    )
+
+
+def _load_reps_override(path: Path | None) -> dict:
+    """The per-row timing repetitions from ``--reps-override`` (a JSON list of
+    row identities, each with ``reps``): the heavy row's three timing
+    repetitions run on three legs, one each. The driver sends a ``reps N`` line
+    ahead of the row's prop / eph line, and the daemon applies it to that line
+    alone. A side file, never a plan key, because a plan key would flow into
+    the output through the row copy. Fewer than one repetition is refused."""
+    if path is None:
+        return {}
+    out: dict = {}
+    for e in json.loads(path.read_text()):
+        n = e["reps"]
+        if not isinstance(n, int) or n < 1:
+            raise SystemExit(f"ERROR: --reps-override {path}: row {_reps_key(e)} asks for {n!r} repetitions.")
+        k = _reps_key(e)
+        if k in out:
+            raise SystemExit(f"ERROR: --reps-override {path}: row {k} is listed twice.")
+        out[k] = n
+    return out
+
+
+def _send_reps(proc, reps_override: dict, r: dict) -> None:
+    """Tell the daemon how many timing repetitions the next prop / eph line runs
+    when the row carries an override; the daemon replies to nothing."""
+    n = reps_override.get(_reps_key(r))
+    if n is not None:
+        proc.stdin.write(f"reps {n}\n")
+
+
 def _context_rows(context: Path | None, input_rows: list) -> list:
     """The rows the cross-row lookups read: the full plan when ``--context`` is
     given, the input itself otherwise. A context that lacks an object of the
@@ -629,6 +671,13 @@ def main() -> int:
         "reference); defaults to --input. A channel leg replays a subset of the plan.",
     )
     p.add_argument(
+        "--reps-override",
+        type=Path,
+        default=None,
+        help="JSON list of row identities with `reps`: the timing repetitions those "
+        "rows run instead of the default best-of-3 (a replica leg of the heavy row runs it once).",
+    )
+    p.add_argument(
         "--fixtures-dir",
         type=Path,
         default=Path(__file__).parent.parent.parent / "fixtures" / "psv",
@@ -659,6 +708,12 @@ def main() -> int:
     # for the non_grav_recovery second pass when any of its reference
     # coefficients is non-zero.
     ref_nongrav = _harvest_ref_nongrav(_context_rows(args.context, rust_rows))
+    reps_override = _load_reps_override(args.reps_override)
+    if reps_override:
+        unknown = sorted(set(reps_override) - {_reps_key(r) for r in rust_rows})
+        if unknown:
+            raise SystemExit(f"ERROR: --reps-override names a row that is not in the input: {unknown[0]}")
+        print(f"Repetition override on {len(reps_override)} row(s).", file=sys.stderr)
 
     cmd = [str(args.runner), "--daemon"]
     if args.data_dir:
@@ -711,6 +766,7 @@ def main() -> int:
             if line is None:
                 continue
             method = _method_token(r)
+            _send_reps(proc, reps_override, r)
             proc.stdin.write(f"{line}\n")
             proc.stdin.flush()
             out_line = _read_line(proc)
@@ -750,6 +806,7 @@ def main() -> int:
             if eph_line is None:
                 continue
             method = _method_token(r)
+            _send_reps(proc, reps_override, r)
             proc.stdin.write(f"{eph_line}\n")
             proc.stdin.flush()
             out_line = _read_line(proc)

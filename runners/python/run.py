@@ -1160,6 +1160,40 @@ def _harvest_ref_non_grav(rows: list) -> dict[str, tuple[float, float, float]]:
     return ref_non_grav
 
 
+def _reps_key(r: dict) -> tuple:
+    """A row's identity for the repetition override: the harness-wide key
+    (object, test_type, propagation_uncertainty, dt, observer, force_model)."""
+    return (
+        r["object"],
+        r["test_type"],
+        r.get("propagation_uncertainty"),
+        float(r["dt_days"]),
+        r.get("observer"),
+        r.get("force_model"),
+    )
+
+
+def _load_reps_override(path: Path | None) -> dict:
+    """The per-row timing repetitions from ``--reps-override`` (a JSON list of
+    row identities, each with ``reps``): the heavy row's three timing
+    repetitions run on three legs, one each. A side file, never a plan key,
+    because a plan key would flow into the output through the row copy. An
+    entry that asks for fewer than one repetition is refused: a row that runs
+    no repetition has no result."""
+    if path is None:
+        return {}
+    out: dict = {}
+    for e in json.loads(path.read_text()):
+        n = e["reps"]
+        if not isinstance(n, int) or n < 1:
+            raise SystemExit(f"ERROR: --reps-override {path}: row {_reps_key(e)} asks for {n!r} repetitions.")
+        k = _reps_key(e)
+        if k in out:
+            raise SystemExit(f"ERROR: --reps-override {path}: row {k} is listed twice.")
+        out[k] = n
+    return out
+
+
 def _context_rows(context: Path | None, input_rows: list) -> list:
     """The rows the cross-row lookups read: the full plan when ``--context`` is
     given (a leg replays a subset of it), the input itself otherwise. A context
@@ -1271,6 +1305,13 @@ def main() -> int:
     p.add_argument("--data-dir", type=str, default=None)
     p.add_argument("--n-timing-runs", type=int, default=3)
     p.add_argument(
+        "--reps-override",
+        type=Path,
+        default=None,
+        help="JSON list of row identities with `reps`: the timing repetitions those "
+        "rows run instead of --n-timing-runs (a replica leg of the heavy row runs it once).",
+    )
+    p.add_argument(
         "--fixtures-dir",
         type=Path,
         default=Path(__file__).parent.parent.parent / "fixtures" / "psv",
@@ -1282,6 +1323,13 @@ def main() -> int:
     if not rust_rows:
         print("input JSON is empty", file=sys.stderr)
         return 1
+
+    reps_override = _load_reps_override(args.reps_override)
+    if reps_override:
+        unknown = sorted(set(reps_override) - {_reps_key(r) for r in rust_rows})
+        if unknown:
+            raise SystemExit(f"ERROR: --reps-override names a row that is not in the input: {unknown[0]}")
+        print(f"Repetition override on {len(reps_override)} row(s).", file=sys.stderr)
 
     _ensure_initialized(args.data_dir)
     print(
@@ -1370,7 +1418,7 @@ def main() -> int:
                 ic_non_grav_dt=r.get("ic_non_grav_dt"),
                 force_model=r["force_model"],
                 method_tag=r.get("propagation_uncertainty"),
-                n_timing_runs=args.n_timing_runs,
+                n_timing_runs=reps_override.get(_reps_key(r), args.n_timing_runs),
                 excluded_perturbers_naif=r.get("excluded_perturbers_naif"),
             )
             if isinstance(ret, _Declined):
@@ -1617,7 +1665,7 @@ def main() -> int:
                 ic_non_grav_dt=r.get("ic_non_grav_dt"),
                 obs_code=obs_code,
                 force_model=r["force_model"],
-                n_timing_runs=args.n_timing_runs,
+                n_timing_runs=reps_override.get(_reps_key(r), args.n_timing_runs),
                 method_tag=r.get("propagation_uncertainty"),
                 excluded_perturbers_naif=r.get("excluded_perturbers_naif"),
             )
