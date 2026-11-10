@@ -257,9 +257,7 @@ env:
   #   grss    setup fetches the debiasing tables (ssd.jpl.nasa.gov) and the
   #           observatory codes (data.minorplanetcenter.net); no tool-set folder
   #           carries them yet
-  #   kete    its import fetches kernels from naif.jpl.nasa.gov (its leg leaves
-  #           NAIF open); closed by the runner-fixes PR
-  UPSTREAM_FETCH_ALLOWLIST: '["grss","kete"]'
+  UPSTREAM_FETCH_ALLOWLIST: '["grss"]'
   TIER: ${{ inputs.tier || 'standard' }}
   # Shared cache keys — every job restores by these exact keys so the
   # downloads/builds `prep` populates fan out warm. Bump a version suffix
@@ -1300,17 +1298,17 @@ jobs:
           fi
           rm -rf data && mkdir -p data && cp -a "$src"/. data/
 
-      # layup, adam-core, ASSIST, find_orb, jorbit, OrbFit, OpenOrb and GRSS read
-      # their data from the third-party tool set, folders `layup/`, `adam-core/`,
-      # `assist/`, `findorb/`, `jorbit/`, `orbfit/`, `oorb/` and `grss/` (every
-      # file each opens, shared kernels included), not from the engine kernel set
-      # and never from JPL or NAIF. find_orb and OpenOrb run under the ASSIST
+      # Every external tool reads its data from the third-party tool set, its
+      # own folder (`layup/`, `adam-core/`, `assist/`, `findorb/`, `jorbit/`,
+      # `orbfit/`, `oorb/`, `kete/`, `grss/`) listing every file it opens,
+      # shared kernels included, not the engine kernel set and never JPL, NAIF
+      # or the MPC. find_orb and OpenOrb run under the ASSIST
       # venv, whose setup checks the `assist/` folder too.
       # prep, the trusted job that already holds the bucket identity, syncs the
       # set and saves it to the cache below; this leg only restores it and
       # refuses a miss by name, with no token, no auth step and no gcloud.
       - name: Restore the third-party tool set
-        if: contains(fromJSON('["layup","adam-core","assist","findorb","jorbit","orbfit","oorb","grss"]'), matrix.tool) && env.ACT != 'true'
+        if: contains(fromJSON('["layup","adam-core","assist","findorb","jorbit","orbfit","oorb","kete","grss"]'), matrix.tool) && env.ACT != 'true'
         uses: actions/cache/restore@v4
         with:
           path: |
@@ -1323,7 +1321,7 @@ jobs:
       # ACT_THIRD_PARTY_DIR), beside the engine set's /host-data. Only the
       # folders this tool reads are copied.
       - name: Copy the third-party tool set from the host mount (act)
-        if: contains(fromJSON('["layup","adam-core","assist","findorb","jorbit","orbfit","oorb","grss"]'), matrix.tool) && env.ACT == 'true'
+        if: contains(fromJSON('["layup","adam-core","assist","findorb","jorbit","orbfit","oorb","kete","grss"]'), matrix.tool) && env.ACT == 'true'
         run: |
           src="${ACT_THIRD_PARTY_DIR:-/host-third-party}"
           # The sentinel files each folder must hold, and the folders each tool reads.
@@ -1335,6 +1333,7 @@ jobs:
             findorb)      dirs="findorb assist"; need="findorb/bc405.dat findorb/bias.dat findorb/linux_p1550p2650.440 assist/linux_p1550p2650.440" ;;
             orbfit)       dirs="orbfit";         need="orbfit/de440.bsp" ;;
             oorb)         dirs="oorb assist";    need="oorb/de440.dat oorb/de440.bsp oorb/asteroid_ephemeris.txt assist/linux_p1550p2650.440" ;;
+            kete)         dirs="kete";           need="kete/de440s.bsp kete/20000001.bsp kete/bias.dat kete/sb441-n16.bsp" ;;
             grss)         dirs="grss";           need="grss/de440.bsp grss/pck00011.tpc grss/sb441-n16s.bsp" ;;
           esac
           for f in $need; do
@@ -1416,12 +1415,11 @@ jobs:
 
       # The allowlisted tools are sealed here, after the setup that still
       # fetches upstream and before the run, which reads only the pinned sets.
-      # kete's import still fetches its kernels from NAIF, so its leg leaves
-      # NAIF open (`--allow-naif`).
+      # The seal covers all six hosts; no leg leaves NAIF open.
       - name: Seal the job from JPL, NAIF and the MPC (after setup, allowlisted tools)
         if: ${{ contains(fromJSON(env.UPSTREAM_FETCH_ALLOWLIST), matrix.tool) }}
         working-directory: empyrean-validation
-        run: ./scripts/seal-upstream.sh ${{ matrix.tool == 'kete' && '--allow-naif' || '' }}
+        run: ./scripts/seal-upstream.sh
 
       # EXT_LEG is this leg's id in the external schedule: an object leg runs
       # only its objects (`--only`), a one-leg tool runs the whole plan.

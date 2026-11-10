@@ -36,12 +36,9 @@ ALLOWLIST = {
     "grss": "setup fetches the debiasing tables from ssd.jpl.nasa.gov and the observatory codes from "
     "data.minorplanetcenter.net (grss's own get_debiasing_data.py and _download_codes_file); no "
     "third-party tool-set folder carries them yet",
-    "kete": "its import fetches kernels from naif.jpl.nasa.gov (its leg leaves NAIF open); closed by the runner-fixes PR",
 }
 # The list may lose tools, never gain one.
-CEILING = frozenset({"grss", "kete"})
-# The one tool whose run itself still reaches NAIF, so its late seal leaves NAIF open.
-NAIF_OPEN = frozenset({"kete"})
+CEILING = frozenset({"grss"})
 
 HOSTS = ("ssd.jpl.nasa.gov", "ssd-api.jpl.nasa.gov", "naif.jpl.nasa.gov", "minorplanetcenter.net")
 # A URL: a scheme, or a host followed by a path. A host named in prose ("reads
@@ -145,7 +142,6 @@ def test_the_scan_covers_the_files_that_used_to_fetch():
 
 def test_the_allowlist_only_shrinks_and_the_workflow_agrees():
     assert set(ALLOWLIST) <= CEILING, f"the upstream-fetch allowlist grew: {sorted(set(ALLOWLIST) - CEILING)}"
-    assert NAIF_OPEN <= set(ALLOWLIST)
     m = re.search(r"^  UPSTREAM_FETCH_ALLOWLIST: '(\[.*\])'$", VALIDATION, re.MULTILINE)
     assert m, "the workflow env names no UPSTREAM_FETCH_ALLOWLIST"
     assert sorted(json.loads(m.group(1))) == sorted(ALLOWLIST), "the workflow's allowlist and this file's disagree"
@@ -180,16 +176,17 @@ def test_external_legs_seal_before_setup_unless_allowlisted():
     i_run = next(i for i, n in enumerate(names) if n.startswith("name: Run ${{ matrix.tool }}"))
     i_late = st.index(late)
     assert i_setup < i_late < i_run, "the allowlisted tools seal after setup and before the run"
-    naif = re.search(r"seal-upstream\.sh \$\{\{ matrix\.tool == '(\w+)' && '--allow-naif' \|\| '' \}\}", late)
-    assert naif and {naif.group(1)} == set(NAIF_OPEN), "only kete's leg leaves NAIF open"
+    assert re.search(r"run: \./scripts/seal-upstream\.sh\s*$", late, re.MULTILINE), "the late seal covers all six hosts too"
+    assert "--allow-naif" not in VALIDATION, "no leg leaves NAIF open"
 
 
-def test_the_seal_script_covers_naif_unless_told_otherwise():
+def test_the_seal_script_always_covers_all_six_hosts():
     text = SEAL.read_text()
     hosts = re.search(r"HOSTS=\(\n(.*?)\n\)", text, re.DOTALL).group(1).split()
-    assert sorted(hosts) == sorted(["ssd.jpl.nasa.gov", "ssd-api.jpl.nasa.gov", "data.minorplanetcenter.net", "minorplanetcenter.net", "www.minorplanetcenter.net"])
-    assert '"") HOSTS+=(naif.jpl.nasa.gov) ;;' in text, "the default seal adds NAIF"
-    assert "--allow-naif) ;;" in text
+    assert sorted(hosts) == sorted(
+        ["ssd.jpl.nasa.gov", "ssd-api.jpl.nasa.gov", "naif.jpl.nasa.gov", "data.minorplanetcenter.net", "minorplanetcenter.net", "www.minorplanetcenter.net"]
+    )
+    assert "HOSTS+=" not in text and "--allow-naif" not in text, "the seal has no way to leave a host open"
 
 
 def test_find_orb_assist_and_grss_read_the_third_party_set():

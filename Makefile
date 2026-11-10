@@ -1263,6 +1263,10 @@ $(CORE_OUT): $(call channel_plan,core) $(CORE_BIN) | check-plan fixtures
 # ephemeris, and OD. Used as a sanity check parallel to ASSIST /
 # find_orb but covering all three test types.
 KETE_VENV := $(EMP_VAL_RUNNERS)/kete/.venv
+# Everything kete loads, and the EFCC18 bias.dat its OD debiases with, comes
+# from the kete folder of the third-party tool set (synced under
+# $(DATA_DIR)/third-party), linked into the runner's private KETE_CACHE_DIR.
+KETE_DATA_DIR ?= $(DATA_DIR)/third-party/kete
 KETE_PY := $(KETE_VENV)/bin/python
 
 setup-kete: $(KETE_PY)
@@ -1275,7 +1279,7 @@ $(KETE_OUT): $(PLAN) $(KETE_PY) | check-plan fixtures
 	@echo "──── Kete: external all-test-types reference ──────────"
 	@$(KETE_PY) $(EMP_VAL_RUNNERS)/kete/run_kete.py \
 	    --input $(PLAN) --output $(KETE_OUT) \
-	    --fixtures-dir $(FIXTURES_PSV) --data-dir $(DATA_DIR)
+	    --fixtures-dir $(FIXTURES_PSV) --data-dir $(KETE_DATA_DIR)
 
 # ── GRSS external comparison — propagation + ephemeris + OD ──
 # The Gauss-Radau Small-body Simulator (Makadia et al.;

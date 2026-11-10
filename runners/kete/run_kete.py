@@ -29,6 +29,9 @@ Kete-specific fields:
     kete_od_fit_epoch_mjd_tdb — epoch kete fitted at, before propagation to
                                t_mjd_tdb (OD rows)
     kete_od_error            — why an OD row has no fit (OD failure rows)
+    kete_unsupported         — why kete does not run this row at all: the object
+                               is one of the sixteen masses kete integrates
+                               (named unsupported, never run)
 
 kete exposes no iteration count or chi-squared for a fit, so OD rows carry
 neither.
@@ -44,6 +47,27 @@ emitted with `kete_od_error` naming the cause.
 Propagation and ephemeris rows are best-effort: when kete cannot process
 one, the row is emitted without `kete_*` fields and a note is logged to
 stderr.
+
+Data: everything kete reads comes from the kete/ folder of the third-party
+tool set (`--data-dir`). kete's import loads (and, when one is missing,
+downloads from NAIF, GitHub and JPL Horizons, retrying for about a minute
+each) the files of `$KETE_CACHE_DIR/kernels/core`, so the runner links the
+folder's kernels there in a private cache directory and sets KETE_CACHE_DIR
+before kete is imported; a missing file is a hard stop that names it. The
+folder's `bias.dat` is the EFCC18 table OD debiases with. kete embeds its
+observatory codes in the binary.
+
+Force model: the sixteen SB441-N16 asteroid masses, as the engine and every
+other reference integrate. kete's include_asteroids set carries five of them
+(Ceres, Pallas, Vesta, Hygiea, Interamnia) on the folder's Horizons SPKs; the
+runner registers the other eleven with register_custom_mass under the NAIF ids
+the folder's sb441-n16.bsp carries (2000000+n), each with kete's own mass and
+radius from its built-in table, and checks that kete then integrates exactly
+sixteen. Every propagation runs with suppress_errors=False, so a body without a
+state is an error rather than a NaN. An object that is itself one of the
+sixteen (the plan names it in `excluded_perturbers_naif`) would perturb itself
+and kete cannot leave a body out, so each of its rows is a named unsupported
+row carrying the reason in `kete_unsupported`, never run.
 """
 
 from __future__ import annotations
@@ -60,12 +84,121 @@ from pathlib import Path
 
 import ades_psv
 
-try:
-    import kete
+# Bound by _load_kete(): importing kete runs its kernel loader, which downloads
+# whatever its cache lacks, so kete is imported only after the cache is staged.
+kete = None
+_HAVE_KETE = False
+
+RUNNER_DIR = Path(__file__).resolve().parent
+# The runner-private kete cache (gitignored); its kernels/core links the folder.
+KETE_CACHE_DIR = RUNNER_DIR / ".kete-cache"
+# Every file kete's loader looks for in kernels/core (kete/spice.py
+# _download_core_files): DE440s, the Earth orientation PCK (any *combined.bpc),
+# its five massive-asteroid SPKs (Horizons products, NAIF 20000000+n) and the
+# three spacecraft SPKs, whose absence changes no result but costs a retried
+# download each; plus sb441-n16.bsp, the states of the eleven SB441-N16 bodies
+# kete's five lack (kete loads every SPK in kernels/core).
+KETE_CORE_FILES = (
+    "de440s.bsp",
+    "20000001.bsp", "20000002.bsp", "20000004.bsp", "20000010.bsp", "20000704.bsp",
+    "spherex.bsp", "spitzer.bsp", "wise.bsp",
+    "sb441-n16.bsp",
+)
+# SB441-N16, the sixteen asteroid perturbers the engine and every reference
+# integrate, by asteroid number.
+SB441_N16 = (1, 2, 3, 4, 7, 10, 15, 16, 31, 52, 65, 87, 88, 107, 511, 704)
+# kete's include_asteroids five, registered by kete under their Horizons ids
+# (20000000+n) and served by the folder's Horizons SPKs.
+KETE_OWN_FIVE = (1, 2, 4, 10, 704)
+# The other eleven, registered under the ids sb441-n16.bsp carries (2000000+n).
+KETE_REGISTERED = tuple(n for n in SB441_N16 if n not in KETE_OWN_FIVE)
+# The NAIF ids of the sixteen as kete integrates them.
+KETE_MASS_IDS = frozenset(
+    [20_000_000 + n for n in KETE_OWN_FIVE] + [2_000_000 + n for n in KETE_REGISTERED]
+)
+# The plan names a self-perturber by 2000000+n in excluded_perturbers_naif.
+SELF_PERTURBER_NAIF = frozenset(2_000_000 + n for n in SB441_N16)
+SELF_PERTURBER_UNSUPPORTED = (
+    "self-perturber: kete integrates the sixteen SB441-N16 masses and has no "
+    "per-body exclusion, so the object would perturb itself"
+)
+KETE_PCK_GLOB = "*combined.bpc"
+
+
+class KeteDataError(RuntimeError):
+    """The kete folder cannot stand in for kete's own downloads; names the gap."""
+
+
+def stage_kete_cache(data_dir: Path, cache_dir: Path) -> list[str]:
+    """Link every kernel kete loads from the kete folder into ``cache_dir``'s
+    kernels/core. Returns the staged names; raises naming what is missing."""
+    missing = [n for n in KETE_CORE_FILES if not (data_dir / n).is_file()]
+    pcks = sorted(data_dir.glob(KETE_PCK_GLOB))
+    if len(pcks) != 1:
+        missing.append(f"exactly one {KETE_PCK_GLOB} (found {len(pcks)})")
+    if not (data_dir / "bias.dat").is_file():
+        missing.append("bias.dat")
+    if missing:
+        raise KeteDataError(f"the kete folder {data_dir} lacks: {', '.join(missing)}")
+    core = cache_dir / "kernels" / "core"
+    core.mkdir(parents=True, exist_ok=True)
+    for old in core.iterdir():  # only this folder's kernels: kete loads every file here
+        old.unlink()
+    names = [*KETE_CORE_FILES, pcks[0].name]
+    for n in names:
+        (core / n).symlink_to((data_dir / n).resolve())
+    return names
+
+
+def _load_kete(data_dir: Path) -> None:
+    """Stage kete's cache from the kete folder, import kete, register the masses."""
+    global kete, _HAVE_KETE
+    import os
+
+    if "kete" in sys.modules:
+        # kete loads its kernels when first imported; one imported before the
+        # cache was staged read some other cache, and nothing here would know.
+        raise KeteDataError("kete was imported before the runner staged its cache")
+    names = stage_kete_cache(data_dir, KETE_CACHE_DIR)
+    os.environ["KETE_CACHE_DIR"] = str(KETE_CACHE_DIR)
+    import kete as _kete
+
+    kete = _kete
     _HAVE_KETE = True
-except Exception as e:
-    print(f"warning: kete import failed: {e}", file=sys.stderr)
-    _HAVE_KETE = False
+    print(f"kete: {len(names)} kernels from {data_dir} via {KETE_CACHE_DIR}", file=sys.stderr)
+    ids = register_sb441_n16(kete)
+    KETE_SETTINGS["asteroid_masses"] = (
+        f"{len(ids)} (SB441-N16): NAIF {', '.join(str(i) for i in ids)}"
+    )
+    print(f"kete: {len(ids)} asteroid masses registered (SB441-N16)", file=sys.stderr)
+
+
+def register_sb441_n16(kete_mod) -> list[int]:
+    """Register the eleven SB441-N16 bodies kete's include_asteroids five lack,
+    each with kete's own mass and radius, and return the asteroid ids kete then
+    integrates. Raises, naming the gap, unless they are exactly the sixteen."""
+    table = {naif: (mass, radius) for _name, naif, mass, radius in kete_mod._core.known_masses()}
+    missing = [20_000_000 + n for n in KETE_REGISTERED if 20_000_000 + n not in table]
+    if missing:
+        raise KeteDataError(f"kete's built-in mass table lacks SB441-N16 bodies {missing}")
+    for n in KETE_REGISTERED:
+        mass, radius = table[20_000_000 + n]
+        kete_mod.propagation.register_custom_mass(2_000_000 + n, mass, radius)
+    ids = sorted(naif for _name, naif, _m, _r in kete_mod._core.registered_masses() if naif > 1000)
+    if set(ids) != KETE_MASS_IDS:
+        raise KeteDataError(
+            f"kete integrates asteroid ids {ids}, not the sixteen SB441-N16 masses "
+            f"{sorted(KETE_MASS_IDS)}"
+        )
+    return ids
+
+
+def kete_unsupported_reason(row: dict) -> str | None:
+    """Why kete does not run this row, or None: an object the plan names as one
+    of the sixteen perturbers would perturb itself in kete."""
+    if SELF_PERTURBER_NAIF & set(row.get("excluded_perturbers_naif") or ()):
+        return SELF_PERTURBER_UNSUPPORTED
+    return None
 
 
 _AU_KM = 149_597_870.700
@@ -119,20 +252,15 @@ def _kete_state(epoch_mjd_tdb: float, pos_au, vel_au_d):
     )
 
 
-# kete's include_asteroids force set is Ceres, Pallas, Interamnia, Hygiea and
-# Vesta — three of which the suite propagates AS test objects. kete has no
-# per-body exclusion, so for those objects the massive-asteroid set would
-# include the object itself (a 1/r² self-singularity, the same failure mode
-# measured at ~7e8 km/30 d with ASSIST). Propagate them planets-only.
-_KETE_MASSIVE = {"Vesta", "Pallas", "Hygiea"}
-
 # kete's configuration, stamped on every row (merge-external carries it to the
 # report's Configurations appendix).
 KETE_SETTINGS = {
-    "force_model": "planets from kete's DE440s plus kete's include_asteroids set "
-    "(Ceres, Pallas, Interamnia, Hygiea, Vesta), kete's own masses",
-    "self_perturbers": "Vesta, Pallas, Hygiea run planets-only (each is in kete's "
-    "massive-asteroid set; kete has no per-body exclusion)",
+    "force_model": "planets from kete's DE440s plus the sixteen SB441-N16 asteroid "
+    "masses, every row: kete's include_asteroids five (Ceres, Pallas, Vesta, Hygiea, "
+    "Interamnia) on the folder's Horizons SPKs, the other eleven registered from kete's "
+    "own mass table with their states from sb441-n16.bsp; suppress_errors=False",
+    "self_perturbers": "an object that is one of the sixteen (Iris, Vesta, Pallas, "
+    "Hygiea) is a named unsupported row: kete has no per-body exclusion",
     "non_grav": "the plan's Marsden A1/A2/A3, g(r) and delay through "
     "NonGravModel.new_comet",
     "ephemeris": "light time iterated against the observer from kete's MPC code table",
@@ -143,20 +271,15 @@ KETE_SETTINGS = {
 
 
 def _kete_prop_opts(row: dict) -> dict:
-    """include_asteroids + non_gravs options for one plan row.
+    """propagate_n_body options for one plan row: the sixteen asteroid masses on
+    every row, errors raised rather than returned as NaN, and the row's non-grav.
 
     Non-grav: the plan's Marsden A1/A2/A3 + g(r) (alpha, r0, m, n, k) + dt
     delay map 1:1 onto kete's NonGravModel.new_comet — without this, comets
     propagate gravity-only while Empyrean models the full non-grav term
     (1e3–1e5 km of apples-to-oranges over ±15 yr).
     """
-    opts: dict = {"include_asteroids": row.get("object") not in _KETE_MASSIVE}
-    if not opts["include_asteroids"]:
-        print(
-            f"  {row.get('object')}: kete runs planets-only "
-            "(object is in kete's massive-asteroid set; no per-body exclusion)",
-            file=sys.stderr,
-        )
+    opts: dict = {"include_asteroids": True, "suppress_errors": False}
     a1 = row.get("ic_a1") or 0.0
     a2 = row.get("ic_a2") or 0.0
     a3 = row.get("ic_a3") or 0.0
@@ -332,7 +455,7 @@ def _od_with_kete(row: dict, fixtures_dir: Path, debias) -> dict | None:
         )
     # The fit uses the force model the propagation arm uses for this object.
     prop_opts = _kete_prop_opts(row)
-    fit_opts: dict = {"include_asteroids": prop_opts["include_asteroids"]}
+    fit_opts: dict = {"include_asteroids": True}
     if "non_gravs" in prop_opts:
         fit_opts["non_grav"] = prop_opts["non_gravs"][0]
     target_jd = row["t_mjd_tdb"] + 2_400_000.5
@@ -446,10 +569,16 @@ def main() -> int:
     p.add_argument(
         "--data-dir",
         type=Path,
-        default=Path.home() / ".empyrean" / "data",
-        help="engine data directory; OD reads its EFCC18 bias.dat (default: ~/.empyrean/data)",
+        default=Path.home() / ".empyrean" / "data" / "third-party" / "kete",
+        help="the kete folder of the third-party tool set: every kernel kete loads, "
+        "and the EFCC18 bias.dat OD debiases with",
     )
     args = p.parse_args()
+    try:
+        _load_kete(args.data_dir)
+    except KeteDataError as e:
+        print(f"ERROR: {e}", file=sys.stderr)
+        return 1
 
     plan = json.loads(args.input.read_text())
     if not plan:
@@ -487,6 +616,12 @@ def main() -> int:
         new["kete_version"] = source_version
         new["kete_settings"] = KETE_SETTINGS
         tt = r.get("test_type")
+        unsupported = kete_unsupported_reason(r)
+        if unsupported is not None and tt in ("propagation", "ephemeris", "orbit_determination"):
+            # A named unsupported row: emitted with its reason, never run.
+            new["kete_unsupported"] = unsupported
+            out_rows.append(new)
+            continue
         if tt == "propagation":
             update = _propagate_with_kete(r)
         elif tt == "ephemeris":
