@@ -254,3 +254,133 @@ def test_a_real_schedule_round_trips_select_then_concat_to_the_plan(cc, tmp_path
         out = tmp_path / f"validation_{channel}.json"
         cc.main(["concat", "--plan", str(plan_path), "--schedule", str(sched_path), "--channel", channel, "--out", str(out), *map(str, reversed(files))])
         assert json.loads(out.read_text()) == [dict(r, channel=channel) for r in plan], channel
+
+
+# ── timing replicas (S4) ─────────────────────────────────────────────────────
+
+HEAVY = 2  # plan row index of the replicated row in small_plan()
+
+
+@pytest.fixture
+def replicated(cc, tmp_path):
+    """small_plan() with row 2 replicated on three python legs; every other row
+    in exactly one leg. Leg files carry distinct emp_time_ms on the replica."""
+    plan = small_plan()
+    plan_path = tmp_path / "validation_plan.json"
+    plan_path.write_text(json.dumps(plan))
+    others = [i for i in range(len(plan)) if i != HEAVY]
+    legs = {"01": sorted([HEAVY] + others[:4]), "02": sorted([HEAVY] + others[4:]), "03": [HEAVY]}
+    spec = [{"leg": k, "rows": v, "predicted_min": 1.0, "reps": {str(HEAVY): 1}} for k, v in legs.items()]
+    schedule = {
+        "schema": cc.sched.SCHEMA,
+        "plan_sha256": cc.sched.file_sha256(plan_path),
+        "channels": {"python": {"legs": spec}},
+        "replicas": [{"channel": "python", "group": "g", "row": HEAVY, "legs": ["01", "02", "03"], "reps": 1}],
+    }
+    sched_path = tmp_path / "schedule.json"
+    sched_path.write_text(json.dumps(schedule))
+    times = {"01": 300.0, "02": 100.0, "03": 200.0}
+
+    def leg_file(leg, mutate=None):
+        rows = []
+        for i in legs[leg]:
+            r = dict(plan[i], channel="python", emp_time_ms=10.0 + i, timestamp=f"t{leg}")
+            if i == HEAVY:
+                r["emp_time_ms"] = times[leg]
+                r["emp_pos_au"] = [0.1, 0.2, 0.3]
+                if mutate:
+                    r.update(mutate)
+            rows.append(r)
+        p = tmp_path / f"validation_python.leg{leg}.json"
+        p.write_text(json.dumps(rows))
+        return p
+
+    return plan, plan_path, sched_path, leg_file, tmp_path
+
+
+def concat_args(plan_path, sched_path, out, files):
+    return ["concat", "--plan", str(plan_path), "--schedule", str(sched_path), "--channel", "python", "--out", str(out), *map(str, files)]
+
+
+def test_concat_folds_replicas_to_one_row_keeping_the_minimum_time_and_says_so(cc, replicated, capsys):
+    plan, plan_path, sched_path, leg_file, tmp = replicated
+    out = tmp / "validation_python.json"
+    assert cc.main(concat_args(plan_path, sched_path, out, [leg_file(k) for k in ("03", "01", "02")])) == 0
+    rows = json.loads(out.read_text())
+    assert len(rows) == len(plan)  # one row for the replicated plan row, not three
+    folded = rows[HEAVY]
+    assert folded["emp_time_ms"] == 100.0 and folded["timestamp"] == "t01"
+    said = capsys.readouterr().out
+    assert "folded" in said and "3 replicas (legs 01,02,03) identical" in said and "min 100.0" in said
+
+
+def test_concat_refuses_replicas_that_disagree_naming_the_field_and_legs(cc, replicated):
+    plan, plan_path, sched_path, leg_file, tmp = replicated
+    files = [leg_file("01"), leg_file("02", {"emp_pos_au": [0.1, 0.2, 0.31]}), leg_file("03")]
+    with pytest.raises(SystemExit, match=r"emp_pos_au.*01 and 02"):
+        cc.main(concat_args(plan_path, sched_path, tmp / "o.json", files))
+    assert not (tmp / "o.json").exists()
+
+
+def test_concat_refuses_a_replica_leg_that_did_not_deliver_the_row(cc, replicated):
+    plan, plan_path, sched_path, leg_file, tmp = replicated
+    f3 = leg_file("03")
+    f3.write_text("[]")
+    with pytest.raises(SystemExit, match="a replica leg did not deliver it"):
+        cc.main(concat_args(plan_path, sched_path, tmp / "o.json", [leg_file("01"), leg_file("02"), f3]))
+
+
+def test_concat_refuses_a_replica_delivered_twice_by_one_leg(cc, replicated):
+    plan, plan_path, sched_path, leg_file, tmp = replicated
+    f1 = leg_file("01")
+    rows = json.loads(f1.read_text())
+    f1.write_text(json.dumps(rows + [r for r in rows if r["dt_days"] == plan[HEAVY]["dt_days"] and r["test_type"] == "propagation"][:1]))
+    with pytest.raises(SystemExit, match="delivered twice"):
+        cc.main(concat_args(plan_path, sched_path, tmp / "o.json", [f1, leg_file("02"), leg_file("03")]))
+
+
+def test_an_unreplicated_row_delivered_by_two_legs_is_still_refused(cc, replicated):
+    plan, plan_path, sched_path, leg_file, tmp = replicated
+    f2 = leg_file("02")
+    f3 = tmp / "validation_python.leg03.json"
+    other = next(i for i in range(len(plan)) if i != HEAVY)
+    rows = json.loads(f3.read_text() if f3.exists() else leg_file("03").read_text())
+    f3.write_text(json.dumps(rows + [dict(plan[other], channel="python")]))
+    with pytest.raises(SystemExit, match="which the schedule gave to another leg"):
+        cc.main(concat_args(plan_path, sched_path, tmp / "o.json", [leg_file("01"), f2, f3]))
+
+
+def test_select_writes_the_legs_repetition_overrides_beside_its_rows(cc, replicated, capsys):
+    plan, plan_path, sched_path, _, tmp = replicated
+    out, reps = tmp / "leg.json", tmp / "leg.reps.json"
+    cc.main(["select", "--plan", str(plan_path), "--schedule", str(sched_path), "--channel", "python", "--leg", "03", "--output", str(out), "--reps-output", str(reps)])
+    entries = json.loads(reps.read_text())
+    assert len(entries) == 1 and entries[0]["reps"] == 1
+    assert (entries[0]["object"], entries[0]["dt_days"]) == (plan[HEAVY]["object"], plan[HEAVY]["dt_days"])
+    assert "1 repetition override(s)" in capsys.readouterr().out
+    # a leg with no replica row writes an empty list, never a stale file
+    sched = json.loads(sched_path.read_text())
+    sched["channels"]["python"]["legs"][0].pop("reps")
+    sched_path.write_text(json.dumps(sched))
+    cc.main(["select", "--plan", str(plan_path), "--schedule", str(sched_path), "--channel", "python", "--leg", "01", "--output", str(out), "--reps-output", str(reps)])
+    assert json.loads(reps.read_text()) == []
+
+
+def test_partition_splits_the_rows_with_an_override_from_the_rest_and_join_puts_them_back(cc, replicated):
+    plan, plan_path, sched_path, _, tmp = replicated
+    out, reps = tmp / "leg.json", tmp / "leg.reps.json"
+    cc.main(["select", "--plan", str(plan_path), "--schedule", str(sched_path), "--channel", "python", "--leg", "01", "--output", str(out), "--reps-output", str(reps)])
+    once, rest = tmp / "once.json", tmp / "rest.json"
+    cc.main(["partition", "--input", str(out), "--reps", str(reps), "--override-out", str(once), "--rest-out", str(rest)])
+    a, b = json.loads(once.read_text()), json.loads(rest.read_text())
+    assert [r["dt_days"] for r in a] == [plan[HEAVY]["dt_days"]] and len(a) + len(b) == len(json.loads(out.read_text()))
+    joined = tmp / "joined.json"
+    cc.main(["join", "--out", str(joined), str(rest), str(once)])
+    assert json.loads(joined.read_text()) == b + a
+
+
+def test_join_refuses_a_file_that_is_not_a_row_list(cc, tmp_path):
+    bad = tmp_path / "bad.json"
+    bad.write_text('{"a": 1}')
+    with pytest.raises(SystemExit, match="not a JSON list"):
+        cc.main(["join", "--out", str(tmp_path / "o.json"), str(bad)])

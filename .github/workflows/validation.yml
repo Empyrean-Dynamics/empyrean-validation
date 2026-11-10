@@ -8,39 +8,44 @@ name: Validation Suite
 #
 # ── Pipeline shape (matrix fan-out) ────────────────────────────────
 #
-#   precheck ─► prep ─► reference ×50 ─► assemble ─┬─► empyrean ────┐
-#                       (one leg per object)        │                ├─► reduce
-#                                                   └─► external ×N ─┘
+#   precheck ─► prep ─► reference ×N ─► assemble ─┬─► empyrean ────┐
+#                       (cost-balanced row legs)   │                ├─► reduce
+#                                                  └─► external ×N ─┘
 #
 #   • prep   — build the engine and harness binaries, sync the kernel set, and
 #              fetch the pinned inputs snapshot (SBDB, Horizons, ADES PSVs)
 #              from the suite's public validation bucket ONCE (plain HTTPS, no
-#              credential) into the shared caches, then emit the per-object
-#              fan-out matrix from the catalog. It no longer queries JPL/MPC
+#              credential) into the shared caches, then list the reference's
+#              candidate rows (`validate run --list-rows`, no engine call) and
+#              pack them, with one OD unit per object, into cost-balanced legs
+#              from the committed cost table (scripts/schedule.py
+#              pack-reference). It no longer queries JPL/MPC
 #              live and no longer runs the reference itself; the ONLY workflow
 #              that reaches JPL/MPC is the manual mint-inputs action. Every
 #              other job restores the inputs snapshot from the actions cache by
 #              snapshot id (no credential) and then seals the JPL/MPC hosts
 #              before running.
-#   • reference — one matrix leg per catalog object, each running prop+eph +
-#              OD for its single object into a shard artifact. Running all
-#              three axes over the whole catalog in ONE job took 176 min and
-#              blew the 180-minute ceiling, discarding ~3 hours of completed
-#              fits (empyrean-qhhw). Per object rather than N balanced shards
-#              because fit cost is not predictable from any cheap proxy —
-#              Didymos fits 6,034 observations in 25.4 min, Eros fits 13,150
-#              in 47 s — so a weight table would silently unbalance whenever
-#              the engine or catalog moved. Legs restore prep's caches
-#              read-only and fail on a miss rather than re-downloading 2 GB
-#              of kernels 50 times. fail-fast:false, so one pathological
-#              object cannot cancel the other 49.
-#   • assemble — the fan-in: reassemble every shard into the canonical
-#              reference, then strip it into validation_plan.json. Checks the
-#              arrived shard set against the catalog and fails NAMING any
-#              absent object — a report built from 49 of 50 objects is
-#              otherwise indistinguishable from a complete one. Runs on
-#              always() so a dead leg produces that named error instead of a
-#              skipped job.
+#   • reference — one matrix leg per entry of the reference schedule, each
+#              running `validate run --select` over its candidate rows and
+#              `validate od` over the objects whose OD run it owns, into a leg
+#              artifact. Running all three axes over the whole catalog in ONE
+#              job took 176 min and blew the 180-minute ceiling, discarding
+#              ~3 hours of completed fits (empyrean-qhhw); a leg per object
+#              could not cut the one object holding the 42-minute 2020 CD3
+#              propagation row, which every channel times best of three. The
+#              heavy row's three timing repetitions run on three legs, one
+#              each, and assemble checks them identical and keeps the minimum.
+#              Legs restore prep's caches read-only and fail on a miss rather
+#              than re-downloading 2 GB of kernels per leg. fail-fast:false, so
+#              one slow leg cannot cancel the others.
+#   • assemble — the fan-in: reassemble every leg into the canonical
+#              reference (scripts/assemble-reference.py), then strip it into
+#              validation_plan.json. Checks that every candidate row is a result
+#              or named as dropped by the leg that ran it and fails NAMING any
+#              missing row or absent leg — a report built from most of the
+#              reference is otherwise indistinguishable from a complete one.
+#              Runs on always() so a dead leg produces that named error
+#              instead of a skipped job.
 #   • empyrean — the four remaining distribution channels (python / c / cli /
 #              core) that need the private empyrean + empyrean-core source
 #              built, in cost-balanced row-level legs: assemble packs the
@@ -147,6 +152,14 @@ on:
         description: "Total channel legs over python / c / cli / core (empty = the default budget; a rehearsal passes a small number)"
         type: string
         default: ""
+      reference_legs:
+        description: "Reference legs (empty = the default budget; a rehearsal passes a small number)"
+        type: string
+        default: ""
+      heavy_min_s:
+        description: "Also fan out any row whose single timing run costs this many seconds (empty = only the rows the cost table marks heavy; a rehearsal passes a small number so a cheap row fans out)"
+        type: string
+        default: ""
   push:
     branches: [main]
     # The empyrean pin, and nothing else. See "Pin-bump push" above for why
@@ -185,6 +198,15 @@ env:
   # channel never gets more legs than it has scheduling units, so a subset
   # dispatch fans out no wider than its rows.
   CHANNEL_LEGS: ${{ inputs.channel_legs || '50' }}
+  # Reference legs (scripts/schedule.py pack-reference): the candidate rows and
+  # one OD unit per object packed by cost. The heavy row's replica legs are the
+  # longest at about 42 minutes, so more than about ten legs buys no wall.
+  REFERENCE_LEGS: ${{ inputs.reference_legs || '10' }}
+  # A row whose single timing run costs this many seconds fans its timing
+  # repetitions out to distinct legs, in the reference and in every channel; the
+  # cost table marks the real one (2020 CD3), and a rehearsal lowers this so a
+  # cheap row fans out. Empty = the table's marks only.
+  HEAVY_MIN_S: ${{ inputs.heavy_min_s || '' }}
   TIER: ${{ inputs.tier || 'standard' }}
   # Shared cache keys — every job restores by these exact keys so the
   # downloads/builds `prep` populates fan out warm. Bump a version suffix
@@ -256,8 +278,10 @@ jobs:
       id-token: write          # Workload Identity Federation, read-only kernel bucket
     timeout-minutes: 90
     outputs:
-      # The per-object fan-out matrix, generated from the catalog.
-      objects: ${{ steps.objects.outputs.objects }}
+      # The reference leg matrix, [{"leg"}], from the reference schedule. The
+      # schedule itself (which rows each leg runs) travels in the
+      # `reference-schedule` artifact; only this short list is a job output.
+      reference_legs: ${{ steps.schedule-reference.outputs.reference_legs }}
       # snapshot_id of the pinned inputs snapshot, read from the manifest.
       # Every downstream job keys the inputs cache on this (prep is the sole
       # writer), so they all restore exactly what prep fetched.
@@ -348,61 +372,79 @@ jobs:
           DATA_DIR: ${{ env.EMPYREAN_DATA_DIR }}
         run: make build
 
-      # The matrix: one entry per catalog object, each carrying the object's
-      # catalog name and a filesystem-safe slug. `list-objects` shares its
-      # filter resolution with `plan`, so the matrix and the shards cannot
-      # disagree about which objects are in scope.
-      - name: Emit per-object matrix
-        id: objects
+      # The reference schedule: the candidate rows (`validate run --list-rows`,
+      # which needs no engine call) and one OD unit per catalog object, packed
+      # into cost-balanced legs from the committed cost table
+      # (fixtures/costs.json). `list-objects` shares its filter resolution with
+      # `plan`, so the objects the legs cover and the plan's objects cannot
+      # disagree. The log lists the predicted leg walls and names every row the
+      # cost table does not know (priced at a class estimate, never zero). The
+      # leg matrix is read from the FILE the target writes, never from make's
+      # stdout: make prints its own recipe banners there whenever it has to
+      # build the CLI first, and that text ahead of the JSON silently breaks
+      # fromJson() and the whole fan-out.
+      - name: Schedule the reference legs
+        id: schedule-reference
         working-directory: empyrean-validation
+        env:
+          DATA_DIR: ${{ env.EMPYREAN_DATA_DIR }}
         run: |
-          # Read the matrix from the FILE the target writes, never from make's
-          # stdout: make prints its own recipe banners there whenever it has to
-          # build the CLI first, and that text ahead of the JSON silently breaks
-          # fromJson() and the whole fan-out.
           make list-objects OBJECTS="${OBJECTS}"
-          matrix="$(cat results/objects.json)"
-          count="$(python3 -c 'import json;print(len(json.load(open("results/objects.json"))))')"
-          test "$count" -gt 0 || { echo "ERROR: matrix is empty — no objects to validate." >&2; exit 1; }
-          echo "objects=$matrix" >> "$GITHUB_OUTPUT"
-          echo "Fanning out $count per-object reference legs."
+          make schedule-reference OBJECTS="${OBJECTS}" TIERS="${TIER}" REFERENCE_LEG_BUDGET="${REFERENCE_LEGS}"
+          python3 scripts/schedule.py validate-reference \
+            --candidates results/reference-candidates.json --objects results/objects.json \
+            --schedule results/reference-schedule.json --costs fixtures/costs.json
+          matrix="$(cat results/reference-leg-matrix.json)"
+          count="$(python3 -c 'import json;print(len(json.load(open("results/reference-leg-matrix.json"))))')"
+          test "$count" -gt 0 || { echo "ERROR: the reference leg matrix is empty." >&2; exit 1; }
+          echo "reference_legs=$matrix" >> "$GITHUB_OUTPUT"
+          echo "Fanning out $count reference legs."
+      - name: Upload the reference schedule
+        uses: actions/upload-artifact@v4
+        with:
+          name: reference-schedule
+          path: |
+            empyrean-validation/results/reference-candidates.json
+            empyrean-validation/results/reference-schedule.json
+            empyrean-validation/results/objects.json
+          retention-days: 30
+          if-no-files-found: error
 
-  # ── reference (per-object matrix) ───────────────────────────────────
-  # One leg per catalog object. Each restores the caches prep warmed, rebuilds
-  # warm, and runs prop+eph + OD for its single object into a shard artifact.
+  # ── reference (cost-balanced legs) ──────────────────────────────────
+  # One leg per entry of the reference schedule prep wrote. Each restores the
+  # caches prep warmed, rebuilds warm, and runs `validate run --select` over its
+  # candidate rows and `validate od` over the objects whose OD run it owns, into
+  # a leg artifact.
   #
-  # Per object rather than N balanced shards because fit cost is not predictable
-  # from any cheap proxy — Didymos fits 6,034 observations in 25.4 min while Eros
-  # fits 13,150 in 47 s — so a static shard table would need measured weights and
-  # would silently unbalance whenever the engine or catalog moved. One leg per
-  # object is generated from the catalog, self-balancing, and confines a crash or
-  # timeout to the object that caused it instead of losing the whole run.
+  # Legs take ROWS, not objects. Fit cost is not predictable from any cheap
+  # proxy (Didymos fits 6,034 observations in 25.4 min while Eros fits 13,150 in
+  # 47 s), so the schedule is priced from measured costs
+  # (fixtures/costs.json, refreshed by PR from a named run), and an object-level
+  # leg cannot hold the one object whose single propagation row costs 42
+  # minutes per run, timed best of three. That row's three timing repetitions
+  # run on three legs, one each; assemble checks them identical and keeps the
+  # minimum. A stale cost table costs balance, never results: every candidate
+  # row still lands exactly once.
   #
-  # fail-fast:false so one pathological object does not cancel the other 49;
-  # `assemble` is what turns a missing shard into a hard failure, by name.
+  # fail-fast:false so one slow leg does not cancel the others; `assemble` is
+  # what turns a missing row or leg into a hard failure, by name.
   reference:
-    name: Reference — ${{ matrix.object.name }}
+    name: Reference — leg ${{ matrix.leg.leg }}
     needs: prep
     runs-on: ubuntu-latest
-    # The heaviest object (2020 CD3, a minimoon with Monte Carlo rows) took 37
-    # and 51 minutes, then ran past a 90-minute budget, on three runs of the
-    # same code, and took 96 minutes on 2026-10-28: runner variance, not a
-    # regression. 2020 CD3 then took 101.3 minutes on run 40612958887
-    # (2026-10-28) and 175.6 minutes on run 42506609035 (2026-11-08), against
-    # the 180-minute budget this line held (bead empyrean-apgbt). 300 minutes
-    # leaves a margin of 1.7x over that slowest leg measured to completion.
-    timeout-minutes: 300
+    # About 3x the longest predicted leg (the heavy row's replica legs, 42
+    # minutes), the margin the slowest measured runner variance asks for: 2020
+    # CD3 took 101.3 minutes on run 40612958887 (2026-10-28) and 175.6 minutes
+    # on run 42506609035 (2026-11-08) when its three timing repetitions shared
+    # one job (bead empyrean-apgbt).
+    timeout-minutes: 180
     strategy:
       fail-fast: false
-      # 25 rather than all 50 is free here, and deliberate. Wall-clock is set by
-      # the single slowest object (Didymos, ~35 min of fits) not by queue depth:
-      # the remaining ~130 min of catalog work spread over 25 slots finishes well
-      # inside that, so capping does not extend the run. What it does buy is a
-      # halved peak on the 2 GB kernel-cache restore and headroom under the
-      # 60-concurrent-job account limit.
+      # Headroom under the 60-concurrent-job account limit and a bounded peak on
+      # the 2 GB kernel-cache restore.
       max-parallel: 25
       matrix:
-        object: ${{ fromJson(needs.prep.outputs.objects) }}
+        leg: ${{ fromJson(needs.prep.outputs.reference_legs) }}
     steps:
       - name: Checkout empyrean-validation (default)
         uses: actions/checkout@v4
@@ -416,10 +458,15 @@ jobs:
           dataset: ${{ env.EMPYREAN_DATASET }}
           inputs-snapshot-id: ${{ needs.prep.outputs.inputs_id }}
           role: reader
+      - name: Download the reference schedule
+        uses: actions/download-artifact@v4
+        with:
+          name: reference-schedule
+          path: empyrean-validation/results
       # `build-reference`, not `build`: only the rust runner, the harness CLI and
       # libempyrean are used here. The full `build` measured 375s on a leg, most
       # of it on the C harness, the CLI and the maturin wheel that a reference
-      # shard never invokes — and this job runs once per catalog object.
+      # leg never invokes.
       - name: Build reference prerequisites (warm)
         working-directory: empyrean-validation
         env:
@@ -427,38 +474,39 @@ jobs:
         run: make build-reference
       # Reader role: the inputs snapshot is already restored and verified
       # offline by engine-setup, and this leg downloads nothing from JPL during
-      # setup, so seal before the shard run — a cache miss then fails at the
+      # setup, so seal before the leg run — a cache miss then fails at the
       # socket rather than silently querying live.
       - name: Seal the job from JPL and the MPC
         working-directory: empyrean-validation
         run: ./scripts/seal-upstream.sh
-      - name: Reference shard — ${{ matrix.object.name }}
+      - name: Reference leg ${{ matrix.leg.leg }}
         working-directory: empyrean-validation
         env:
           DATA_DIR: ${{ env.EMPYREAN_DATA_DIR }}
         run: |
           make shard-reference \
-            OBJECT="${{ matrix.object.name }}" \
-            SLUG="${{ matrix.object.slug }}" \
+            LEG="${{ matrix.leg.leg }}" \
+            OBJECTS="${OBJECTS}" \
             TIERS="${TIER}"
-      - name: Upload reference shard
+      - name: Upload reference leg
         uses: actions/upload-artifact@v4
         with:
-          name: reference-shard-${{ matrix.object.slug }}
-          path: empyrean-validation/results/shards/${{ matrix.object.slug }}/
+          name: reference-leg-${{ matrix.leg.leg }}
+          path: empyrean-validation/results/shards/${{ matrix.leg.leg }}/
           retention-days: 30
           if-no-files-found: error
 
   # ── assemble ───────────────────────────────────────────────────────
-  # Fan-in: reassemble every per-object shard into the canonical reference and
+  # Fan-in: reassemble every reference leg into the canonical reference and
   # strip it into the plan every replay channel reads.
   #
-  # This is the job that makes the fan-out safe. `assemble-reference` checks the
-  # arrived shard set against the catalog enumeration and fails naming any object
-  # that is missing — a report rendered from 49 of 50 objects is otherwise
-  # indistinguishable from a complete one. It runs even when legs failed
-  # (always()) precisely so it can produce that named error rather than being
-  # skipped into silence.
+  # This is the job that makes the fan-out safe. `assemble-reference` checks
+  # that every candidate row is a result or named as dropped by the leg that ran
+  # it, folds the heavy row's replicas, and fails naming any row that is missing
+  # or any leg that did not arrive — a report rendered from most of the
+  # reference is otherwise indistinguishable from a complete one. It runs even
+  # when legs failed (always()) precisely so it can produce that named error
+  # rather than being skipped into silence.
   assemble:
     name: Assemble — reference + plan
     needs: [prep, reference]
@@ -496,17 +544,22 @@ jobs:
       - name: Build harness binary
         working-directory: empyrean-validation
         run: cargo build --release --bin empyrean-validation
-      - name: Download every reference shard
+      - name: Download the reference schedule
         uses: actions/download-artifact@v4
         with:
-          pattern: reference-shard-*
+          name: reference-schedule
+          path: empyrean-validation/results
+      - name: Download every reference leg
+        uses: actions/download-artifact@v4
+        with:
+          pattern: reference-leg-*
           path: empyrean-validation/results/shards
       # No flatten step: assemble-reference resolves both the local layout
-      # (shards/<slug>/) and the one download-artifact produces
-      # (shards/reference-shard-<slug>/). A shell step that normalized one into
+      # (shards/<leg>/) and the one download-artifact produces
+      # (shards/reference-leg-<leg>/). A shell step that normalized one into
       # the other would silently produce nothing if the nesting assumption were
       # wrong — and that assumption cannot be verified outside a real run.
-      - name: Show staged shards
+      - name: Show staged legs
         working-directory: empyrean-validation/results/shards
         run: find . -maxdepth 1 -mindepth 1 -type d -print | sort
       # `make plan` reads the pinned Sun/Horizons/SBDB snapshot (the mint's
@@ -532,7 +585,7 @@ jobs:
         working-directory: empyrean-validation
         run: ./scripts/seal-upstream.sh
       # REFERENCE_ASSEMBLED=1 tells `plan` that the unified reference is already
-      # on disk (assemble-reference just wrote it from the shards). Without it,
+      # on disk (assemble-reference just wrote it from the legs). Without it,
       # make walks $(RUST) -> $(RUST_PROPEPH)/$(RUST_OD) -> $(RUST_BIN), a file
       # target only the phony `build-rust` produces, and aborts with "No rule to
       # make target .../validate" — this job deliberately carries no engine.
@@ -588,6 +641,7 @@ jobs:
             empyrean-validation/results/validation_rust.json
             empyrean-validation/results/validation_rust_od_orbits.jsonl
             empyrean-validation/results/validation_rust_od_compare.jsonl
+            empyrean-validation/results/validation_rust_dropped.json
             empyrean-validation/results/schedule.json
             empyrean-validation/results/leg-matrix.json
           retention-days: 30
@@ -1092,13 +1146,13 @@ jobs:
       # merge-multiple flattens each single-file artifact into the one results dir.
       #
       # These are two EXPLICIT patterns, not a blanket download, because the run
-      # now also carries 50 `reference-shard-<slug>` artifacts and every one of
+      # now also carries the `reference-leg-<leg>` artifacts and every one of
       # them contains files named validation_rust_propeph.json,
       # validation_rust_od.json and the two sidecars. Flattened together with
       # merge-multiple they would collide on those names and overwrite the
-      # assembled full-catalog reference with whichever single object's shard
-      # landed last — a report built from one object while looking complete.
-      # The shards were already consumed by `assemble`; reduce must not see them.
+      # assembled full-catalog reference with whichever single leg landed last —
+      # a report built from a fraction of the reference while looking complete.
+      # The legs were already consumed by `assemble`; reduce must not see them.
       - name: Download plan + assembled reference
         uses: actions/download-artifact@v4
         with:
@@ -1118,7 +1172,10 @@ jobs:
       # Each channel arrives as one file per leg; put it back together in
       # plan order before the merge, against the schedule that dealt the rows
       # out, refusing a short channel, a duplicate row, and a row outside its
-      # leg's selection.
+      # leg's selection. A row whose timing repetitions ran on several legs (the
+      # schedule's `replicas`) is folded: the copies must be identical bit for
+      # bit except the volatile fields or the step fails naming the row, the
+      # field and the legs, and the merged row keeps the minimum emp_time_ms.
       - name: Assemble channel legs
         working-directory: empyrean-validation
         run: |

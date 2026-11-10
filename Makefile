@@ -178,7 +178,16 @@ COSTS := $(ROOT)/fixtures/costs.json
 # account's 60 concurrent jobs after the external legs and a reserve.
 CHANNEL_LEG_BUDGET ?= 50
 SCHEDULED_CHANNELS := python,c,cli,core
+# A row whose single timing run costs this many seconds or more fans its timing
+# repetitions out to distinct legs (the cost table marks the rows, today the
+# one 42-minute 2020 CD3 propagation; this lowers the bar so a cheap row fans
+# out in a rehearsal). Empty = the cost table's own marks only.
+HEAVY_MIN_S ?=
+HEAVY_FLAG := $(if $(HEAVY_MIN_S),--heavy-min-s $(HEAVY_MIN_S),)
 channel_plan = $(if $(LEG),$(RESULTS_DIR)/validation_plan.leg-$(1).json,$(PLAN))
+# The side file of a leg's per-row timing repetition overrides: a replica leg of
+# the heavy row runs it once. Never a plan key, which would flow into outputs.
+channel_reps = $(if $(LEG),--reps-override $(RESULTS_DIR)/validation_plan.leg-$(1).reps.json,)
 RUST_PROPEPH := $(RESULTS_DIR)/validation_rust_propeph.json
 RUST_OD := $(RESULTS_DIR)/validation_rust_od.json
 RUST := $(RESULTS_DIR)/validation_rust.json
@@ -646,19 +655,16 @@ json.dump(a+b, open('$(RUST)','w'), indent=2, default=str); \
 print(f'Wrote {len(a)+len(b)} unified rust rows ({len(a)} prop+eph, {len(b)} OD) to $(RUST)')"
 endif
 
-# ── Per-object reference shards (CI matrix fan-out) ─────────
+# ── Reference legs (CI matrix fan-out) ──────────────────────
 # The rust reference is the expensive half of this suite: running all three
 # axes over the full catalog in one process took 176 min and blew the CI job's
 # 180-minute ceiling, taking ~3 hours of completed fits with it (empyrean-qhhw).
-# The work is embarrassingly parallel per object, so CI fans it out one leg per
-# object and reassembles here.
-#
-# Why per-object rather than N balanced shards: cost is NOT predictable from
-# any cheap proxy — Didymos fits 6,034 observations in 25.4 min while Eros
-# fits 13,150 in 47 s — so a static shard table would need measured weights
-# and would silently unbalance whenever the engine or catalog moved. One leg
-# per object is generated from the catalog, self-balancing forever, and isolates
-# a crash or timeout to the single object that caused it.
+# CI therefore fans it out in legs and reassembles here. The legs used to be one
+# per object (an object is a self-balancing unit: fit cost is NOT predictable
+# from any cheap proxy, Didymos fits 6,034 observations in 25.4 min while Eros
+# fits 13,150 in 47 s), but one object holds the single row that costs 42
+# minutes per run, timed best of three, so a leg now takes ROWS, packed by the
+# committed cost table (see schedule-reference below).
 SHARD_DIR := $(RESULTS_DIR)/shards
 
 # Same filters as ONLY_FLAG, for the catalog enumeration that drives the matrix.
@@ -685,42 +691,93 @@ $(OBJECTS_JSON): $(EMP_VAL_BIN)
 sys.exit('ERROR: $(OBJECTS_JSON) is empty — no objects to validate.') if not d else None; \
 print(f'Wrote {len(d)} objects to $(OBJECTS_JSON)')"
 
-# One object's slice of the reference. OBJECT is the catalog name
-# ("46P/Wirtanen"), SLUG its safe token ("46P_Wirtanen") — both come from
-# `list-objects` so they always correspond.
+# The reference is computed in cost-balanced LEGS, not one job per object: the
+# one object holding the 42-minute 2020 CD3 propagation row (timed best of three
+# in every channel) outran every job budget, and an object-level split cannot
+# cut it. A candidate row is a propagation or ephemeris row the rust runner
+# requests; `validate run --list-rows` prints them in emission order and needs
+# no engine call, so prep lists them, packs them (with one OD unit per object)
+# into legs by cost (scripts/schedule.py pack-reference), and each leg runs
+# `validate run --select` over its rows and `validate od --only` over the
+# objects whose OD run it owns.
+REFERENCE_CANDIDATES := $(RESULTS_DIR)/reference-candidates.json
+REFERENCE_SCHEDULE := $(RESULTS_DIR)/reference-schedule.json
+REFERENCE_LEG_MATRIX := $(RESULTS_DIR)/reference-leg-matrix.json
+REFERENCE_LEG_BUDGET ?= 16
+
+.PHONY: list-reference-rows schedule-reference
+list-reference-rows: $(RUST_BIN)
+	@mkdir -p $(RESULTS_DIR)
+	@$(DYLD) $(RUST_BIN) run --list-rows $(ONLY_FLAG) --tiers $(TIERS) \
+	    --data-dir $(DATA_DIR) --cache-dir $(CACHE_DIR) > $(REFERENCE_CANDIDATES)
+	@python3 -c "import json,sys; d=json.load(open('$(REFERENCE_CANDIDATES)')); \
+sys.exit('ERROR: $(REFERENCE_CANDIDATES) is empty: no candidate rows.') if not d else None; \
+print(f'Wrote {len(d)} candidate reference rows to $(REFERENCE_CANDIDATES)')"
+
+# The reference schedule: a pure function of the candidate rows, the object
+# list, the committed cost table and the leg budget. Writes the schedule and the
+# leg matrix, prints each leg's predicted wall, names every row the cost table
+# does not know.
+schedule-reference: $(OBJECTS_JSON) list-reference-rows
+	@echo "──── Schedule: pack the reference into cost-balanced legs ───"
+	@python3 $(ROOT)/scripts/schedule.py pack-reference --candidates $(REFERENCE_CANDIDATES) \
+	    --objects $(OBJECTS_JSON) --costs $(COSTS) --legs $(REFERENCE_LEG_BUDGET) $(HEAVY_FLAG) \
+	    --out $(REFERENCE_SCHEDULE) --matrix $(REFERENCE_LEG_MATRIX)
+
+# One reference leg. LEG is the leg id from $(REFERENCE_SCHEDULE).
 #
 # `od` derives its two JSONL sidecars from the --output stem, so pointing
-# --output into the shard directory lands them there too, with no second path
-# to keep in sync.
+# --output into the leg directory lands them there too, with no second path to
+# keep in sync. A leg always writes validation_rust_propeph.json (with its
+# .dropped.json) and validation_rust_od.json, empty lists when it has nothing of
+# that kind, so the assemble step finds the same files in every leg.
 shard-reference: $(RUST_BIN) $(EMP_VAL_BIN) | fixtures
-	@test -n "$(OBJECT)" || { echo "ERROR: shard-reference needs OBJECT=<catalog name>."; exit 1; }
-	@test -n "$(SLUG)"   || { echo "ERROR: shard-reference needs SLUG=<safe token>."; exit 1; }
-	@mkdir -p $(SHARD_DIR)/$(SLUG)
-	@echo "──── Reference shard: $(OBJECT) [prop + ephemeris] ─────"
-	@$(DYLD) $(RUST_BIN) run --only "$(OBJECT)" --tiers $(TIERS) \
-	    --data-dir $(DATA_DIR) --cache-dir $(CACHE_DIR) \
-	    --output $(SHARD_DIR)/$(SLUG)/validation_rust_propeph.json
-	@echo "──── Reference shard: $(OBJECT) [orbit determination] ──"
-	@$(DYLD) $(RUST_BIN) od --only "$(OBJECT)" --tier $(TIERS) \
-	    --data-dir $(DATA_DIR) --cache-dir $(CACHE_DIR) \
-	    --fixtures-dir $(FIXTURES_PSV) \
-	    --output $(SHARD_DIR)/$(SLUG)/validation_rust_od.json
-	@python3 -c "$$ASSERT_SHARD_COMPLETE" $(SHARD_DIR)/$(SLUG) "$(OBJECT)"
+	@test -n "$(LEG)" || { echo "ERROR: shard-reference needs LEG=<leg id> (see $(REFERENCE_SCHEDULE))."; exit 1; }
+	@mkdir -p $(SHARD_DIR)/$(LEG)
+	@python3 $(ROOT)/scripts/reference-legs.py select --candidates $(REFERENCE_CANDIDATES) \
+	    --schedule $(REFERENCE_SCHEDULE) --leg "$(LEG)" \
+	    --rows-out $(SHARD_DIR)/$(LEG)/leg.rows.json --reps-out $(SHARD_DIR)/$(LEG)/leg.reps.json \
+	    --objects-out $(SHARD_DIR)/$(LEG)/leg.objects
+	@if [ -s $(SHARD_DIR)/$(LEG)/leg.rows.json ]; then \
+	    echo "──── Reference leg $(LEG) [prop + ephemeris rows] ────────"; \
+	    $(DYLD) $(RUST_BIN) run --select $(SHARD_DIR)/$(LEG)/leg.rows.json \
+	        --reps-override $(SHARD_DIR)/$(LEG)/leg.reps.json $(ONLY_FLAG) --tiers $(TIERS) \
+	        --data-dir $(DATA_DIR) --cache-dir $(CACHE_DIR) \
+	        --output $(SHARD_DIR)/$(LEG)/validation_rust_propeph.json || exit 1; \
+	else \
+	    echo "Reference leg $(LEG): no propagation or ephemeris rows."; \
+	    echo "[]" > $(SHARD_DIR)/$(LEG)/validation_rust_propeph.json; \
+	    echo "[]" > $(SHARD_DIR)/$(LEG)/validation_rust_propeph.json.dropped.json; \
+	fi
+	@if [ -s $(SHARD_DIR)/$(LEG)/leg.objects ]; then \
+	    echo "──── Reference leg $(LEG) [orbit determination: $$(cat $(SHARD_DIR)/$(LEG)/leg.objects)] ──"; \
+	    $(DYLD) $(RUST_BIN) od --only "$$(cat $(SHARD_DIR)/$(LEG)/leg.objects)" --tier $(TIERS) \
+	        --data-dir $(DATA_DIR) --cache-dir $(CACHE_DIR) \
+	        --fixtures-dir $(FIXTURES_PSV) \
+	        --output $(SHARD_DIR)/$(LEG)/validation_rust_od.json || exit 1; \
+	else \
+	    echo "Reference leg $(LEG): no orbit-determination objects."; \
+	    echo "[]" > $(SHARD_DIR)/$(LEG)/validation_rust_od.json; \
+	fi
+	@# The rows file is tested by the shell, not $(wildcard): make caches directory
+	@# listings, and a file written earlier in this same recipe reads as absent, which
+	@# would run the check against an empty selection and refuse every result row.
+	@selection=""; if [ -s $(SHARD_DIR)/$(LEG)/leg.rows.json ]; then selection="--rows $(SHARD_DIR)/$(LEG)/leg.rows.json"; fi; \
+	python3 $(ROOT)/scripts/reference-legs.py check --dir $(SHARD_DIR)/$(LEG) $$selection \
+	    --objects "$$(cat $(SHARD_DIR)/$(LEG)/leg.objects 2>/dev/null)"
 
-# Reassemble every per-object shard into the canonical reference, then let the
-# existing $(RUST) merge + strip-plan rules take over unchanged.
-#
-# This is the fan-in, and fan-ins are where a parallel pipeline goes quietly
-# wrong: a leg that died leaves its object simply absent, and a report rendered
-# from 49 of 50 objects looks exactly like a healthy one. So the shard set is
-# checked against the catalog enumeration and any missing object is named and
-# fatal — never warned about, never skipped.
-assemble-reference: $(EMP_VAL_BIN)
-	@echo "──── Reference: reassemble per-object shards ───────────"
+# Reassemble every leg into the canonical reference, then let the existing
+# $(RUST) merge + strip-plan rules take over unchanged (scripts/assemble-reference.py
+# says what it checks: every candidate row a result or named as dropped by the leg
+# that ran it, replicas folded, every object's OD run delivered once).
+assemble-reference:
+	@echo "──── Reference: reassemble the legs ────────────────────"
 	@mkdir -p $(SHARD_DIR)
-	@$(EMP_VAL_BIN) list-objects $(LIST_ONLY_FLAG) --format lines > $(SHARD_DIR)/.expected
-	@python3 -c "$$ASSEMBLE_SHARDS" $(SHARD_DIR) $(SHARD_DIR)/.expected \
-	    $(RUST_PROPEPH) $(RUST_OD) $(RUST_OD_ORBITS) $(RUST_OD_COMPARE) $(RUST)
+	@python3 $(ROOT)/scripts/assemble-reference.py --schedule $(REFERENCE_SCHEDULE) \
+	    --candidates $(REFERENCE_CANDIDATES) --legs-dir $(SHARD_DIR) \
+	    --out-propeph $(RUST_PROPEPH) --out-od $(RUST_OD) --out-orbits $(RUST_OD_ORBITS) \
+	    --out-compare $(RUST_OD_COMPARE) --out-unified $(RUST) \
+	    --out-dropped $(RESULTS_DIR)/validation_rust_dropped.json
 
 .PHONY: list-objects shard-reference assemble-reference lint-workflows
 
@@ -769,126 +826,6 @@ lint-workflows:
 	@echo "──── actionlint: .github/workflows ─────────────────────"
 	@actionlint -shellcheck= .github/workflows/*.yml
 	@echo "  workflows OK."
-
-# A shard must contain both halves and be parseable. Zero OD rows is legal for
-# one object (not every catalog entry need carry fittable astrometry) but zero
-# prop+eph rows means the run produced nothing for an object CI believes it
-# covered — the silent-empty shape, caught here at the shard rather than after
-# 50 of them have been concatenated into an innocuous-looking whole.
-define ASSERT_SHARD_COMPLETE
-import json, sys, pathlib
-d, obj = pathlib.Path(sys.argv[1]), sys.argv[2]
-propeph, od = d / "validation_rust_propeph.json", d / "validation_rust_od.json"
-problems = []
-counts = {}
-for f in (propeph, od):
-    if not f.is_file():
-        problems.append(f"{f.name}: missing")
-        continue
-    try:
-        counts[f.name] = len(json.load(open(f)))
-    except Exception as exc:
-        problems.append(f"{f.name}: unparseable ({exc})")
-for side in ("validation_rust_od_orbits.jsonl", "validation_rust_od_compare.jsonl"):
-    if counts.get("validation_rust_od.json") and not (d / side).is_file():
-        problems.append(f"{side}: missing, but the OD pass emitted rows")
-if counts.get("validation_rust_propeph.json") == 0:
-    problems.append("validation_rust_propeph.json: zero rows")
-if problems:
-    print(f"ERROR: reference shard for {obj!r} is not usable:", file=sys.stderr)
-    for p in problems:
-        print(f"  - {p}", file=sys.stderr)
-    print("       A shard that is short here is an object silently absent from", file=sys.stderr)
-    print("       the assembled reference and from the report.", file=sys.stderr)
-    raise SystemExit(1)
-print(f"  shard OK: {obj} — {counts.get('validation_rust_propeph.json', 0)} prop+eph rows, "
-      f"{counts.get('validation_rust_od.json', 0)} OD rows")
-endef
-export ASSERT_SHARD_COMPLETE
-
-define ASSEMBLE_SHARDS
-import json, pathlib, sys
-shard_dir = pathlib.Path(sys.argv[1])
-expected_file = pathlib.Path(sys.argv[2])
-out_propeph, out_od, out_orbits, out_compare, out_unified = (
-    pathlib.Path(p) for p in sys.argv[3:8]
-)
-
-expected = []
-for line in expected_file.read_text().splitlines():
-    if line.strip():
-        slug, _, name = line.partition("\t")
-        expected.append((slug, name))
-if not expected:
-    raise SystemExit("ERROR: catalog enumeration produced zero objects; refusing to assemble.")
-
-def shard_path(slug):
-    """Locate one object's shard directory, whichever layout staged it.
-
-    A local run writes results/shards/<slug>/ directly. CI downloads the
-    per-object artifacts, and actions/download-artifact nests each one under a
-    directory named after the artifact — results/shards/reference-shard-<slug>/.
-    Accepting both means this does not depend on that action's nesting behavior,
-    which cannot be verified outside a real run; a shell step that flattened one
-    layout into the other would silently produce nothing if the assumption were
-    wrong, and every object would then read as missing.
-    """
-    for candidate in (shard_dir / slug, shard_dir / f"reference-shard-{slug}"):
-        if (candidate / "validation_rust_propeph.json").is_file():
-            return candidate
-    return shard_dir / slug  # canonical path, for the error message
-
-propeph, od, orbits, compare, missing = [], [], [], [], []
-for slug, name in expected:
-    d = shard_path(slug)
-    p, o = d / "validation_rust_propeph.json", d / "validation_rust_od.json"
-    if not (p.is_file() and o.is_file()):
-        missing.append(f"{name} (slug {slug}): "
-                       f"{'propeph' if not p.is_file() else ''}"
-                       f"{' and ' if not p.is_file() and not o.is_file() else ''}"
-                       f"{'od' if not o.is_file() else ''} shard absent")
-        continue
-    propeph += json.load(open(p))
-    od += json.load(open(o))
-    for src, dst in ((d / "validation_rust_od_orbits.jsonl", orbits),
-                     (d / "validation_rust_od_compare.jsonl", compare)):
-        if src.is_file():
-            dst += [ln for ln in src.read_text().splitlines() if ln.strip()]
-
-if missing:
-    print(f"ERROR: {len(missing)} of {len(expected)} reference shards did not arrive:",
-          file=sys.stderr)
-    for m in missing:
-        print(f"  - {m}", file=sys.stderr)
-    print("       Every object in the catalog gets a matrix leg; a leg that failed or", file=sys.stderr)
-    print("       was cancelled leaves its object ABSENT, and a report built from a", file=sys.stderr)
-    print("       partial reference is indistinguishable from a complete one.", file=sys.stderr)
-    print("       Re-run the failed leg(s); do not assemble around them.", file=sys.stderr)
-    raise SystemExit(1)
-
-# Unlike a single object's shard, the assembled whole having no OD rows means
-# the entire OD axis is dead — the empyrean-7wo5 shape the suite exists to catch.
-if not od:
-    raise SystemExit("ERROR: assembled reference carries zero OD rows across all "
-                     f"{len(expected)} objects. The OD axis produced nothing, which is a "
-                     "dead axis, not a passing one. Check the fixture fetch (make fixtures).")
-
-# The unified reference is written HERE, not by the $(RUST) rule, because the
-# assemble job carries no engine: that rule's prerequisites name $(RUST_BIN),
-# which only the phony `build-rust` produces, so make would abort before
-# running any recipe. Both halves are already in memory, so emit it directly
-# and let `make plan REFERENCE_ASSEMBLED=1` treat it as given.
-for path, rows in ((out_propeph, propeph), (out_od, od), (out_unified, propeph + od)):
-    path.parent.mkdir(parents=True, exist_ok=True)
-    json.dump(rows, open(path, "w"), indent=2, default=str)
-for path, lines in ((out_orbits, orbits), (out_compare, compare)):
-    path.write_text("".join(ln + "\n" for ln in lines))
-
-print(f"Assembled {len(expected)} shards -> {len(propeph)} prop+eph rows, {len(od)} OD rows, "
-      f"{len(orbits)} orbit sidecar rows, {len(compare)} compare sidecar rows; "
-      f"unified {len(propeph) + len(od)} rows -> {out_unified}")
-endef
-export ASSEMBLE_SHARDS
 
 # ── Test plan ──────────────────────────────────────────────
 # The plan is the canonical test fixture: same row schema as a channel
@@ -992,7 +929,8 @@ $(RESULTS_DIR)/validation_plan.leg-%.json: $(PLAN) check-plan
 	@echo "──── Plan: select this leg's rows of the prebuilt plan ──"
 	@test -n "$(LEG)" || { echo "ERROR: $@ needs LEG=<leg id> (see $(SCHEDULE))."; exit 1; }
 	@python3 $(ROOT)/scripts/channel-chunks.py select --plan $(PLAN) \
-	    --schedule $(SCHEDULE) --channel $* --leg "$(LEG)" --output $@
+	    --schedule $(SCHEDULE) --channel $* --leg "$(LEG)" --output $@ \
+	    --reps-output $(RESULTS_DIR)/validation_plan.leg-$*.reps.json
 
 # The cost-balanced schedule of the channel legs: a pure function of the plan,
 # the committed cost table and the leg budget. Writes $(SCHEDULE) and the leg
@@ -1002,7 +940,7 @@ $(RESULTS_DIR)/validation_plan.leg-%.json: $(PLAN) check-plan
 schedule: $(PLAN) check-plan
 	@echo "──── Schedule: pack the plan into cost-balanced legs ────"
 	@python3 $(ROOT)/scripts/schedule.py pack --plan $(PLAN) --costs $(COSTS) \
-	    --channels $(SCHEDULED_CHANNELS) --budget $(CHANNEL_LEG_BUDGET) \
+	    --channels $(SCHEDULED_CHANNELS) --budget $(CHANNEL_LEG_BUDGET) $(HEAVY_FLAG) \
 	    --out $(SCHEDULE) --matrix $(LEG_MATRIX)
 
 # Rebuild the committed cost table from a named run's results: FROM is a
@@ -1019,13 +957,14 @@ run-python: $(call channel_plan,python) check-plan fixtures
 	@echo "──── Python channel: replay plan ───────────────────────"
 	@$(WHEEL_PY) $(EMPYREAN_RUNNERS)/python/run.py \
 	    --input $(call channel_plan,python) --context $(PLAN) --output $(PYTHON) \
+	    $(call channel_reps,python) \
 	    --fixtures-dir $(FIXTURES_PSV) \
 	    --data-dir $(DATA_DIR)
 
 run-c: $(call channel_plan,c) $(C_BIN) check-plan fixtures
 	@echo "──── C channel: replay plan (prop / eph / OD) ──────────"
 	@$(WHEEL_PY) $(EMPYREAN_RUNNERS)/c/drive.py \
-	    --input $(call channel_plan,c) --context $(PLAN) \
+	    --input $(call channel_plan,c) --context $(PLAN) $(call channel_reps,c) \
 	    --output $(C_OUT) --runner $(C_BIN) \
 	    --fixtures-dir $(FIXTURES_PSV) \
 	    $(if $(filter-out $(HOME)/.empyrean/data,$(DATA_DIR)),--data-dir $(DATA_DIR),)
@@ -1033,7 +972,7 @@ run-c: $(call channel_plan,c) $(C_BIN) check-plan fixtures
 run-cli: $(call channel_plan,cli) $(CLI_BIN) check-plan fixtures
 	@echo "──── CLI channel: fork-exec one binary per plan row ────"
 	@$(DYLD) $(WHEEL_PY) $(EMPYREAN_RUNNERS)/cli/drive.py \
-	    --input $(call channel_plan,cli) --context $(PLAN) \
+	    --input $(call channel_plan,cli) --context $(PLAN) $(call channel_reps,cli) \
 	    --output $(CLI_OUT) --runner $(CLI_BIN) \
 	    --fixtures-dir $(FIXTURES_PSV) \
 	    $(if $(filter-out $(HOME)/.empyrean/data,$(DATA_DIR)),--data-dir $(DATA_DIR),)
@@ -1120,10 +1059,29 @@ ifneq ($(WITH_CORE),1)
 	@echo "──── Core channel skipped (empyrean-core not found) ────"
 endif
 
+# A replica leg of the heavy row (a leg with repetition overrides) runs the rows
+# that carry one in their own validate-core process with --n-timing-runs 1, the
+# rest as usual, and joins the two outputs: validate-core has no per-row
+# repetition input, and none is needed.
 $(CORE_OUT): $(call channel_plan,core) $(CORE_BIN) | check-plan fixtures
 	@echo "──── Core channel: replay plan via empyrean-core ───────"
-	@$(DYLD) $(CORE_BIN) --input $(call channel_plan,core) --output $(CORE_OUT) \
-	    --fixtures-dir $(FIXTURES_PSV)
+	@if [ -n "$(LEG)" ] && [ "$$(python3 -c "import json;print(len(json.load(open('$(RESULTS_DIR)/validation_plan.leg-core.reps.json'))))")" != "0" ]; then \
+	    python3 $(ROOT)/scripts/channel-chunks.py partition --input $(call channel_plan,core) \
+	        --reps $(RESULTS_DIR)/validation_plan.leg-core.reps.json \
+	        --override-out $(RESULTS_DIR)/validation_plan.leg-core.once.json \
+	        --rest-out $(RESULTS_DIR)/validation_plan.leg-core.rest.json || exit 1; \
+	    echo "[]" > $(CORE_OUT).rest; \
+	    if [ "$$(python3 -c "import json;print(len(json.load(open('$(RESULTS_DIR)/validation_plan.leg-core.rest.json'))))")" != "0" ]; then \
+	        $(DYLD) $(CORE_BIN) --input $(RESULTS_DIR)/validation_plan.leg-core.rest.json --output $(CORE_OUT).rest \
+	            --fixtures-dir $(FIXTURES_PSV) || exit 1; \
+	    fi; \
+	    $(DYLD) $(CORE_BIN) --n-timing-runs 1 --input $(RESULTS_DIR)/validation_plan.leg-core.once.json \
+	        --output $(CORE_OUT).once --fixtures-dir $(FIXTURES_PSV) || exit 1; \
+	    python3 $(ROOT)/scripts/channel-chunks.py join --out $(CORE_OUT) $(CORE_OUT).rest $(CORE_OUT).once || exit 1; \
+	else \
+	    $(DYLD) $(CORE_BIN) --input $(call channel_plan,core) --output $(CORE_OUT) \
+	        --fixtures-dir $(FIXTURES_PSV); \
+	fi
 
 # ── Kete external comparison (standalone, not in report) ───
 # kete is Dar Dahlen's open-source NEO toolkit (originally developed

@@ -644,6 +644,10 @@ fn run_daemon(ctx: &Context) -> Result<(), Box<dyn std::error::Error>> {
 
     eprintln!("ready");
     let mut warmed_up = false;
+    // Timing repetitions for the NEXT prop / eph line only, set by a `reps N`
+    // line (no reply): the heavy row's three timing repetitions run on three
+    // legs, one each. None = the default best-of-3.
+    let mut pending_reps: Option<usize> = None;
     let stdin = std::io::stdin();
     let mut stdout = std::io::stdout();
     for line in stdin.lock().lines() {
@@ -657,11 +661,20 @@ fn run_daemon(ctx: &Context) -> Result<(), Box<dyn std::error::Error>> {
             None => (trimmed, ""),
         };
         match mode_word {
-            "prop" => match daemon_prop(ctx, rest, &mut warmed_up) {
+            "reps" => match rest.parse::<usize>() {
+                Ok(n) if n >= 1 => pending_reps = Some(n),
+                _ => writeln!(stdout, "fail reps_invalid_{rest}")?,
+            },
+            "prop" => match daemon_prop(
+                ctx,
+                rest,
+                &mut warmed_up,
+                take_reps(&mut pending_reps, "prop"),
+            ) {
                 Ok(out) => writeln!(stdout, "{out}")?,
                 Err(e) => writeln!(stdout, "fail {e}")?,
             },
-            "eph" => match daemon_eph(ctx, rest) {
+            "eph" => match daemon_eph(ctx, rest, take_reps(&mut pending_reps, "eph")) {
                 Ok(out) => writeln!(stdout, "{out}")?,
                 Err(e) => writeln!(stdout, "fail {e}")?,
             },
@@ -675,6 +688,21 @@ fn run_daemon(ctx: &Context) -> Result<(), Box<dyn std::error::Error>> {
     }
     Ok(())
 }
+
+/// The timing repetitions the next prop / eph line runs: the pending `reps N`
+/// count (consumed), else the default best-of-3. With
+/// `EMPYREAN_RUNNER_ECHO_REPS` set in the environment the applied count is
+/// reported on stderr, which is how the tests see it.
+fn take_reps(pending: &mut Option<usize>, what: &str) -> usize {
+    let n = pending.take().unwrap_or(DEFAULT_TIMING_RUNS);
+    if std::env::var_os("EMPYREAN_RUNNER_ECHO_REPS").is_some() {
+        eprintln!("reps applied: {what} {n}");
+    }
+    n
+}
+
+/// Default timed repetitions per row (best of N).
+const DEFAULT_TIMING_RUNS: usize = 3;
 
 /// Parse the EXCL token of a prop / eph daemon line: `-` (no exclusion) or the
 /// plan row's `excluded_perturbers_naif` as comma-separated NAIF ids, mapped to
@@ -841,7 +869,12 @@ fn parse_prop_args(
     Ok((orbit, tier_from_int(force_model), target, method, excluded))
 }
 
-fn daemon_prop(ctx: &Context, rest: &str, warmed_up: &mut bool) -> Result<String, String> {
+fn daemon_prop(
+    ctx: &Context,
+    rest: &str,
+    warmed_up: &mut bool,
+    n_reps: usize,
+) -> Result<String, String> {
     let (orbit, force, target, method, excluded) = parse_prop_args(rest)?;
     let (attach_cov, umethod) = match &method {
         Some((a, m)) => (*a, m.clone()),
@@ -873,7 +906,7 @@ fn daemon_prop(ctx: &Context, rest: &str, warmed_up: &mut bool) -> Result<String
     let mut last_pos = [0.0f64; 3];
     let mut last_vel = [0.0f64; 3];
     let mut last_result: Option<empyrean::PropagationResult> = None;
-    for _ in 0..3 {
+    for _ in 0..n_reps {
         let t0 = Instant::now();
         let result = ctx
             .propagate(std::slice::from_ref(&orbit), &[target], &cfg)
@@ -925,7 +958,7 @@ fn daemon_prop(ctx: &Context, rest: &str, warmed_up: &mut bool) -> Result<String
     }
 }
 
-fn daemon_eph(ctx: &Context, rest: &str) -> Result<String, String> {
+fn daemon_eph(ctx: &Context, rest: &str, n_reps: usize) -> Result<String, String> {
     // Same as prop (18 fields) plus a trailing observer code.
     let mut tokens = rest.split_whitespace();
     let mut floats = Vec::with_capacity(18);
@@ -1007,7 +1040,7 @@ fn daemon_eph(ctx: &Context, rest: &str) -> Result<String, String> {
     let mut last_rho = f64::NAN;
     let mut last_lt = f64::NAN;
     let mut last_eph: Option<empyrean::EphemerisResult> = None;
-    for _ in 0..3 {
+    for _ in 0..n_reps {
         let t0 = Instant::now();
         let entries = ctx
             .generate_ephemeris(std::slice::from_ref(&orbit), &observers, &cfg)

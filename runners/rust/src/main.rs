@@ -17,6 +17,7 @@ use clap::{Parser, Subcommand};
 
 use empyrean::Context;
 
+mod rows;
 mod runner;
 mod synth;
 mod truth_check;
@@ -235,6 +236,22 @@ struct RunArgs {
     /// (kete, ASSIST) that don't propagate uncertainty.
     #[arg(long)]
     no_covariance: bool,
+    /// Print the candidate rows (JSON, one object per row, in the order the
+    /// run emits them) for the objects in scope and exit. Needs no engine
+    /// call: CI prep lists the rows and packs them into reference legs.
+    #[arg(long)]
+    list_rows: bool,
+    /// Compute only the rows listed in this JSON file (a list of row
+    /// identities: object, test_type, propagation_uncertainty, dt_days,
+    /// observer, force_model; extra fields are ignored). A selected row the
+    /// engine refuses is named in `<output>.dropped.json`.
+    #[arg(long)]
+    select: Option<PathBuf>,
+    /// Timing repetitions per row, replacing the default: a JSON list of row
+    /// identities each with a `reps` count. The heavy row's three timing
+    /// repetitions run on three legs, one each.
+    #[arg(long)]
+    reps_override: Option<PathBuf>,
 }
 
 #[derive(Parser, Debug)]
@@ -661,6 +678,71 @@ fn write_jsonl<T: serde::Serialize>(
 }
 
 fn run(args: RunArgs) -> Result<(), Box<dyn std::error::Error>> {
+    let all_objects = empyrean_validation::catalog::all_objects();
+    let in_scope: Vec<&empyrean_validation::catalog::ValidationObject> = if args.only.is_empty() {
+        all_objects
+    } else {
+        all_objects
+            .into_iter()
+            .filter(|o| args.only.iter().any(|n| n == o.name))
+            .collect()
+    };
+    if in_scope.is_empty() {
+        eprintln!("No matching objects.");
+        return Ok(());
+    }
+
+    let select = match &args.select {
+        Some(p) => Some(rows::load_rows(p)?),
+        None => None,
+    };
+    let reps_override = match &args.reps_override {
+        Some(p) => rows::load_reps_override(p)?,
+        None => rows::RepsOverride::default(),
+    };
+    let config = runner::ValidateConfig {
+        tiers: args.tiers,
+        n_timing_runs: args.n_timing_runs,
+        attach_covariance: !args.no_covariance,
+        select: select.as_deref().map(rows::RowSelection::from_rows),
+        reps_override,
+    };
+
+    // The candidates of the full scope, in emission order. A selection must be
+    // a subset of them, and a repetition override must name only candidates:
+    // a misspelled row would otherwise select nothing and run nothing.
+    let candidates = runner::candidate_rows(&in_scope, &config);
+    if args.list_rows {
+        println!("{}", serde_json::to_string(&candidates)?);
+        return Ok(());
+    }
+    let known: std::collections::HashSet<String> = candidates.iter().map(|c| c.key()).collect();
+    if let Some(rows) = &select {
+        if let Some(bad) = rows.iter().find(|r| !known.contains(&r.key())) {
+            return Err(format!(
+                "--select names a row that is not a candidate of the objects in scope: {}",
+                bad.key()
+            )
+            .into());
+        }
+        if rows.is_empty() {
+            return Err("--select lists no rows".into());
+        }
+    }
+
+    // Only the objects the selection touches are loaded.
+    let selected: Vec<&empyrean_validation::catalog::ValidationObject> = match &config.select {
+        None => in_scope,
+        Some(sel) => in_scope
+            .into_iter()
+            .filter(|o| {
+                candidates
+                    .iter()
+                    .any(|c| c.object == o.name && sel.contains(c))
+            })
+            .collect(),
+    };
+
     eprintln!("Loading empyrean context...");
     let ctx = Context::from_data_dir(args.data_dir.as_deref())?;
 
@@ -670,27 +752,7 @@ fn run(args: RunArgs) -> Result<(), Box<dyn std::error::Error>> {
     std::fs::create_dir_all(&sbdb_cache_dir)?;
     std::fs::create_dir_all(&horizons_cache_dir)?;
 
-    let all_objects = empyrean_validation::catalog::all_objects();
-    let selected: Vec<&empyrean_validation::catalog::ValidationObject> = if args.only.is_empty() {
-        all_objects
-    } else {
-        all_objects
-            .into_iter()
-            .filter(|o| args.only.iter().any(|n| n == o.name))
-            .collect()
-    };
-    if selected.is_empty() {
-        eprintln!("No matching objects.");
-        return Ok(());
-    }
-
-    let config = runner::ValidateConfig {
-        tiers: args.tiers,
-        n_timing_runs: args.n_timing_runs,
-        attach_covariance: !args.no_covariance,
-    };
-
-    let results = runner::run_propagation_validation(
+    let run = runner::run_propagation_validation(
         &ctx,
         &selected,
         &config,
@@ -702,12 +764,18 @@ fn run(args: RunArgs) -> Result<(), Box<dyn std::error::Error>> {
     if let Some(parent) = args.output.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    let json = serde_json::to_string_pretty(&results)?;
+    let json = serde_json::to_string_pretty(&run.rows)?;
     std::fs::write(&args.output, json)?;
+    // Written on every run, empty when nothing was refused: assemble reads one
+    // per leg and tells a refused row from a row lost to a dead leg.
+    let dropped_path = rows::dropped_path(&args.output);
+    std::fs::write(&dropped_path, serde_json::to_string_pretty(&run.dropped)?)?;
     eprintln!(
-        "\nWrote {} results to {}",
-        results.len(),
-        args.output.display()
+        "\nWrote {} results to {} ({} dropped rows named in {})",
+        run.rows.len(),
+        args.output.display(),
+        run.dropped.len(),
+        dropped_path.display()
     );
     Ok(())
 }

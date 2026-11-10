@@ -617,7 +617,27 @@ static void capture_eph_products(struct Products* p,
     }
 }
 
+/* Timing repetitions per row: the default best-of-3, or the count a `reps N`
+ * line set for the NEXT prop / eph line only (the driver sends it for a row
+ * whose timing repetitions run on other legs: the heavy row's three
+ * repetitions run on three legs, one each). `reps` produces no output. With
+ * EMPYREAN_RUNNER_ECHO_REPS set in the environment, each prop / eph row
+ * reports the count it applied on stderr, which is how the tests see it. */
+static int pending_reps = 0;
+
+static int take_reps(const char* what) {
+    int n = pending_reps > 0 ? pending_reps : 3;
+    pending_reps = 0;
+    if (getenv("EMPYREAN_RUNNER_ECHO_REPS")) {
+        fprintf(stderr, "reps applied: %s %d\n", what, n);
+    }
+    return n;
+}
+
 static int handle_prop(EmpyreanContext* ctx, const char* rest, int* warmed_up) {
+    /* Consumed before any parse can fail, so a refused line never leaves its
+     * count pending for the next row. */
+    const int n_reps = take_reps("prop");
     double epoch, x, y, z, vx, vy, vz;
     double a1, a2, a3, g[5];
     int force_model;
@@ -701,7 +721,7 @@ static int handle_prop(EmpyreanContext* ctx, const char* rest, int* warmed_up) {
     char refusal_status[512] = {0};
     char refusal_msg[2048] = {0};
 
-    for (int rep = 0; rep < 3; rep++) {
+    for (int rep = 0; rep < n_reps; rep++) {
         struct EmpyreanPropagationResult result;
         memset(&result, 0, sizeof(result));
         double t0 = now_ms();
@@ -757,6 +777,7 @@ static int handle_prop(EmpyreanContext* ctx, const char* rest, int* warmed_up) {
 }
 
 static int handle_eph(EmpyreanContext* ctx, const char* rest) {
+    const int n_reps = take_reps("eph");
     double epoch, x, y, z, vx, vy, vz;
     double a1, a2, a3, g[5];
     int force_model;
@@ -855,7 +876,7 @@ static int handle_eph(EmpyreanContext* ctx, const char* rest) {
     char refusal_status[512] = {0};
     char refusal_msg[2048] = {0};
 
-    for (int rep = 0; rep < 3; rep++) {
+    for (int rep = 0; rep < n_reps; rep++) {
         memset(&result, 0, sizeof(result));
         double t0 = now_ms();
         int rc = empyrean_generate_ephemeris(ctx, &orbit, 1,
@@ -1324,6 +1345,14 @@ int main(int argc, char** argv) {
 
         if (strcmp(mode, "prop") == 0) {
             handle_prop(ctx, rest, &warmed_up);
+        } else if (strcmp(mode, "reps") == 0) {
+            /* No reply: the count applies to the next prop / eph line. */
+            int n = atoi(rest);
+            if (n < 1) {
+                printf("fail reps_invalid_%s\n", rest);
+            } else {
+                pending_reps = n;
+            }
         } else if (strcmp(mode, "eph") == 0) {
             handle_eph(ctx, rest);
         } else if (strcmp(mode, "od") == 0) {

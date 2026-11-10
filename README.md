@@ -139,19 +139,27 @@ push to `main` moves the empyrean pin, and on manual dispatch (optionally with
 an `objects` subset and a `tier`):
 
 ```text
-precheck ─► prep ─► reference ×50 ─► assemble ─┬─► empyrean (4 channels × cost-balanced row legs) ─┐
-                    (one leg per object)   (plan + schedule)                                    ├─► reduce
+precheck ─► prep ─► reference ×N ─► assemble ─┬─► empyrean (4 channels × cost-balanced row legs) ─┐
+                    (cost-balanced row legs) (plan + schedule)                                  ├─► reduce
                                                 └─► external (one leg per tool) ───────────────────┘
 ```
 
 - **prep** builds the engine and the harness, warms the shared caches,
-  fetches the pinned inputs snapshot into them, and deals the catalog into the
-  per-object matrix.
+  fetches the pinned inputs snapshot into them, lists the reference's candidate
+  rows (`validate run --list-rows`) and packs them, with one orbit-determination
+  unit per object, into cost-balanced reference legs (`make schedule-reference`).
 - **reference** runs the rust reference (propagation, ephemeris, orbit
-  determination) for one object per leg, so a slow or failing object costs
-  only its own leg.
-- **assemble** reassembles the per-object shards into the reference, fails
-  naming any object whose shard did not arrive, strips the reference into
+  determination) one leg at a time: a leg runs `validate run --select` over its
+  rows and `validate od` over the objects it owns, so a slow or failing leg
+  costs only its own rows. The one row that costs 42 minutes per run (2020 CD3,
+  propagation, dt = -5475 d, `auto`; every channel times it best of three) runs
+  its three timing repetitions on three legs, one each.
+- **assemble** reassembles the legs into the reference
+  ([`scripts/assemble-reference.py`](scripts/assemble-reference.py): every
+  candidate row must be a result or named as refused in the dropped file of the
+  leg that ran it, and the heavy row's replicas must be identical bit for bit,
+  keeping the minimum time), fails naming any missing row or absent leg, strips
+  the reference into
   the plan, and packs the plan's rows into cost-balanced channel legs
   ([`scripts/schedule.py`](scripts/schedule.py): longest-first from the
   committed cost table `fixtures/costs.json`, which names the run it came from;
@@ -166,7 +174,8 @@ precheck ─► prep ─► reference ×50 ─► assemble ─┬─► empyrean
 - **external** replays the whole plan through one comparator per leg.
 - **reduce** reassembles each channel from its legs in plan order
   (`channel-chunks.py concat`, which refuses a missing leg, a duplicate row
-  and a row outside its leg's selection), folds the external
+  and a row outside its leg's selection, and folds a row's timing replicas the
+  same way), folds the external
   references onto the core rows, renders the report, runs the gate, and
   publishes the report from a full-catalog run on `main`.
 
@@ -191,8 +200,9 @@ make run-core PLAN_PREBUILT=1 LEG=03                 # the core channel over leg
 - `runners/`: the per-channel runners and the external-reference runners
   (see [runners/README.md](runners/README.md)).
 - `scripts/`: the inputs snapshot tool (`inputs.py`), the leg scheduler
-  (`schedule.py`), the leg select and reassemble tool (`channel-chunks.py`)
-  and the network seal (`seal-upstream.sh`).
+  (`schedule.py`), the leg select and reassemble tool (`channel-chunks.py`),
+  the reference leg tools (`reference-legs.py`, `assemble-reference.py`), the
+  timing replica merge (`replicas.py`) and the network seal (`seal-upstream.sh`).
 - `fixtures/`: the pin of the inputs snapshot (`manifest.json`; the data
   itself is fetched, see [fixtures/README.md](fixtures/README.md)).
 - `Makefile`: the orchestrator every local run and every CI job goes through.
