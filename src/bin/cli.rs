@@ -40,6 +40,7 @@ use empyrean_validation::{
     catalog::{
         RADAR_FIXTURE_OBJECTS, ValidationObject, all_objects, filter_by_name, filter_by_population,
     },
+    comparators::{self, ComparatorOutcome, read_tool_records},
     inputs::{InputProduct, cache_file_name, missing_input},
     plan::{PlanConfig, build_plan},
     report::{SUMMARY_TEST_TYPES, generate_report},
@@ -288,6 +289,12 @@ struct MergeExternalArgs {
     /// reference — making JPL a full OD tool alongside find_orb / layup.
     #[arg(long)]
     jpl_sbdb_cache: Option<PathBuf>,
+    /// A file of `TOOL=REASON` lines, one per comparator whose file never
+    /// arrived (its leg failed and staged nothing). Each is recorded as
+    /// `failed: <reason>` in the comparator sidecar so the report names it,
+    /// exactly like a comparator whose file was present but malformed.
+    #[arg(long = "comparator-absent-file")]
+    comparator_absent_file: Option<PathBuf>,
 }
 
 #[derive(Parser, Debug)]
@@ -759,103 +766,204 @@ fn arm_plan(args: ArmPlanArgs) -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
+/// Run one comparator's load and merge on its own.
+///
+/// The fold either lands whole or not at all: rows are snapshotted first and
+/// restored when it fails, so a comparator that dies halfway (a bad record, an
+/// engine error in the middle of a multi-pass fold) leaves nothing of itself on
+/// the rows. The failure is named with its reason on stderr and recorded in the
+/// outcome list that becomes the sidecar the report reads; the merge goes on to
+/// the next comparator.
+fn isolated_merge(
+    tool: &str,
+    rows: &mut Vec<ValidationResult>,
+    outcomes: &mut Vec<ComparatorOutcome>,
+    fold: impl FnOnce(&mut Vec<ValidationResult>) -> Result<usize, Box<dyn std::error::Error>>,
+) {
+    let snapshot = rows.clone();
+    match fold(rows) {
+        Ok(n) => outcomes.push(ComparatorOutcome::merged(tool, n)),
+        Err(e) => {
+            *rows = snapshot;
+            let outcome = ComparatorOutcome::failed(tool, e.to_string());
+            eprintln!(
+                "  COMPARATOR FAILED --{tool}: {} -- skipped; the merge, the report and ci-check go on.",
+                outcome.reason.as_deref().unwrap_or_default()
+            );
+            outcomes.push(outcome);
+        }
+    }
+}
+
 fn merge_external(args: MergeExternalArgs) -> Result<(), Box<dyn std::error::Error>> {
     let raw = std::fs::read_to_string(&args.input)
         .map_err(|e| format!("read {}: {e}", args.input.display()))?;
     let mut rows: Vec<ValidationResult> = serde_json::from_str(&raw)?;
+    let mut outcomes: Vec<ComparatorOutcome> = Vec::new();
+
+    // A comparator the caller already knows did not deliver (its leg failed and
+    // staged nothing) is recorded the same way as one whose file is bad, so the
+    // published page names it.
+    let absent_specs = match &args.comparator_absent_file {
+        Some(path) => std::fs::read_to_string(path)
+            .map_err(|e| format!("read {}: {e}", path.display()))?
+            .lines()
+            .filter(|l| !l.trim().is_empty())
+            .map(str::to_string)
+            .collect(),
+        None => Vec::<String>::new(),
+    };
+    for spec in &absent_specs {
+        let (tool, reason) = spec.split_once('=').ok_or_else(|| {
+            format!("--comparator-absent-file expects TOOL=REASON lines, got `{spec}`")
+        })?;
+        eprintln!("  COMPARATOR FAILED --{tool}: {reason} -- skipped.");
+        outcomes.push(ComparatorOutcome::failed(tool, reason));
+    }
 
     if let Some(path) = &args.core_stm {
-        let n = merge_core_stm(&mut rows, path)?;
-        eprintln!("Merged {n} core first-order STM rows (emp_stm)");
+        isolated_merge("core-stm", &mut rows, &mut outcomes, |rows| {
+            let n = merge_core_stm(rows, path)?;
+            eprintln!("Merged {n} core first-order STM rows (emp_stm)");
+            Ok(n)
+        });
     }
     if let Some(path) = &args.core_fd_stm {
-        let n = merge_core_fd_stm(&mut rows, path)?;
-        eprintln!("Merged {n} finite-difference STM reference rows (fd_stm)");
+        isolated_merge("core-fd-stm", &mut rows, &mut outcomes, |rows| {
+            let n = merge_core_fd_stm(rows, path)?;
+            eprintln!("Merged {n} finite-difference STM reference rows (fd_stm)");
+            Ok(n)
+        });
     }
     if let Some(path) = &args.assist {
-        let n = merge_assist(&mut rows, path)?;
-        eprintln!("Merged {n} ASSIST rows");
+        isolated_merge("assist", &mut rows, &mut outcomes, |rows| {
+            let n = merge_assist(rows, path)?;
+            eprintln!("Merged {n} ASSIST rows");
+            Ok(n)
+        });
     }
     if let Some(path) = &args.findorb {
-        let n = merge_findorb(&mut rows, path)?;
-        eprintln!("Merged {n} find_orb rows");
-        let (np, ne) = merge_findorb_ephem(&mut rows, path)?;
-        if np + ne > 0 {
-            eprintln!("Merged {np} find_orb propagation + {ne} ephemeris reference rows");
-        }
+        isolated_merge("findorb", &mut rows, &mut outcomes, |rows| {
+            let n = merge_findorb(rows, path)?;
+            eprintln!("Merged {n} find_orb rows");
+            let (np, ne) = merge_findorb_ephem(rows, path)?;
+            if np + ne > 0 {
+                eprintln!("Merged {np} find_orb propagation + {ne} ephemeris reference rows");
+            }
+            Ok(n)
+        });
     }
     if let Some(path) = &args.findorb_radar {
-        let n = merge_findorb(&mut rows, path)?;
-        eprintln!("Merged {n} find_orb radar rows");
-        // The reference channel now carries orbit_determination_radar rows
-        // (every channel replays the radar arc), so find_orb's radar fits
-        // should fold onto them. Zero folds out of a non-empty input file is
-        // therefore an anomaly, not the by-design outcome it once was — say it
-        // out loud rather than let it hide behind an otherwise-silent success.
-        if n == 0 {
-            eprintln!(
-                "  NOTE: find_orb ran its radar pass but no reference row accepted it. \
-                 The reference channel was expected to carry orbit_determination_radar \
-                 rows for the radar objects; none matched. Check that the radar OD rows \
-                 were replayed into the reference channel. find_orb's radar fits are \
-                 preserved verbatim in {}.",
-                path.display()
-            );
-        }
+        isolated_merge("findorb-radar", &mut rows, &mut outcomes, |rows| {
+            let n = merge_findorb(rows, path)?;
+            eprintln!("Merged {n} find_orb radar rows");
+            // The reference channel now carries orbit_determination_radar rows
+            // (every channel replays the radar arc), so find_orb's radar fits
+            // should fold onto them. Zero folds out of a non-empty input file is
+            // therefore an anomaly, not the by-design outcome it once was -- say
+            // it out loud rather than let it hide behind an otherwise-silent
+            // success.
+            if n == 0 {
+                eprintln!(
+                    "  NOTE: find_orb ran its radar pass but no reference row accepted it. \
+                     The reference channel was expected to carry orbit_determination_radar \
+                     rows for the radar objects; none matched. Check that the radar OD rows \
+                     were replayed into the reference channel. find_orb's radar fits are \
+                     preserved verbatim in {}.",
+                    path.display()
+                );
+            }
+            Ok(n)
+        });
     }
     if let Some(path) = &args.oorb {
-        let n = merge_oorb(&mut rows, path)?;
-        eprintln!("Merged {n} OpenOrb rows");
+        isolated_merge("oorb", &mut rows, &mut outcomes, |rows| {
+            let n = merge_oorb(rows, path)?;
+            eprintln!("Merged {n} OpenOrb rows");
+            Ok(n)
+        });
     }
     if let Some(path) = &args.orbfit {
-        let n = merge_orbfit(&mut rows, path)?;
-        eprintln!("Merged {n} OrbFit rows");
+        isolated_merge("orbfit", &mut rows, &mut outcomes, |rows| {
+            let n = merge_orbfit(rows, path)?;
+            eprintln!("Merged {n} OrbFit rows");
+            Ok(n)
+        });
     }
     if let Some(path) = &args.layup {
-        let n = merge_layup(&mut rows, path)?;
-        eprintln!("Merged {n} layup rows");
+        isolated_merge("layup", &mut rows, &mut outcomes, |rows| {
+            let n = merge_layup(rows, path)?;
+            eprintln!("Merged {n} layup rows");
+            Ok(n)
+        });
     }
     if let Some(path) = &args.kete {
-        let n = merge_tool_times(&mut rows, path, "kete_time_ms", |r, v| r.kete_time_ms = v)?;
-        eprintln!("Merged {n} kete timing rows");
+        isolated_merge("kete", &mut rows, &mut outcomes, |rows| {
+            let n = merge_tool_times(rows, path, "kete_time_ms", |r, v| r.kete_time_ms = v)?;
+            eprintln!("Merged {n} kete timing rows");
+            Ok(n)
+        });
     }
     if let Some(path) = &args.jorbit {
-        let n = merge_tool_times(&mut rows, path, "jorbit_time_ms", |r, v| {
-            r.jorbit_time_ms = v
-        })?;
-        eprintln!("Merged {n} jorbit timing rows");
+        isolated_merge("jorbit", &mut rows, &mut outcomes, |rows| {
+            let n = merge_tool_times(rows, path, "jorbit_time_ms", |r, v| r.jorbit_time_ms = v)?;
+            eprintln!("Merged {n} jorbit timing rows");
+            Ok(n)
+        });
     }
     if let Some(path) = &args.grss {
-        let n = merge_grss(&mut rows, path)?;
-        eprintln!("Merged {n} GRSS rows");
+        isolated_merge("grss", &mut rows, &mut outcomes, |rows| {
+            let n = merge_grss(rows, path)?;
+            eprintln!("Merged {n} GRSS rows");
+            Ok(n)
+        });
     }
     if let Some(path) = &args.grss_radar {
-        let n = merge_grss(&mut rows, path)?;
-        eprintln!("Merged {n} GRSS radar rows");
-        // Same as `--findorb-radar`: the reference channel now carries
-        // orbit_determination_radar rows, so GRSS's radar fits should fold
-        // onto them. Zero folds out of a non-empty input file is an anomaly,
-        // not a by-design outcome — say it out loud.
-        if n == 0 {
-            eprintln!(
-                "  NOTE: GRSS ran its radar pass but no reference row accepted it. \
-                 The reference channel was expected to carry orbit_determination_radar \
-                 rows for the radar objects; none matched. Check that the radar OD rows \
-                 were replayed into the reference channel. GRSS's radar fits — including \
-                 its delay/Doppler residual RMS, an axis no other channel measures — are \
-                 preserved verbatim in {}.",
-                path.display()
-            );
-        }
+        isolated_merge("grss-radar", &mut rows, &mut outcomes, |rows| {
+            let n = merge_grss(rows, path)?;
+            eprintln!("Merged {n} GRSS radar rows");
+            // Same as `--findorb-radar`: the reference channel now carries
+            // orbit_determination_radar rows, so GRSS's radar fits should fold
+            // onto them. Zero folds out of a non-empty input file is an anomaly,
+            // not a by-design outcome -- say it out loud.
+            if n == 0 {
+                eprintln!(
+                    "  NOTE: GRSS ran its radar pass but no reference row accepted it. \
+                     The reference channel was expected to carry orbit_determination_radar \
+                     rows for the radar objects; none matched. Check that the radar OD rows \
+                     were replayed into the reference channel. GRSS's radar fits -- including \
+                     its delay/Doppler residual RMS, an axis no other channel measures -- are \
+                     preserved verbatim in {}.",
+                    path.display()
+                );
+            }
+            Ok(n)
+        });
     }
     if let Some(dir) = &args.jpl_sbdb_cache {
-        let n = merge_jpl(&mut rows, dir)?;
-        eprintln!("Merged {n} JPL SBDB OD-reference rows");
+        isolated_merge("jpl-sbdb", &mut rows, &mut outcomes, |rows| {
+            let n = merge_jpl(rows, dir)?;
+            eprintln!("Merged {n} JPL SBDB OD-reference rows");
+            Ok(n)
+        });
     }
 
     let out_path = args.output.unwrap_or(args.input);
     std::fs::write(&out_path, serde_json::to_string_pretty(&rows)?)?;
+    comparators::write_sidecar(&out_path, &outcomes)?;
     eprintln!("Wrote merged results to {}", out_path.display());
+    let failed: Vec<&ComparatorOutcome> = outcomes.iter().filter(|o| o.is_failed()).collect();
+    if !failed.is_empty() {
+        eprintln!(
+            "{} comparator(s) failed and were skipped: {}",
+            failed.len(),
+            failed
+                .iter()
+                .map(|o| format!("{} ({})", o.tool, o.failure_line().unwrap_or_default()))
+                .collect::<Vec<_>>()
+                .join("; ")
+        );
+    }
     Ok(())
 }
 
@@ -896,8 +1004,7 @@ fn merge_core_stm(
     rows: &mut [ValidationResult],
     path: &std::path::Path,
 ) -> Result<usize, Box<dyn std::error::Error>> {
-    let txt = std::fs::read_to_string(path).map_err(|e| format!("read {}: {e}", path.display()))?;
-    let recs: Vec<serde_json::Value> = serde_json::from_str(&txt)?;
+    let recs = read_tool_records(path)?;
     let mut idx: std::collections::HashMap<(String, i64, Option<String>), &serde_json::Value> =
         Default::default();
     for a in &recs {
@@ -934,8 +1041,7 @@ fn merge_core_fd_stm(
     rows: &mut [ValidationResult],
     path: &std::path::Path,
 ) -> Result<usize, Box<dyn std::error::Error>> {
-    let txt = std::fs::read_to_string(path).map_err(|e| format!("read {}: {e}", path.display()))?;
-    let recs: Vec<serde_json::Value> = serde_json::from_str(&txt)?;
+    let recs = read_tool_records(path)?;
     let mut idx: std::collections::HashMap<(String, i64, Option<String>), &serde_json::Value> =
         Default::default();
     for a in &recs {
@@ -1029,8 +1135,7 @@ fn merge_assist(
     rows: &mut Vec<ValidationResult>,
     path: &std::path::Path,
 ) -> Result<usize, Box<dyn std::error::Error>> {
-    let txt = std::fs::read_to_string(path).map_err(|e| format!("read {}: {e}", path.display()))?;
-    let assist: Vec<serde_json::Value> = serde_json::from_str(&txt)?;
+    let assist = read_tool_records(path)?;
     let au_km = empyrean_validation::compare::AU_KM;
 
     // Snapshot the core empyrean outputs BEFORE any mutation: the propagated
@@ -1180,8 +1285,7 @@ fn merge_findorb(
     rows: &mut [ValidationResult],
     path: &std::path::Path,
 ) -> Result<usize, Box<dyn std::error::Error>> {
-    let txt = std::fs::read_to_string(path).map_err(|e| format!("read {}: {e}", path.display()))?;
-    let fo: Vec<serde_json::Value> = serde_json::from_str(&txt)?;
+    let fo = read_tool_records(path)?;
     // Key on (object, test_type) so the optical find_orb fit attaches to the
     // `orbit_determination` row and the radar-augmented fit (find_orb run over
     // the fixtures/psv-radar/ files, which carry the ADES <radar> table)
@@ -1226,8 +1330,7 @@ fn merge_oorb(
     rows: &mut [ValidationResult],
     path: &std::path::Path,
 ) -> Result<usize, Box<dyn std::error::Error>> {
-    let txt = std::fs::read_to_string(path).map_err(|e| format!("read {}: {e}", path.display()))?;
-    let oo: Vec<serde_json::Value> = serde_json::from_str(&txt)?;
+    let oo = read_tool_records(path)?;
     let mut prop_idx: std::collections::HashMap<(String, i64), &serde_json::Value> =
         Default::default();
     let mut eph_idx: std::collections::HashMap<(String, i64, String), &serde_json::Value> =
@@ -1303,8 +1406,7 @@ fn merge_orbfit(
     rows: &mut [ValidationResult],
     path: &std::path::Path,
 ) -> Result<usize, Box<dyn std::error::Error>> {
-    let txt = std::fs::read_to_string(path).map_err(|e| format!("read {}: {e}", path.display()))?;
-    let of: Vec<serde_json::Value> = serde_json::from_str(&txt)?;
+    let of = read_tool_records(path)?;
     let mut idx: std::collections::HashMap<String, &serde_json::Value> = Default::default();
     for f in &of {
         if let Some(o) = f["object"].as_str() {
@@ -1340,8 +1442,7 @@ fn merge_layup(
     rows: &mut [ValidationResult],
     path: &std::path::Path,
 ) -> Result<usize, Box<dyn std::error::Error>> {
-    let txt = std::fs::read_to_string(path).map_err(|e| format!("read {}: {e}", path.display()))?;
-    let lu: Vec<serde_json::Value> = serde_json::from_str(&txt)?;
+    let lu = read_tool_records(path)?;
     let mut idx: std::collections::HashMap<String, &serde_json::Value> = Default::default();
     for f in &lu {
         if let Some(o) = f["object"].as_str() {
@@ -1387,8 +1488,7 @@ fn merge_grss(
     rows: &mut [ValidationResult],
     path: &std::path::Path,
 ) -> Result<usize, Box<dyn std::error::Error>> {
-    let txt = std::fs::read_to_string(path).map_err(|e| format!("read {}: {e}", path.display()))?;
-    let gr: Vec<serde_json::Value> = serde_json::from_str(&txt)?;
+    let gr = read_tool_records(path)?;
     let mut prop_idx: std::collections::HashMap<(String, i64), &serde_json::Value> =
         Default::default();
     let mut eph_idx: std::collections::HashMap<(String, i64, String), &serde_json::Value> =
@@ -1502,8 +1602,7 @@ fn merge_tool_times(
     field: &str,
     set: impl Fn(&mut ValidationResult, Option<f64>),
 ) -> Result<usize, Box<dyn std::error::Error>> {
-    let txt = std::fs::read_to_string(path).map_err(|e| format!("read {}: {e}", path.display()))?;
-    let ext: Vec<serde_json::Value> = serde_json::from_str(&txt)?;
+    let ext = read_tool_records(path)?;
     let mut idx: std::collections::HashMap<(String, String, i64, String), f64> = Default::default();
     for o in &ext {
         let (Some(name), Some(tt)) = (o["object"].as_str(), o["test_type"].as_str()) else {
@@ -1546,8 +1645,7 @@ fn merge_findorb_ephem(
     rows: &mut [ValidationResult],
     path: &std::path::Path,
 ) -> Result<(usize, usize), Box<dyn std::error::Error>> {
-    let txt = std::fs::read_to_string(path).map_err(|e| format!("read {}: {e}", path.display()))?;
-    let fo: Vec<serde_json::Value> = serde_json::from_str(&txt)?;
+    let fo = read_tool_records(path)?;
     let vec3 = |v: &serde_json::Value| -> Option<[f64; 3]> {
         let a = v.as_array()?;
         if a.len() != 3 {
@@ -1826,7 +1924,18 @@ fn report(args: ReportArgs) -> Result<(), Box<dyn std::error::Error>> {
     // be reported with the names that were actually tried.
     let mut sidecars_tried: Vec<PathBuf> = Vec::new();
     let mut sidecar_found: Option<PathBuf> = None;
+    // The comparators `merge-external` skipped, read from the sidecar it writes
+    // beside its merged output, so the page names every one.
+    let mut comparator_outcomes: Vec<ComparatorOutcome> = Vec::new();
     for path in &args.results {
+        if let Some(found) = comparators::read_sidecar(path)? {
+            for c in &found {
+                if let Some(line) = c.failure_line() {
+                    eprintln!("  COMPARATOR FAILED --{}: {line}", c.tool);
+                }
+            }
+            comparator_outcomes.extend(found);
+        }
         let raw =
             std::fs::read_to_string(path).map_err(|e| format!("read {}: {e}", path.display()))?;
         let rows: Vec<ValidationResult> =
@@ -1971,6 +2080,7 @@ fn report(args: ReportArgs) -> Result<(), Box<dyn std::error::Error>> {
         args.summary.as_deref(),
         predict_agg.as_ref(),
         &predict_runs,
+        &comparator_outcomes,
     )
     .map_err(|e| format!("report: {e}"))?;
     eprintln!("Wrote report to {}", args.output.display());
@@ -2508,6 +2618,23 @@ fn ci_check(args: CiCheckArgs) -> Result<(), Box<dyn std::error::Error>> {
     };
     if let Some(planned) = &planned {
         failures.extend(reference_coverage_failures(&summary, planned));
+    }
+
+    // A comparator `merge-external` skipped is never a gate failure (an external
+    // reference that did not deliver does not make the engine wrong), but it is
+    // named here beside the verdict so the gate's green is not read as "every
+    // comparator ran".
+    if let Some(comparators) = summary["comparators"].as_array() {
+        for c in comparators
+            .iter()
+            .filter(|c| c["status"].as_str() == Some("failed"))
+        {
+            eprintln!(
+                "ci-check: NOTE comparator {} failed and is absent from the report: {}",
+                c["tool"].as_str().unwrap_or("?"),
+                c["reason"].as_str().unwrap_or("no reason recorded")
+            );
+        }
     }
 
     if failures.is_empty() {
@@ -3885,5 +4012,253 @@ mod tests {
         // an empty filter that quietly resolved to an empty set would fan out
         // zero legs and produce an empty-but-green run.
         assert_eq!(select_objects(&[], &[]).unwrap().len(), all_objects().len());
+    }
+
+    // ── per-comparator isolation (merge-external) ──────────────────────────
+
+    /// Every merge flag that takes a per-row JSON file, with a well-formed file
+    /// for it. A malformed or empty file on any ONE of them must fail that
+    /// comparator only.
+    const FILE_COMPARATOR_FLAGS: [&str; 12] = [
+        "core-stm",
+        "core-fd-stm",
+        "assist",
+        "findorb",
+        "findorb-radar",
+        "oorb",
+        "orbfit",
+        "layup",
+        "kete",
+        "jorbit",
+        "grss",
+        "grss-radar",
+    ];
+
+    fn merge_args(dir: &std::path::Path, flags: &[(&str, &std::path::Path)]) -> MergeExternalArgs {
+        let base = write_results(dir, "base.json", &[od_row("Eros")]);
+        let mut argv: Vec<String> = vec![
+            "merge-external".into(),
+            "-i".into(),
+            base.display().to_string(),
+            "-o".into(),
+            dir.join("merged.json").display().to_string(),
+        ];
+        for (flag, path) in flags {
+            argv.push(format!("--{flag}"));
+            argv.push(path.display().to_string());
+        }
+        MergeExternalArgs::parse_from(argv)
+    }
+
+    fn good_layup(dir: &std::path::Path) -> PathBuf {
+        let p = dir.join("good-layup.json");
+        std::fs::write(
+            &p,
+            r#"[{"object":"Eros","test_type":"orbit_determination","layup_chi2":10.5}]"#,
+        )
+        .unwrap();
+        p
+    }
+
+    fn outcome<'a>(outcomes: &'a [ComparatorOutcome], tool: &str) -> &'a ComparatorOutcome {
+        outcomes
+            .iter()
+            .find(|o| o.tool == tool)
+            .unwrap_or_else(|| panic!("no outcome for {tool}: {outcomes:?}"))
+    }
+
+    #[test]
+    fn a_bad_file_fails_only_its_own_comparator_for_every_comparator_class() {
+        // One malformed and one empty file per comparator flag, each alongside a
+        // good layup file: the merge must still succeed, still fold layup, name
+        // the bad tool with its parse error, and leave every other row alone.
+        for flag in FILE_COMPARATOR_FLAGS {
+            for (kind, body, reason_has) in [
+                ("malformed", r#"[{"object":"Eros","test_ty"#, "parse"),
+                ("empty", "", "file is empty"),
+            ] {
+                let dir = tempfile::tempdir().unwrap();
+                let bad = dir.path().join(format!("{flag}.json"));
+                std::fs::write(&bad, body).unwrap();
+                let layup = good_layup(dir.path());
+                let kete = dir.path().join("good-kete.json");
+                std::fs::write(
+                    &kete,
+                    r#"[{"object":"Eros","test_type":"orbit_determination","kete_time_ms":3.0}]"#,
+                )
+                .unwrap();
+                // The layup comparator itself is the bad one in one case; a good
+                // kete file then proves the rest of the merge went on.
+                let (flags, good_name): (Vec<(&str, &std::path::Path)>, &str) = if flag == "layup" {
+                    (
+                        vec![("layup", bad.as_path()), ("kete", kete.as_path())],
+                        "kete",
+                    )
+                } else {
+                    (
+                        vec![("layup", layup.as_path()), (flag, bad.as_path())],
+                        "layup",
+                    )
+                };
+                let bad_path = bad.clone();
+                let args = merge_args(dir.path(), &flags);
+                merge_external(args).unwrap_or_else(|e| {
+                    panic!("--{flag} {kind} file aborted the whole merge: {e}")
+                });
+
+                let outcomes = comparators::read_sidecar(&dir.path().join("merged.json"))
+                    .unwrap()
+                    .expect("sidecar written");
+                let o = outcome(&outcomes, flag);
+                assert!(o.is_failed(), "--{flag} {kind}: {o:?}");
+                let reason = o.reason.as_deref().unwrap();
+                assert!(reason.contains(reason_has), "--{flag} {kind}: {reason}");
+                assert!(
+                    reason.contains(&bad_path.display().to_string()),
+                    "the reason must name the file: {reason}"
+                );
+                assert!(!outcome(&outcomes, good_name).is_failed());
+
+                let merged: Vec<ValidationResult> = serde_json::from_str(
+                    &std::fs::read_to_string(dir.path().join("merged.json")).unwrap(),
+                )
+                .unwrap();
+                if good_name == "layup" {
+                    assert_eq!(merged[0].layup_chi2, Some(10.5), "--{flag}");
+                } else {
+                    assert_eq!(merged[0].kete_time_ms, Some(3.0), "--{flag}");
+                    assert_eq!(merged[0].layup_chi2, None, "failed layup left no trace");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_failed_comparator_that_changed_rows_first_leaves_nothing_behind() {
+        let mut rows = vec![od_row("Eros")];
+        let before = rows.clone();
+        let mut outcomes = Vec::new();
+        isolated_merge("layup", &mut rows, &mut outcomes, |rows| {
+            rows[0].layup_chi2 = Some(1.0);
+            rows.push(od_row("Bennu"));
+            Err("died halfway".into())
+        });
+        assert_eq!(rows, before, "the half-applied fold must be undone");
+        assert_eq!(outcomes.len(), 1);
+        assert!(outcomes[0].is_failed());
+        assert_eq!(outcomes[0].failure_line().unwrap(), "failed: died halfway");
+    }
+
+    #[test]
+    fn an_absent_comparator_is_recorded_and_named() {
+        let dir = tempfile::tempdir().unwrap();
+        let absent = dir.path().join("absent.txt");
+        std::fs::write(&absent, "orbfit=leg did not deliver\n\n").unwrap();
+        let mut args = merge_args(dir.path(), &[]);
+        args.comparator_absent_file = Some(absent);
+        merge_external(args).unwrap();
+        let outcomes = comparators::read_sidecar(&dir.path().join("merged.json"))
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            outcome(&outcomes, "orbfit").failure_line().unwrap(),
+            "failed: leg did not deliver"
+        );
+        std::fs::write(dir.path().join("bad.txt"), "no-equals-sign\n").unwrap();
+        let mut bad = merge_args(dir.path(), &[]);
+        bad.comparator_absent_file = Some(dir.path().join("bad.txt"));
+        assert!(
+            merge_external(bad).is_err(),
+            "a malformed spec is a usage error"
+        );
+    }
+
+    #[test]
+    fn a_clean_merge_writes_an_all_merged_sidecar_replacing_a_stale_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let merged = dir.path().join("merged.json");
+        comparators::write_sidecar(&merged, &[ComparatorOutcome::failed("kete", "stale")]).unwrap();
+        let layup = good_layup(dir.path());
+        merge_external(merge_args(dir.path(), &[("layup", layup.as_path())])).unwrap();
+        let outcomes = comparators::read_sidecar(&merged).unwrap().unwrap();
+        assert_eq!(outcomes, vec![ComparatorOutcome::merged("layup", 1)]);
+    }
+
+    #[test]
+    fn a_missing_sbdb_snapshot_fails_only_the_jpl_comparator() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut args = merge_args(dir.path(), &[]);
+        args.jpl_sbdb_cache = Some(dir.path().join("no-such-sbdb"));
+        merge_external(args).unwrap();
+        let outcomes = comparators::read_sidecar(&dir.path().join("merged.json"))
+            .unwrap()
+            .unwrap();
+        assert!(outcome(&outcomes, "jpl-sbdb").is_failed());
+    }
+
+    #[test]
+    fn the_report_names_a_failed_comparator_on_the_page_and_in_the_summary() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut prop = ValidationResult::empty();
+        prop.object = "Eros".into();
+        prop.channel = "rust".into();
+        prop.test_type = "propagation".into();
+        let results = write_results(dir.path(), "validation_core_merged.json", &[prop]);
+        comparators::write_sidecar(
+            &results,
+            &[
+                ComparatorOutcome::merged("assist", 4),
+                ComparatorOutcome::failed("kete", "parse /x/kete.json: EOF while parsing"),
+            ],
+        )
+        .unwrap();
+        let out = dir.path().join("report.html");
+        let summary = dir.path().join("summary.json");
+        report(ReportArgs {
+            results: vec![results],
+            output: out.clone(),
+            summary: Some(summary.clone()),
+            predict_agg: vec![],
+            predict_run: vec![],
+        })
+        .unwrap();
+        let html = std::fs::read_to_string(&out).unwrap();
+        let cfg = &html[html.find("id=\"s05c\"").expect("Configurations section")..];
+        assert!(
+            cfg.contains("<code>kete</code>: failed: parse /x/kete.json: EOF while parsing"),
+            "the failed comparator must read on the page"
+        );
+        assert!(
+            !cfg.contains("<code>assist</code>"),
+            "a merged comparator is not a failure line"
+        );
+        let sum: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&summary).unwrap()).unwrap();
+        let listed = sum["comparators"].as_array().unwrap();
+        assert_eq!(listed.len(), 2);
+        assert_eq!(listed[1]["status"], "failed");
+        assert_eq!(listed[1]["reason"], "parse /x/kete.json: EOF while parsing");
+    }
+
+    #[test]
+    fn the_report_without_a_sidecar_carries_an_empty_comparator_list() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut prop = ValidationResult::empty();
+        prop.object = "Eros".into();
+        prop.channel = "rust".into();
+        prop.test_type = "propagation".into();
+        let results = write_results(dir.path(), "validation_rust.json", &[prop]);
+        let summary = dir.path().join("summary.json");
+        report(ReportArgs {
+            results: vec![results],
+            output: dir.path().join("r.html"),
+            summary: Some(summary.clone()),
+            predict_agg: vec![],
+            predict_run: vec![],
+        })
+        .unwrap();
+        let sum: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&summary).unwrap()).unwrap();
+        assert_eq!(sum["comparators"].as_array().unwrap().len(), 0);
     }
 }

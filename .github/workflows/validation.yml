@@ -182,6 +182,14 @@ env:
   CARGO_NET_GIT_FETCH_WITH_CLI: true
   GCS_BUCKET: gs://empyrean-validation
   EMPYREAN_DATA_DIR: ${{ github.workspace }}/data
+  # Where the prebuilt engine library lives, for EVERY job (scripts/engine_lib.py,
+  # .github/actions/engine-lib). empyrean-sys's build script resolves
+  # EMPYREAN_LIB_DIR before anything else, so with this set a build can never fall
+  # through to the public release URL (which answered HTTP 504 on 2026-11-09): a
+  # job that did not populate the directory panics with "libempyrean not found"
+  # instead of downloading. prep fetches the library once through the
+  # authenticated API; every other job restores it from the cache.
+  EMPYREAN_LIB_DIR: ${{ github.workspace }}/engine-lib
   # The numerical-parity suite runs on a single interpreter by design: the
   # empyrean python channel ships as an abi3 wheel, so its compiled binary is
   # byte-identical across CPython 3.10–3.14 — running the (expensive) suite per
@@ -372,6 +380,22 @@ jobs:
           DATA_DIR: ${{ env.EMPYREAN_DATA_DIR }}
         run: make build
 
+      # Build once. Every reference, channel and reduce job runs these exact
+      # bytes (hash-verified, `make ... PREBUILT_BIN=1`) instead of compiling its
+      # own: the rust, CLI and C runners, validate-core, the harness, the engine's
+      # C library and the wheel. scripts/prebuilt.py refuses by name a component
+      # that did not build.
+      - name: Pack the prebuilt binaries
+        working-directory: empyrean-validation
+        run: python3 scripts/prebuilt.py pack --out prebuilt
+      - name: Upload the prebuilt binaries
+        uses: actions/upload-artifact@v4
+        with:
+          name: prebuilt-bin
+          path: empyrean-validation/prebuilt
+          retention-days: 30
+          if-no-files-found: error
+
       # The reference schedule: the candidate rows (`validate run --list-rows`,
       # which needs no engine call) and one OD unit per catalog object, packed
       # into cost-balanced legs from the committed cost table
@@ -458,20 +482,29 @@ jobs:
           dataset: ${{ env.EMPYREAN_DATASET }}
           inputs-snapshot-id: ${{ needs.prep.outputs.inputs_id }}
           role: reader
+          skip-build: "true"
       - name: Download the reference schedule
         uses: actions/download-artifact@v4
         with:
           name: reference-schedule
           path: empyrean-validation/results
-      # `build-reference`, not `build`: only the rust runner, the harness CLI and
-      # libempyrean are used here. The full `build` measured 375s on a leg, most
-      # of it on the C harness, the CLI and the maturin wheel that a reference
-      # leg never invokes.
-      - name: Build reference prerequisites (warm)
+      # Nothing is compiled here: the rust runner and the harness are the bytes
+      # prep built (the full `build` measured 375s on a leg). `PREBUILT_BIN=1`
+      # makes `build-reference` assert them against the manifest and refuse, by
+      # name, a missing or altered binary instead of rebuilding.
+      - name: Download the prebuilt binaries
+        uses: actions/download-artifact@v4
+        with:
+          name: prebuilt-bin
+          path: empyrean-validation/prebuilt
+      - name: Unpack the prebuilt binaries
+        working-directory: empyrean-validation
+        run: python3 scripts/prebuilt.py unpack --from prebuilt
+      - name: Assert the prebuilt reference prerequisites
         working-directory: empyrean-validation
         env:
           DATA_DIR: ${{ env.EMPYREAN_DATA_DIR }}
-        run: make build-reference
+        run: make build-reference PREBUILT_BIN=1
       # Reader role: the inputs snapshot is already restored and verified
       # offline by engine-setup, and this leg downloads nothing from JPL during
       # setup, so seal before the leg run — a cache miss then fails at the
@@ -484,7 +517,7 @@ jobs:
         env:
           DATA_DIR: ${{ env.EMPYREAN_DATA_DIR }}
         run: |
-          make shard-reference \
+          make shard-reference PREBUILT_BIN=1 \
             LEG="${{ matrix.leg.leg }}" \
             OBJECTS="${OBJECTS}" \
             TIERS="${TIER}"
@@ -523,27 +556,22 @@ jobs:
         uses: actions/checkout@v4
         with:
           path: empyrean-validation
-      - uses: actions-rust-lang/setup-rust-toolchain@v1
-        with:
-          rustflags: ""
-          cache-workspaces: empyrean-validation
       - uses: actions/setup-python@v5
         with:
           python-version: ${{ env.PYTHON_VERSION }}
-      - name: Cache cargo state
-        uses: actions/cache@v4
+      # Only the harness binary is needed here (list-objects + strip-plan), and
+      # it is the one prep built: no toolchain, no compile. The engine library
+      # comes from prep's cache (verified offline), never the public URL.
+      - name: Engine library (restored from prep; no public release URL)
+        uses: ./empyrean-validation/.github/actions/engine-lib
+      - name: Download the prebuilt binaries
+        uses: actions/download-artifact@v4
         with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            empyrean-validation/target
-          key: cargo-assemble-${{ hashFiles('empyrean-validation/Cargo.lock') }}
-          restore-keys: cargo-
-      # Only the harness binary is needed here (list-objects + strip-plan);
-      # no engine, no kernels, no fixtures.
-      - name: Build harness binary
+          name: prebuilt-bin
+          path: empyrean-validation/prebuilt
+      - name: Unpack the prebuilt harness
         working-directory: empyrean-validation
-        run: cargo build --release --bin empyrean-validation
+        run: python3 scripts/prebuilt.py unpack --from prebuilt --only harness
       - name: Download the reference schedule
         uses: actions/download-artifact@v4
         with:
@@ -592,8 +620,8 @@ jobs:
       - name: Assemble reference + strip plan
         working-directory: empyrean-validation
         run: |
-          make assemble-reference OBJECTS="${OBJECTS}"
-          make plan REFERENCE_ASSEMBLED=1 OBJECTS="${OBJECTS}" TIERS="${TIER}"
+          make assemble-reference PREBUILT_BIN=1 OBJECTS="${OBJECTS}"
+          make plan PREBUILT_BIN=1 REFERENCE_ASSEMBLED=1 OBJECTS="${OBJECTS}" TIERS="${TIER}"
 
       # Pack the plan's rows into cost-balanced channel legs: a pure function
       # of the plan, the committed cost table (fixtures/costs.json, refreshed
@@ -605,7 +633,7 @@ jobs:
         id: schedule
         working-directory: empyrean-validation
         run: |
-          make schedule PLAN_PREBUILT=1 CHANNEL_LEG_BUDGET="${CHANNEL_LEGS}"
+          make schedule PREBUILT_BIN=1 PLAN_PREBUILT=1 CHANNEL_LEG_BUDGET="${CHANNEL_LEGS}"
           python3 scripts/schedule.py validate --plan results/validation_plan.json \
             --schedule results/schedule.json --costs fixtures/costs.json
           matrix="$(cat results/leg-matrix.json)"
@@ -649,7 +677,7 @@ jobs:
 
   # ── empyrean ───────────────────────────────────────────────────────
   # The four remaining distribution channels (python / c / cli / core)
-  # that need the private empyrean + empyrean-core build. rust already ran
+  # that need the private empyrean + empyrean-core build (done once, in prep). rust already ran
   # in the reference legs (assemble strips it into the plan), so this job
   # replays the prebuilt plan, one cost-balanced row-level leg at a time,
   # through the wheel, the C ABI, the CLI, and empyrean-core direct.
@@ -672,8 +700,9 @@ jobs:
     # runner that plan, with the full plan as --context for the lookups that
     # cross rows. Before the object filter, OBJECTS reached no runner and every
     # leg replayed the whole plan (2026-10-28: all 30,033 rows on every leg).
-    # Each leg builds only what its channel links and uploads one leg file;
-    # reduce puts the legs back in plan order per channel before the merge.
+    # Each leg runs the binaries prep built (it compiles nothing) and uploads
+    # one leg file; reduce puts the legs back in plan order per channel before
+    # the merge.
     timeout-minutes: 240
     strategy:
       fail-fast: false
@@ -684,82 +713,16 @@ jobs:
         uses: actions/checkout@v4
         with:
           path: empyrean-validation
-      # The c, python and cli channels build the distribution from this sibling
-      # checkout, so it must be the release the manifests pin (runners/rust/
-      # Cargo.toml → crates.io), not the default branch, which moves ahead to an
-      # unreleased rc and makes `check-engine-version` refuse the build. The
-      # engine-setup action pins the same way for the jobs that use it.
-      - name: Resolve the pinned distribution version
-        id: pinned-engine
-        run: |
-          version="$(sed -n 's/^empyrean = "=\(.*\)"/\1/p' empyrean-validation/runners/rust/Cargo.toml)"
-          if [ -z "$version" ]; then
-            echo "ERROR: could not read the pinned empyrean version from empyrean-validation/runners/rust/Cargo.toml." >&2
-            exit 1
-          fi
-          echo "version=$version" >> "$GITHUB_OUTPUT"
-          echo "Pinned distribution: v$version"
-      - name: Checkout empyrean (sibling)
-        uses: actions/checkout@v4
-        with:
-          repository: Empyrean-Dynamics/empyrean
-          path: empyrean
-          ref: v${{ steps.pinned-engine.outputs.version }}
-          token: ${{ secrets.GH_PAT }}
-      # The reference channel builds the engine the distribution binds (see
-      # engine-setup): the same tag, read from the pinned distribution's C ABI
-      # manifest, never empyrean-core's default branch.
-      - name: Resolve the engine the distribution binds
-        id: pinned-core
-        run: |
-          tag="$(sed -n 's/^empyrean-core = {.*tag = "\([^"]*\)".*/\1/p' empyrean/empyrean-c/Cargo.toml)"
-          if [ -z "$tag" ]; then
-            echo "ERROR: could not read the empyrean-core tag from empyrean/empyrean-c/Cargo.toml" >&2
-            echo "       of the pinned distribution v${{ steps.pinned-engine.outputs.version }}." >&2
-            exit 1
-          fi
-          echo "tag=$tag" >> "$GITHUB_OUTPUT"
-          echo "Reference engine: empyrean-core $tag"
-      - name: Checkout empyrean-core (sibling)
-        uses: actions/checkout@v4
-        with:
-          repository: Empyrean-Dynamics/empyrean-core
-          path: empyrean-core
-          token: ${{ secrets.GH_PAT }}
-          ref: ${{ steps.pinned-core.outputs.tag }}
-      - name: Checkout core dep (transitive)
-        uses: actions/checkout@v4
-        with:
-          repository: Empyrean-Dynamics/scott
-          path: scott
-          token: ${{ secrets.GH_PAT }}
-      - name: Checkout core dep 2 (transitive)
-        uses: actions/checkout@v4
-        with:
-          repository: Empyrean-Dynamics/villeneuve
-          path: villeneuve
-          token: ${{ secrets.GH_PAT }}
-      - name: Checkout nolan (transitive)
-        uses: actions/checkout@v4
-        with:
-          repository: Empyrean-Dynamics/nolan
-          path: nolan
-          token: ${{ secrets.GH_PAT }}
-      - name: Configure git for any non-patched private deps
-        run: git config --global url."https://x-access-token:${{ secrets.GH_PAT }}@github.com/".insteadOf "ssh://git@github.com/"
-
-      - uses: actions-rust-lang/setup-rust-toolchain@v1
-        with:
-          rustflags: ""
-          cache-workspaces: |
-            empyrean-validation
-            empyrean-validation/runners/rust
-            empyrean-validation/runners/cli
       - uses: actions/setup-python@v5
         with:
           python-version: ${{ env.PYTHON_VERSION }}
-      - name: Install uv (used by empyrean-py wheel build)
-        run: pip install uv
+
+      # The engine library, restored from prep's cache and verified offline. The
+      # c and cli runners and the wheel were built against the engine prep built;
+      # nothing here compiles, so there is no sibling checkout, no toolchain and
+      # no uv, and no job in this run reaches the public release URL.
+      - name: Engine library (restored from prep; no public release URL)
+        uses: ./empyrean-validation/.github/actions/engine-lib
 
       - name: Restore empyrean data kernels
         id: cache-data
@@ -779,17 +742,6 @@ jobs:
             exit 1
           fi
           rm -rf data && mkdir -p data && cp -a "$src"/. data/
-      - name: Cache cargo state
-        uses: actions/cache@v4
-        with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            empyrean/target
-            empyrean-core/target
-            empyrean-validation/target
-          key: cargo-${{ hashFiles('**/Cargo.lock', '**/Cargo.toml') }}
-          restore-keys: cargo-
 
       # Inputs snapshot (prep is the sole fetcher): restore by snapshot id and
       # verify offline, no credential. The replay channels fit the pinned PSVs
@@ -815,29 +767,36 @@ jobs:
           name: prep-plan-and-rust
           path: empyrean-validation/results
 
-      # Build the wheel / C ABI / CLI / core binaries, then replay the
-      # prebuilt plan through each. PLAN_PREBUILT=1 stops the Makefile
-      # from trying to rebuild the rust reference (assemble produced it).
-      # Build only what the four replay channels need: the native lib
-      # (C/CLI/core link it via DYLD), the C ABI runner, the CLI runner,
-      # the wheel, and empyrean-core direct. The rust runner is not built
-      # here — it ran in prep and its output is staged.
-      - name: Build empyrean distribution artifacts
+      # Build once, run everywhere: the wheel, the C ABI runner, the CLI runner,
+      # validate-core and the engine's C library are the bytes prep built. The
+      # unpack hash-verifies each against the manifest; `PREBUILT_BIN=1` then
+      # makes each build target ASSERT its artifact (and install the wheel into
+      # this leg's venv) and never compile. A missing or altered binary fails the
+      # leg by name instead of being rebuilt into something prep did not measure.
+      - name: Download the prebuilt binaries
+        uses: actions/download-artifact@v4
+        with:
+          name: prebuilt-bin
+          path: empyrean-validation/prebuilt
+      - name: Unpack the prebuilt binaries
+        working-directory: empyrean-validation
+        run: python3 scripts/prebuilt.py unpack --from prebuilt
+      - name: Assert the prebuilt ${{ matrix.channel }} artifacts
         working-directory: empyrean-validation
         env:
           DATA_DIR: ${{ env.EMPYREAN_DATA_DIR }}
         run: |
           # The c and cli drivers run under the wheel's virtualenv (the
-          # Makefile's WHEEL_VENV python), so those legs build the wheel too.
+          # Makefile's WHEEL_VENV python), so those legs install the wheel too.
           case "${{ matrix.channel }}" in
-            python) make build-empyrean-c build-wheel ;;
-            c)      make build-empyrean-c build-wheel build-c ;;
-            cli)    make build-empyrean-c build-wheel build-cli ;;
-            core)   make build-core ;;
+            python) make build-empyrean-c build-wheel PREBUILT_BIN=1 ;;
+            c)      make build-empyrean-c build-wheel build-c PREBUILT_BIN=1 ;;
+            cli)    make build-empyrean-c build-wheel build-cli PREBUILT_BIN=1 ;;
+            core)   make build-core PREBUILT_BIN=1 ;;
             *)      echo "unknown channel ${{ matrix.channel }}" >&2; exit 1 ;;
           esac
-      # Seal after the builds (which pull only from cargo/crates/pip) and
-      # before the replay, which reads the snapshot and must never fetch live.
+      # Seal after the wheel install (which pulls only from PyPI) and before the
+      # replay, which reads the snapshot and must never fetch live.
       - name: Seal the job from JPL and the MPC
         working-directory: empyrean-validation
         run: ./scripts/seal-upstream.sh
@@ -849,7 +808,7 @@ jobs:
         env:
           DATA_DIR: ${{ env.EMPYREAN_DATA_DIR }}
         run: |
-          make run-${{ matrix.channel }} PLAN_PREBUILT=1 LEG="${{ matrix.leg }}" TIERS="${TIER}"
+          make run-${{ matrix.channel }} PREBUILT_BIN=1 PLAN_PREBUILT=1 LEG="${{ matrix.leg }}" TIERS="${TIER}"
           mv results/validation_${{ matrix.channel }}.json \
              results/validation_${{ matrix.channel }}.leg${{ matrix.leg }}.json
 
@@ -1060,6 +1019,17 @@ jobs:
           DATA_DIR: ${{ env.EMPYREAN_DATA_DIR }}
         run: make run-${{ matrix.tool }} PLAN_PREBUILT=1 OBJECTS="${OBJECTS}" TIERS="${TIER}"
 
+      # A malformed or empty file fails ITS OWN leg here, with the tool named,
+      # instead of being uploaded and discovered in reduce. (reduce's
+      # merge-external also isolates each comparator, so even a file that slips
+      # past is skipped and named on the report; this is the earlier, louder
+      # check.) The shape is the one the merge reads: a JSON array of objects
+      # carrying a string `object`. This leg compiles nothing and loads no
+      # engine, so it needs no engine library.
+      - name: Validate ${{ matrix.tool }} output
+        working-directory: empyrean-validation
+        run: python3 scripts/validate_external.py --tool ${{ matrix.tool }} --results-dir results
+
       # Upload whatever this leg produced. find_orb emits two files
       # (optical + radar); the glob covers per-tool naming without a
       # per-tool branch. if-no-files-found:error so a leg that ran but
@@ -1107,13 +1077,22 @@ jobs:
         with:
           path: empyrean-validation
 
-      - uses: actions-rust-lang/setup-rust-toolchain@v1
-        with:
-          rustflags: ""
-          cache-workspaces: empyrean-validation
       - uses: actions/setup-python@v5
         with:
           python-version: ${{ env.PYTHON_VERSION }}
+
+      # The harness is the binary prep built (no toolchain, no compile), run
+      # against the engine library prep fetched once and cached.
+      - name: Engine library (restored from prep; no public release URL)
+        uses: ./empyrean-validation/.github/actions/engine-lib
+      - name: Download the prebuilt binaries
+        uses: actions/download-artifact@v4
+        with:
+          name: prebuilt-bin
+          path: empyrean-validation/prebuilt
+      - name: Unpack the prebuilt harness
+        working-directory: empyrean-validation
+        run: python3 scripts/prebuilt.py unpack --from prebuilt --only harness
 
       # merge-external reads the pinned SBDB snapshot for JPL reference
       # elements. Restore by snapshot id (prep is the sole fetcher) and verify
@@ -1132,15 +1111,6 @@ jobs:
       - name: Verify the pinned inputs snapshot offline
         working-directory: empyrean-validation
         run: make fixtures INPUTS_OFFLINE=1
-      - name: Cache cargo state
-        uses: actions/cache@v4
-        with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            empyrean-validation/target
-          key: cargo-${{ hashFiles('empyrean-validation/**/Cargo.lock', 'empyrean-validation/**/Cargo.toml') }}
-          restore-keys: cargo-
 
       # Pull the plan/reference and the channel artifacts flat into results/.
       # merge-multiple flattens each single-file artifact into the one results dir.
@@ -1195,13 +1165,15 @@ jobs:
         working-directory: empyrean-validation
         run: ./scripts/seal-upstream.sh
 
-      # reduce builds only the harness, then folds in whichever external
-      # channels are present (skipping any that a failed leg left absent).
+      # reduce runs only the prebuilt harness, then folds in whichever external
+      # channels are present (skipping any that a failed leg left absent, and any
+      # whose file is unusable: merge-external isolates each comparator and the
+      # report names every one it skipped as "failed: <reason>").
       # WITH_CORE=1 so REPORT_INPUTS is core-keyed (the empyrean job always
       # produces core under a precheck-gated run).
       - name: Merge + report
         working-directory: empyrean-validation
-        run: make reduce PLAN_PREBUILT=1 WITH_CORE=1
+        run: make reduce PREBUILT_BIN=1 PLAN_PREBUILT=1 WITH_CORE=1
 
       # Per-axis row floors, not just aggregate parity. Without them the gate
       # passes on "orbit_determination: 0 compared", which is how a dead OD

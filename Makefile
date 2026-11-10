@@ -51,6 +51,17 @@ EMPYREAN_ROOT := $(abspath $(ROOT)/../empyrean)
 EMPYREAN_CORE_ROOT := $(abspath $(ROOT)/../empyrean-core)
 EMPYREAN_VALIDATION_ROOT := $(ROOT)
 
+# PREBUILT_BIN=1: the compiled binaries (the rust / CLI / C runners, the harness,
+# validate-core, the engine's C library and the wheel) were built ONCE, in prep,
+# and staged into $(PREBUILT_DIR) by the prebuilt-bin artifact (scripts/prebuilt.py
+# unpack puts each where the build would have). In this mode every `build-*`
+# target below ASSERTS its artifact exists and still hashes to the manifest, and
+# NEVER compiles: a missing or altered binary fails the leg by name instead of
+# being silently rebuilt into something other than what prep measured.
+PREBUILT_BIN ?=
+PREBUILT_DIR := $(ROOT)/prebuilt
+PREBUILT_VERIFY := python3 $(ROOT)/scripts/prebuilt.py verify --manifest $(PREBUILT_DIR)/PREBUILT.json
+
 OBJECTS ?=
 TIERS ?= standard
 # Matrix-CI plumbing. When PLAN_PREBUILT=1 the plan is assumed to have been
@@ -110,7 +121,7 @@ FO_BIN := $(EMP_VAL_RUNNERS)/findorb/install/bin/fo
 # `empyrean-core/src/bin/validate-core.rs` behind the `validate`
 # feature flag.
 CORE_BIN := $(EMPYREAN_CORE_ROOT)/target/release/validate-core
-WITH_CORE := $(if $(wildcard $(EMPYREAN_CORE_ROOT)/Cargo.toml),1,)
+WITH_CORE := $(if $(or $(wildcard $(EMPYREAN_CORE_ROOT)/Cargo.toml),$(and $(PREBUILT_BIN),$(wildcard $(CORE_BIN)))),1,)
 
 # OpenOrb: DEFAULT-OFF, and that is a decision, not an oversight.
 #
@@ -362,6 +373,13 @@ SIBLING_EMPYREAN := $(shell sed -n '1,10s/^version = "\(.*\)"/\1/p' $(EMPYREAN_R
 # fix is one `git checkout` away.
 .PHONY: check-engine-version
 check-engine-version:
+ifeq ($(PREBUILT_BIN),1)
+	@test -n "$(PINNED_EMPYREAN)" || { \
+	    echo "ERROR: could not read the pinned empyrean version from $(EMPYREAN_RUNNERS)/rust/Cargo.toml."; \
+	    exit 1; }
+	@$(PREBUILT_VERIFY) --component engine-c --engine-version "$(PINNED_EMPYREAN)"
+	@echo "engine version OK: $(PINNED_EMPYREAN) (pinned == the prebuilt binaries' engine)"
+else
 	@test -n "$(PINNED_EMPYREAN)" || { \
 	    echo "ERROR: could not read the pinned empyrean version from $(EMPYREAN_RUNNERS)/rust/Cargo.toml."; \
 	    exit 1; }
@@ -381,13 +399,18 @@ check-engine-version:
 	    echo "       EMPYREAN_ROOT at a checkout of it."; \
 	    exit 1; }
 	@echo "engine version OK: $(PINNED_EMPYREAN) (pinned == $(EMPYREAN_ROOT))"
+endif
 
 # PHONY: cargo's incremental build is cheap when nothing changed and
 # this is the only way to guarantee `libempyrean.dylib` matches the
 # header that bindgen was compiled against.
 build-empyrean-c: check-engine-version
+ifeq ($(PREBUILT_BIN),1)
+	@$(PREBUILT_VERIFY) --component engine-c
+else
 	@echo "──── Building empyrean-c (libempyrean.dylib) ───────────"
 	@cd $(EMPYREAN_ROOT) && cargo build --release -p empyrean-c
+endif
 
 # All cargo-based build steps below are PHONY so cargo's incremental
 # fingerprinting decides whether to rebuild. A bare file target with no
@@ -395,20 +418,32 @@ build-empyrean-c: check-engine-version
 # to sibling crates wouldn't rebuild the linked binary because make sees
 # the file already exists.
 build-rust:
+ifeq ($(PREBUILT_BIN),1)
+	@$(PREBUILT_VERIFY) --component rust-runner
+else
 	@echo "──── Building rust runner ──────────────────────────────"
 	@cd $(EMPYREAN_RUNNERS)/rust && cargo build --release
+endif
 
 # Gated on the version check: this compiles against $(EMPYREAN_ROOT)'s
 # empyrean.h and links its dylib, so a mismatched checkout produces a wall
 # of struct / signature errors whose cause is one line of `make` output
 # away. Fail with the cause instead.
 build-c: check-engine-version
+ifeq ($(PREBUILT_BIN),1)
+	@$(PREBUILT_VERIFY) --component c-runner
+else
 	@echo "──── Building C runner ─────────────────────────────────"
 	@cd $(EMPYREAN_RUNNERS)/c && $(MAKE) EMPYREAN_ROOT="$(EMPYREAN_ROOT)"
+endif
 
 build-cli:
+ifeq ($(PREBUILT_BIN),1)
+	@$(PREBUILT_VERIFY) --component cli-runner
+else
 	@echo "──── Building CLI runner ───────────────────────────────"
 	@cd $(EMPYREAN_RUNNERS)/cli && cargo build --release
+endif
 
 # The python / c / cli channels all run through this venv's interpreter,
 # and the python channel imports the empyrean extension that maturin
@@ -422,7 +457,15 @@ $(WHEEL_VENV)/bin/maturin:
 # Same gate as build-c: the wheel is compiled from $(EMPYREAN_ROOT)'s
 # empyrean-py, so a mismatched checkout ships the python channel a
 # different engine than the rust and cli channels resolve.
-build-wheel: check-engine-version $(WHEEL_VENV)/bin/maturin
+build-wheel: check-engine-version $(if $(PREBUILT_BIN),,$(WHEEL_VENV)/bin/maturin)
+ifeq ($(PREBUILT_BIN),1)
+	@# The wheel was built once in prep; this leg only installs those bytes
+	@# (after verifying them) into its own venv.
+	@$(PREBUILT_VERIFY) --component wheel
+	@echo "──── Installing the prebuilt empyrean-py wheel ─────────"
+	@test -x $(WHEEL_PY) || python3 -m venv $(WHEEL_VENV)
+	@$(WHEEL_PY) -m pip install --quiet --force-reinstall $(WHEEL_VENV)/wheelhouse/*.whl
+else
 	@echo "──── Building empyrean-py wheel ────────────────────────"
 	@# Build the wheel and pip-install it, rather than `maturin develop`.
 	@# develop resolves the project's dev dependency-groups (which include
@@ -433,6 +476,7 @@ build-wheel: check-engine-version $(WHEEL_VENV)/bin/maturin
 	@cd $(EMPYREAN_ROOT)/empyrean-py && \
 	    $(WHEEL_VENV)/bin/maturin build --release --out $(WHEEL_VENV)/wheelhouse
 	@$(WHEEL_PY) -m pip install --quiet --force-reinstall $(WHEEL_VENV)/wheelhouse/*.whl
+endif
 
 # Optional: empyrean-core "core" channel runner. Only invoked when the
 # sibling empyrean-core tree exists (WITH_CORE auto-detected above).
@@ -440,15 +484,23 @@ build-wheel: check-engine-version $(WHEEL_VENV)/bin/maturin
 # the `validate` feature so the lib's dep tree stays clean for
 # distribution.
 build-core:
+ifeq ($(PREBUILT_BIN),1)
+	@$(PREBUILT_VERIFY) --component core-runner
+else
 	@echo "──── Building empyrean-core direct runner ──────────────"
 	@cd $(EMPYREAN_CORE_ROOT) && cargo build --release --bin validate-core --features validate
+endif
 
 # `empyrean-validation` CLI: meta operations (plan / merge-external /
 # report / ci-check) shared across every empyrean repo. Built from this
 # repo's own crate.
 build-empyrean-validation:
+ifeq ($(PREBUILT_BIN),1)
+	@$(PREBUILT_VERIFY) --component harness
+else
 	@echo "──── Building empyrean-validation CLI ──────────────────"
 	@cd $(EMPYREAN_VALIDATION_ROOT) && cargo build --release --bin empyrean-validation
+endif
 
 # File target so rules that need the binary (plan strip, merge, report) can
 # depend on it directly instead of failing with "No rule to make target"
@@ -1292,6 +1344,7 @@ reduce: build-empyrean-validation
 	elif [ -f "$(RUST)" ]; then ref="$(RUST)"; merged="$(RUST_MERGED)"; \
 	else echo "ERROR: reduce found neither $(CORE_OUT) nor $(RUST) — no reference channel was staged."; exit 1; fi; \
 	echo "Reference channel: $$ref  →  $$merged"; \
+	: > "$(RESULTS_DIR)/comparators-absent.txt"; \
 	flags=""; \
 	add() { \
 	    if [ -f "$$2" ]; then \
@@ -1303,6 +1356,7 @@ reduce: build-empyrean-validation
 	        echo "  skip $$1 — DISABLED by decision: $$3"; \
 	    else \
 	        echo "  skip $$1 — MISSING: $$2 was not staged. Its matrix leg was expected to run and did not deliver (fail-fast:false keeps the rest alive); the report omits this comparator."; \
+	        printf '%s=%s\n' "$${1#--}" "its leg staged no output ($$(basename $$2) is missing), so it is absent from this report" >> "$(RESULTS_DIR)/comparators-absent.txt"; \
 	    fi; }; \
 	add --assist        "$(ASSIST_OUT)"          ""; \
 	add --findorb       "$(FINDORB_OUT)"         ""; \
@@ -1315,6 +1369,7 @@ reduce: build-empyrean-validation
 	add --orbfit        "$(ORBFIT_OUT)"          ""; \
 	add --layup         "$(LAYUP_OUT)"           ""; \
 	if [ -d "$(CACHE_DIR)/sbdb" ]; then flags="$$flags --jpl-sbdb-cache $(CACHE_DIR)/sbdb"; fi; \
+	if [ -s "$(RESULTS_DIR)/comparators-absent.txt" ]; then flags="$$flags --comparator-absent-file $(RESULTS_DIR)/comparators-absent.txt"; fi; \
 	$(EMP_VAL_BIN) merge-external -i "$$ref" -o "$$merged" $$flags
 	@$(EMP_VAL_BIN) report \
 	    --results $(REPORT_INPUTS) \
@@ -1336,7 +1391,7 @@ ARCHIVE_DIR := $(RESULTS_DIR)/archive
 # responses cached at the time). Removing them is now something you have to ask
 # for by name.
 clean:
-	@rm -f $(REPORT) $(REPORT_DATA) $(SUMMARY) $(RUST_MERGED) $(CORE_MERGED) $(PLAN) $(wildcard $(RESULTS_DIR)/validation_plan.leg-*.json)
+	@rm -f $(REPORT) $(REPORT_DATA) $(SUMMARY) $(RUST_MERGED) $(CORE_MERGED) $(PLAN) $(wildcard $(RESULTS_DIR)/validation_plan.leg-*.json) $(wildcard $(RESULTS_DIR)/*_merged_comparators.json) $(wildcard $(RESULTS_DIR)/comparators-absent.txt)
 	@echo "Removed the derived report / summary / merge / plan from $(RESULTS_DIR)."
 	@echo "Per-channel results are PRESERVED — 'make clean-results' removes those,"
 	@echo "'make archive' snapshots them to $(ARCHIVE_DIR)/<timestamp>/ first."

@@ -44,6 +44,10 @@ env:
   # The registered kernel set every empyrean repo pins (lang/workflow/gcp-project.md).
   EMPYREAN_DATASET: kernels-full-2026-10-13
   EMPYREAN_DATA_DIR: ${{ github.workspace }}/data
+  # The prebuilt engine library every build here links, fetched once by the first
+  # job's engine-setup (authenticated API) and restored by the rest; set for the
+  # whole run so empyrean-sys can never fall through to the public release URL.
+  EMPYREAN_LIB_DIR: ${{ github.workspace }}/engine-lib
   # Kernels only (see the header): the JPL/MPC query clients are not gated by it.
   EMPYREAN_OFFLINE: "1"
   OBJECTS: ${{ inputs.objects }}

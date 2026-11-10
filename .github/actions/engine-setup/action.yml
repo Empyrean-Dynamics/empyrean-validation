@@ -55,6 +55,16 @@ inputs:
     description: Install uv (only the wheel-building jobs need it).
     required: false
     default: "false"
+  skip-build:
+    description: >
+      `"true"` for a job that RUNS prebuilt binaries (the prebuilt-bin artifact prep
+      uploads, unpacked by `make ... PREBUILT_BIN=1`) and compiles nothing: the
+      sibling engine checkouts, the Rust toolchain, the private-dependency git
+      rewrite and the cargo cache are all skipped, because nothing here builds.
+      The kernels, the inputs snapshot and the engine library are still set up
+      the same way.
+    required: false
+    default: "false"
 
 runs:
   using: composite
@@ -68,6 +78,7 @@ runs:
     # empyrean checkout to its tag.
     - name: Resolve the pinned distribution version
       id: pinned-engine
+      if: inputs.skip-build != 'true'
       shell: bash
       run: |
         version="$(sed -n 's/^empyrean = "=\(.*\)"/\1/p' empyrean-validation/runners/rust/Cargo.toml)"
@@ -87,6 +98,7 @@ runs:
     # already on disk. Every caller therefore checks out empyrean-validation
     # into ./empyrean-validation first, and this action adds the siblings.
     - name: Checkout empyrean (sibling)
+      if: inputs.skip-build != 'true'
       uses: actions/checkout@v4
       with:
         repository: Empyrean-Dynamics/empyrean
@@ -101,6 +113,7 @@ runs:
     # it. A manifest without that pin is a stop, not a fall-through to main.
     - name: Resolve the engine the distribution binds
       id: pinned-core
+      if: inputs.skip-build != 'true'
       shell: bash
       run: |
         tag="$(sed -n 's/^empyrean-core = {.*tag = "\([^"]*\)".*/\1/p' empyrean/empyrean-c/Cargo.toml)"
@@ -112,6 +125,7 @@ runs:
         echo "tag=$tag" >> "$GITHUB_OUTPUT"
         echo "Reference engine: empyrean-core $tag"
     - name: Checkout empyrean-core (sibling)
+      if: inputs.skip-build != 'true'
       uses: actions/checkout@v4
       with:
         repository: Empyrean-Dynamics/empyrean-core
@@ -119,28 +133,33 @@ runs:
         token: ${{ inputs.gh-pat }}
         ref: ${{ steps.pinned-core.outputs.tag }}
     - name: Checkout core dep (transitive)
+      if: inputs.skip-build != 'true'
       uses: actions/checkout@v4
       with:
         repository: Empyrean-Dynamics/scott
         path: scott
         token: ${{ inputs.gh-pat }}
     - name: Checkout core dep 2 (transitive)
+      if: inputs.skip-build != 'true'
       uses: actions/checkout@v4
       with:
         repository: Empyrean-Dynamics/villeneuve
         path: villeneuve
         token: ${{ inputs.gh-pat }}
     - name: Checkout nolan (transitive)
+      if: inputs.skip-build != 'true'
       uses: actions/checkout@v4
       with:
         repository: Empyrean-Dynamics/nolan
         path: nolan
         token: ${{ inputs.gh-pat }}
     - name: Configure git for any non-patched private deps
+      if: inputs.skip-build != 'true'
       shell: bash
       run: git config --global url."https://x-access-token:${{ inputs.gh-pat }}@github.com/".insteadOf "ssh://git@github.com/"
 
     - uses: actions-rust-lang/setup-rust-toolchain@v1
+      if: inputs.skip-build != 'true'
       with:
         rustflags: ""
         cache-workspaces: |
@@ -150,6 +169,17 @@ runs:
     - uses: actions/setup-python@v5
       with:
         python-version: ${{ inputs.python-version }}
+
+    # The engine library, fetched once through the authenticated API by the
+    # writer and restored by every reader; EMPYREAN_LIB_DIR (set for the whole
+    # run by the workflow) then points every build and run at it, and no job
+    # reaches the public release URL. After the toolchain step: the writer runs
+    # `cargo fetch` to locate the empyrean-sys crate's checksums.
+    - name: Engine library (once, authenticated; no public release URL)
+      uses: ./empyrean-validation/.github/actions/engine-lib
+      with:
+        role: ${{ inputs.role }}
+        token: ${{ inputs.gh-pat }}
     - name: Install uv (used by empyrean-py wheel build)
       if: inputs.install-python-tooling == 'true'
       shell: bash
@@ -273,6 +303,7 @@ runs:
         key: empyrean-data-${{ inputs.dataset }}-set-codes
 
     - name: Cache cargo state
+      if: inputs.skip-build != 'true'
       uses: actions/cache@v4
       with:
         path: |
