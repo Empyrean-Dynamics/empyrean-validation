@@ -14,17 +14,20 @@ model = Veres2017SigmaModel.from_csv()
 filled_ra, filled_dec, report = fill_missing(obs_codes, astcats, ra_sigma, dec_sigma, model)
 ```
 
-First consumer: the `adam-core` runner (adam-core's public `CORE_OD_V1` profile has
-no sigma-fill stage and requires finite, positive input variances). The `layup`
-runner is the next intended consumer — this is why it lives here, not inside
-`runners/adam-core/`.
+Consumers: the `adam-core` runner (adam-core's public `CORE_OD_V1` profile has no
+sigma-fill stage and requires finite, positive input variances) and the `layup`
+runners (layup's `weight_data="supplied"` uses each observation's `rmsRA` /
+`rmsDec` and gives a missing one its flat C++ default). Both fill from this one
+model, which is why it lives here and not inside either runner.
 
 ## Discipline
 
 - **Reported sigmas are never overwritten.** Only a missing (None / NaN / non-positive)
-  sigma is filled.
+  sigma is filled. An observation with one of the two reported keeps it and has only
+  the other filled; it counts under its fill level and in `partially_reported`.
 - **Every filled observation is labelled** by fill level and the counts (`reported`,
-  `filled`, `filled_by_level`, `total`, `table_sha256`) are carried on the OD row.
+  `filled`, `partially_reported`, `filled_by_level`, `total`, `table_sha256`) are
+  carried on the OD row.
   No sigma value is ever silently defaulted, and there is no invented fallback
   number: the table holds only values the paper states.
 - **The model is public and provenance-tracked**, never inline magic numbers: the
@@ -64,6 +67,14 @@ which 46,291 carry a reported sigma and 121,032 are filled:
 | `no_catalog` | 15,247 |
 | `catalog_unrecognized` | 0 |
 
-No fixture observation names a catalog outside the table's vocabulary today; the
-branch exists so one that appears is labelled, not absorbed. Per-object counts are
-recorded on every OD row (`adam_core_sigma_source`).
+No fixture observation names a catalog outside the table's vocabulary today, and
+none carries only one of its two sigmas (`partially_reported` is 0 on every object);
+both branches exist so an observation that needs one is labelled, not absorbed.
+
+The layup runners keep space-based rows (layup places them from `sys` / `pos1..3`),
+so over the same 50 fixtures they see 183,464 observations: 58,764 reported, and
+124,700 filled (18,575 `station`, 90,539 `catalog`, 15,586 `no_catalog`, 0
+`catalog_unrecognized`), measured through `run_layup._prepare_input`.
+
+Per-object counts are recorded on every OD row (`adam_core_sigma_source`,
+`layup_sigma_source`).

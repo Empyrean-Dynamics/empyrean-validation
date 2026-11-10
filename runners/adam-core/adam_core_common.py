@@ -424,8 +424,9 @@ def build_source_catalog(psv_text: str, object_id: str, ok, model=None):
     built — never adam-core's private table, and a REPORTED sigma is never
     overwritten. Returns ``(catalog | None, associations | None, n_dropped,
     dropped_stations, n_parsed, sigma_report)`` where ``sigma_report`` carries the
-    fill model, ``reported``, ``filled`` and ``filled_by_level`` (station / catalog
-    / global) counts.
+    fill model, ``reported``, ``filled``, ``partially_reported`` (one of the two
+    sigmas reported and kept, the other filled) and ``filled_by_level`` (station /
+    catalog / no_catalog / catalog_unrecognized) counts.
     """
     import pyarrow as pa
     import pyarrow.compute as pc
@@ -433,7 +434,7 @@ def build_source_catalog(psv_text: str, object_id: str, ok, model=None):
     from adam_core.observations.ades import ADES_string_to_tables
 
     sys.path.insert(0, str(HERE.parent))
-    from sigmafill.veres2017 import fill_missing
+    from sigmafill.veres2017 import LEVELS, MODEL_NAME, fill_missing
 
     _ctx, ades = ADES_string_to_tables(normalize_psv(psv_text))
     stns = ades.stn.to_pylist()
@@ -441,13 +442,16 @@ def build_source_catalog(psv_text: str, object_id: str, ok, model=None):
     droppable = sorted({s for s in set(stns) if not ok(s)})
     n_dropped = sum(1 for s in stns if s in set(droppable))
     if droppable:
-        keep = pa.array(sorted(s for s in set(stns) if ok(s)))
+        # Typed like the column: an object whose every station drops would otherwise
+        # build a null-typed empty array, and is_in raises ArrowTypeError on it.
+        keep = pa.array(sorted(s for s in set(stns) if ok(s)), type=ades.stn.type)
         ades = ades.apply_mask(pc.is_in(ades.stn, value_set=keep))
     n = len(ades)
     if n == 0:
+        # The same keys fill_missing reports, so an all-dropped object reads alike.
         return None, None, n_dropped, droppable, n_parsed, {
-            "model": "Veres2017SigmaFill", "reported": 0, "filled": 0,
-            "filled_by_level": {"station": 0, "catalog": 0, "global": 0}, "total": 0,
+            "model": MODEL_NAME, "reported": 0, "filled": 0, "partially_reported": 0,
+            "filled_by_level": {lvl: 0 for lvl in LEVELS}, "total": 0,
         }
 
     obs_codes = ades.stn.to_pylist()

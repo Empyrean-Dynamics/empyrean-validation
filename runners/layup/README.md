@@ -24,9 +24,9 @@ fitting from astrometry; propagation and ephemeris rows are skipped,
 matching the pattern of `run_findorb.py` / `run_orbfit.py`. ASSIST is
 the external reference for propagation; Horizons for ephemeris.
 
-The runner fits every `fixtures/psv/*.psv` fixture with
-`layup orbitfit … ADES_psv` and emits, per object, the layup fit's
-quality metrics. Radar-augmented OD (`fixtures/psv-radar/`) is out of
+The runner fits every `fixtures/psv/*.psv` fixture through layup's
+Python API (`fit_one.py`, one process per object) and emits, per object,
+the layup fit's quality metrics. Radar-augmented OD (`fixtures/psv-radar/`) is out of
 scope for this first integration.
 
 ## χ², not arcsec RMS
@@ -51,25 +51,54 @@ RMS). **reduced-χ²** (≈1 for a consistent fit) is the most tool-agnostic
 metric. Likewise `nobs_fit` is layup's own count and may not match
 empyrean/find_orb's observation-count convention.
 
-**Astrometric weighting (missing errors).** The OD fixtures carry blank
-`rmsRA` / `rmsDec`. layup never imputes a missing error; its behavior is
-set by the weighting mode:
+**Settings (layup at its own documented best practice, owner ruling D4).** Every
+fit runs through `fit_one.py`, which calls `layup.orbitfit.orbitfit` the way
+layup's own `orbitfit_cli` does; the CLI cannot set any of this beyond the
+booleans `--weight-data` and `--debias`. Each setting cites layup 1.1.0:
 
-- *stock default* (`--no-weight-data`): a single flat σ from layup's C++
-  core on **every** observation — uniform weighting, not comparable to a
-  real per-observation OD scheme;
-- *Veres 2017* (`--weight-data`): a principled per-observatory σ (Vereš et
-  al. 2017 — a per-station lookup, 0.1″–1.5″, refined by epoch / catalog /
-  program; default 1.5″/1.0″ for unknown codes);
-- *supplied* (layup API only, not the CLI): the per-obs `rmsRA` / `rmsDec`
-  directly, but NaN/≤0 rows fall back to the flat default.
+| Setting | Value | Where layup documents it |
+|---|---|---|
+| `weight_data` | `"supplied"`: each observation's `rmsRA` / `rmsDec` used directly | `orbitfit` docstring: "uses the per-observation `rmsRA` / `rmsDec` columns (arcseconds) directly, e.g. ADES-reported uncertainties" |
+| sigma fill | reported sigma kept; a missing one filled by the shared public Vereš 2017 model ([`../sigmafill`](../sigmafill/)) | same docstring: a NaN or nonpositive supplied value "falls back to the default", layup's flat C++ sigma, which the fill keeps any observation from reaching |
+| `debias` | `True`: EFCC18 star-catalog debiasing | `orbitfit` docstring ("apply debiasing corrections"); `generate_bias_dict` reads the high-resolution `bias.dat` staged from the registered `debias_hires2018.tgz` |
+| `fit_nongrav` | `"auto"` at the default `NongravAutoThresholds` | `orbitfit` docstring and issue #357: the gravity-only fit is kept unless its reduced chi-square exceeds 1.5; otherwise A2, A1, A3, then A1+A2, then A1+A2+A3 are tried, and the most parsimonious model with delta chi-square at least 9 per parameter and every term at 3 sigma is adopted |
+| `nongrav_gr` | layup's default, asteroidal (r/r0)^-2, for every object | `orbitfit` docstring: "For a comet, pass `constants.MARSDEN_1973_GOFR`" |
+| `iod`, `engine` | `"auto"` (Gauss, BK-IOD fallback), `"cartesian"` | layup's defaults (`orbitfit` signature) |
 
-Because the fixtures have no reported errors, **this runner defaults to
-Veres 2017** (`--weight-data` ON) so layup's χ² is a principled weighted χ²
-rather than a flat-σ figure. The mode is recorded per row as
-`layup_weighting`. The choice shifts reduced-χ² materially (≈2× on some
-short arcs), so it is a deliberate, documented default — pass
-`--no-weight-data` for stock layup.
+About a third of the optical rows (58,764 of 183,464) carry a reported sigma; the
+rest are filled, and `layup_sigma_source` counts reported, filled, half-reported
+and the fill level of each filled observation. layup's flat default and its own
+Vereš-table mode (`weight_data=True`) are therefore never used: the suite's runners
+share one fill. The identification, photometry and free-text columns the fit
+does not use (`provID`, `trkSub`, `prog`, `band`, `photCat`, `notes`, `remarks`)
+are dropped from the prepared input, because layup's `np.sort(data,
+order="obsTime")` breaks timestamp ties on the remaining fields and a string/NaN
+mix there raised `TypeError` on Apophis.
+
+**Model differences, stated on every row.** The force model is ASSIST over DE440
+and SB441-N16 from the registered `layup/` folder, the engine set's own bytes. The
+non-grav model is layup's, chosen from the data by its auto ladder; the comet
+g(r) is not selected, because choosing a law by designation is barred, so a comet
+that adopts a non-grav term fits it with the asteroidal law. The adopted terms are
+in `layup_nongrav_adopted` (`{}`: gravity only).
+
+**Self-perturbers.** Iris, Vesta, Pallas and Hygiea are themselves in SB441-N16,
+and layup's ASSIST force model takes the whole set with no way to leave a body
+out, so a fit would pull each toward its own ephemeris. Fitted anyway, none
+converges (flag 3 for Vesta and Hygiea, flag 4 for Iris and Pallas). Their rows
+are named unsupported
+(`layup_converged: false`, `layup_unsupported` with the reason) and never fitted,
+the rule the adam-core runner follows for the same reason.
+
+Every row carries `layup_settings` (the table above, `LAYUP_SETTINGS` in
+`run_layup.py`) and `layup_version`. A fit that fails or times out is a named row
+with `layup_converged: false` and `layup_error`, never a dropped object; a fit
+that does not converge keeps layup's own `layup_flag`.
+
+The walk and Monte-Carlo runners (`run_layup_walk.py`, `run_layup_mc_predict.py`)
+fit every window through the same driver and the same input adapter, so they run
+at the same settings; a warm window passes the previous state as layup's
+`initial_guess` (state only).
 
 The fitted barycentric-Cartesian state + epoch are also carried in the
 per-object JSON (`layup_state_bcart_eq`, `layup_epoch_mjd_tdb`) for
@@ -183,20 +212,19 @@ The output JSON is consumed by `empyrean-validation merge-external
 `orbit_determination` rows of the reference channel and then feeds the
 HTML report.
 
-layup is **opt-in** in the pipeline (gated behind `WITH_LAYUP=1`, like
-OrbFit) — it does not run as part of `make all`:
+layup runs by default in the pipeline (`WITH_LAYUP=1`); `WITH_LAYUP=` skips it:
 
 ```bash
 make setup-layup             # one-time
 make run-layup               # produce results/validation_layup.json
-make all WITH_LAYUP=1        # fold layup into the merged report
+make all WITH_LAYUP=         # the merged report without layup
 ```
 
 ## License + attribution
 
-layup is MIT-licensed. This runner shells out to the upstream `layup`
-CLI in an isolated venv; no layup code is linked into or imported by
-empyrean.
+layup is MIT-licensed. This runner calls layup's Python API in a
+subprocess under an isolated venv; no layup code is linked into or
+imported by empyrean.
 
 - Source: <https://github.com/Smithsonian/layup>
 - Docs: <https://layup.readthedocs.io>

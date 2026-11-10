@@ -1364,11 +1364,12 @@ $(JORBIT_OUT): $(PLAN) $(JORBIT_PY) | check-plan
 	$(JORBIT_PY) $(EMP_VAL_RUNNERS)/jorbit/run_jorbit.py \
 	    --input $(PLAN) --output $(JORBIT_OUT) --data-dir $(DATA_DIR) "$$@"
 
-# ── layup (opt-in external OD reference) ─────────────────────
+# ── layup (external OD reference) ───────────────────────────
 # MIT-licensed, ASSIST-backed orbit fitter (Smithsonian / CfA; Matthew
 # Holman et al.). Fits the optical OD fixtures directly from ADES PSV and
 # folds χ² / reduced-χ² / n_obs / convergence onto the OD rows alongside
-# find_orb + OrbFit. Opt-in via WITH_LAYUP=1 (heavy C-extension build).
+# find_orb + OrbFit. On by default (WITH_LAYUP=1; WITH_LAYUP= skips it). Each
+# fit runs layup's Python API at its documented settings (runners/layup/README.md).
 LAYUP_VENV := $(EMP_VAL_RUNNERS)/layup/.venv
 LAYUP_PY := $(LAYUP_VENV)/bin/python
 # layup's data directory (its --ar): every kernel, the observatory codes and

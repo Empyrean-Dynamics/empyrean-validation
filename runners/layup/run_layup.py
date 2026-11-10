@@ -8,9 +8,9 @@ The output is consumed by ``empyrean-validation merge-external --layup``, which
 folds the fields onto the ``orbit_determination`` rows of the reference channel
 (the same shape as the find_orb and OrbFit external OD references).
 
-layup is invoked as a CLI subprocess (``layup orbitfit <input> ADES_psv``) so no
-layup code is imported into empyrean; it runs entirely inside its own venv (see
-``setup.sh``). Its N-body fit uses ASSIST with the binary DE440 planets + the
+Each fit runs layup's Python API in a subprocess (``fit_one.py``, one process per
+object) under layup's own venv (see ``setup.sh``), so no layup code is imported
+into empyrean. Its N-body fit uses ASSIST with the binary DE440 planets + the
 SB441-N16 asteroid set — the same dynamical model the ASSIST propagation channel
 uses — which makes it a strong independent cross-check of empyrean's OD pipeline.
 
@@ -34,6 +34,12 @@ routes them onto the optical OD rows):
     layup_niter           — LM iteration count
     layup_method          — IOD/fit method layup reported
     layup_flag            — raw fit flag (0 == success)
+    layup_nongrav_adopted — the A1/A2/A3 terms the auto ladder adopted ({} = gravity only)
+    layup_sigma_source    — reported / filled counts and the fill level of each filled sigma
+    layup_settings        — every setting, each citing layup (``LAYUP_SETTINGS``)
+    layup_version         — the installed layup distribution
+    layup_error           — on a failed row only: the reason (exit tail, timeout)
+    layup_unsupported     — on a row layup cannot fit at all: the reason (self-perturbers)
 
 Why χ² and not an arcsec RMS: layup reports a χ² (``csq``) and its degrees of
 freedom, not a post-fit residual RMS in arcsec. Deriving an arcsec figure would
@@ -43,13 +49,16 @@ one — the χ²/reduced-χ² layup does report are folded instead.
 Comparability caveat: ``csq`` depends on each tool's observation weighting,
 debiasing, and astrometric error model, so layup's χ² is NOT strictly
 apples-to-apples with empyrean's ``od_chi2`` (nor find_orb's / OrbFit's RMS).
-The OD fixtures carry blank ``rmsRA`` / ``rmsDec``, and layup's stock default
-then applies a single flat σ to every observation — not comparable to a real
-per-observation OD weighting — so this runner defaults to layup's **Veres-2017**
-per-observatory weighting (``--weight-data`` ON), giving a principled per-station
-σ. ``--no-weight-data`` reverts to layup's flat default; ``--debias`` is off by
-default (matching the find_orb runner). The recorded ``layup_weighting`` field
-notes which was used. The most tool-agnostic quantity is reduced-χ² (≈1 for a
+Settings (owner ruling D4: each tool at its own documented best practice, fed
+the same data products). Every fit runs through ``fit_one.py``, layup's Python API
+(the CLI cannot express these): ``weight_data="supplied"`` uses the per-observation
+``rmsRA`` / ``rmsDec``, which hold the fixture's REPORTED sigma where it has one
+(about a third of the optical rows carry one) and the shared public Vereš 2017
+value (``runners/sigmafill``) where it does not; ``debias=True`` applies EFCC18;
+``fit_nongrav="auto"`` is layup's adaptive A1/A2/A3 ladder. The row's
+``layup_settings`` (``LAYUP_SETTINGS``, each value citing layup) and
+``layup_sigma_source`` state all of this; ``run_layup_walk.py`` fits through the
+same driver and the same input adapter. The most tool-agnostic quantity is reduced-χ² (≈1 for a
 statistically consistent fit regardless of the weighting scale). Likewise
 ``nobs_fit`` is layup's own fittable-observation count; whether it counts
 observations or residuals is layup's convention and may differ from
@@ -84,9 +93,10 @@ this runner does optical OD only, matching the ``orbit_determination`` rows.
 from __future__ import annotations
 
 import argparse
+import importlib.util
 import json
 import os
-import shutil
+import signal
 import statistics
 import subprocess
 import sys
@@ -112,33 +122,76 @@ _PRIMARY_ID = "layupID"
 _STAGED_DATA = Path(__file__).resolve().parent / "data"
 
 
-def _orbitfit_binary() -> Path | None:
-    """Resolve the ``layup-orbitfit`` console script next to this interpreter.
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))  # runners/ -> sigmafill
+from sigmafill.veres2017 import Veres2017SigmaModel, fill_missing  # noqa: E402
 
-    run_layup.py is executed by the layup venv's python (see the Makefile /
-    setup.sh), so the entry point is a sibling of ``sys.executable``. We call
-    the direct ``layup-orbitfit`` entry point rather than the ``layup orbitfit``
-    dispatcher: the dispatcher discovers verbs by scanning ``$PATH`` for
-    ``layup-*`` executables, which fails when the venv bin dir is not on
-    ``$PATH`` (as when invoked by absolute path). The direct entry point has no
-    such dependency.
-    """
-    cand = Path(sys.executable).parent / "layup-orbitfit"
-    if cand.exists():
-        return cand
-    found = shutil.which("layup-orbitfit")
-    return Path(found) if found else None
+FIT_ONE = Path(__file__).resolve().parent / "fit_one.py"
+
+# Identification, photometry and free-text columns the fit does not use. Dropped
+# from the prepared input because layup's `np.sort(data, order="obsTime")`
+# (layup/orbitfit.py:1421) breaks timestamp ties by comparing the remaining
+# fields, and an object column that mixes strings with the NaN pandas reads for a
+# blank makes that comparison raise TypeError: Apophis (4 duplicate obsTimes) failed
+# every time. Nothing here feeds the fit under weight_data="supplied".
+UNUSED_COLUMNS = ("provID", "trkSub", "prog", "band", "photCat", "notes", "remarks")
+
+# Iris, Vesta, Pallas and Hygiea are themselves in SB441-N16, and layup's ASSIST
+# force model takes the whole set with no way to leave a body out, so a fit of one
+# of them pulls the object toward its own ephemeris (a 1/r^2 self-singularity).
+# Fitted anyway, none converges (flag 3 for Vesta and Hygiea, 4 for Iris and
+# Pallas). They are named unsupported rows instead, the rule the adam-core runner
+# follows for the same reason (owner ruling 2026-11-08), never a self-perturbed fit.
+SELF_PERTURBERS = frozenset({"Iris", "Vesta", "Pallas", "Hygiea"})
+SELF_PERTURBER_UNSUPPORTED = (
+    "self-perturber: SB441-N16 includes the object and layup 1.1.0's ASSIST force "
+    "model cannot leave a body out, so the object would perturb itself"
+)
 
 
-def _prepare_input(psv_path: Path, obj_token: str, work_dir: Path) -> Path | None:
+def unsupported_reason(obj_name: str) -> str | None:
+    """Why layup cannot fit this object at its settings, or None when it can."""
+    return SELF_PERTURBER_UNSUPPORTED if obj_name in SELF_PERTURBERS else None
+
+
+# layup's own documented best-practice settings, recorded on every row. fit_one.py
+# makes the call; each value cites where layup 1.1.0 documents it.
+LAYUP_SETTINGS = {
+    "interface": "layup 1.1.0 Python API, layup.orbitfit.orbitfit, one process per object (fit_one.py); "
+    "the CLI cannot set weight_data='supplied' or fit_nongrav",
+    "weight_data": "supplied: each observation's rmsRA/rmsDec used directly (layup orbitfit docstring: "
+    "'e.g. ADES-reported uncertainties')",
+    "sigma_fill": "reported rmsRA/rmsDec kept; a missing one filled by the shared public Veres et al. 2017 "
+    "model (runners/sigmafill), so no observation falls to layup's flat C++ default",
+    "debias": "EFCC18 star-catalog debiasing, debias=True (layup's high-resolution bias.dat, from the "
+    "registered debias_hires2018.tgz)",
+    "fit_nongrav": "auto: layup's adaptive ladder (issue #357; A2, A1, A3, then A1+A2, then A1+A2+A3) at its "
+    "default NongravAutoThresholds (tried only above reduced chi2 1.5; adopted at delta chi2 >= 9 per "
+    "parameter and 3 sigma each)",
+    "nongrav_gr": "layup's default asteroidal (r/r0)^-2 for every object; its Marsden 1973 water-ice law is "
+    "not selected for comets, because choosing a law by designation is barred",
+    "iod": "auto (Gauss, BK-IOD fallback; layup default)",
+    "engine": "cartesian (layup default)",
+    "force_model": "ASSIST: DE440 planets + SB441-N16 asteroids (the registered layup/ folder)",
+    "self_perturbers": "Iris, Vesta, Pallas, Hygiea: named unsupported (SB441-N16 includes each; "
+    "layup cannot leave a body out of its force model)",
+    "input_columns_dropped": "provID, trkSub, prog, band, photCat, notes, remarks (unused by the fit; a "
+    "string/NaN mix there makes layup's obsTime tie-break sort raise, orbitfit.py:1421)",
+}
+
+
+def _prepare_input(psv_path: Path, obj_token: str, work_dir: Path):
     """Normalize an ADES PSV fixture into a layup-ingestible PSV.
 
     Strips the space padding from names and values, and prepends a constant
-    ``layupID`` column so the whole file fits as one object. Returns the written
-    path, or ``None`` if the file could not be parsed.
+    ``layupID`` column so the whole file fits as one object. Observations with no
+    reported ``rmsRA`` / ``rmsDec`` get the shared public Vereš 2017 value written
+    into those columns (a reported value is never touched), so layup's
+    ``weight_data="supplied"`` sees a sigma on every row. Returns
+    ``(written path, sigma report)``, or ``(None, None)`` if the file could not be
+    parsed.
     """
     if not _HAVE_PANDAS:
-        return None
+        return None, None
     # Count leading comment lines (e.g. `# version=2017`) so pandas reads the
     # true header row, and re-emit them so the output stays valid ADES.
     pre_header: list[str] = []
@@ -158,7 +211,7 @@ def _prepare_input(psv_path: Path, obj_token: str, work_dir: Path) -> Path | Non
         )
     except Exception as e:  # noqa: BLE001
         print(f"  {obj_token}: PSV parse failed: {e}", file=sys.stderr)
-        return None
+        return None, None
     # Strip padding from column names and every value.
     df.columns = [c.strip() for c in df.columns]
     for col in df.columns:
@@ -167,13 +220,58 @@ def _prepare_input(psv_path: Path, obj_token: str, work_dir: Path) -> Path | Non
     # then prepend the constant id so it is unambiguously the first column.
     df = df.drop(columns=[c for c in df.columns if c == _PRIMARY_ID], errors="ignore")
     df.insert(0, _PRIMARY_ID, obj_token)
+    df, report = _fill_sigma(df)
+    df = df.drop(columns=[c for c in UNUSED_COLUMNS if c in df.columns])
 
     out = work_dir / "layup_input.psv"
     with open(out, "w") as f:
         for line in pre_header:
             f.write(line + "\n")
         df.to_csv(f, sep="|", index=False)
-    return out
+    return out, report
+
+
+def missing_data(ar_data_path: str) -> list[str]:
+    """Every file layup checks for that the data directory lacks (empty: ready).
+
+    layup checks for every data file before it fits and downloads a missing one
+    from the address its release names, so a runner refuses to start instead.
+    Shared by the OD, walk and Monte-Carlo runners.
+    """
+    from stage_data import Layout, verify
+
+    return verify(Path(ar_data_path), Layout.from_layup())
+
+
+def _num(v: str):
+    try:
+        f = float(v)
+    except (TypeError, ValueError):
+        return None
+    return f if f == f else None
+
+
+def _fill_sigma(df):
+    """Write the shared Vereš 2017 value into rmsRA/rmsDec where none was reported.
+
+    A reported value is never overwritten; a row with only one of the two keeps it
+    and gets the other filled. Returns ``(df, report)`` with the reported / filled
+    counts and the fill level of every filled observation.
+    """
+    for col in ("rmsRA", "rmsDec"):
+        if col not in df.columns:
+            df[col] = ""
+    stn = df["stn"].tolist()
+    cat = df["astCat"].tolist() if "astCat" in df.columns else [""] * len(df)
+    ra = [_num(v) for v in df["rmsRA"]]
+    dec = [_num(v) for v in df["rmsDec"]]
+    fra, fdec, report = fill_missing(stn, cat, ra, dec, _SIGMA_MODEL)
+    df["rmsRA"] = [repr(v) for v in fra]
+    df["rmsDec"] = [repr(v) for v in fdec]
+    return df, report
+
+
+_SIGMA_MODEL = Veres2017SigmaModel.from_csv()
 
 
 def _read_orbitfit_csv(csv_path: Path) -> dict | None:
@@ -212,66 +310,64 @@ def layup_env(ar_data_path: str | None) -> dict[str, str]:
     return env
 
 
+def run_bounded(cmd: list[str], timeout_s: float, cwd: Path, env: dict[str, str]):
+    """``subprocess.run`` whose timeout also ends the fit's own children.
+
+    layup fits through a spawn-context process pool even with one worker.
+    ``subprocess.run`` kills only the direct child on a timeout, so the pool's
+    child, orphaned, would go on fitting (CPU and memory) for the rest of the run.
+    Each fit runs in a session of its own and the whole session is killed on a
+    timeout or any other interruption. Raises ``subprocess.TimeoutExpired`` like
+    ``subprocess.run``.
+    """
+    proc = subprocess.Popen(
+        cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+        cwd=cwd, env=env, start_new_session=True,
+    )
+    try:
+        out, err = proc.communicate(timeout=timeout_s)
+    except BaseException:
+        os.killpg(proc.pid, signal.SIGKILL)
+        proc.communicate()
+        raise
+    return subprocess.CompletedProcess(cmd, proc.returncode, out, err)
+
+
 def _fit_one(
     psv_path: Path,
     obj_token: str,
-    orbitfit_bin: Path,
-    ar_data_path: str | None,
+    ar_data_path: str,
     timeout_s: float,
-    weight_data: bool = False,
-    debias: bool = False,
-) -> dict | None:
-    """Run one layup orbit fit; return the layup_* payload or ``None``."""
+):
+    """Run one layup fit through its API driver. Returns ``(payload, None)`` on
+    success or ``(None, reason)``; a failure is a named row, never a skip."""
     with tempfile.TemporaryDirectory(prefix="layup_") as td:
         work = Path(td)
-        prepared = _prepare_input(psv_path, obj_token, work)
+        prepared, sigma_report = _prepare_input(psv_path, obj_token, work)
         if prepared is None:
-            return None
-        # layup 1.1 takes an output DIRECTORY (-o, which also receives its
-        # log files) and a file stem (--stem); the fit lands at <dir>/<stem>.csv.
-        out_stem = "layup_orbit"
+            return None, "PSV fixture could not be parsed"
+        out_csv = work / "layup_orbit.csv"
         cmd = [
-            str(orbitfit_bin),
-            str(prepared),
-            "ADES_psv",
-            "--primary-id-column-name",
-            _PRIMARY_ID,
-            "-o",
-            str(work),
-            "--stem",
-            out_stem,
-            "-f",
+            sys.executable, str(FIT_ONE), str(prepared),
+            "--ar", ar_data_path, "--primary-id", _PRIMARY_ID, "--out", str(out_csv),
         ]
-        if weight_data:
-            cmd.append("--weight-data")
-        if debias:
-            cmd.append("--debias")
-        if ar_data_path:
-            cmd += ["--ar", ar_data_path]
-
         t0 = time.perf_counter()
         try:
-            proc = subprocess.run(
-                cmd,
-                capture_output=True,
-                text=True,
-                timeout=timeout_s,
-                cwd=work,
-                env=layup_env(ar_data_path),
-            )
+            proc = run_bounded(cmd, timeout_s, work, layup_env(ar_data_path))
         except subprocess.TimeoutExpired:
             print(f"  {obj_token}: TIMEOUT after {timeout_s:.0f}s", file=sys.stderr)
-            return None
+            return None, f"timed out after {timeout_s:.0f}s"
         ms = (time.perf_counter() - t0) * 1000.0
         if proc.returncode != 0:
             tail = (proc.stderr or proc.stdout or "").strip().splitlines()[-3:]
-            print(f"  {obj_token}: orbitfit exit {proc.returncode}: {' | '.join(tail)}", file=sys.stderr)
-            return None
+            reason = f"orbitfit exit {proc.returncode}: {' | '.join(tail)}"[:400]
+            print(f"  {obj_token}: {reason}", file=sys.stderr)
+            return None, reason
 
-        row = _read_orbitfit_csv(work / f"{out_stem}.csv")
+        row = _read_orbitfit_csv(out_csv)
         if row is None:
             print(f"  {obj_token}: no fitted orbit in output", file=sys.stderr)
-            return None
+            return None, "orbitfit wrote no fitted orbit"
 
     def _f(key: str) -> float | None:
         v = row.get(key)
@@ -301,10 +397,14 @@ def _fit_one(
         "layup_niter": _i("niter"),
         "layup_method": (str(row.get("method")) if row.get("method") is not None else None),
         "layup_flag": flag,
+        "layup_sigma_source": sigma_report,
     }
+    # The non-grav model layup's auto ladder adopted (NaN = not adopted).
+    adopted = {n: _f(n.lower()) for n in ("A1", "A2", "A3") if _f(n.lower()) is not None}
+    payload["layup_nongrav_adopted"] = adopted
     if all(s is not None for s in state):
         payload["layup_state_bcart_eq"] = state
-    return payload
+    return payload, None
 
 
 def _layup_version() -> str | None:
@@ -373,23 +473,6 @@ def main() -> int:
         help="Per-fixture fit timeout in seconds (skip + log on overrun).",
     )
     p.add_argument(
-        "--weight-data",
-        action=argparse.BooleanOptionalAction,
-        default=True,
-        help="Apply layup's Veres-2017 per-observatory astrometric weighting (layup's "
-        "--weight-data). ON by default: the OD fixtures carry blank rmsRA/rmsDec, and "
-        "layup's stock default (--no-weight-data) then falls back to a single flat σ on "
-        "every observation, which is not comparable to a real per-observation OD weighting. "
-        "Veres-2017 gives a principled per-station σ instead. Pass --no-weight-data for "
-        "stock layup flat weighting.",
-    )
-    p.add_argument(
-        "--debias",
-        action="store_true",
-        help="Pass layup's --debias (catalog/epoch astrometry debiasing). Off by default "
-        "(matches the find_orb reference runner, which also runs without debiasing).",
-    )
-    p.add_argument(
         "--only",
         type=str,
         default=None,
@@ -397,7 +480,7 @@ def main() -> int:
     )
     args = p.parse_args()
 
-    orbitfit_bin = _orbitfit_binary()
+    have_layup = importlib.util.find_spec("layup") is not None
     psv_files = sorted(args.psv_dir.glob("*.psv"))
     if not psv_files:
         # Without this, an empty fixture directory produced `[]` and exit 0:
@@ -431,11 +514,11 @@ def main() -> int:
     source_version = (
         f"layup {version}"
         if version
-        else "layup unknown (layup-orbitfit version not resolved)"
+        else "layup unknown (distribution version not resolved)"
     )
 
     records: list[dict] = []
-    if not _HAVE_PANDAS or orbitfit_bin is None:
+    if not _HAVE_PANDAS or not have_layup:
         # This used to emit `[]` and return 0 "so the merge step still has
         # input". That is the shape this suite exists to catch: reduce folds the
         # file in because it EXISTS, and the report shows a layup comparison
@@ -445,8 +528,8 @@ def main() -> int:
         # inconsistent sibling. A comparator with nothing to compare is a
         # failure with a cause, and the cause is named here.
         missing = []
-        if orbitfit_bin is None:
-            missing.append("`layup-orbitfit` was not found next to this interpreter")
+        if not have_layup:
+            missing.append(f"layup does not import under this interpreter ({sys.executable})")
         if not _HAVE_PANDAS:
             missing.append("pandas failed to import (needed to normalize the PSV fixtures)")
         print(
@@ -457,17 +540,13 @@ def main() -> int:
         )
         return 1
 
-    # layup checks for every data file before it fits and downloads a missing
-    # one from the address its release names; a renamed upstream file then
-    # fails every fit with a 404. Refuse to start instead, naming the files.
-    from stage_data import Layout, verify
-
+    # A missing data file would be downloaded mid-fit; refuse, naming the files.
     # Absolute: each fit runs with its scratch directory as the working directory.
     args.ar_data_path = str(Path(args.ar_data_path).absolute())
-    missing_data = verify(Path(args.ar_data_path), Layout.from_layup())
-    if missing_data:
+    missing = missing_data(args.ar_data_path)
+    if missing:
         print(
-            f"ERROR: layup's data directory {args.ar_data_path} lacks: {', '.join(missing_data)}.\n"
+            f"ERROR: layup's data directory {args.ar_data_path} lacks: {', '.join(missing)}.\n"
             "       Stage it from the registered kernel set first:\n"
             f"         {sys.executable} {Path(__file__).with_name('stage_data.py')} "
             f"--data-dir <synced set> --dest {args.ar_data_path}\n"
@@ -478,7 +557,7 @@ def main() -> int:
 
     print(f"layup OD validation ({len(psv_files)} fixtures)", file=sys.stderr)
     print(f"  data:  {args.ar_data_path}", file=sys.stderr)
-    print(f"  layup: {orbitfit_bin} (version {version or '?'})", file=sys.stderr)
+    print(f"  layup: {version or '?'} through {FIT_ONE.name} under {sys.executable}", file=sys.stderr)
 
     for psv_path in psv_files:
         stem = psv_path.stem
@@ -486,27 +565,30 @@ def main() -> int:
         if only is not None and stem not in only and obj_name not in only:
             continue
         print(f"{obj_name}", file=sys.stderr)
-        payload = _fit_one(
-            psv_path,
-            stem,
-            orbitfit_bin,
-            args.ar_data_path,
-            args.timeout,
-            weight_data=args.weight_data,
-            debias=args.debias,
-        )
-        if payload is None:
-            continue
         record = {
             "object": obj_name,
             "test_type": "orbit_determination",
             "timestamp": timestamp,
             "source_version": source_version,
             "layup_version": version,
-            # Provenance for the χ² interpretation: which weighting produced csq.
-            "layup_weighting": ("veres2017" if args.weight_data else "flat_default")
-            + ("+debias" if args.debias else ""),
+            # Every setting that shaped csq, each citing where layup documents it.
+            "layup_settings": LAYUP_SETTINGS,
         }
+        unsupported = unsupported_reason(obj_name)
+        if unsupported is not None:
+            # A named unsupported row: never fitted, never dropped.
+            print(f"  {unsupported}", file=sys.stderr)
+            record["layup_converged"] = False
+            record["layup_unsupported"] = unsupported
+            records.append(record)
+            continue
+        payload, failure = _fit_one(psv_path, stem, args.ar_data_path, args.timeout)
+        if payload is None:
+            # A named failed row, never a dropped object.
+            record["layup_converged"] = False
+            record["layup_error"] = failure
+            records.append(record)
+            continue
         record.update(payload)
         records.append(record)
         rc = record.get("layup_reduced_chi2")

@@ -118,3 +118,12 @@ def test_nonpositive_sigma_is_treated_as_missing():
     _fra, _fdec, rep = fill_missing(["F51"], ["Gaia2"], [0.0], [-1.0], MODEL)
     assert rep["reported"] == 0 and rep["filled"] == 1
     assert rep["filled_by_level"]["station"] == 1
+
+
+def test_a_half_reported_row_keeps_its_reported_component():
+    # rmsRA reported (0.31"), rmsDec missing: the reported value must survive and
+    # only Dec is filled (station F51 = 0.2"). Overwriting RA would break the rule.
+    fra, fdec, rep = fill_missing(["F51"], ["Gaia2"], [0.31], [float("nan")], MODEL)
+    assert fra[0] == 0.31 and fdec[0] == 0.2
+    assert rep["reported"] == 0 and rep["filled"] == 1 and rep["partially_reported"] == 1
+    assert rep["filled_by_level"]["station"] == 1

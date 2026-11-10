@@ -1,11 +1,11 @@
 """Shared public Vereš et al. (2017) astrometric sigma-fill for the validation suite.
 
 Any external orbit-determination runner whose tool refuses observations without
-reported per-observation uncertainties fills the missing sigmas from this ONE
-public model before handing the astrometry to the tool (adam-core's public
-CORE_OD_V1 profile now; layup next). It is deliberately a standalone, dependency-
-light module (``csv`` + ``math`` only) so each runner can import it under its own
-venv:
+reported per-observation uncertainties, or would give them a flat default, fills
+the missing sigmas from this ONE public model before handing the astrometry to the
+tool (adam-core's public CORE_OD_V1 profile; layup's weight_data="supplied"). It
+is deliberately a standalone, dependency-light module (``csv`` + ``math`` only) so
+each runner can import it under its own venv:
 
     import sys; sys.path.insert(0, "<repo>/runners")
     from sigmafill.veres2017 import Veres2017SigmaModel, fill_missing
@@ -126,30 +126,39 @@ def fill_missing(obs_codes, astcats, ra_sigma, dec_sigma,
     ``report`` is::
 
         {"model": MODEL_NAME, "table": <csv path>, "reported": int,
-         "filled": int, "filled_by_level": {"station": int, "catalog": int,
-         "no_catalog": int, "catalog_unrecognized": int}, "total": int,
-         "table_sha256": str}
+         "filled": int, "partially_reported": int, "filled_by_level":
+         {"station": int, "catalog": int, "no_catalog": int,
+         "catalog_unrecognized": int}, "total": int, "table_sha256": str}
+
+    ``partially_reported`` counts observations with one of the two sigmas reported
+    (kept) and the other filled; each is also counted under its fill level.
     """
     n = len(obs_codes)
     out_ra = [None] * n
     out_dec = [None] * n
     reported = 0
+    partial = 0
     by_level = {lvl: 0 for lvl in LEVELS}
     for i in range(n):
         r, d = ra_sigma[i], dec_sigma[i]
-        if not _is_missing(r) and not _is_missing(d):
+        r_ok, d_ok = not _is_missing(r), not _is_missing(d)
+        if r_ok and d_ok:
             out_ra[i], out_dec[i] = float(r), float(d)
             reported += 1
             continue
         sra, sdec, level = model.lookup(obs_codes[i], astcats[i])
-        out_ra[i], out_dec[i] = sra, sdec
+        # A reported half is NEVER overwritten: only the missing component is filled.
+        out_ra[i] = float(r) if r_ok else sra
+        out_dec[i] = float(d) if d_ok else sdec
         by_level[level] += 1
+        partial += 1 if (r_ok or d_ok) else 0
     report = {
         "model": MODEL_NAME,
         "table": model.source,
         "table_sha256": hashlib.sha256(Path(model.source).read_bytes()).hexdigest(),
         "reported": reported,
         "filled": sum(by_level.values()),
+        "partially_reported": partial,
         "filled_by_level": by_level,
         "total": n,
     }

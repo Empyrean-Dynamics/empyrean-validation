@@ -5,7 +5,8 @@
 
 Runs the same ingestion the OD rows use (space-based stations dropped first), and
 prints, per object and in total, reported vs filled by level
-(station / catalog / no_catalog / catalog_unrecognized). The totals are the numbers
+(station / catalog / no_catalog / catalog_unrecognized), and the half-reported
+observations (one sigma reported and kept, the other filled). The totals are the numbers
 the sigmafill README refers to.
 """
 
@@ -32,20 +33,20 @@ def main() -> int:
     C.configure_kernels(args.data_dir)  # same start-up contract as the runner
     ok = resolvable_fn()
     model = C.sigma_model()
-    total = {"reported": 0, "filled": 0, "total": 0, **{lvl: 0 for lvl in LEVELS}}
+    total = {"reported": 0, "filled": 0, "partially_reported": 0, "total": 0, **{lvl: 0 for lvl in LEVELS}}
     per_obj = {}
     for psv in sorted(args.fixtures_dir.glob("*.psv")):
         cat, _a, _d, _dr, _n, rep = C.build_source_catalog(psv.read_text(), psv.stem, ok, model)
         per_obj[psv.stem] = rep
-        for k in ("reported", "filled", "total"):
+        for k in ("reported", "filled", "partially_reported", "total"):
             total[k] += rep[k]
         for lvl in LEVELS:
             total[lvl] += rep["filled_by_level"].get(lvl, 0)
-    print(f"{'object':26s} {'total':>7s} {'reported':>8s} " + " ".join(f"{l:>20s}" for l in LEVELS))
+    print(f"{'object':26s} {'total':>7s} {'reported':>8s} {'half':>6s} " + " ".join(f"{l:>20s}" for l in LEVELS))
     for o, r in per_obj.items():
-        print(f"{o:26s} {r['total']:7d} {r['reported']:8d} "
+        print(f"{o:26s} {r['total']:7d} {r['reported']:8d} {r['partially_reported']:6d} "
               + " ".join(f"{r['filled_by_level'].get(l, 0):20d}" for l in LEVELS))
-    print(f"{'TOTAL':26s} {total['total']:7d} {total['reported']:8d} "
+    print(f"{'TOTAL':26s} {total['total']:7d} {total['reported']:8d} {total['partially_reported']:6d} "
           + " ".join(f"{total[l]:20d}" for l in LEVELS))
     if args.json:
         args.json.write_text(json.dumps({"total": total, "objects": per_obj}, indent=2))

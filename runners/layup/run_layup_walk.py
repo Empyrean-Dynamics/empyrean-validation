@@ -22,14 +22,18 @@ is in the sidecars beside it.
 
 What layup does and does not deliver here
 -----------------------------------------
-* **Fit** — one ``layup-orbitfit`` subprocess per window over a per-window ADES
-  PSV built by *filtering the original fixture lines* (§2.4: fit-set identity is
-  a protocol invariant, not a per-tool reparse). Same flags/conventions as the
-  full-arc runner ``run_layup.py``: injected constant ``layupID`` primary-id
-  column, ``--weight-data`` (Veres 2017 per-observatory σ) on by default,
-  ``--debias`` off by default, ``--ar`` passed through when given.
+* **Fit** — one ``fit_one.py`` subprocess per window (layup's Python API) over a
+  per-window ADES PSV built by *filtering the original fixture lines* (§2.4:
+  fit-set identity is a protocol invariant, not a per-tool reparse), passed
+  through ``run_layup.py``'s own input adapter. So the walk fits at exactly the
+  full-arc runner's settings (``run_layup.LAYUP_SETTINGS``): reported
+  ``rmsRA`` / ``rmsDec`` kept and a missing one filled by the shared public
+  Vereš 2017 model, ``weight_data="supplied"``, EFCC18 debiasing on (the
+  reference walk's default fit-side arm debiases too; the manifest's debias is a
+  scoring correction, never applied to fit inputs), ``fit_nongrav="auto"``, and
+  the staged data directory (``--ar`` plus ``LAYUP_CACHE_DIR``).
 * **Warm start** — §2.5 allows the *state estimate only* to cross a window
-  boundary. layup's ``-g/--guess`` mechanism is exactly that: its C++
+  boundary. layup's ``initial_guess`` (the CLI's ``-g``) is exactly that: its C++
   ``run_from_vector_with_initial_guess`` seeds the LM from ``state`` + ``epoch``
   (plus non-grav amplitudes, unused here) and ignores the guess covariance
   entirely. The guess file this runner writes therefore carries the state, the
@@ -57,9 +61,12 @@ What layup does and does not deliver here
   computes RA/Dec rates internally but drops them from the emitted recarray), so
   both fields are omitted and the scoring kernel falls back to the reference
   channel's shared position angle for the AT/CT rotation.
-* **Solve-for width** — 6 (state only; no non-gravs, no Marsden DT), recorded as
-  ``n_solve_for`` so no cross-tool statement is made across differing
-  dimensionality.
+* **Solve-for width** — 6 plus the non-grav terms layup's auto ladder adopted in
+  that window (no Marsden DT), recorded as ``n_solve_for`` so no cross-tool
+  statement is made across differing dimensionality. layup's predict carries the
+  adopted A1/A2/A3 (``parse_fit_result``, its issue #522) but transports only the
+  6x6 state covariance, so a non-grav window's sky covariance omits the non-grav
+  terms' uncertainty: layup's behavior, recorded as it is.
 
 Failure discipline
 ------------------
@@ -75,32 +82,27 @@ A fit-set count mismatch — kept PSV lines ≠ the manifest's ``n_obs_fit`` —
 loud per-window failure record, because fit-set identity is the one thing that
 makes "same window" mean the same thing across five tools.
 
-Known upstream issue (named, not hidden)
-----------------------------------------
-At the pinned layup ref (``60b5b75``) the ``layup-orbitfit`` console script
-**cannot run a warm fit at all**: ``layup_cmdline/orbitfit.py::execute`` reads
-``args.i`` while the parser stores ``--iod`` under ``dest="iod"``, so every
-``-g/--guess`` invocation dies with ``AttributeError: 'Namespace' object has no
-attribute 'i'`` before any fitting happens. No command line avoids it. Cold fits
-therefore go through the console script unchanged (exactly as ``run_layup.py``
-invokes it); warm fits go through ``_GUESS_SHIM`` below — that same console
-script with the one missing attribute supplied and nothing else changed. Run
-with ``--no-warm-start`` to walk entirely through the stock console script.
+Warm fits and the CLI
+---------------------
+The ``layup-orbitfit`` console script cannot run a warm fit at layup 1.1.0:
+``layup_cmdline/orbitfit.py::execute`` reads ``args.i`` while the parser stores
+``--iod`` under ``dest="iod"``, so every ``-g/--guess`` invocation dies with
+``AttributeError``. The API driver passes the guess as ``initial_guess``
+directly, the way ``orbitfit_cli`` would, so no shim is needed.
 
 Usage (must run under the layup venv's interpreter, see ``layup/setup.sh``):
 
     runners/layup/.venv/bin/python runners/layup/run_layup_walk.py \\
-        --profile ladder --only "2024 YR4"
+        --profile ladder --only "2024 YR4" --ar-data-path runners/layup/data
 """
 
 from __future__ import annotations
 
 import argparse
 import bisect
+import importlib.util
 import json
 import math
-import os
-import shutil
 import subprocess
 import sys
 import tempfile
@@ -118,13 +120,19 @@ except Exception as e:  # noqa: BLE001
     _HAVE_DEPS = False
     _DEPS_ERROR = str(e)
 
+# The full-arc runner owns the input adapter (sigma fill, column drops), the API
+# driver path and the settings; the walk reuses them so the two cannot drift.
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import run_layup as RL  # noqa: E402
+
 
 # Tool tag on every emitted record (matches the §4.4 runner table).
 TOOL = "layup"
 # Externals run their defaults only — one arm.
 CONFIG_ARM = "default"
-# layup solves the 6-element barycentric-Cartesian state and nothing else.
-N_SOLVE_FOR = 6
+# layup solves the 6-element barycentric-Cartesian state, plus whichever non-grav
+# terms its auto ladder adopts in a window (see _n_solve_for).
+N_STATE = 6
 # Primary-id column injected into every prepared PSV. Named distinctly so it
 # never collides with the fixtures' own (mostly-blank) provID / permID columns.
 _PRIMARY_ID = "layupID"
@@ -220,23 +228,6 @@ def _days_from_civil(y: int, m: int, d: int) -> int:
 # ── layup install discovery ─────────────────────────────────
 
 
-def _orbitfit_binary() -> Path | None:
-    """Resolve the ``layup-orbitfit`` console script next to this interpreter.
-
-    This script is executed by the layup venv's python, so the entry point is a
-    sibling of ``sys.executable``. The direct entry point is used rather than the
-    ``layup orbitfit`` dispatcher: the dispatcher discovers verbs by scanning
-    ``$PATH`` for ``layup-*`` executables, which fails when the venv bin dir is
-    not on ``$PATH`` (as when invoked by absolute path). Same resolution as
-    ``run_layup.py``.
-    """
-    cand = Path(sys.executable).parent / "layup-orbitfit"
-    if cand.exists():
-        return cand
-    found = shutil.which("layup-orbitfit")
-    return Path(found) if found else None
-
-
 def _layup_version() -> str | None:
     """Best available layup version string, for the run banner.
 
@@ -314,40 +305,6 @@ def _write_window_psv(fx: Fixture, keep: set[tuple[str, str]], out: Path) -> int
     return len(kept)
 
 
-def _prepare_input(psv_path: Path, obj_token: str, out: Path) -> None:
-    """Normalize a window PSV into a layup-ingestible PSV.
-
-    Strips the ADES space padding and prepends a constant ``layupID`` column so
-    the whole file fits as one object — the fixtures lead with a ``permID``
-    column that is blank for many comets and recently-designated objects, so
-    layup's default (first column == a consistently-populated primary id) does
-    not hold. Identical to ``run_layup.py``'s adapter.
-    """
-    pre_header: list[str] = []
-    with open(psv_path) as fh:
-        for line in fh:
-            if line.startswith(("#", "!")):
-                pre_header.append(line.rstrip("\n"))
-            else:
-                break
-    df = pd.read_csv(
-        psv_path,
-        sep="|",
-        skiprows=list(range(len(pre_header))),
-        dtype=str,
-        keep_default_na=False,
-    )
-    df.columns = [c.strip() for c in df.columns]
-    for col in df.columns:
-        df[col] = df[col].str.strip()
-    df = df.drop(columns=[c for c in df.columns if c == _PRIMARY_ID], errors="ignore")
-    df.insert(0, _PRIMARY_ID, obj_token)
-    with open(out, "w") as f:
-        for line in pre_header:
-            f.write(line + "\n")
-        df.to_csv(f, sep="|", index=False)
-
-
 # ── orbitfit invocation ─────────────────────────────────────
 
 _STATE_COLS = ("x", "y", "z", "xdot", "ydot", "zdot")
@@ -394,48 +351,6 @@ def _write_guess(state: dict, obj_token: str, out: Path) -> None:
     out.write_text("|".join(cols) + "\n" + "|".join(vals) + "\n")
 
 
-# The `layup-orbitfit` console script is
-#     from layup_cmdline.orbitfit import main; sys.exit(main())
-# and is used verbatim for cold fits. It cannot run a WARM fit at the pinned ref
-# (60b5b75): `layup_cmdline/orbitfit.py::execute` opens with
-#     if args.g and args.i == "gauss":
-# but the parser stores `--iod` under `dest="iod"`, so `args.i` never exists and
-# EVERY `-g/--guess` invocation dies with `AttributeError: 'Namespace' object has
-# no attribute 'i'` before reaching `orbitfit_cli`. That is an upstream bug, not
-# a usage error — there is no command line that creates the attribute.
-#
-# This shim is that console script with the missing alias supplied and nothing
-# else. It changes no science: `execute` only uses `args.i` to null *itself* out,
-# while `orbitfit_cli` reads the real `cli_args.iod`, and `_orbitfit` skips IOD
-# whenever a valid guess is present regardless. The alias is added only when
-# absent, so an upstream fix silently turns this back into the console script.
-# Warm fits therefore run layup's own CLI path with layup's own flags; the one
-# difference from the cold path is the `-g` flag itself.
-_GUESS_SHIM = '''"""`layup-orbitfit` console script + the -g/--guess attribute fix (see runner)."""
-import sys
-
-import layup_cmdline.orbitfit as m
-
-_execute = m.execute
-
-
-def execute(args):
-    if not hasattr(args, "i"):
-        args.i = getattr(args, "iod", "gauss")
-    return _execute(args)
-
-
-m.execute = execute
-
-# The __main__ guard is load-bearing, exactly as in the console script: layup
-# fits through a spawn-context ProcessPoolExecutor, and every worker re-imports
-# this file. Without the guard the workers would re-enter main() and die with
-# multiprocessing's "attempt to start a new process before bootstrapping".
-if __name__ == "__main__":
-    sys.exit(m.main())
-'''
-
-
 def _read_orbitfit_csv(csv_path: Path) -> dict | None:
     """Read the single fitted-orbit row layup's ``orbitfit`` writes.
 
@@ -479,66 +394,51 @@ class FitOutcome:
 def _fit_window(
     window_psv: Path,
     obj_token: str,
-    orbitfit_bin: Path,
     work: Path,
     guess: dict | None,
     opts: argparse.Namespace,
 ) -> FitOutcome:
-    """Run one ``layup-orbitfit`` subprocess over one window's observations."""
-    prepared = work / "layup_input.psv"
-    try:
-        _prepare_input(window_psv, obj_token, prepared)
-    except Exception as e:  # noqa: BLE001
-        return FitOutcome(None, f"psv_prepare_failed: {e}", 0.0)
+    """Fit one window through the full-arc runner's input adapter and API driver.
 
-    out_stem = work / "layup_orbit"
-    out_csv = Path(f"{out_stem}.csv")
+    ``run_layup._prepare_input`` keeps every reported sigma and fills a missing
+    one from the shared Vereš 2017 model; ``fit_one.py`` fits at
+    ``run_layup.LAYUP_SETTINGS``. A warm window passes the previous state as
+    ``--guess`` (state only, see ``_write_guess``).
+    """
+    unsupported = RL.unsupported_reason(obj_token)
+    if unsupported is not None:
+        return FitOutcome(None, unsupported, 0.0)
+    prepared, _sigma_report = RL._prepare_input(window_psv, obj_token, work)
+    if prepared is None:
+        return FitOutcome(None, "psv_prepare_failed: the window PSV could not be parsed", 0.0)
+
+    out_csv = work / "layup_orbit.csv"
     if out_csv.exists():
         out_csv.unlink()
 
-    if guess is None:
-        launch = [str(orbitfit_bin)]
-    else:
-        # Warm fit: the console script cannot take -g at this pin (see _GUESS_SHIM).
-        shim = work / "layup_orbitfit_guess.py"
-        if not shim.exists():
-            shim.write_text(_GUESS_SHIM)
-        launch = [sys.executable, str(shim)]
-
     cmd = [
-        *launch,
+        sys.executable,
+        str(RL.FIT_ONE),
         str(prepared),
-        "ADES_psv",
-        "--primary-id-column-name",
+        "--ar",
+        str(opts.ar_data_path),
+        "--primary-id",
         _PRIMARY_ID,
-        "-o",
-        str(out_stem),
-        "-f",
+        "--out",
+        str(out_csv),
     ]
-    if opts.weight_data:
-        cmd.append("--weight-data")
-    if opts.debias:
-        cmd.append("--debias")
-    if opts.ar_data_path:
-        cmd += ["--ar", opts.ar_data_path]
     if guess is not None:
         guess_path = work / "layup_guess.psv"
         _write_guess(guess, obj_token, guess_path)
-        cmd += ["-g", str(guess_path)]
+        cmd += ["--guess", str(guess_path)]
 
     t0 = time.perf_counter()
     try:
-        proc = subprocess.run(
-            cmd,
-            capture_output=True,
-            text=True,
-            timeout=opts.timeout,
-            cwd=work,
-            # layup reads its SPICE kernels from LAYUP_CACHE_DIR whatever --ar says
-            # (see run_layup.layup_env); the staged directory is that cache.
-            env={**os.environ, **({"LAYUP_CACHE_DIR": str(opts.ar_data_path)} if opts.ar_data_path else {})},
-            check=False,  # a nonzero exit is a named failure record, not an exception
-        )
+        # A nonzero exit is a named failure record, not an exception. layup reads
+        # its SPICE kernels from LAYUP_CACHE_DIR whatever --ar says (see
+        # run_layup.layup_env); run_bounded also ends the fit's pool child on a
+        # timeout, which would otherwise keep fitting.
+        proc = RL.run_bounded(cmd, opts.timeout, work, RL.layup_env(str(opts.ar_data_path)))
     except subprocess.TimeoutExpired:
         return FitOutcome(None, f"orbitfit_timeout_{opts.timeout:.0f}s", (time.perf_counter() - t0) * 1000.0)
     ms = (time.perf_counter() - t0) * 1000.0
@@ -632,6 +532,21 @@ def _resolve_fixture(fixtures_dir: Path, name: str, mpc_designation: str) -> Pat
     return None
 
 
+def _n_solve_for(row: dict) -> int:
+    """6 state elements plus each non-grav term layup's auto ladder adopted.
+
+    layup writes all of ``a1`` / ``a2`` / ``a3`` under ``fit_nongrav="auto"`` and
+    fills only the adopted ones (the rest NaN), the rule its own
+    ``parse_fit_result`` uses to decide which terms are active.
+    """
+    adopted = 0
+    for col in ("a1", "a2", "a3"):
+        v = _fnum(row, col)
+        if v is not None and v != 0.0:
+            adopted += 1
+    return N_STATE + adopted
+
+
 def _window_record(
     obj: str,
     window_index: int,
@@ -673,7 +588,7 @@ def _window_record(
         epoch = _fnum(row, "epochMJD_TDB")
         if nobs is not None:
             rec["n_obs_used"] = nobs
-        rec["n_solve_for"] = N_SOLVE_FOR
+        rec["n_solve_for"] = _n_solve_for(row)
         if niter is not None:
             rec["iterations"] = niter
         if csq is not None:
@@ -745,7 +660,6 @@ def _walk_object(
     obj: dict,
     fixtures_dir: Path,
     profile: str,
-    orbitfit_bin: Path,
     opts: argparse.Namespace,
 ) -> tuple[list[dict], list[dict], dict]:
     """Walk one object's windows. Returns (window records, predictions, stats)."""
@@ -818,7 +732,7 @@ def _walk_object(
                 continue
 
             outcome = _fit_window(
-                window_psv, obj_token, orbitfit_bin, work, guess if opts.warm_start else None, opts
+                window_psv, obj_token, work, guess if opts.warm_start else None, opts
             )
             if outcome.row is None:
                 fail(idx, warm, outcome.failure, outcome.fit_time_ms)
@@ -993,29 +907,16 @@ def main() -> int:
     p.add_argument(
         "--ar-data-path",
         type=str,
-        default=None,
-        help="ASSIST+Rebound data directory from `layup bootstrap` (passed through as --ar, "
-        "and used as the predict cache dir). Default: let layup resolve its own cache.",
+        default=str(RL._STAGED_DATA),
+        help="layup's data directory, staged from the third-party tool set by stage_data.py "
+        "(the fit's --ar, LAYUP_CACHE_DIR, and the predict cache dir). Every file layup checks "
+        f"for must be present. Default: {RL._STAGED_DATA.name}/ beside this script.",
     )
     p.add_argument(
         "--timeout",
         type=float,
         default=900.0,
         help="Per-window fit timeout in seconds (recorded as a named failure on overrun).",
-    )
-    p.add_argument(
-        "--weight-data",
-        action=argparse.BooleanOptionalAction,
-        default=True,
-        help="Apply layup's Veres-2017 per-observatory astrometric weighting. ON by default, "
-        "matching run_layup.py: many fixture rows carry blank rmsRA/rmsDec and layup's stock "
-        "default then applies one flat sigma to every observation.",
-    )
-    p.add_argument(
-        "--debias",
-        action="store_true",
-        help="Pass layup's --debias (catalog/epoch astrometry debiasing). Off by default, "
-        "matching run_layup.py and the find_orb runner.",
     )
     p.add_argument(
         "--no-warm-start",
@@ -1034,13 +935,21 @@ def main() -> int:
         )
         return 1
 
-    orbitfit_bin = _orbitfit_binary()
-    if orbitfit_bin is None:
+    if importlib.util.find_spec("layup") is None:
         print(
-            "ERROR: `layup-orbitfit` was not found next to this interpreter and not on $PATH.\n"
+            f"ERROR: layup does not import under this interpreter ({sys.executable}).\n"
             "       Run this under runners/layup/.venv/bin/python; build the venv with "
             "`make setup-layup`.\n"
             "       (Emitting empty sidecars would report 'layup predicted nothing' as a pass.)",
+            file=sys.stderr,
+        )
+        return 1
+    args.ar_data_path = str(Path(args.ar_data_path).absolute())
+    missing = RL.missing_data(args.ar_data_path)
+    if missing:
+        print(
+            f"ERROR: layup's data directory {args.ar_data_path} lacks: {', '.join(missing)}.\n"
+            "       Stage it with stage_data.py first (layup would download it mid-fit).",
             file=sys.stderr,
         )
         return 1
@@ -1087,9 +996,8 @@ def main() -> int:
         file=sys.stderr,
     )
     print(
-        f"  layup: {orbitfit_bin} (version {version or 'unknown'})\n"
-        f"  weighting: {'veres2017' if args.weight_data else 'flat_default'}"
-        f"{'+debias' if args.debias else ''}  warm_start: {not args.no_warm_start}",
+        f"  layup: {version or 'unknown'} through {RL.FIT_ONE.name} at run_layup.LAYUP_SETTINGS\n"
+        f"  data: {args.ar_data_path}  warm_start: {not args.no_warm_start}",
         file=sys.stderr,
     )
 
@@ -1099,15 +1007,13 @@ def main() -> int:
     totals = {"windows": 0, "converged": 0, "failed": 0, "predictions": 0, "with_cov": 0}
 
     opts = Namespace(
-        weight_data=args.weight_data,
-        debias=args.debias,
         ar_data_path=args.ar_data_path,
         timeout=args.timeout,
         warm_start=not args.no_warm_start,
     )
 
     for obj in selected:
-        wins, preds, stats = _walk_object(obj, fixtures_dir, args.profile, orbitfit_bin, opts)
+        wins, preds, stats = _walk_object(obj, fixtures_dir, args.profile, opts)
         all_windows.extend(wins)
         all_predictions.extend(preds)
         for k in totals:

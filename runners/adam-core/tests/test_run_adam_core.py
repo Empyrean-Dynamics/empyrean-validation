@@ -209,6 +209,19 @@ def test_build_source_catalog_fills_and_labels():
     assert all(math.isfinite(v) and v > 0 for v in sra)
 
 
+def test_an_all_dropped_object_reports_the_fill_levels_the_fill_uses():
+    """An object whose every station is dropped reports the same counters as a filled
+    one: the four fill levels and partially_reported, never a stale 'global' level."""
+    from sigmafill.veres2017 import LEVELS
+
+    psv = ("# version=2017\npermID|mode|stn|obsTime|ra|dec|rmsRA|rmsDec|astCat\n"
+           "T|CCD|C51|2020-01-01T00:00:00.000Z|10.0|5.0|||Gaia2\n")
+    catalog, _a, n_dropped, _d, _n, ss = C.build_source_catalog(psv, "X", lambda s: False)
+    assert catalog is None and n_dropped == 1
+    assert set(ss["filled_by_level"]) == set(LEVELS)
+    assert ss["partially_reported"] == 0 and ss["total"] == 0
+
+
 def test_missing_asteroid_path_raises():
     """The October planets-only trick (a non-existent asteroids_path) is dead in
     adam-assist 0.6.0: construction must RAISE (strict DAF binding). This is the
