@@ -11,7 +11,7 @@
 # into this directory's .venv and driven only as a subprocess
 # (`make run-grss`).
 #
-# ── Two things this script does that `pip install grss` does not ────────────
+# ── Three things this script does that `pip install grss` does not ──────────
 #
 # 1. INTERPRETER. GRSS depends on basemap (for its plotting helpers), which
 #    caps at Python < 3.14. A 3.14 interpreter fails with an unhelpful
@@ -26,7 +26,11 @@
 #    stages only the DE440-case set (~235 MB) under GRSS's own names:
 #
 #        de440.bsp  sb441-n16s.bsp  earth_{latest,historic,predict}.bpc
-#        moon_pa_de440.bpc  pck00011.tpc
+#        moon_pa_de440.bpc
+#
+#    (get_kernels.py also fetches pck00011.tpc, which GRSS never opens: no
+#    file name in the package's Python or its compiled core names it, so it is
+#    not staged.)
 #
 #    Every kernel comes from GRSS's folder of the third-party tool set
 #    (dataset third-party-tools-*, folder `grss/`, synced by the suite under
@@ -45,6 +49,16 @@
 #    A missing kernel is never papered over: run_grss.py asserts every file
 #    the requested version needs is present and non-empty before it fits or
 #    propagates anything, and names this script when one is not.
+#
+# 3. ASTROMETRY TABLES. GRSS opens three more files under its package
+#    directory, which it otherwise downloads at run time: the low-resolution
+#    Eggl et al. (2020) debiasing table debias/lowres_data/bias.dat (every
+#    optical fit; from JPL SSD's debias_2018.tgz) and the observatory tables
+#    fit/codes.json and fit/special_codes.json (written from the MPC
+#    observatory-codes API). The same grss/ folder carries all three, so they
+#    are copied there too and setup reaches none of JPL, NAIF and the MPC. They
+#    are copies, not links: run_grss.py refreshes codes.json's modification
+#    time so GRSS's daily re-download never fires.
 set -euo pipefail
 
 cd "$(dirname "$0")"
@@ -133,7 +147,7 @@ echo "grss package: $GRSS_PKG"
 # Staged here, deliberately, instead of letting `import grss` shell out to
 # get_kernels.py — see the header.
 KDIR="$GRSS_PKG/kernels"
-mkdir -p "$KDIR"
+mkdir -p "$KDIR" "$GRSS_PKG/debias/lowres_data" "$GRSS_PKG/fit"
 
 # GRSS_DATA_DIR is GRSS's folder of the third-party tool set (the Makefile
 # passes it; the suite's default is ~/.empyrean/data/third-party/grss). Each
@@ -148,16 +162,16 @@ if [ ! -d "$GRSS_DATA_DIR" ]; then
     echo "       prep job does)." >&2
     exit 1
 fi
-stage_from_set() {  # stage_from_set <pattern> <grss name>
-    local pattern="$1" name="$2"
+stage_from_set() {  # stage_from_set <pattern> <name under the package> [dir, default kernels]
+    local pattern="$1" name="$2" dir="${3:-$KDIR}"
     local matches=()
     while IFS= read -r f; do matches+=("$f"); done < <(find "$GRSS_DATA_DIR" -maxdepth 1 -name "$pattern" \( -type f -o -type l \) | sort)
     if [ "${#matches[@]}" -ne 1 ] || [ ! -s "${matches[0]}" ]; then
         echo "ERROR: expected exactly one non-empty '$pattern' in the third-party tool set's" >&2
-        echo "       grss/ folder at $GRSS_DATA_DIR; found ${#matches[@]}. GRSS never downloads a kernel." >&2
+        echo "       grss/ folder at $GRSS_DATA_DIR; found ${#matches[@]}. GRSS never downloads a file." >&2
         exit 1
     fi
-    local src="${matches[0]}" dest="$KDIR/$name"
+    local src="${matches[0]}" dest="$dir/$name"
     if [ -f "$dest" ] && cmp -s "$src" "$dest"; then
         printf '  ok       %-22s %s (set)\n' "$name" "$(basename "$src")"
     else
@@ -171,7 +185,6 @@ stage_from_set "earth_latest_high_prec.bpc"   "earth_latest.bpc"
 stage_from_set "earth_620120_*.bpc"           "earth_historic.bpc"
 stage_from_set "earth_*_predict.bpc"          "earth_predict.bpc"
 stage_from_set "moon_pa_de440_*.bpc"          "moon_pa_de440.bpc"
-stage_from_set "pck00011.tpc"                 "pck00011.tpc"
 if [ "$GRSS_DE_KERNEL" = "441" ]; then
     stage_from_set "sb441-n16.bsp" "sb441-n16.bsp"
     stage_from_set "de441.bsp"     "de441.bsp"
@@ -180,48 +193,13 @@ else
     stage_from_set "sb441-n16s.bsp" "sb441-n16s.bsp"
 fi
 
-# ── 3. Astrometry auxiliary data ───────────────────────────
-# Eggl et al. (2020) star-catalog debiasing tables + the MPC observatory-code
-# table. Fetched HERE so `make run-grss` needs no network: grss.utils
-# .initialize() re-downloads codes.json when it is over a day old, but skips
-# the whole step when offline, so the run-time path only works if setup left
-# a usable copy behind.
-#
-# STILL UPSTREAM: the grss package fetches the debiasing tables from
-# ssd.jpl.nasa.gov and the codes from data.minorplanetcenter.net. No folder of
-# the third-party tool set carries them yet, so grss is on the workflow's
-# UPSTREAM_FETCH_ALLOWLIST (scripts/tests/test_no_upstream_fetch.py) and its
-# leg seals after this setup instead of before it.
+# ── 3. Astrometry tables ───────────────────────────────────
+# Copied from the same folder, never downloaded (see the header).
 echo
-echo "──── Debiasing tables (Eggl et al. 2020) ────────────────"
-"$VENV_PY" "$GRSS_PKG/debias/get_debiasing_data.py"
-test -f "$GRSS_PKG/debias/lowres_data/bias.dat" || {
-    echo "ERROR: debiasing table $GRSS_PKG/debias/lowres_data/bias.dat is missing." >&2
-    echo "       GRSS's optical weighting scheme reads it on every fit." >&2
-    exit 1
-}
-
-echo
-echo "──── MPC observatory codes ──────────────────────────────"
-"$VENV_PY" -c "
-import os, sys
-sys.path.insert(0, '$(dirname "$GRSS_PKG")')
-# Importing grss runs grss.utils.initialize(), which shells out to the
-# package's own get_kernels.py / get_debiasing_data.py. This script owns both
-# fetches (see the header), so neuter os.system for the duration of the import
-# rather than letting it emit two 'sh: python: command not found' lines into an
-# otherwise clean setup log — or, worse, succeed and pull the 4.4 GB set.
-# run_grss.py does the same thing, and reports what it blocked.
-_real_system = os.system
-os.system = lambda cmd: 0
-from grss.utils import _download_codes_file
-os.system = _real_system
-_download_codes_file()
-"
-test -s "$GRSS_PKG/fit/codes.json" || {
-    echo "ERROR: $GRSS_PKG/fit/codes.json is missing or empty." >&2
-    exit 1
-}
+echo "──── Debiasing and observatory tables → $GRSS_PKG ────"
+stage_from_set "bias.dat"           "bias.dat"           "$GRSS_PKG/debias/lowres_data"
+stage_from_set "codes.json"         "codes.json"         "$GRSS_PKG/fit"
+stage_from_set "special_codes.json" "special_codes.json" "$GRSS_PKG/fit"
 
 echo
 echo "grss venv ready: $(pwd)/.venv"

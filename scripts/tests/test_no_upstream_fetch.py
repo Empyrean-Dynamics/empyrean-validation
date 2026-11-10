@@ -31,14 +31,11 @@ VALIDATION = (WF / "validation.yml").read_text()
 SEAL = ROOT / "scripts" / "seal-upstream.sh"
 
 # The external tools that still fetch from JPL, NAIF or the MPC, with what they
-# fetch. Each is sealed after its setup instead of before it.
-ALLOWLIST = {
-    "grss": "setup fetches the debiasing tables from ssd.jpl.nasa.gov and the observatory codes from "
-    "data.minorplanetcenter.net (grss's own get_debiasing_data.py and _download_codes_file); no "
-    "third-party tool-set folder carries them yet",
-}
-# The list may lose tools, never gain one.
-CEILING = frozenset({"grss"})
+# fetch. Each would be sealed after its setup instead of before it. Every tool
+# now reads its files from the third-party tool set, so the list is empty.
+ALLOWLIST: dict[str, str] = {}
+# The list may lose tools, never gain one: it is empty and stays so.
+CEILING: frozenset[str] = frozenset()
 
 HOSTS = ("ssd.jpl.nasa.gov", "ssd-api.jpl.nasa.gov", "naif.jpl.nasa.gov", "minorplanetcenter.net")
 # A URL: a scheme, or a host followed by a path. A host named in prose ("reads
@@ -203,6 +200,24 @@ def test_find_orb_assist_and_grss_read_the_third_party_set():
     restore = re.search(r"- name: Restore the third-party tool set\n\s+if: (.*)\n", VALIDATION.split("\n  external:\n", 1)[1]).group(1)
     for tool in ("layup", "assist", "findorb", "grss"):
         assert f'"{tool}"' in restore, f"the {tool} leg does not restore the third-party set"
+
+
+def test_the_grss_setup_stages_every_table_grss_would_download_from_its_folder():
+    """GRSS's debiasing table and observatory tables come from its folder of the
+    third-party tool set, copied under the package directory where GRSS opens them;
+    nothing in the setup fetches them, and the run checks each by name."""
+    text = (ROOT / "runners" / "grss" / "setup.sh").read_text()
+    code = "\n".join(ln for ln in text.splitlines() if not ln.lstrip().startswith("#"))
+    for name, under in (("bias.dat", "debias/lowres_data"), ("codes.json", "fit"), ("special_codes.json", "fit")):
+        assert re.search(rf'stage_from_set "{re.escape(name)}"\s+"{re.escape(name)}"\s+"\$GRSS_PKG/{under}"', code), name
+    for fetch in ("get_debiasing_data", "_download_codes_file", "import grss", "from grss"):
+        assert fetch not in code, f"runners/grss/setup.sh still runs {fetch}"
+    run = (ROOT / "runners" / "grss" / "run_grss.py").read_text()
+    for rel in ("debias/lowres_data/bias.dat", "fit/codes.json", "fit/special_codes.json"):
+        assert f'"{rel}"' in run, f"run_grss.py does not check {rel}"
+    restore = VALIDATION.split("\n  external:\n", 1)[1]
+    sentinels = re.search(r'grss\)\s+dirs="grss";\s+need="([^"]+)"', restore).group(1).split()
+    assert {"grss/bias.dat", "grss/codes.json", "grss/special_codes.json"} <= set(sentinels)
 
 
 def test_the_grss_setup_never_imports_grss_with_its_shell_outs_live():

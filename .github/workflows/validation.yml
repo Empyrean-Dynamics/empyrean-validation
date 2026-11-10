@@ -251,13 +251,12 @@ env:
   EXTERNAL_LEG_TARGET_MIN: ${{ inputs.external_leg_minutes || '' }}
   # The external tools whose setup or import still reaches JPL, NAIF or the MPC,
   # and so seal after setup instead of before it. No validation job may reach
-  # those hosts (the manual mint-inputs run is the only one that does); this
-  # list is what is left to close, and scripts/tests/test_no_upstream_fetch.py
-  # fails if it grows or disagrees with the test's own copy:
-  #   grss    setup fetches the debiasing tables (ssd.jpl.nasa.gov) and the
-  #           observatory codes (data.minorplanetcenter.net); no tool-set folder
-  #           carries them yet
-  UPSTREAM_FETCH_ALLOWLIST: '["grss"]'
+  # those hosts (the manual mint-inputs run is the only one that does), and
+  # since every tool reads its files from the third-party tool set the list is
+  # empty: every external leg seals before setup.
+  # scripts/tests/test_no_upstream_fetch.py fails if it grows or disagrees with
+  # the test's own copy.
+  UPSTREAM_FETCH_ALLOWLIST: '[]'
   TIER: ${{ inputs.tier || 'standard' }}
   # Shared cache keys — every job restores by these exact keys so the
   # downloads/builds `prep` populates fan out warm. Bump a version suffix
@@ -1334,7 +1333,7 @@ jobs:
             orbfit)       dirs="orbfit";         need="orbfit/de440.bsp" ;;
             oorb)         dirs="oorb assist";    need="oorb/de440.dat oorb/de440.bsp oorb/asteroid_ephemeris.txt assist/linux_p1550p2650.440" ;;
             kete)         dirs="kete";           need="kete/de440s.bsp kete/20000001.bsp kete/bias.dat kete/sb441-n16.bsp" ;;
-            grss)         dirs="grss";           need="grss/de440.bsp grss/pck00011.tpc grss/sb441-n16s.bsp" ;;
+            grss)         dirs="grss";           need="grss/de440.bsp grss/sb441-n16s.bsp grss/bias.dat grss/codes.json grss/special_codes.json" ;;
           esac
           for f in $need; do
             if [ ! -f "$src/$f" ]; then

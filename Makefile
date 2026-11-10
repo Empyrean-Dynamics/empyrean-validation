@@ -1297,8 +1297,9 @@ $(KETE_OUT): $(PLAN) $(KETE_PY) | check-plan fixtures
 GRSS_VENV := $(EMP_VAL_RUNNERS)/grss/.venv
 GRSS_PY := $(GRSS_VENV)/bin/python
 
-# GRSS's seven SPICE kernels come from its folder of the third-party tool set,
-# synced under $(DATA_DIR)/third-party; none is downloaded.
+# GRSS's six SPICE kernels, its debiasing table and its two observatory tables
+# come from its folder of the third-party tool set, synced under
+# $(DATA_DIR)/third-party; none is downloaded.
 GRSS_DATA_DIR ?= $(DATA_DIR)/third-party/grss
 setup-grss: $(GRSS_PY)
 $(GRSS_PY):
