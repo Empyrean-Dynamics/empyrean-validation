@@ -371,7 +371,10 @@ def run_findorb(
                 for dt in ephem_spec["dt_days"]:
                     f.write(f"JD {ephem_spec['epoch_mjd_tdb'] + dt + 2400000.5:.6f}\n")
             with open(os.path.join(tmp_dir, "environ.dat"), "a") as f:
-                f.write("EPHEM_STEPS=1 tephem_times.txt\nTT_EPHEMERIS=1\n")
+                # find_orb dates vectors in TT and observables in UTC (see
+                # findorb_common on EPHEMERIS_TIMESCALE); match_dt's tolerance
+                # spans TT - UTC, and each row is evaluated at its TT instant.
+                f.write("EPHEM_STEPS=1 tephem_times.txt\n")
             base = f"{fo_bin} {obs_file} -c -d 2 -D {tmp_dir}/environ.dat -O {tmp_dir}"
             # State vectors (-E 0,17: type 1 = state vectors + computer
             # friendly), geocentric (500) — geometric, equatorial J2000,

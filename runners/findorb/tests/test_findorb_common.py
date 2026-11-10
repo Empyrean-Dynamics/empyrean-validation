@@ -136,12 +136,77 @@ def test_od_and_walk_write_the_same_settings_except_ephemeris_epochs(tmp_path):
                         debiasing=WALK.DEBIAS_AXIS[WALK.FIT_DEBIAS])
     od = _kv((od_dir / "environ.dat").read_text().splitlines())
     walk = _kv((walk_dir / "environ.dat").read_text().splitlines())
-    only_walk = {"EPHEM_STEPS", "TT_EPHEMERIS"}
+    only_walk = {"EPHEM_STEPS"}
     assert set(walk) - set(od) == only_walk
     for k in set(od):
         assert od[k] == walk[k], k  # SETTINGS2 included: both debias with EFCC18
     assert walk["SETTINGS2"].split()[-1] == "1"
     assert od["ENCKE"] == "0" and od["ASTEROID_PERT_LIST"] == ""
+
+
+# ── the walk's ephemeris dates come back UTC and are converted to TT ────
+
+ENVIRON_DEF = RUNNER / "build" / "find_orb" / "environ.def"  # find_orb's documented settings
+EPHEM0 = RUNNER / "build" / "find_orb" / "ephem0.cpp"
+LSK = os.environ.get("NAIF_LSK")  # the registered naif0012.tls (layup/ folder of the tool set)
+
+
+def test_neither_runner_sets_a_time_scale_keyword(tmp_path):
+    """TT_EPHEMERIS is no keyword of find_orb's, and its real one
+    (EPHEMERIS_TIMESCALE=TT) breaks total.json at the pinned commit, so the
+    runners set neither and the walk converts the UTC dates itself."""
+    walk_dir = tmp_path / "walk"
+    walk_dir.mkdir()
+    WALK._write_environ(walk_dir, 3, "times.txt", FC.PERTURBERS, "", debiasing=True)
+    text = (walk_dir / "environ.dat").read_text()
+    assert "TT_EPHEMERIS" not in text and "EPHEMERIS_TIMESCALE" not in text
+    for src in ("run_findorb.py", "run_findorb_walk.py"):
+        code = (RUNNER / src).read_text()
+        assert "TT_EPHEMERIS=" not in code and "EPHEMERIS_TIMESCALE=TT\\n" not in code, src
+
+
+def test_the_walk_dates_each_ephemeris_row_in_tt_from_find_orbs_utc(tmp_path):
+    """A row find_orb dates 2024-03-08 09:36:18.144 UTC is the TT instant
+    69.184 s later (37 leap seconds + 32.184 s), and the epoch check compares that
+    with the TT epoch find_orb was handed."""
+    mjd_utc = 60377.400210000
+    jd_utc = mjd_utc + 2400000.5
+    eph = tmp_path / "eph_304.txt"
+    eph.write_text(f"#(304) x\n{jd_utc:.6f} 264.31462779 -21.37828213 3.10 2.20 120.0 0.0266 266.48\n")
+    rows = WALK._parse_ephem_file(eph)
+    assert isinstance(rows, list) and len(rows) == 1, rows
+    assert rows[0]["jd_utc"] == pytest.approx(jd_utc, abs=1e-9)
+    assert rows[0]["jd_tt"] == pytest.approx(jd_utc + 69.184 / 86400.0, abs=1e-9)
+    assert abs(rows[0]["jd_tt"] - WALK.mjd_utc_to_jd_tt(mjd_utc)) < 1e-6  # within the walk's epoch check
+
+
+@pytest.mark.skipif(not ENVIRON_DEF.is_file(), reason="find_orb source not built (runners/findorb/setup.sh)")
+def test_find_orbs_time_scale_keyword_is_ephemeris_timescale_not_tt_ephemeris():
+    environ, ephem = ENVIRON_DEF.read_text(), EPHEM0.read_text()
+    assert "\nEPHEMERIS_TIMESCALE=" in environ
+    assert 'get_environment_ptr( "EPHEMERIS_TIMESCALE")' in ephem
+    assert "TT_EPHEMERIS" not in environ and "TT_EPHEMERIS" not in ephem
+    # The JSON ephemeris writer keys the token at header offset 5 as the ISO date,
+    # which the TT header's extra token breaks (why the runners leave it unset).
+    assert "if( hptr == header + 5)   /* second token -> ISO date */" in ephem
+    assert '(*timescale == \'T\' ? "(TT) "  : "(UTC)")' in ephem
+
+
+@pytest.mark.skipif(not LSK, reason="set NAIF_LSK to the registered naif0012.tls")
+def test_the_walks_leap_second_table_is_the_registered_lsk():
+    text = Path(LSK).read_text()
+    block = re.search(r"DELTA_AT\s*=\s*\((.*?)\)", text, re.DOTALL).group(1)
+    pairs = re.findall(r"([\d.]+),\s*@(\d{4})-([A-Z]{3})-(\d+)", block)
+    months = {m: i for i, m in enumerate("JAN FEB MAR APR MAY JUN JUL AUG SEP OCT NOV DEC".split(), 1)}
+
+    def mjd(y, m, d):  # civil date to MJD (Fliegel and Van Flandern)
+        a = (14 - m) // 12
+        yy, mm = y + 4800 - a, m + 12 * a - 3
+        jdn = d + (153 * mm + 2) // 5 + 365 * yy + yy // 4 - yy // 100 + yy // 400 - 32045
+        return jdn - 2400001
+
+    lsk = [(mjd(int(y), months[mo], int(d)), float(s)) for s, y, mo, d in pairs]
+    assert lsk == [(m, s) for m, s in WALK.LEAP_SECONDS]
 
 
 # ── the walk's fit debiases as the reference walk's does ────
