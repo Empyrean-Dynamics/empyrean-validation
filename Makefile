@@ -1068,7 +1068,7 @@ schedule: $(PLAN) check-plan
 	    --out $(SCHEDULE) --matrix $(LEG_MATRIX)
 
 # The external legs (S7): one leg per tool, or, for a tool the external cost
-# table prices per object (jorbit, OrbFit, adam-core), object legs packed longest object
+# table prices per object (jorbit, OrbFit, kete, adam-core), object legs packed longest object
 # first so no leg replays the whole catalog, each with a timeout sized to its
 # predicted wall (scripts/schedule.py pack-external). EXTERNAL_TOOLS names the
 # tools that run; EXTERNAL_LEG_TARGET_MIN overrides the table's target leg wall
@@ -1263,6 +1263,10 @@ $(CORE_OUT): $(call channel_plan,core) $(CORE_BIN) | check-plan fixtures
 # ephemeris, and OD. Used as a sanity check parallel to ASSIST /
 # find_orb but covering all three test types.
 KETE_VENV := $(EMP_VAL_RUNNERS)/kete/.venv
+# Everything kete loads, and the EFCC18 bias.dat its OD debiases with, comes
+# from the kete folder of the third-party tool set (synced under
+# $(DATA_DIR)/third-party), linked into the runner's private KETE_CACHE_DIR.
+KETE_DATA_DIR ?= $(DATA_DIR)/third-party/kete
 KETE_PY := $(KETE_VENV)/bin/python
 
 setup-kete: $(KETE_PY)
@@ -1271,11 +1275,20 @@ $(KETE_PY):
 	@cd $(EMP_VAL_RUNNERS)/kete && ./setup.sh
 
 run-kete: $(KETE_OUT)
+# EXT_LEG runs one object leg of the external schedule (`--only` its objects).
+# No kete row reads another object's rows, so the merged legs are the rows one
+# unchunked run writes.
 $(KETE_OUT): $(PLAN) $(KETE_PY) | check-plan fixtures
 	@echo "──── Kete: external all-test-types reference ──────────"
-	@$(KETE_PY) $(EMP_VAL_RUNNERS)/kete/run_kete.py \
+	@set --; \
+	if [ -n "$(EXT_LEG)" ]; then \
+	    only="$$(python3 $(ROOT)/scripts/channel-chunks.py external-objects --plan $(PLAN) \
+	        --schedule $(EXTERNAL_SCHEDULE) --tool kete --leg "$(EXT_LEG)")" || exit 1; \
+	    if [ -n "$$only" ]; then echo "  leg $(EXT_LEG): $$only"; set -- --only "$$only"; fi; \
+	fi; \
+	$(KETE_PY) $(EMP_VAL_RUNNERS)/kete/run_kete.py \
 	    --input $(PLAN) --output $(KETE_OUT) \
-	    --fixtures-dir $(FIXTURES_PSV) --data-dir $(DATA_DIR)
+	    --fixtures-dir $(FIXTURES_PSV) --data-dir $(KETE_DATA_DIR) "$$@"
 
 # ── GRSS external comparison — propagation + ephemeris + OD ──
 # The Gauss-Radau Small-body Simulator (Makadia et al.;

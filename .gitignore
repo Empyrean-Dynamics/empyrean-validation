@@ -47,6 +47,8 @@ runners/*/.venv/
 # jorbit's runner-private astropy download cache: the registered set's DE440
 # and SB441-N16, staged under jorbit's URL keys by runners/jorbit/jorbit_offline.py.
 runners/jorbit/.astropy-cache/
+# kete's private cache: kernels/core links the kete folder (run_kete.py).
+runners/kete/.kete-cache/
 
 # Python bytecode caches, wherever an interpreter imports a module from
 # the tree: the runners imported directly (smoke-testing helpers without

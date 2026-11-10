@@ -4,9 +4,10 @@ comparator file before the merge, in the order one unchunked run writes, with
 comparator isolation intact.
 
 Covers scripts/schedule.py (pack-external, validate-external),
-scripts/channel-chunks.py (external-objects, concat-external), the two runner
-flags the object legs use (run_jorbit.py --only, run_orbfit.py --only /
---defer-all-failed) and `make run-adam-core EXT_LEG=`."""
+scripts/channel-chunks.py (external-objects, concat-external), the runner flags
+the object legs use (run_jorbit.py --only, run_orbfit.py --only /
+--defer-all-failed, run_kete.py --only), `make run-kete EXT_LEG=` and
+`make run-adam-core EXT_LEG=`."""
 
 import importlib.util
 import json
@@ -342,12 +343,59 @@ def test_an_orbfit_leg_defers_the_every_object_failed_verdict_to_the_merge(orbfi
     assert rc == 2
 
 
+def test_kete_refuses_an_only_naming_an_object_outside_the_plan_before_loading_kete(world):
+    """Refused before kete is imported, so it holds without kete installed."""
+    for only, said in (("A,Nope", "['Nope']"), (" , ", "no object")):
+        r = subprocess.run(
+            [sys.executable, str(ROOT / "runners/kete/run_kete.py"), "--input", str(world["pp"]), "--only", only,
+             "--output", str(world["dir"] / "x.json"), "--data-dir", str(world["dir"] / "no-kete-folder")],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        assert r.returncode == 2 and said in r.stderr, r.stderr
+
+
 # A stand-in for a tool's python that records the argv make handed it.
 ARGV_STUB = """#!{py}
 import json, sys
 a = sys.argv[1:]
 json.dump(a, open(a[a.index("--output") + 1], "w"))
 """
+
+
+@pytest.mark.skipif(shutil.which("make") is None, reason="make unavailable")
+@pytest.mark.parametrize("leg", ["01", "02", ""])
+def test_make_run_kete_replays_only_its_legs_objects(sc, world, leg):
+    """An object leg hands run_kete.py its objects as --only; with no EXT_LEG
+    the whole plan runs, as before the chunking."""
+    costs = json.loads(world["cp"].read_text())
+    costs["tools"]["kete"] = {"setup_min": 1.0, "leg_overhead_min": 0.5, "default_object_min": 3.0, "object_min": {"A": 9.0}}
+    world["cp"].write_text(json.dumps(costs))
+    s, sp = sched(sc, world, tools=("kete",))
+    results = world["dir"] / "results"
+    results.mkdir()
+    (results / "validation_plan.json").write_text(world["pp"].read_text())
+    s["plan_sha256"] = sc.file_sha256(results / "validation_plan.json")
+    sp.write_text(json.dumps(s))
+    stub = world["dir"] / "kete-python"
+    stub.write_text(ARGV_STUB.format(py=sys.executable))
+    stub.chmod(0o755)
+    r = subprocess.run(
+        ["make", "-o", "fixtures", "run-kete", "PLAN_PREBUILT=1", f"EXT_LEG={leg}", f"RESULTS_DIR={results}",
+         f"EXTERNAL_SCHEDULE={sp}", f"KETE_PY={stub}"],
+        cwd=ROOT,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert r.returncode == 0, r.stdout + r.stderr
+    argv = json.loads((results / "validation_kete.json").read_text())
+    want = {leg_["leg"]: leg_["objects"] for leg_ in s["tools"]["kete"]["legs"]}
+    if leg:
+        assert argv[argv.index("--only") + 1] == ",".join(want[leg])
+    else:
+        assert "--only" not in argv
 
 
 @pytest.mark.skipif(shutil.which("make") is None, reason="make unavailable")

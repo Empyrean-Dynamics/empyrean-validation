@@ -1044,10 +1044,11 @@ def heavy_leg_matrix(sched: dict) -> list[dict]:
 # ── external legs (S7) ──────────────────────────────────────────────────────
 #
 # Each external tool runs as one or more legs. A tool the external cost table
-# prices per object (jorbit, OrbFit, adam-core) is cut by object, longest object
-# first, so no leg replays the whole catalog: jorbit died of memory after 41 to
-# 71 min on two hosted runs, OrbFit took 44 to 51, and adam-core's fits outran
-# its 150-minute leg. Every other tool runs as one leg.
+# prices per object (jorbit, OrbFit, kete, adam-core) is cut by object, longest
+# object first, so no leg replays the whole catalog: jorbit died of memory after
+# 41 to 71 min on two hosted runs, OrbFit took 44 to 51, kete with the sixteen
+# SB441-N16 masses outran its 31-minute leg, and adam-core's fits outran its
+# 150-minute leg. Every other tool runs as one leg.
 # Each leg's timeout is a multiple of its predicted wall, never a flat budget.
 # reduce puts a tool's legs back into its one comparator file
 # (channel-chunks.py concat-external) before the merge.
