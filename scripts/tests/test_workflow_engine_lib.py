@@ -20,7 +20,7 @@ ACTIONS = ROOT / ".github" / "actions"
 VALIDATION = (WF / "validation.yml").read_text()
 
 # Jobs that compile or run engine-linked code (the harness, the runners).
-ENGINE_JOBS = ["prep", "reference", "assemble", "empyrean", "reduce"]
+ENGINE_JOBS = ["prep", "reference", "reference-heavy", "assemble", "assemble-final", "empyrean", "empyrean-heavy", "reduce"]
 # Jobs that must not: they run third-party tools in a secretless sandbox.
 NON_ENGINE_JOBS = ["precheck", "external"]
 
@@ -109,9 +109,9 @@ def test_engine_setup_skips_every_compile_prerequisite_when_asked():
 
 def test_the_reference_job_compiles_nothing_and_the_others_only_assert_prebuilt():
     all_jobs = jobs(VALIDATION)
-    ref = "\n".join(code_lines(all_jobs["reference"]))
-    assert 'skip-build: "true"' in ref
-    for name in ("reference", "assemble", "empyrean", "reduce"):
+    for name in ("reference", "reference-heavy"):
+        assert 'skip-build: "true"' in "\n".join(code_lines(all_jobs[name])), f"{name} compiles"
+    for name in ("reference", "reference-heavy", "assemble", "assemble-final", "empyrean", "empyrean-heavy", "reduce"):
         code = "\n".join(code_lines(all_jobs[name]))
         assert "cargo " not in code, f"{name} compiles"
         assert "setup-rust-toolchain" not in code, f"{name} installs a toolchain"

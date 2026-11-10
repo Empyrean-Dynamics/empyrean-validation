@@ -36,8 +36,28 @@ bytes, so a schedule can be reproduced, diffed and tested.
         `validate run --select` for its rows and `validate od --only` for its
         objects (scripts/reference-legs.py).
 
-    schedule.py validate-reference --candidates C --objects O --schedule S --costs T
-        the validator's refusals for a reference schedule.
+    schedule.py validate-reference --candidates C --objects O --schedule S --costs T \
+        [--heavy-schedule H]
+        the validator's refusals for a reference schedule (and its heavy one).
+
+    schedule.py heavy --candidates C --costs T --out results/heavy.json \
+        --select-out results/heavy-select.json [--heavy-min-s S]
+        names the heavy propagation rows to decouple (S5, below) and their
+        warm-up leaders, and the rows `validate run --emit-plan-rows` builds.
+        pack-reference --heavy H --heavy-out HS then packs them into no light
+        leg and writes their rust replicas' legs (h01, ...); pack --heavy H
+        leaves them out of the channel legs.
+
+    schedule.py pack-heavy --heavy-plan results/heavy-plan.json --heavy H \
+        --costs T --out results/schedule-heavy.json --matrix results/heavy-leg-matrix.json
+        the channel replicas of each decoupled row, one per leg, over the heavy
+        plan, in the channel schedule's format; validate-heavy checks one.
+
+    schedule.py pack-external --plan P --costs fixtures/external-costs.json \
+        --out results/external-schedule.json --matrix results/external-leg-matrix.json
+        the external legs (S7): object legs for a tool priced per object,
+        longest object first, one leg for every other tool, each with a timeout
+        sized to its predicted wall; validate-external checks one.
 
 Heavy rows (S4). A row whose single timing run costs HEAVY_MIN_S or more is
 fanned out: its timing repetitions run on that many distinct legs, one each,
@@ -49,6 +69,13 @@ The fan-out count is the channel's own timed repetitions for the row
 (reps()), so no replica leg runs a repetition the channel did not run before.
 A leg's repetition overrides ride in the schedule (`reps`), and the side file
 the drivers read is written by `select`; a plan key would flow into outputs.
+
+Heavy decoupling (S5). A heavy PROPAGATION row goes further: it leaves the light
+legs altogether. prep emits its plan row with no engine call and its rust and
+channel replicas run on legs of their own from prep, in parallel with the light
+reference; the final assemble checks the full reference strips to the plan
+everything replayed. A heavy ephemeris row stays in the light legs and fans out
+there, because its plan row carries a note the engine writes.
 
 Row identity: (object, test_type, propagation_uncertainty, dt for propagation
 and ephemeris rows or 0, observer, force_model), unique across the plan.
@@ -172,14 +199,20 @@ def zero_cost(channel: str, r: dict) -> bool:
 # ── units ───────────────────────────────────────────────────────────────────
 
 
-def units(channel: str, plan: list) -> list[list[int]]:
-    """Scheduling units as lists of plan indices, in order of first row."""
+def units(channel: str, plan: list, exclude: frozenset = frozenset()) -> list[list[int]]:
+    """Scheduling units as lists of plan indices, in order of first row.
+    `exclude` names decoupled rows (S5: heavy propagation rows that run on their
+    own legs from prep), which belong to no unit here."""
     if channel not in CHANNELS:
         raise SystemExit(f"ERROR: unknown channel {channel!r}; expected one of {', '.join(CHANNELS)}.")
     out: list[list[int]] = []
     od_unit: dict = {}
     for i, r in enumerate(plan):
         tt = r["test_type"]
+        if i in exclude:
+            if tt != "propagation":
+                raise SystemExit(f"ERROR: plan row {i} is decoupled but is a {tt!r} row; only propagation rows decouple.")
+            continue
         if tt in PROP_EPH or channel == "core":
             out.append([i])
             continue
@@ -328,7 +361,7 @@ def heavy_units(channel: str, plan: list, table: CostTable, ul: list[list[int]],
     return out
 
 
-def pack(channel: str, plan: list, table: CostTable, n_legs: int, heavy_min_s: float | None = None):
+def pack(channel: str, plan: list, table: CostTable, n_legs: int, heavy_min_s: float | None = None, exclude: frozenset = frozenset()):
     """Greedy longest-first packing. Ties break by plan index, so the result is
     a pure function of its inputs. For c and cli, each leg is first seeded with
     a light propagation row (the warm-up leader), and a heavy propagation unit
@@ -337,7 +370,7 @@ def pack(channel: str, plan: list, table: CostTable, n_legs: int, heavy_min_s: f
     priced at one run; its legs carry a repetition override of 1.
 
     Returns (legs, estimated, heaviest unit minutes, total minutes, replicas)."""
-    ul = units(channel, plan)
+    ul = units(channel, plan, exclude)
     costs, rowcost, estimated = price_units(channel, plan, table, ul)
     if n_legs < 1:
         raise SystemExit(f"ERROR: {channel} needs at least one leg (got {n_legs}).")
@@ -433,14 +466,16 @@ def build_schedule(
     budget: int,
     legs: dict[str, int] | None,
     heavy_min_s: float | None = None,
+    heavy_path: Path | None = None,
 ):
     with open(plan_path) as f:
         plan = json.load(f)
     table = CostTable.load(costs_path)
+    decoupled = decoupled_plan_rows(plan, load_json(heavy_path)) if heavy_path else frozenset()
     totals = {}
     fan_out = {}
     for c in channels:
-        ul = units(c, plan)
+        ul = units(c, plan, decoupled)
         costs, _, _ = price_units(c, plan, table, ul)
         totals[c] = (sum(costs), max(costs, default=0.0))
         fan_out[c] = max(heavy_units(c, plan, table, ul, costs, heavy_min_s).values(), default=1)
@@ -458,11 +493,12 @@ def build_schedule(
         "cost_table_run": table.data.get("run_id"),
         "leg_budget": budget,
         "heavy_min_s": heavy_min_s,
+        "decoupled": sorted(decoupled),
         "channels": {},
         "replicas": [],
     }
     for c in channels:
-        legs_c, est, _, total, reps_c = pack(c, plan, table, counts[c], heavy_min_s)
+        legs_c, est, _, total, reps_c = pack(c, plan, table, counts[c], heavy_min_s, decoupled)
         sched["channels"][c] = {"total_min": round(total, 3), "legs": legs_c, "estimated_rows": est}
         sched["replicas"].extend(reps_c)
     return sched, plan, table
@@ -475,10 +511,10 @@ def leg_matrix(sched: dict) -> list[dict]:
 # ── validation ──────────────────────────────────────────────────────────────
 
 
-def validate_channel(ch: str, body: dict, plan: list, table: CostTable, replicas: list[dict], bad: list[str]) -> None:
+def validate_channel(ch: str, body: dict, plan: list, table: CostTable, replicas: list[dict], bad: list[str], decoupled: frozenset = frozenset()) -> None:
     """The partition, unit-closure, warm-up and replica refusals for one
     channel's legs, appended to `bad`. Shared by the channel and the reference
-    schedules."""
+    schedules. A decoupled row (S5) must be in no leg: it runs on the heavy legs."""
     n = len(plan)
     reps_rows = {rep["row"]: rep for rep in replicas if rep["channel"] == ch}
     legs_of: dict[int, list[str]] = {}
@@ -493,9 +529,12 @@ def validate_channel(ch: str, body: dict, plan: list, table: CostTable, replicas
                 bad.append(f"{ch} leg {leg['leg']}: row index {i} is outside the plan")
             else:
                 legs_of.setdefault(i, []).append(leg["leg"])
-    missing = [i for i in range(n) if i not in legs_of]
+    missing = [i for i in range(n) if i not in legs_of and i not in decoupled]
     if missing:
         bad.append(f"{ch}: {len(missing)} plan rows are in no leg (first: {missing[0]})")
+    for i in sorted(decoupled):
+        if i in legs_of:
+            bad.append(f"{ch}: decoupled row {i} is in light leg(s) {legs_of[i]}; it runs on the heavy legs only")
     for i, ls in sorted(legs_of.items()):
         if i in reps_rows:
             continue
@@ -518,7 +557,7 @@ def validate_channel(ch: str, body: dict, plan: list, table: CostTable, replicas
         for i_str, cnt in leg.get("reps", {}).items():
             if int(i_str) not in reps_rows or leg["leg"] not in reps_rows[int(i_str)]["legs"]:
                 bad.append(f"{ch} leg {leg['leg']}: repetition override on row {i_str}, which is not a declared replica of this leg")
-    for u in units(ch, plan):
+    for u in units(ch, plan, decoupled):
         legs_u = {tuple(legs_of.get(i, ())) for i in u}
         if len(legs_u) > 1 and not (len(u) == 1):
             bad.append(f"{ch}: unit {key_str(row_key(plan[u[0]]))} is split across legs {sorted(map(str, legs_u))}")
@@ -546,8 +585,12 @@ def validate(plan: list, plan_sha256: str, sched: dict, table: CostTable) -> lis
     if sched["cost_table_sha256"] != table.sha256:
         bad.append("the schedule was built from a different cost table (hash mismatch)")
     replicas = sched.get("replicas", [])
+    decoupled = frozenset(sched.get("decoupled", []))
+    if any(not (0 <= i < len(plan)) or plan[i]["test_type"] != "propagation" for i in decoupled):
+        bad.append("the schedule decouples a row that is not a propagation row of the plan")
+        return bad
     for ch, body in sched["channels"].items():
-        validate_channel(ch, body, plan, table, replicas, bad)
+        validate_channel(ch, body, plan, table, replicas, bad, decoupled)
     return bad
 
 
@@ -595,23 +638,31 @@ def build_reference_schedule(
     costs_path: Path,
     n_legs: int,
     heavy_min_s: float | None = None,
+    heavy_path: Path | None = None,
 ):
     """Pack the reference: candidate rows plus one OD unit per object, into legs.
 
     The candidate list is what `validate run --list-rows` printed. The legs'
     `rows` index into it; `od_objects` name the objects whose `validate od`
-    run the leg owns."""
+    run the leg owns. With a heavy file (S5), the decoupled rows it names are
+    packed into no light leg (`decoupled` lists them); build_heavy_reference_schedule
+    gives them legs of their own."""
     cands = load_json(candidates_path)
     objects = [o["name"] if isinstance(o, dict) else str(o) for o in load_json(objects_path)]
     table = CostTable.load(costs_path)
+    decoupled = frozenset()
+    if heavy_path:
+        heavy = load_json(heavy_path)
+        check_heavy_file(heavy, candidates_path)
+        decoupled = frozenset(h["index"] for h in heavy["rows"])
     od_rows = od_pseudo_rows(objects, table)
     full = cands + od_rows
-    ul = units("rust", full)
+    ul = units("rust", full, decoupled)
     costs, _, _ = price_units("rust", full, table, ul)
     # A heavy row's replicas need that many distinct legs; a small leg count (a
     # rehearsal) must not turn that into a refusal.
     n_legs = max(n_legs, max(heavy_units("rust", full, table, ul, costs, heavy_min_s).values(), default=1))
-    legs_all, est, _, total, reps_r = pack("rust", full, table, n_legs, heavy_min_s)
+    legs_all, est, _, total, reps_r = pack("rust", full, table, n_legs, heavy_min_s, decoupled)
     n_c = len(cands)
     legs = []
     for leg in legs_all:
@@ -637,6 +688,7 @@ def build_reference_schedule(
         "cost_table_run": table.data.get("run_id"),
         "leg_budget": n_legs,
         "heavy_min_s": heavy_min_s,
+        "decoupled": sorted(decoupled),
         "total_min": round(total, 3),
         "estimated_rows": est,
         "legs": legs,
@@ -656,7 +708,7 @@ def validate_reference(cands: list, objects: list[str], cands_sha256: str, sched
     if sched["cost_table_sha256"] != table.sha256:
         bad.append("the schedule was built from a different cost table (hash mismatch)")
     body = {"legs": [{"leg": x["leg"], "rows": x["rows"], "reps": x.get("reps", {})} for x in sched["legs"]]}
-    validate_channel("rust", body, cands, table, sched.get("replicas", []), bad)
+    validate_channel("rust", body, cands, table, sched.get("replicas", []), bad, frozenset(sched.get("decoupled", [])))
     owner: dict[str, list[str]] = defaultdict(list)
     for leg in sched["legs"]:
         for o in leg["od_objects"]:
@@ -667,6 +719,459 @@ def validate_reference(cands: list, objects: list[str], cands_sha256: str, sched
     for o in owner:
         if o not in objects:
             bad.append(f"leg {owner[o][0]} runs the OD of {o}, which is not in the object list")
+    return bad
+
+
+# ── heavy decoupling (S5) ───────────────────────────────────────────────────
+#
+# A heavy propagation row (the cost table marks it, or one timing run costs at
+# least --heavy-min-s in any channel) is taken off the critical path: prep
+# builds its plan row with no engine call (`validate run --emit-plan-rows`,
+# the real run's own row constructor), its rust and channel timing replicas run
+# on legs of their own from prep, in parallel with the light reference, and
+# the final assemble checks the reference's strip equals the published plan.
+# Only propagation rows decouple: their plan content is input-determined. An
+# ephemeris row carries a note the engine's first-order ephemeris writes, so a
+# heavy ephemeris row stays in the light legs and fans out there (S4).
+
+HEAVY_SCHEMA = 1
+IDENTITY = ("object", "test_type", "propagation_uncertainty", "dt_days", "observer", "force_model")
+
+
+def identity(r: dict) -> dict:
+    return {f: r.get(f) for f in IDENTITY}
+
+
+def single_run_s(channel: str, r: dict, table: CostTable) -> float:
+    v, _ = table.price(channel, r)
+    return v * 60.0 / reps(channel, r)
+
+
+def select_heavy(cands: list, table: CostTable, channels: list[str], heavy_min_s: float | None) -> list[int]:
+    """Candidate indices of the decoupled rows: propagation rows the cost table
+    marks heavy, or (with heavy_min_s) whose single timing run costs at least
+    that many seconds in any of `channels` (the reference and every replay
+    channel), in candidate order."""
+    out = []
+    for i, r in enumerate(cands):
+        if r["test_type"] != "propagation":
+            continue
+        marked = key_str(row_key(r)) in table.heavy_rows
+        slow = heavy_min_s is not None and any(single_run_s(c, r, table) >= heavy_min_s for c in channels)
+        if marked or slow:
+            out.append(i)
+    return out
+
+
+def pick_leaders(cands: list, heavy: list[int], table: CostTable, n: int) -> dict[int, list[int]]:
+    """For each heavy row, `n` distinct light propagation rows of the same object
+    that precede it in candidate order: the warm-up leaders of its c and cli
+    legs (the daemons warm up on a session's first propagation row, and five
+    untimed runs of a heavy row would add hours). A leader is not heavy and
+    costs under LEADER_MAX_S per run in both warm-up channels. No row leads two
+    legs, so a leader's output is never delivered twice."""
+    taken: set[int] = set()
+    hs = set(heavy)
+    out: dict[int, list[int]] = {}
+    for h in heavy:
+        obj = cands[h]["object"]
+        pool = [
+            i
+            for i in range(h)
+            if i not in hs
+            and i not in taken
+            and cands[i]["object"] == obj
+            and cands[i]["test_type"] == "propagation"
+            and all(single_run_s(c, cands[i], table) < LEADER_MAX_S for c in WARMUP_CHANNELS)
+        ]
+        if len(pool) < n:
+            raise SystemExit(
+                f"ERROR: the heavy row {key_str(row_key(cands[h]))} needs {n} light propagation rows of "
+                f"{obj!r} ahead of it to lead its c and cli legs; the candidates hold {len(pool)}."
+            )
+        out[h] = pool[:n]
+        taken.update(pool[:n])
+    return out
+
+
+def build_heavy(candidates_path: Path, costs_path: Path, channels: list[str], heavy_min_s: float | None) -> dict:
+    """The heavy file prep writes: the decoupled rows and their leaders."""
+    cands = load_json(candidates_path)
+    table = CostTable.load(costs_path)
+    heavy = select_heavy(cands, table, ["rust", *channels], heavy_min_s)
+    n_lead = max((reps(c, cands[h]) for h in heavy for c in WARMUP_CHANNELS if c in channels), default=0)
+    leaders = pick_leaders(cands, heavy, table, n_lead) if n_lead else {h: [] for h in heavy}
+    return {
+        "schema": HEAVY_SCHEMA,
+        "kind": "heavy",
+        "candidates_sha256": file_sha256(candidates_path),
+        "cost_table_sha256": table.sha256,
+        "heavy_min_s": heavy_min_s,
+        "channels": channels,
+        "rows": [
+            {"index": h, "key": key_str(row_key(cands[h])), "row": identity(cands[h]), "leaders": [identity(cands[i]) for i in leaders[h]]}
+            for h in heavy
+        ],
+    }
+
+
+def heavy_select_rows(heavy: dict, cands: list) -> list[dict]:
+    """The rows `validate run --select ... --emit-plan-rows` builds: every
+    decoupled row and its leaders, in candidate order."""
+    idx = {key_str(row_key(r)): i for i, r in enumerate(cands)}
+    want = set()
+    for h in heavy["rows"]:
+        want.add(h["index"])
+        want.update(idx[key_str(row_key(lead))] for lead in h["leaders"])
+    return [identity(cands[i]) for i in sorted(want)]
+
+
+def check_heavy_file(heavy: dict, candidates_path: Path) -> None:
+    if heavy.get("schema") != HEAVY_SCHEMA or heavy.get("kind") != "heavy":
+        raise SystemExit(f"ERROR: not a heavy file of schema {HEAVY_SCHEMA}.")
+    if heavy["candidates_sha256"] != file_sha256(candidates_path):
+        raise SystemExit("ERROR: the heavy file was built for a different candidate list; refusing to schedule from it.")
+
+
+def decoupled_plan_rows(plan: list, heavy: dict) -> frozenset:
+    """Plan indices of the decoupled rows the plan holds (a row the emit run
+    dropped, for want of an input, is in no plan)."""
+    want = {h["key"] for h in heavy["rows"]}
+    return frozenset(i for i, r in enumerate(plan) if key_str(row_key(r)) in want)
+
+
+def build_heavy_reference_schedule(candidates_path: Path, objects_path: Path, costs_path: Path, heavy_path: Path) -> dict:
+    """The rust replicas of each decoupled row, one per leg (`h01`, ...), in the
+    reference schedule's own format so the reference leg machinery runs them
+    unchanged. A row the reference times n times gets n legs; n = 1 gets one leg
+    and no override."""
+    cands = load_json(candidates_path)
+    objects = [o["name"] if isinstance(o, dict) else str(o) for o in load_json(objects_path)]
+    table = CostTable.load(costs_path)
+    heavy = load_json(heavy_path)
+    check_heavy_file(heavy, candidates_path)
+    legs: list[dict] = []
+    replicas: list[dict] = []
+    for h in heavy["rows"]:
+        i = h["index"]
+        n = reps("rust", cands[i])
+        v, _ = table.price("rust", cands[i])
+        ids = []
+        for _ in range(n):
+            lid = f"h{len(legs) + 1:02d}"
+            ids.append(lid)
+            leg = {"leg": lid, "rows": [i], "od_objects": [], "units": 1, "predicted_min": round(v / n, 4)}
+            if n > 1:
+                leg["reps"] = {str(i): 1}
+            legs.append(leg)
+        if n > 1:
+            replicas.append({"channel": "rust", "group": key_str(row_key(cands[i])), "row": i, "legs": ids, "reps": 1})
+    return {
+        "schema": SCHEMA,
+        "kind": "reference",
+        "heavy": True,
+        "candidates_sha256": file_sha256(candidates_path),
+        "candidate_rows": len(cands),
+        "objects": objects,
+        "cost_table_sha256": table.sha256,
+        "cost_table_run": table.data.get("run_id"),
+        "heavy_min_s": heavy["heavy_min_s"],
+        "decoupled": sorted(h["index"] for h in heavy["rows"]),
+        "total_min": round(sum(leg["predicted_min"] for leg in legs), 3),
+        "estimated_rows": [],
+        "legs": legs,
+        "replicas": replicas,
+    }
+
+
+def validate_heavy_reference(cands: list, cands_sha256: str, sched: dict, light: dict) -> list[str]:
+    """The heavy reference schedule runs exactly the rows the light schedule
+    decoupled, each on as many distinct legs as the reference times it."""
+    if sched.get("schema") != SCHEMA or sched.get("kind") != "reference" or not sched.get("heavy"):
+        return ["not a heavy reference schedule"]
+    if sched["candidates_sha256"] != cands_sha256 or light["candidates_sha256"] != cands_sha256:
+        return ["the heavy or light reference schedule was built for a different candidate list"]
+    bad: list[str] = []
+    if sorted(sched["decoupled"]) != sorted(light.get("decoupled", [])):
+        bad.append("the heavy reference schedule runs a different row set than the light schedule decoupled")
+    legs_of: dict[int, list[str]] = defaultdict(list)
+    ids = [leg["leg"] for leg in sched["legs"]]
+    if len(set(ids)) != len(ids) or any(not lid.startswith("h") for lid in ids):
+        bad.append("heavy reference leg ids must be unique and start with 'h'")
+    light_ids = {leg["leg"] for leg in light["legs"]}
+    if light_ids & set(ids):
+        bad.append(f"heavy reference legs reuse light leg ids {sorted(light_ids & set(ids))}")
+    for leg in sched["legs"]:
+        if leg["od_objects"]:
+            bad.append(f"heavy reference leg {leg['leg']} owns OD objects")
+        for i in leg["rows"]:
+            legs_of[i].append(leg["leg"])
+    reps_rows = {rep["row"]: rep for rep in sched.get("replicas", [])}
+    for i in sched["decoupled"]:
+        n = reps("rust", cands[i])
+        have = legs_of.get(i, [])
+        if len(have) != n or len(set(have)) != n:
+            bad.append(f"decoupled row {key_str(row_key(cands[i]))} is on legs {have}; the reference times it {n} times")
+        if n > 1 and sorted(reps_rows.get(i, {}).get("legs", [])) != sorted(have):
+            bad.append(f"decoupled row {key_str(row_key(cands[i]))} is not declared a replica of legs {have}")
+        for leg in sched["legs"]:
+            if leg["leg"] in have and n > 1 and leg.get("reps", {}).get(str(i)) != 1:
+                bad.append(f"heavy reference leg {leg['leg']} carries {key_str(row_key(cands[i]))} without its repetition override")
+    for i in legs_of:
+        if i not in sched["decoupled"]:
+            bad.append(f"heavy reference legs run row {i}, which is not decoupled")
+    return bad
+
+
+def build_heavy_channel_schedule(heavy_plan_path: Path, heavy_path: Path, costs_path: Path, channels: list[str]) -> tuple[dict, list]:
+    """The channel replicas of each decoupled row, in the channel schedule's
+    format over the heavy plan (the emitted plan rows of the decoupled rows and
+    their leaders), so `channel-chunks.py select` and `concat` run them
+    unchanged. Per channel, a row the channel times n times gets n legs
+    (`h01`, ...), each running it once; a c or cli leg opens on its own leader.
+    The leaders' outputs are warm-up only: reduce keeps the decoupled rows."""
+    plan = load_json(heavy_plan_path)
+    table = CostTable.load(costs_path)
+    heavy = load_json(heavy_path)
+    pidx: dict[str, int] = {}
+    for i, r in enumerate(plan):
+        k = key_str(row_key(r))
+        if k in pidx:
+            raise SystemExit(f"ERROR: the heavy plan holds {k} twice.")
+        if r["test_type"] != "propagation":
+            raise SystemExit(f"ERROR: the heavy plan holds a {r['test_type']!r} row ({k}); it holds propagation rows only.")
+        pidx[k] = i
+    sched = {
+        "schema": SCHEMA,
+        "kind": "heavy",
+        "plan_sha256": file_sha256(heavy_plan_path),
+        "plan_rows": len(plan),
+        "cost_table_sha256": table.sha256,
+        "cost_table_run": table.data.get("run_id"),
+        "heavy_min_s": heavy["heavy_min_s"],
+        "decoupled": sorted(pidx[h["key"]] for h in heavy["rows"] if h["key"] in pidx),
+        "leaders": sorted(pidx[key_str(row_key(lead))] for h in heavy["rows"] if h["key"] in pidx for lead in h["leaders"]),
+        "not_emitted": [h["key"] for h in heavy["rows"] if h["key"] not in pidx],
+        "channels": {},
+        "replicas": [],
+    }
+    for ch in channels:
+        legs: list[dict] = []
+        for h in heavy["rows"]:
+            if h["key"] not in pidx:
+                continue
+            i = pidx[h["key"]]
+            n = reps(ch, plan[i])
+            v, _ = table.price(ch, plan[i])
+            ids = []
+            for k in range(n):
+                lid = f"h{len(legs) + 1:02d}"
+                ids.append(lid)
+                rows = [i]
+                lead_min = 0.0
+                if ch in WARMUP_CHANNELS:
+                    lk = key_str(row_key(h["leaders"][k]))
+                    if lk not in pidx:
+                        raise SystemExit(f"ERROR: the leader {lk} of {h['key']} is not in the heavy plan (the emit run dropped it).")
+                    rows = sorted([pidx[lk], i])
+                    lead_min, _ = table.price(ch, plan[pidx[lk]])
+                leg = {"leg": lid, "rows": rows, "units": len(rows), "predicted_min": round(v / n + lead_min, 4)}
+                if n > 1:
+                    leg["reps"] = {str(i): 1}
+                legs.append(leg)
+            if n > 1:
+                sched["replicas"].append({"channel": ch, "group": h["key"], "row": i, "legs": ids, "reps": 1})
+        sched["channels"][ch] = {"total_min": round(sum(leg["predicted_min"] for leg in legs), 3), "legs": legs, "estimated_rows": []}
+    return sched, plan
+
+
+def validate_heavy_channels(plan: list, plan_sha256: str, sched: dict, table: CostTable) -> list[str]:
+    """Each decoupled row on as many distinct legs as the channel times it, with
+    its override; each c and cli leg opening on a leader of its own; nothing
+    but decoupled rows and leaders on any leg."""
+    if sched.get("schema") != SCHEMA or sched.get("kind") != "heavy":
+        return ["not a heavy channel schedule"]
+    if sched["plan_sha256"] != plan_sha256:
+        return ["the heavy channel schedule was built for a different heavy plan (hash mismatch)"]
+    bad: list[str] = []
+    dec, lead = set(sched["decoupled"]), set(sched["leaders"])
+    reps_by = {(rep["channel"], rep["row"]): rep for rep in sched["replicas"]}
+    for ch, body in sched["channels"].items():
+        legs_of: dict[int, list[str]] = defaultdict(list)
+        ids = [leg["leg"] for leg in body["legs"]]
+        if len(set(ids)) != len(ids) or any(not lid.startswith("h") for lid in ids):
+            bad.append(f"{ch}: heavy leg ids must be unique and start with 'h'")
+        for leg in body["legs"]:
+            if list(leg["rows"]) != sorted(set(leg["rows"])):
+                bad.append(f"{ch} leg {leg['leg']}: rows are unsorted or repeated")
+            for i in leg["rows"]:
+                legs_of[i].append(leg["leg"])
+                if i not in dec and i not in lead:
+                    bad.append(f"{ch} leg {leg['leg']}: row {i} is neither decoupled nor a leader")
+            on_leg = [i for i in leg["rows"] if i in dec]
+            if len(on_leg) != 1:
+                bad.append(f"{ch} leg {leg['leg']}: holds {len(on_leg)} decoupled rows; a heavy leg holds one")
+            if ch in WARMUP_CHANNELS:
+                first = leg["rows"][0] if leg["rows"] else None
+                if first not in lead:
+                    bad.append(f"{ch} leg {leg['leg']}: does not open on a light leader row; the daemon would warm up on the heavy row")
+                elif single_run_s(ch, plan[first], table) >= LEADER_MAX_S:
+                    bad.append(f"{ch} leg {leg['leg']}: its leader {key_str(row_key(plan[first]))} is not light")
+            elif any(i in lead for i in leg["rows"]):
+                bad.append(f"{ch} leg {leg['leg']}: carries a leader, which only the warm-up channels run")
+        for i in dec:
+            n = reps(ch, plan[i])
+            have = legs_of.get(i, [])
+            if len(have) != n or len(set(have)) != n:
+                bad.append(f"{ch}: decoupled row {key_str(row_key(plan[i]))} is on legs {have}; the channel times it {n} times")
+            rep = reps_by.get((ch, i))
+            if n > 1 and (rep is None or sorted(rep["legs"]) != sorted(have)):
+                bad.append(f"{ch}: decoupled row {key_str(row_key(plan[i]))} is not declared a replica of legs {have}")
+            for leg in body["legs"]:
+                if leg["leg"] in have and n > 1 and leg.get("reps", {}).get(str(i)) != 1:
+                    bad.append(f"{ch} leg {leg['leg']}: carries a replica without its repetition override")
+        if ch in WARMUP_CHANNELS:
+            for i in lead:
+                if len(legs_of.get(i, [])) > 1:
+                    bad.append(f"{ch}: leader {key_str(row_key(plan[i]))} leads legs {legs_of[i]}; a leader leads one leg")
+    return bad
+
+
+def heavy_leg_matrix(sched: dict) -> list[dict]:
+    return leg_matrix(sched)
+
+
+# ── external legs (S7) ──────────────────────────────────────────────────────
+#
+# Each external tool runs as one or more legs. A tool the external cost table
+# prices per object (jorbit, OrbFit) is cut by object, longest object first, so
+# no leg replays the whole catalog: jorbit died of memory after 41 to 71 min on
+# two hosted runs and OrbFit took 44 to 51. Every other tool runs as one leg.
+# Each leg's timeout is a multiple of its predicted wall, never a flat budget.
+# reduce puts a tool's legs back into its one comparator file
+# (channel-chunks.py concat-external) before the merge.
+
+EXTERNAL_SCHEMA = 1
+EXTERNAL_TOOLS = ("assist", "findorb", "kete", "jorbit", "layup", "orbfit", "grss")
+# The comparator files a tool's leg writes, by stem (validation_<stem>.json).
+EXTERNAL_STEMS = {"findorb": ["findorb", "findorb_radar"], "grss": ["grss", "grss_radar"]}
+# A tool whose run exits nonzero only when every object failed: in a chunked run
+# the rule is applied once, over the merged file, by concat-external.
+EXTERNAL_ALL_FAILED = {"orbfit": "orbfit_error"}
+
+
+def plan_objects(plan: list) -> list[str]:
+    seen: dict[str, None] = {}
+    for r in plan:
+        seen.setdefault(r["object"], None)
+    return list(seen)
+
+
+def build_external_schedule(plan_path: Path, costs_path: Path, tools: list[str], target_leg_min: float | None = None) -> dict:
+    plan = load_json(plan_path)
+    table = load_json(costs_path)
+    if table.get("schema") != EXTERNAL_SCHEMA:
+        raise SystemExit(f"ERROR: external cost table schema {table.get('schema')!r}, expected {EXTERNAL_SCHEMA}.")
+    objects = plan_objects(plan)
+    if not objects:
+        raise SystemExit("ERROR: the plan names no objects.")
+    target = float(target_leg_min if target_leg_min is not None else table["target_leg_min"])
+    if target <= 0:
+        raise SystemExit(f"ERROR: the target leg wall must be positive (got {target}).")
+    factor, floor = float(table["timeout_factor"]), int(table["timeout_floor_min"])
+    known_jobs = [t["job_min"] for t in table["tools"].values() if "job_min" in t]
+    out_tools: dict[str, dict] = {}
+    for tool in tools:
+        if tool in out_tools:
+            raise SystemExit(f"ERROR: external tool {tool!r} is listed twice.")
+        spec = table["tools"].get(tool)
+        estimated: list[str] = []
+        legs: list[dict] = []
+        if spec is not None and "object_min" in spec:
+            cost = {}
+            for o in objects:
+                if o in spec["object_min"]:
+                    cost[o] = float(spec["object_min"][o])
+                else:
+                    cost[o] = float(spec["default_object_min"])
+                    estimated.append(f"{o}: not in the external cost table; priced at {spec['default_object_min']} min")
+            n = min(len(objects), max(1, math.ceil(sum(cost.values()) / target)))
+            load = [0.0] * n
+            members: list[list[str]] = [[] for _ in range(n)]
+            for o in sorted(objects, key=lambda o: (-cost[o], objects.index(o))):
+                k = min(range(n), key=lambda k: (load[k], k))
+                members[k].append(o)
+                load[k] += cost[o]
+            over = float(spec["setup_min"]) + float(spec["leg_overhead_min"])
+            for k in range(n):
+                legs.append({"leg": f"{k + 1:02d}", "objects": sorted(members[k], key=objects.index), "predicted_min": round(over + load[k], 3)})
+            chunked = True
+        else:
+            if spec is None:
+                job = max(known_jobs)
+                estimated.append(f"{tool}: not in the external cost table; priced at the largest measured job wall, {job} min")
+            else:
+                job = float(spec["job_min"])
+            legs.append({"leg": "01", "objects": None, "predicted_min": round(job, 3)})
+            chunked = False
+        for leg in legs:
+            leg["timeout_min"] = max(floor, math.ceil(factor * leg["predicted_min"]))
+        body = {"chunked": chunked, "stems": EXTERNAL_STEMS.get(tool, [tool]), "legs": legs, "estimated": estimated}
+        if tool in EXTERNAL_ALL_FAILED:
+            body["all_failed_field"] = EXTERNAL_ALL_FAILED[tool]
+        out_tools[tool] = body
+    return {
+        "schema": EXTERNAL_SCHEMA,
+        "kind": "external",
+        "plan_sha256": file_sha256(plan_path),
+        "objects": objects,
+        "external_costs_sha256": file_sha256(costs_path),
+        "target_leg_min": target,
+        "timeout_factor": factor,
+        "timeout_floor_min": floor,
+        "tools": out_tools,
+    }
+
+
+def external_leg_matrix(sched: dict) -> list[dict]:
+    return [{"tool": t, "leg": leg["leg"], "timeout": leg["timeout_min"]} for t, body in sched["tools"].items() for leg in body["legs"]]
+
+
+def validate_external(plan: list, plan_sha256: str, sched: dict) -> list[str]:
+    """A chunked tool covers every plan object exactly once; every leg has a
+    timeout of at least the floor and above its predicted wall."""
+    if sched.get("schema") != EXTERNAL_SCHEMA or sched.get("kind") != "external":
+        return ["not an external schedule"]
+    if sched["plan_sha256"] != plan_sha256:
+        return ["the external schedule was built for a different plan (hash mismatch)"]
+    bad: list[str] = []
+    objects = plan_objects(plan)
+    if sched["objects"] != objects:
+        bad.append("the external schedule's objects are not the plan's objects in plan order")
+    for tool, body in sched["tools"].items():
+        ids = [leg["leg"] for leg in body["legs"]]
+        if not ids or len(set(ids)) != len(ids):
+            bad.append(f"{tool}: leg ids are empty or repeated")
+        for leg in body["legs"]:
+            if leg["timeout_min"] < sched["timeout_floor_min"] or leg["timeout_min"] <= leg["predicted_min"]:
+                bad.append(f"{tool} leg {leg['leg']}: timeout {leg['timeout_min']} min is below the floor or the predicted {leg['predicted_min']} min")
+        if body["chunked"]:
+            seen: dict[str, str] = {}
+            for leg in body["legs"]:
+                if not leg["objects"]:
+                    bad.append(f"{tool} leg {leg['leg']}: holds no objects")
+                for o in leg["objects"] or []:
+                    if o in seen:
+                        bad.append(f"{tool}: {o} is in legs {seen[o]} and {leg['leg']}")
+                    seen[o] = leg["leg"]
+            missing = [o for o in objects if o not in seen]
+            if missing:
+                bad.append(f"{tool}: {len(missing)} plan objects are in no leg (first: {missing[0]})")
+            extra = [o for o in seen if o not in objects]
+            if extra:
+                bad.append(f"{tool}: legs name objects outside the plan (first: {extra[0]})")
+        elif len(body["legs"]) != 1 or body["legs"][0]["objects"] is not None:
+            bad.append(f"{tool}: an unchunked tool runs one leg over every object")
     return bad
 
 
@@ -808,14 +1313,46 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--budget", required=True, type=int, help="total legs over all channels")
     p.add_argument("--legs", default="", help="fixed leg counts, e.g. python=3,c=3 (overrides the budget split)")
     p.add_argument("--heavy-min-s", type=float, default=None, help="also fan out any row whose single run costs this many seconds")
+    p.add_argument("--heavy", type=Path, help="the heavy file prep wrote: its decoupled rows go in no light leg")
     p.add_argument("--out", required=True, type=Path)
     p.add_argument("--matrix", type=Path)
+    hv = sub.add_parser("heavy")
+    hv.add_argument("--candidates", required=True, type=Path)
+    hv.add_argument("--costs", required=True, type=Path)
+    hv.add_argument("--channels", default="python,c,cli,core")
+    hv.add_argument("--heavy-min-s", type=float, default=None)
+    hv.add_argument("--out", required=True, type=Path)
+    hv.add_argument("--select-out", required=True, type=Path, help="the rows `validate run --emit-plan-rows` builds")
+    ph = sub.add_parser("pack-heavy")
+    ph.add_argument("--heavy-plan", required=True, type=Path)
+    ph.add_argument("--heavy", required=True, type=Path)
+    ph.add_argument("--costs", required=True, type=Path)
+    ph.add_argument("--channels", default="python,c,cli,core")
+    ph.add_argument("--out", required=True, type=Path)
+    ph.add_argument("--matrix", type=Path)
+    vh = sub.add_parser("validate-heavy")
+    vh.add_argument("--heavy-plan", required=True, type=Path)
+    vh.add_argument("--schedule", required=True, type=Path)
+    vh.add_argument("--costs", required=True, type=Path)
+    pe = sub.add_parser("pack-external")
+    pe.add_argument("--plan", required=True, type=Path)
+    pe.add_argument("--costs", required=True, type=Path, help="fixtures/external-costs.json")
+    pe.add_argument("--tools", default=",".join(EXTERNAL_TOOLS))
+    pe.add_argument("--target-leg-min", type=float, default=None, help="override the table's target leg wall (a rehearsal lowers it)")
+    pe.add_argument("--out", required=True, type=Path)
+    pe.add_argument("--matrix", type=Path)
+    ve = sub.add_parser("validate-external")
+    ve.add_argument("--plan", required=True, type=Path)
+    ve.add_argument("--schedule", required=True, type=Path)
     pr = sub.add_parser("pack-reference")
     pr.add_argument("--candidates", required=True, type=Path)
     pr.add_argument("--objects", required=True, type=Path)
     pr.add_argument("--costs", required=True, type=Path)
     pr.add_argument("--legs", required=True, type=int)
     pr.add_argument("--heavy-min-s", type=float, default=None)
+    pr.add_argument("--heavy", type=Path, help="the heavy file: its rows run on the heavy legs, not the light ones")
+    pr.add_argument("--heavy-out", type=Path, help="the heavy reference schedule (with --heavy)")
+    pr.add_argument("--heavy-matrix", type=Path)
     pr.add_argument("--out", required=True, type=Path)
     pr.add_argument("--matrix", type=Path)
     vr = sub.add_parser("validate-reference")
@@ -823,6 +1360,7 @@ def main(argv: list[str] | None = None) -> int:
     vr.add_argument("--objects", required=True, type=Path)
     vr.add_argument("--schedule", required=True, type=Path)
     vr.add_argument("--costs", required=True, type=Path)
+    vr.add_argument("--heavy-schedule", type=Path)
     v = sub.add_parser("validate")
     v.add_argument("--plan", required=True, type=Path)
     v.add_argument("--schedule", required=True, type=Path)
@@ -842,7 +1380,7 @@ def main(argv: list[str] | None = None) -> int:
             missing = [c for c in channels if c not in legs]
             if missing:
                 raise SystemExit(f"ERROR: --legs names no count for {', '.join(missing)}.")
-        sched, plan, table = build_schedule(args.plan, args.costs, channels, args.budget, legs, args.heavy_min_s)
+        sched, plan, table = build_schedule(args.plan, args.costs, channels, args.budget, legs, args.heavy_min_s, args.heavy)
         bad = validate(plan, sched["plan_sha256"], sched, table)
         if bad:
             raise SystemExit("ERROR: the schedule failed its own validation:\n  " + "\n  ".join(bad))
@@ -850,6 +1388,8 @@ def main(argv: list[str] | None = None) -> int:
         if args.matrix:
             write_json(leg_matrix(sched), args.matrix)
         print(f"Schedule: {len(plan)} plan rows, cost table from run {table.data.get('run_id')} -> {args.out}")
+        if sched["decoupled"]:
+            print(f"  decoupled (heavy legs from prep): {', '.join(key_str(row_key(plan[i])) for i in sched['decoupled'])}")
         print(summarize(sched))
         for ch, body in sched["channels"].items():
             if body["estimated_rows"]:
@@ -857,15 +1397,82 @@ def main(argv: list[str] | None = None) -> int:
                 for line in body["estimated_rows"][:50]:
                     print("    " + line, file=sys.stderr)
         return 0
+    if args.cmd == "heavy":
+        channels = [c.strip() for c in args.channels.split(",") if c.strip()]
+        heavy = build_heavy(args.candidates, args.costs, channels, args.heavy_min_s)
+        write_json(heavy, args.out, indent=1)
+        write_json(heavy_select_rows(heavy, load_json(args.candidates)), args.select_out)
+        if heavy["rows"]:
+            for h in heavy["rows"]:
+                print(f"Decoupled heavy row: {h['key']} (leaders: {', '.join(key_str(row_key(x)) for x in h['leaders'])})")
+        else:
+            print("No heavy propagation rows: nothing is decoupled.")
+        return 0
+    if args.cmd == "pack-heavy":
+        channels = [c.strip() for c in args.channels.split(",") if c.strip()]
+        sched, plan = build_heavy_channel_schedule(args.heavy_plan, args.heavy, args.costs, channels)
+        bad = validate_heavy_channels(plan, sched["plan_sha256"], sched, CostTable.load(args.costs))
+        if bad:
+            raise SystemExit("ERROR: the heavy channel schedule failed its own validation:\n  " + "\n  ".join(bad))
+        write_json(sched, args.out)
+        if args.matrix:
+            write_json(heavy_leg_matrix(sched), args.matrix)
+        n = sum(len(b["legs"]) for b in sched["channels"].values())
+        print(f"Heavy channel schedule: {len(sched['decoupled'])} decoupled row(s), {n} leg(s) over {', '.join(channels)} -> {args.out}")
+        for key in sched["not_emitted"]:
+            print(f"  NOTE: {key} was not emitted (an input it needs is not in the pinned snapshot); it has no channel legs.")
+        return 0
+    if args.cmd == "validate-heavy":
+        bad = validate_heavy_channels(load_json(args.heavy_plan), file_sha256(args.heavy_plan), load_json(args.schedule), CostTable.load(args.costs))
+        if bad:
+            raise SystemExit("ERROR: invalid heavy channel schedule:\n  " + "\n  ".join(bad))
+        print(f"{args.schedule}: valid")
+        return 0
+    if args.cmd == "pack-external":
+        tools = [t.strip() for t in args.tools.split(",") if t.strip()]
+        sched = build_external_schedule(args.plan, args.costs, tools, args.target_leg_min)
+        bad = validate_external(load_json(args.plan), sched["plan_sha256"], sched)
+        if bad:
+            raise SystemExit("ERROR: the external schedule failed its own validation:\n  " + "\n  ".join(bad))
+        write_json(sched, args.out)
+        if args.matrix:
+            write_json(external_leg_matrix(sched), args.matrix)
+        print(f"External schedule: {len(sched['objects'])} objects, target leg {sched['target_leg_min']} min -> {args.out}")
+        for tool, body in sched["tools"].items():
+            walls = [leg["predicted_min"] for leg in body["legs"]]
+            print(
+                f"  {tool:8s} {len(walls):3d} leg(s)  max {max(walls):6.1f} min  timeouts "
+                f"{','.join(str(leg['timeout_min']) for leg in body['legs'])} min"
+            )
+            for line in body["estimated"]:
+                print(f"    ESTIMATED: {line}", file=sys.stderr)
+        return 0
+    if args.cmd == "validate-external":
+        bad = validate_external(load_json(args.plan), file_sha256(args.plan), load_json(args.schedule))
+        if bad:
+            raise SystemExit("ERROR: invalid external schedule:\n  " + "\n  ".join(bad))
+        print(f"{args.schedule}: valid")
+        return 0
     if args.cmd == "pack-reference":
-        sched, cands, table = build_reference_schedule(args.candidates, args.objects, args.costs, args.legs, args.heavy_min_s)
+        if bool(args.heavy) != bool(args.heavy_out):
+            raise SystemExit("ERROR: --heavy and --heavy-out go together.")
+        sched, cands, table = build_reference_schedule(args.candidates, args.objects, args.costs, args.legs, args.heavy_min_s, args.heavy)
         objects = sched["objects"]
         bad = validate_reference(cands, objects, sched["candidates_sha256"], sched, table)
+        heavy_sched = None
+        if args.heavy:
+            heavy_sched = build_heavy_reference_schedule(args.candidates, args.objects, args.costs, args.heavy)
+            bad += validate_heavy_reference(cands, sched["candidates_sha256"], heavy_sched, sched)
         if bad:
             raise SystemExit("ERROR: the reference schedule failed its own validation:\n  " + "\n  ".join(bad))
         write_json(sched, args.out)
         if args.matrix:
             write_json([{"leg": leg["leg"]} for leg in sched["legs"]], args.matrix)
+        if heavy_sched is not None:
+            write_json(heavy_sched, args.heavy_out)
+            if args.heavy_matrix:
+                write_json([{"leg": leg["leg"]} for leg in heavy_sched["legs"]], args.heavy_matrix)
+            print(f"Heavy reference schedule: {len(heavy_sched['decoupled'])} decoupled row(s) on {len(heavy_sched['legs'])} leg(s) -> {args.heavy_out}")
         print(f"Reference schedule: {len(cands)} candidate rows, {len(objects)} objects, cost table from run {table.data.get('run_id')} -> {args.out}")
         print(summarize_reference(sched))
         if sched["estimated_rows"]:
@@ -878,6 +1485,10 @@ def main(argv: list[str] | None = None) -> int:
         sched = load_json(args.schedule)
         objects = [o["name"] if isinstance(o, dict) else str(o) for o in load_json(args.objects)]
         bad = validate_reference(cands, objects, file_sha256(args.candidates), sched, CostTable.load(args.costs))
+        if args.heavy_schedule:
+            bad += validate_heavy_reference(cands, file_sha256(args.candidates), load_json(args.heavy_schedule), sched)
+        elif sched.get("decoupled"):
+            bad.append("the schedule decouples rows, but no --heavy-schedule runs them")
         if bad:
             raise SystemExit("ERROR: invalid reference schedule:\n  " + "\n  ".join(bad))
         print(f"{args.schedule}: valid")

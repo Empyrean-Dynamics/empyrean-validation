@@ -314,10 +314,14 @@ setup: setup-assist setup-findorb setup-kete setup-jorbit setup-grss $(if $(WITH
 	@echo
 	@echo "External dependencies installed."
 
+# ASSIST's two ephemerides (the binary DE440 linux_p1550p2650.440 and
+# sb441-n16.bsp) come from its folder of the third-party tool set, synced under
+# $(DATA_DIR)/third-party; never downloaded.
+ASSIST_DATA_DIR ?= $(DATA_DIR)/third-party/assist
 setup-assist: $(ASSIST_VENV)/bin/python
 $(ASSIST_VENV)/bin/python:
-	@echo "──── Setting up ASSIST venv + DE440 ────────────────────"
-	@cd $(EMP_VAL_RUNNERS)/assist && ./setup.sh
+	@echo "──── Setting up ASSIST venv (ephemerides from the third-party set) ─"
+	@cd $(EMP_VAL_RUNNERS)/assist && ./setup.sh "$(ASSIST_DATA_DIR)"
 
 setup-findorb: $(FO_BIN)
 $(FO_BIN):
@@ -756,6 +760,27 @@ REFERENCE_CANDIDATES := $(RESULTS_DIR)/reference-candidates.json
 REFERENCE_SCHEDULE := $(RESULTS_DIR)/reference-schedule.json
 REFERENCE_LEG_MATRIX := $(RESULTS_DIR)/reference-leg-matrix.json
 REFERENCE_LEG_BUDGET ?= 16
+# The heavy propagation rows (the cost table marks them; HEAVY_MIN_S adds any
+# row whose single timing run costs that much in any channel) are DECOUPLED:
+# they run on legs of their own from prep, in parallel with the light reference
+# (scripts/schedule.py, "heavy decoupling"). prep writes the heavy file, builds
+# their plan rows with no engine call (`validate run --emit-plan-rows`), and
+# schedules their rust replicas (the heavy reference schedule) and their channel
+# replicas (the heavy channel schedule, over the heavy plan).
+HEAVY := $(RESULTS_DIR)/heavy.json
+HEAVY_SELECT := $(RESULTS_DIR)/heavy-select.json
+HEAVY_PLAN := $(RESULTS_DIR)/heavy-plan.json
+REFERENCE_HEAVY_SCHEDULE := $(RESULTS_DIR)/reference-heavy-schedule.json
+REFERENCE_HEAVY_LEG_MATRIX := $(RESULTS_DIR)/reference-heavy-leg-matrix.json
+HEAVY_SCHEDULE := $(RESULTS_DIR)/schedule-heavy.json
+HEAVY_LEG_MATRIX := $(RESULTS_DIR)/heavy-leg-matrix.json
+# The schedule a reference leg reads its rows from: the light one, or the heavy
+# one for a reference-heavy leg (LEG=h01 ...).
+REFERENCE_LEG_SCHEDULE ?= $(REFERENCE_SCHEDULE)
+# The decoupled rows the final assemble found the engine refused after the plan
+# was published; reduce discards them from every channel and external.
+HEAVY_DROPPED := $(RESULTS_DIR)/validation_rust_heavy_dropped.json
+PLAN_FINAL := $(RESULTS_DIR)/validation_plan.final.json
 
 .PHONY: list-reference-rows schedule-reference
 list-reference-rows: $(RUST_BIN)
@@ -771,10 +796,23 @@ print(f'Wrote {len(d)} candidate reference rows to $(REFERENCE_CANDIDATES)')"
 # leg matrix, prints each leg's predicted wall, names every row the cost table
 # does not know.
 schedule-reference: $(OBJECTS_JSON) list-reference-rows
+	@echo "──── Heavy rows: decouple them and emit their plan rows ─"
+	@python3 $(ROOT)/scripts/schedule.py heavy --candidates $(REFERENCE_CANDIDATES) --costs $(COSTS) \
+	    --channels $(SCHEDULED_CHANNELS) $(HEAVY_FLAG) --out $(HEAVY) --select-out $(HEAVY_SELECT)
+	@if [ "$$(python3 -c "import json;print(len(json.load(open('$(HEAVY_SELECT)'))))")" != "0" ]; then \
+	    $(DYLD) $(RUST_BIN) run --select $(HEAVY_SELECT) --emit-plan-rows $(ONLY_FLAG) --tiers $(TIERS) \
+	        --data-dir $(DATA_DIR) --cache-dir $(CACHE_DIR) --output $(HEAVY_PLAN) || exit 1; \
+	else \
+	    echo "[]" > $(HEAVY_PLAN); echo "[]" > $(HEAVY_PLAN).dropped.json; \
+	fi
 	@echo "──── Schedule: pack the reference into cost-balanced legs ───"
 	@python3 $(ROOT)/scripts/schedule.py pack-reference --candidates $(REFERENCE_CANDIDATES) \
 	    --objects $(OBJECTS_JSON) --costs $(COSTS) --legs $(REFERENCE_LEG_BUDGET) $(HEAVY_FLAG) \
+	    --heavy $(HEAVY) --heavy-out $(REFERENCE_HEAVY_SCHEDULE) --heavy-matrix $(REFERENCE_HEAVY_LEG_MATRIX) \
 	    --out $(REFERENCE_SCHEDULE) --matrix $(REFERENCE_LEG_MATRIX)
+	@echo "──── Schedule: the heavy rows' channel replicas ────────"
+	@python3 $(ROOT)/scripts/schedule.py pack-heavy --heavy-plan $(HEAVY_PLAN) --heavy $(HEAVY) \
+	    --costs $(COSTS) --channels $(SCHEDULED_CHANNELS) --out $(HEAVY_SCHEDULE) --matrix $(HEAVY_LEG_MATRIX)
 
 # One reference leg. LEG is the leg id from $(REFERENCE_SCHEDULE).
 #
@@ -787,7 +825,7 @@ shard-reference: $(RUST_BIN) $(EMP_VAL_BIN) | fixtures
 	@test -n "$(LEG)" || { echo "ERROR: shard-reference needs LEG=<leg id> (see $(REFERENCE_SCHEDULE))."; exit 1; }
 	@mkdir -p $(SHARD_DIR)/$(LEG)
 	@python3 $(ROOT)/scripts/reference-legs.py select --candidates $(REFERENCE_CANDIDATES) \
-	    --schedule $(REFERENCE_SCHEDULE) --leg "$(LEG)" \
+	    --schedule $(REFERENCE_LEG_SCHEDULE) --leg "$(LEG)" \
 	    --rows-out $(SHARD_DIR)/$(LEG)/leg.rows.json --reps-out $(SHARD_DIR)/$(LEG)/leg.reps.json \
 	    --objects-out $(SHARD_DIR)/$(LEG)/leg.objects
 	@if [ -s $(SHARD_DIR)/$(LEG)/leg.rows.json ]; then \
@@ -822,16 +860,36 @@ shard-reference: $(RUST_BIN) $(EMP_VAL_BIN) | fixtures
 # $(RUST) merge + strip-plan rules take over unchanged (scripts/assemble-reference.py
 # says what it checks: every candidate row a result or named as dropped by the leg
 # that ran it, replicas folded, every object's OD run delivered once).
+#
+# Two steps since the heavy rows decoupled. `assemble-reference` (the assemble
+# job) takes the decoupled rows from the plan rows prep emitted for them: the
+# reference it writes is provisional and exists to be stripped into the plan the
+# channels and externals replay while the heavy legs still run. `assemble-final`
+# (the assemble-final job) takes them from the heavy reference legs, writes the
+# canonical reference, strips it and checks the strip equals the published plan
+# apart from the timestamp, failing closed by row and field; a decoupled row the
+# engine refused goes to $(HEAVY_DROPPED).
+ASSEMBLE_LEGS = --schedule $(REFERENCE_SCHEDULE) --candidates $(REFERENCE_CANDIDATES) --legs-dir $(SHARD_DIR) \
+    --out-propeph $(RUST_PROPEPH) --out-od $(RUST_OD) --out-orbits $(RUST_OD_ORBITS) \
+    --out-compare $(RUST_OD_COMPARE) --out-unified $(RUST) \
+    --out-dropped $(RESULTS_DIR)/validation_rust_dropped.json
 assemble-reference:
-	@echo "──── Reference: reassemble the legs ────────────────────"
+	@echo "──── Reference: reassemble the light legs (decoupled rows from their emitted plan rows) ─"
 	@mkdir -p $(SHARD_DIR)
-	@python3 $(ROOT)/scripts/assemble-reference.py --schedule $(REFERENCE_SCHEDULE) \
-	    --candidates $(REFERENCE_CANDIDATES) --legs-dir $(SHARD_DIR) \
-	    --out-propeph $(RUST_PROPEPH) --out-od $(RUST_OD) --out-orbits $(RUST_OD_ORBITS) \
-	    --out-compare $(RUST_OD_COMPARE) --out-unified $(RUST) \
-	    --out-dropped $(RESULTS_DIR)/validation_rust_dropped.json
+	@python3 $(ROOT)/scripts/assemble-reference.py $(ASSEMBLE_LEGS) \
+	    $(if $(wildcard $(HEAVY)),--decoupled-plan $(HEAVY_PLAN) --heavy $(HEAVY),)
 
-.PHONY: list-objects shard-reference assemble-reference lint-workflows
+assemble-final:
+	@echo "──── Reference: reassemble every leg, heavy legs included ─"
+	@mkdir -p $(SHARD_DIR)
+	@python3 $(ROOT)/scripts/assemble-reference.py $(ASSEMBLE_LEGS) \
+	    --heavy-schedule $(REFERENCE_HEAVY_SCHEDULE)
+	@$(EMP_VAL_BIN) strip-plan --input $(RUST) --output $(PLAN_FINAL)
+	@python3 $(ROOT)/scripts/assemble-reference.py check-final --published $(PLAN) --final $(PLAN_FINAL) \
+	    --heavy $(HEAVY) --dropped $(RESULTS_DIR)/validation_rust_dropped.json \
+	    --out-heavy-dropped $(HEAVY_DROPPED)
+
+.PHONY: list-objects shard-reference assemble-reference assemble-final lint-workflows
 
 # Mint a validation inputs snapshot LOCALLY into a scratch tree, no upload:
 # the one online path (.github/workflows/mint-inputs.yml) by hand, minus the
@@ -942,6 +1000,25 @@ print("  plan OD rows: " + ", ".join(f"{n} {t}" for t, n in sorted(c.items())))
 endef
 export ASSERT_PLAN_HAS_OD
 
+# A heavy leg (empyrean-heavy) replays the HEAVY plan: the emitted plan rows of
+# the decoupled rows and their warm-up leaders, every one a propagation row. It
+# holds no OD row by construction, so it is checked for what it is instead.
+define ASSERT_HEAVY_PLAN
+import json, sys
+
+path = sys.argv[1]
+rows = json.load(open(path))
+if not rows:
+    sys.exit(f"ERROR: {path} is empty: a heavy leg has nothing to replay.")
+bad = sorted({r.get("test_type") for r in rows} - {"propagation"})
+if bad:
+    sys.exit(f"ERROR: {path} holds {bad} rows; the heavy plan holds propagation rows only.")
+print(f"  heavy plan: {len(rows)} propagation rows")
+endef
+export ASSERT_HEAVY_PLAN
+# `full` (the plan assemble published) or `heavy` (the heavy plan prep emitted).
+PLAN_KIND ?= full
+
 plan: $(PLAN) check-plan
 ifeq ($(PLAN_PREBUILT),1)
 # Matrix-CI replay/external leg: the plan was produced by the prep job and
@@ -963,7 +1040,13 @@ endif
 # python3 rather than $(WHEEL_PY) because the external legs carry no
 # wheel venv.
 check-plan: $(PLAN)
+ifeq ($(PLAN_KIND),heavy)
+	@python3 -c "$$ASSERT_HEAVY_PLAN" $(PLAN)
+else ifeq ($(PLAN_KIND),full)
 	@python3 -c "$$ASSERT_PLAN_HAS_OD" $(PLAN) $(OD_TEST_TYPES)
+else
+	@echo "ERROR: PLAN_KIND=$(PLAN_KIND) is neither full nor heavy."; exit 1
+endif
 
 # One channel leg's rows of the prebuilt plan (see channel_plan).
 #
@@ -993,7 +1076,29 @@ schedule: $(PLAN) check-plan
 	@echo "──── Schedule: pack the plan into cost-balanced legs ────"
 	@python3 $(ROOT)/scripts/schedule.py pack --plan $(PLAN) --costs $(COSTS) \
 	    --channels $(SCHEDULED_CHANNELS) --budget $(CHANNEL_LEG_BUDGET) $(HEAVY_FLAG) \
+	    $(if $(wildcard $(HEAVY)),--heavy $(HEAVY),) \
 	    --out $(SCHEDULE) --matrix $(LEG_MATRIX)
+
+# The external legs (S7): one leg per tool, or, for a tool the external cost
+# table prices per object (jorbit, OrbFit), object legs packed longest object
+# first so no leg replays the whole catalog, each with a timeout sized to its
+# predicted wall (scripts/schedule.py pack-external). EXTERNAL_TOOLS names the
+# tools that run; EXTERNAL_LEG_TARGET_MIN overrides the table's target leg wall
+# (a rehearsal lowers it to cut two objects into two legs).
+EXTERNAL_COSTS := $(ROOT)/fixtures/external-costs.json
+EXTERNAL_SCHEDULE ?= $(RESULTS_DIR)/external-schedule.json
+EXTERNAL_LEG_MATRIX := $(RESULTS_DIR)/external-leg-matrix.json
+EXTERNAL_TOOLS ?= assist,findorb,kete,jorbit,layup,orbfit,grss
+EXTERNAL_LEG_TARGET_MIN ?=
+# One external leg's id in $(EXTERNAL_SCHEDULE); empty runs the tool over the
+# whole plan, as before the chunking.
+EXT_LEG ?=
+.PHONY: schedule-external
+schedule-external: $(PLAN) check-plan
+	@echo "──── Schedule: the external legs ───────────────────────"
+	@python3 $(ROOT)/scripts/schedule.py pack-external --plan $(PLAN) --costs $(EXTERNAL_COSTS) \
+	    --tools $(EXTERNAL_TOOLS) $(if $(EXTERNAL_LEG_TARGET_MIN),--target-leg-min $(EXTERNAL_LEG_TARGET_MIN),) \
+	    --out $(EXTERNAL_SCHEDULE) --matrix $(EXTERNAL_LEG_MATRIX)
 
 # Rebuild the committed cost table from a named run's results: FROM is a
 # directory holding that run's validation_plan.json, validation_rust.json and
@@ -1034,7 +1139,7 @@ run-assist: $(PLAN) check-plan $(ASSIST_PY)
 	@$(ASSIST_PY) $(EMP_VAL_RUNNERS)/assist/run_assist.py $(PLAN) \
 	    --output $(ASSIST_OUT) \
 	    --horizons-cache $(CACHE_DIR)/horizons \
-	    --data-dir $(DATA_DIR)
+	    --data-dir $(ASSIST_DATA_DIR)
 
 # find_orb's build fails loudly (see findorb/setup.sh), and a missing binary
 # at RUN time is a failure too, not a skip. This used to
@@ -1045,6 +1150,8 @@ run-assist: $(PLAN) check-plan $(ASSIST_PY)
 # reduce then omits find_orb honestly.
 # fo asserts without ~/.find_orb (miscell.cpp); a cached build restores the
 # binary but not $HOME, so the config dir is installed here when missing.
+# find_orb's binary DE440 comes from its folder of the third-party tool set.
+FINDORB_DATA_DIR ?= $(DATA_DIR)/third-party/findorb
 run-findorb: $(ASSIST_PY) check-plan fixtures
 	@test -f "$(HOME)/.find_orb/cospar.txt" || { \
 	    echo "──── Installing find_orb config directory (cached build) ───"; \
@@ -1054,14 +1161,21 @@ run-findorb: $(ASSIST_PY) check-plan fixtures
 	    echo "       Build it with: make setup-findorb"; \
 	    echo "       (An empty result file would report 'find_orb compared nothing' as a pass.)"; \
 	    exit 1; }
+	@# find_orb links its binary DE440 only when the file is there and otherwise
+	@# runs without it, so its absence is refused here rather than discovered in
+	@# the residuals.
+	@test -s "$(FINDORB_DATA_DIR)/linux_p1550p2650.440" || { \
+	    echo "ERROR: $(FINDORB_DATA_DIR)/linux_p1550p2650.440 is missing: find_orb's DE440 comes from"; \
+	    echo "       the findorb/ folder of the third-party tool set (synced under $(DATA_DIR)/third-party)."; \
+	    exit 1; }
 	@echo "──── find_orb: external OD reference ───────────────────"
 	@$(ASSIST_PY) $(EMP_VAL_RUNNERS)/findorb/run_findorb.py $(FIXTURES_PSV) \
 	    --output $(FINDORB_OUT) --fo-binary $(FO_BIN) \
-	    --data-dir $(DATA_DIR) --plan $(PLAN)
+	    --data-dir $(FINDORB_DATA_DIR) --plan $(PLAN)
 	@echo "──── find_orb: radar-augmented OD reference (psv-radar) ─"
 	@$(ASSIST_PY) $(EMP_VAL_RUNNERS)/findorb/run_findorb.py $(FIXTURES_PSV_RADAR) \
 	    --output $(FINDORB_RADAR_OUT) --fo-binary $(FO_BIN) \
-	    --data-dir $(DATA_DIR) --test-type orbit_determination_radar
+	    --data-dir $(FINDORB_DATA_DIR) --test-type orbit_determination_radar
 
 # ── OpenOrb (oorb) external comparison — propagation + ephemeris ─
 # Independent Fortran implementation (Granvik et al., University of
@@ -1098,10 +1212,20 @@ setup-orbfit:
 	@cd $(EMP_VAL_RUNNERS)/orbfit && ./setup.sh
 
 run-orbfit: $(ORBFIT_OUT)
+# EXT_LEG runs one object leg of the external schedule; its "every object
+# failed" verdict is then taken over the merged legs (channel-chunks.py
+# concat-external), so a leg whose few objects all fail does not hide the rest.
 $(ORBFIT_OUT): $(PLAN) | check-plan fixtures
 	@echo "──── OrbFit: external OD reference (neofit2.x via docker) ──"
-	@$(EMP_VAL_RUNNERS)/orbfit/run_orbfit.py \
-	    --plan $(PLAN) --output $(ORBFIT_OUT) --psv-dir $(FIXTURES_PSV)
+	@set --; \
+	if [ -n "$(EXT_LEG)" ]; then \
+	    only="$$(python3 $(ROOT)/scripts/channel-chunks.py external-objects --plan $(PLAN) \
+	        --schedule $(EXTERNAL_SCHEDULE) --tool orbfit --leg "$(EXT_LEG)")" || exit 1; \
+	    set -- --defer-all-failed; \
+	    if [ -n "$$only" ]; then echo "  leg $(EXT_LEG): $$only"; set -- --defer-all-failed --only "$$only"; fi; \
+	fi; \
+	$(EMP_VAL_RUNNERS)/orbfit/run_orbfit.py \
+	    --plan $(PLAN) --output $(ORBFIT_OUT) --psv-dir $(FIXTURES_PSV) "$$@"
 
 # Optional: empyrean-core direct (no FFI). Replays the plan in-process so
 # the report's Section 09 can show binding-translation drift (rust wrapper
@@ -1173,10 +1297,13 @@ $(KETE_OUT): $(PLAN) $(KETE_PY) | check-plan fixtures
 GRSS_VENV := $(EMP_VAL_RUNNERS)/grss/.venv
 GRSS_PY := $(GRSS_VENV)/bin/python
 
+# GRSS's seven SPICE kernels come from its folder of the third-party tool set,
+# synced under $(DATA_DIR)/third-party; none is downloaded.
+GRSS_DATA_DIR ?= $(DATA_DIR)/third-party/grss
 setup-grss: $(GRSS_PY)
 $(GRSS_PY):
 	@echo "──── Setting up grss venv + SPICE kernels ──────────────"
-	@cd $(EMP_VAL_RUNNERS)/grss && DATA_DIR="$(DATA_DIR)" ./setup.sh
+	@cd $(EMP_VAL_RUNNERS)/grss && GRSS_DATA_DIR="$(GRSS_DATA_DIR)" ./setup.sh
 
 run-grss: $(GRSS_OUT)
 # find_orb's and layup's RUN-time rule (the venv BUILD stays optional): a
@@ -1214,10 +1341,19 @@ $(JORBIT_PY):
 	@cd $(EMP_VAL_RUNNERS)/jorbit && DATA_DIR="$(DATA_DIR)" ./setup.sh
 
 run-jorbit: $(JORBIT_OUT)
+# EXT_LEG runs one object leg of the external schedule (`--only` its objects);
+# jorbit still reads the whole plan, so its geocentre ephemeris spans every
+# geocentric row exactly as an unchunked run's does.
 $(JORBIT_OUT): $(PLAN) $(JORBIT_PY) | check-plan
 	@echo "──── jorbit: external (opt-in) reference ───────────────"
-	@$(JORBIT_PY) $(EMP_VAL_RUNNERS)/jorbit/run_jorbit.py \
-	    --input $(PLAN) --output $(JORBIT_OUT) --data-dir $(DATA_DIR)
+	@set --; \
+	if [ -n "$(EXT_LEG)" ]; then \
+	    only="$$(python3 $(ROOT)/scripts/channel-chunks.py external-objects --plan $(PLAN) \
+	        --schedule $(EXTERNAL_SCHEDULE) --tool jorbit --leg "$(EXT_LEG)")" || exit 1; \
+	    if [ -n "$$only" ]; then echo "  leg $(EXT_LEG): $$only"; set -- --only "$$only"; fi; \
+	fi; \
+	$(JORBIT_PY) $(EMP_VAL_RUNNERS)/jorbit/run_jorbit.py \
+	    --input $(PLAN) --output $(JORBIT_OUT) --data-dir $(DATA_DIR) "$$@"
 
 # ── layup (opt-in external OD reference) ─────────────────────
 # MIT-licensed, ASSIST-backed orbit fitter (Smithsonian / CfA; Matthew
@@ -1352,6 +1488,9 @@ reduce: build-empyrean-validation
 	            echo "  NOTE $$1 — marked DISABLED ($$3) yet $$2 IS staged; folding it in anyway. Someone re-enabled the leg without clearing the note."; \
 	        fi; \
 	        flags="$$flags $$1 $$2"; \
+	    elif [ -f "$$2.absent" ]; then \
+	        echo "  skip $$1 — NOT MERGED from its legs: $$(head -1 "$$2.absent")"; \
+	        printf '%s=%s\n' "$${1#--}" "its legs could not be merged into one file: $$(head -1 "$$2.absent")" >> "$(RESULTS_DIR)/comparators-absent.txt"; \
 	    elif [ -n "$$3" ]; then \
 	        echo "  skip $$1 — DISABLED by decision: $$3"; \
 	    else \

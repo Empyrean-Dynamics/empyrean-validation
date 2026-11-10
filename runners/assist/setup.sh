@@ -1,17 +1,22 @@
 #!/usr/bin/env bash
 # Setup ASSIST comparison environment.
 #
-# Creates a Python virtual environment with rebound + ASSIST and downloads
-# the required ASSIST ephemeris data files.
+# Creates a Python virtual environment with rebound + ASSIST and checks the two
+# ephemeris files ASSIST reads are present in its folder of the third-party
+# tool set (dataset third-party-tools-*, folder `assist/`, synced by the suite
+# under $DATA_DIR/third-party). Nothing is downloaded: the planets file
+# (linux_p1550p2650.440) and the asteroid file (sb441-n16.bsp) come only from
+# that folder, and a missing one is a hard stop naming the set.
 #
 # Usage:
-#   ./scripts/assist/setup.sh [--data-dir DIR]
+#   ./runners/assist/setup.sh [ASSIST_DATA_DIR]
 #
-# Default data directory: ~/.empyrean/data/
+# Default ASSIST_DATA_DIR: $EMPYREAN_DATA_DIR/third-party/assist
+# (or ~/.empyrean/data/third-party/assist).
 
 set -euo pipefail
 
-DATA_DIR="${1:-${EMPYREAN_DATA_DIR:-$HOME/.empyrean/data}}"
+DATA_DIR="${1:-${EMPYREAN_DATA_DIR:-$HOME/.empyrean/data}/third-party/assist}"
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 VENV_DIR="$SCRIPT_DIR/.venv"
 
@@ -47,26 +52,22 @@ echo "Installing dependencies..."
 python -m pip install --upgrade pip >/dev/null
 python -m pip install "rebound==4.6.0" "assist==1.2.3" "numpy>=1.24,<3"
 
-# ── Download ASSIST ephemeris data ──────────────────────
-mkdir -p "$DATA_DIR"
-
+# ── ASSIST ephemeris data, from the third-party tool set ─
+# The assist/ folder lists every file ASSIST reads. Never downloaded: a missing
+# or empty file is a stop, so a run can never use a planets file the pinned set
+# does not carry.
 PLANETS_FILE="$DATA_DIR/linux_p1550p2650.440"
 ASTEROIDS_FILE="$DATA_DIR/sb441-n16.bsp"
-
-if [ ! -f "$PLANETS_FILE" ]; then
-    echo "Downloading ASSIST planets ephemeris (~100 MB)..."
-    curl -L -o "$PLANETS_FILE" \
-        "https://ssd.jpl.nasa.gov/ftp/eph/planets/Linux/de440/linux_p1550p2650.440"
-else
-    echo "Planets ephemeris: already present"
-fi
-
-if [ ! -f "$ASTEROIDS_FILE" ]; then
-    echo "SB441 asteroid ephemeris should already be in $DATA_DIR from empyrean init"
-    echo "If not, run: empyrean init"
-else
-    echo "Asteroid ephemeris: already present"
-fi
+for f in "$PLANETS_FILE" "$ASTEROIDS_FILE"; do
+    if [ ! -s "$f" ]; then
+        echo "ERROR: $f is missing or empty." >&2
+        echo "       ASSIST reads its ephemerides from the assist/ folder of the third-party" >&2
+        echo "       tool set (synced by CI prep into \$DATA_DIR/third-party). Sync the set," >&2
+        echo "       or pass its assist/ folder as the first argument. Nothing is downloaded." >&2
+        exit 1
+    fi
+    echo "  $(basename "$f"): present ($(wc -c < "$f" | tr -d ' ') bytes, third-party set)"
+done
 
 echo
 echo "Setup complete. Run ASSIST comparison with:"
