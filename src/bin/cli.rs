@@ -1471,6 +1471,9 @@ fn merge_layup(
         r.layup_reduced_chi2 = f["layup_reduced_chi2"].as_f64();
         r.layup_n_obs_used = f["layup_n_obs_used"].as_u64().map(|v| v as u32);
         r.layup_converged = f["layup_converged"].as_bool();
+        r.layup_flag = f["layup_flag"].as_i64().map(|v| v as i32);
+        r.layup_flag_name = f["layup_flag_name"].as_str().map(str::to_string);
+        r.layup_flag_meaning = f["layup_flag_meaning"].as_str().map(str::to_string);
         r.layup_time_ms = f["layup_time_ms"].as_f64();
         n += 1;
     }
@@ -3665,7 +3668,9 @@ mod tests {
             f,
             r#"[{{"object":"Eros","test_type":"orbit_determination",
                  "layup_chi2":10.5,"layup_reduced_chi2":1.05,
-                 "layup_n_obs_used":512,"layup_converged":true,
+                 "layup_n_obs_used":512,"layup_converged":false,
+                 "layup_flag":3,"layup_flag_name":"FLAG_NO_ROOT_CONVERGED",
+                 "layup_flag_meaning":"none converged",
                  "layup_time_ms":42.0}}]"#
         )
         .unwrap();
@@ -3677,7 +3682,13 @@ mod tests {
         assert_eq!(od.layup_chi2, Some(10.5));
         assert_eq!(od.layup_reduced_chi2, Some(1.05));
         assert_eq!(od.layup_n_obs_used, Some(512));
-        assert_eq!(od.layup_converged, Some(true));
+        assert_eq!(od.layup_converged, Some(false));
+        assert_eq!(od.layup_flag, Some(3));
+        assert_eq!(
+            od.layup_flag_name.as_deref(),
+            Some("FLAG_NO_ROOT_CONVERGED")
+        );
+        assert_eq!(od.layup_flag_meaning.as_deref(), Some("none converged"));
         assert_eq!(od.layup_time_ms, Some(42.0));
 
         // Propagation row for the same object stays clear.

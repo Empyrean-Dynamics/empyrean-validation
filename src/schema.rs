@@ -1140,6 +1140,18 @@ pub struct ValidationResult {
     /// (`flag == 0` in the orbitfit output). Comparable to `od_converged`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub layup_converged: Option<bool>,
+    /// layup's raw `flag` for the fit (0 converged; see `layup_flag_name`). The
+    /// whole-arc `layup_chi2` is meaningful only for the flags that say a fit of the
+    /// arc converged (0, 2, 6, 9); for any other flag it is a failed candidate's.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub layup_flag: Option<i32>,
+    /// layup's own constant name for `layup_flag` (`FLAG_NO_ROOT_CONVERGED`), looked
+    /// up in the installed package by the runner.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub layup_flag_name: Option<String>,
+    /// One line on what `layup_flag` means, from layup's source comments.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub layup_flag_meaning: Option<String>,
     /// layup wall-clock per fit (ms). This is cold-subprocess time (one
     /// `layup-orbitfit` process per object), so it is dominated by layup's
     /// per-process startup — import/JIT/SPICE-kernel/ASSIST init — not the
@@ -1341,7 +1353,38 @@ pub struct ValidationResult {
     pub notes: String,
 }
 
+/// The layup `flag` values that say a fit of the whole arc converged: 0, and the
+/// converged-with-a-warning 2 (reduced chi-square above threshold), 6 (degenerate
+/// covariance) and 9 (implausible orbit). For any other flag the chi-square layup
+/// writes is a failed candidate's on the primary interval, not a fit of the arc.
+pub const LAYUP_WHOLE_ARC_FIT_FLAGS: [i32; 4] = [0, 2, 6, 9];
+
 impl ValidationResult {
+    /// Whether layup's chi-square on this row is a fit of the whole arc. A row
+    /// carrying layup's flag answers by [`LAYUP_WHOLE_ARC_FIT_FLAGS`]; a row from
+    /// before the flag was recorded is a fit unless layup said it did not converge.
+    #[must_use]
+    pub fn layup_chi2_is_a_fit(&self) -> bool {
+        match self.layup_flag {
+            Some(f) => LAYUP_WHOLE_ARC_FIT_FLAGS.contains(&f),
+            None => self.layup_converged != Some(false),
+        }
+    }
+
+    /// layup's chi-square as the report presents it: the number only where the flag
+    /// says a fit of the whole arc converged, otherwise `None`.
+    #[must_use]
+    pub fn layup_chi2_shown(&self) -> Option<f64> {
+        self.layup_chi2.filter(|_| self.layup_chi2_is_a_fit())
+    }
+
+    /// layup's reduced chi-square under the same rule as [`Self::layup_chi2_shown`].
+    #[must_use]
+    pub fn layup_reduced_chi2_shown(&self) -> Option<f64> {
+        self.layup_reduced_chi2
+            .filter(|_| self.layup_chi2_is_a_fit())
+    }
+
     /// Construct a row with all `Option` fields set to `None` and
     /// `Vec` fields empty. Convenient for tests; production code should
     /// use the channel-specific runner builders that fill in test
@@ -1480,6 +1523,9 @@ impl ValidationResult {
             layup_reduced_chi2: None,
             layup_n_obs_used: None,
             layup_converged: None,
+            layup_flag: None,
+            layup_flag_name: None,
+            layup_flag_meaning: None,
             layup_time_ms: None,
             adam_core_vs_horizons_km: None,
             adam_core_separation_arcsec: None,
@@ -1976,6 +2022,9 @@ mod tests {
             "layup_reduced_chi2",
             "layup_n_obs_used",
             "layup_converged",
+            "layup_flag",
+            "layup_flag_name",
+            "layup_flag_meaning",
             "layup_time_ms",
         ] {
             assert!(!s_none.contains(key), "{key} must be omitted when None");
@@ -1987,6 +2036,9 @@ mod tests {
         r.layup_reduced_chi2 = Some(1.03);
         r.layup_n_obs_used = Some(4135);
         r.layup_converged = Some(true);
+        r.layup_flag = Some(3);
+        r.layup_flag_name = Some("FLAG_NO_ROOT_CONVERGED".into());
+        r.layup_flag_meaning = Some("none converged".into());
         r.layup_time_ms = Some(1234.5);
         let s = serde_json::to_string(&r).unwrap();
         assert!(s.contains("layup_chi2"));

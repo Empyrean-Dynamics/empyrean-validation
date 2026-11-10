@@ -4398,12 +4398,38 @@ fn findorb_convergence_cell(r: &ValidationResult) -> ConvergenceCell {
     ConvergenceCell::Converged { iterations: None }
 }
 
+/// What the convergence cell says about layup's own flag: number, name and meaning
+/// as the runner recorded them, never a number the report derived.
+fn layup_flag_text(r: &ValidationResult) -> String {
+    match (r.layup_flag, &r.layup_flag_name, &r.layup_flag_meaning) {
+        (Some(f), Some(name), Some(meaning)) => format!("layup flag {f}, {name}: {meaning}"),
+        (Some(f), _, _) => format!(
+            "layup flag {f} (the row carries no name or meaning for it; re-run the layup runner)"
+        ),
+        (None, _, _) => "layup's orbitfit returned flag \u{2260} 0 (the row carries no flag \
+                         value; re-run the layup runner)"
+            .to_string(),
+    }
+}
+
 fn layup_convergence_cell(r: &ValidationResult) -> ConvergenceCell {
     match r.layup_converged {
         Some(true) => ConvergenceCell::Converged { iterations: None },
-        Some(false) => ConvergenceCell::NotConverged {
-            reason: Some("layup's orbitfit returned flag ≠ 0".to_string()),
-        },
+        Some(false) => {
+            let tail = if r.layup_chi2_is_a_fit() {
+                match r.layup_reduced_chi2 {
+                    Some(c) => format!("; a fit of the whole arc, reduced \u{3c7}\u{b2} {c:.4}"),
+                    None => "; a fit of the whole arc".to_string(),
+                }
+            } else {
+                "; no fit of the arc, so no \u{3c7}\u{b2} is shown (the one the row holds is a failed \
+                 candidate's)"
+                    .to_string()
+            };
+            ConvergenceCell::NotConverged {
+                reason: Some(format!("{}{tail}", layup_flag_text(r))),
+            }
+        }
         None => {
             let produced = r.layup_chi2.is_some()
                 || r.layup_reduced_chi2.is_some()
@@ -9991,7 +10017,7 @@ pub fn generate_report(
                 r.channel == "core"
                     && (r.findorb_rms_residual.is_some()
                         || r.orbfit_rms_arcsec.is_some()
-                        || r.layup_reduced_chi2.is_some()
+                        || r.layup_reduced_chi2_shown().is_some()
                         || r.adam_core_reduced_chi2.is_some()
                         || r.grss_rms_arcsec.is_some()
                         || r.ref_od_reduced_chi2.is_some())
@@ -10845,6 +10871,11 @@ const TOOL_AXES = {{
 // Filled by boot() once the dataset is present; hasAxis() reads it and every
 // caller of hasAxis runs only from a boot-registered renderer.
 let TOOL_AXIS_DATA = {{}};
+// layup's chi-square is a fit of the whole arc only where its flag says one converged
+// (0, or the converged-with-a-warning 2, 6, 9); for any other flag it is a failed
+// candidate's. A row from before the flag was recorded counts unless layup said it
+// did not converge. Mirrors ValidationResult::layup_chi2_is_a_fit.
+function layupFitOfArc(r) {{ return r.layup_flag != null ? [0, 2, 6, 9].includes(r.layup_flag) : r.layup_converged !== false; }}
 function computeToolAxisData() {{
     const has = {{}};
     const mark = (t, ax) => {{ (has[t] = has[t] || new Set()).add(ax); }};
@@ -10862,7 +10893,7 @@ function computeToolAxisData() {{
         if (r.n_obs_used != null) mark('empyrean', 'od_nobs');
         if (r.findorb_rms_residual != null) {{ mark('findorb', 'od_rms'); mark('findorb', 'od_nobs'); }}
         if (r.orbfit_rms_arcsec != null) {{ mark('orbfit', 'od_rms'); mark('orbfit', 'od_nobs'); }}
-        if (r.layup_reduced_chi2 != null) mark('layup', 'od_chi2');
+        if (layupFitOfArc(r) && r.layup_reduced_chi2 != null) mark('layup', 'od_chi2');
         if (r.layup_n_obs_used != null) mark('layup', 'od_nobs');
         if (r.findorb_vs_horizons_km != null) {{ mark('findorb', 'prop_pos'); mark('jpl', 'prop_pos'); }}
         if (r.emp_vs_findorb_km != null) {{ mark('findorb', 'prop_pos'); mark('empyrean', 'prop_pos'); }}
@@ -10923,7 +10954,7 @@ function ephSepArcsec(row, t1, t2) {{
 // Per-tool absolute scalars.
 function toolTimeMs(row, tool) {{ return ({{ empyrean: row.emp_time_ms, assist: row.assist_time_ms, oorb: row.oorb_time_ms, grss: row.grss_time_ms }})[tool] ?? null; }}
 function odRms(row, tool) {{ return ({{ empyrean: row.od_rms_combined_arcsec, findorb: row.findorb_rms_residual, orbfit: row.orbfit_rms_arcsec, grss: row.grss_rms_arcsec }})[tool] ?? null; }}
-function odReducedChi2(row, tool) {{ return ({{ empyrean: row.od_reduced_chi2, layup: row.layup_reduced_chi2, jpl: row.ref_od_reduced_chi2, grss: row.grss_reduced_chi2 }})[tool] ?? null; }}
+function odReducedChi2(row, tool) {{ return ({{ empyrean: row.od_reduced_chi2, layup: layupFitOfArc(row) ? row.layup_reduced_chi2 : null, jpl: row.ref_od_reduced_chi2, grss: row.grss_reduced_chi2 }})[tool] ?? null; }}
 function odNobs(row, tool) {{ return ({{ empyrean: row.n_obs_used, findorb: row.findorb_n_obs_used, orbfit: row.orbfit_n_obs_used, layup: row.layup_n_obs_used, jpl: row.ref_od_n_obs_used, grss: row.grss_n_obs_used }})[tool] ?? null; }}
 
 // ── Mahalanobis (uncertainty-unit) offsets ──────────────────────────────
@@ -13805,6 +13836,12 @@ mod tests {
         assert!(
             expected.contains("layup_reduced_chi2"),
             "layup fields absent from the dataset",
+        );
+        // The page scripts read layup's chi-square only through the flag gate.
+        assert!(
+            html.contains("layupFitOfArc(r) && r.layup_reduced_chi2 != null")
+                && html.contains("layup: layupFitOfArc(row) ? row.layup_reduced_chi2 : null"),
+            "the page must gate layup's chi-square on its flag",
         );
 
         // (2) the page carries no inline dataset, and no distinctive row value.
@@ -20044,6 +20081,139 @@ mod tests {
             html.contains("below the 50% coverage floor"),
             "the external fitter's status was not rendered"
         );
+    }
+
+    /// A layup row as the runner records it: raw chi-square always present, plus
+    /// layup's own flag number, name and meaning.
+    fn layup_row(flag: i32, name: &str, meaning: &str) -> ValidationResult {
+        let mut r = synthetic_core_od_row("Apophis");
+        r.layup_flag = Some(flag);
+        r.layup_flag_name = Some(name.to_string());
+        r.layup_flag_meaning = Some(meaning.to_string());
+        r.layup_converged = Some(flag == 0);
+        r.layup_chi2 = Some(3.0e12);
+        r.layup_reduced_chi2 = Some(1.5e12);
+        r
+    }
+
+    fn not_converged_reason(r: &ValidationResult) -> String {
+        match layup_convergence_cell(r) {
+            ConvergenceCell::NotConverged { reason } => reason.expect("a reason"),
+            _ => panic!("expected a not-converged cell"),
+        }
+    }
+
+    #[test]
+    fn layup_cell_names_the_flag_and_withholds_a_failed_candidates_chi2() {
+        let r = layup_row(
+            3,
+            "FLAG_NO_ROOT_CONVERGED",
+            "candidates were produced, none converged on the primary interval",
+        );
+        let why = not_converged_reason(&r);
+        assert!(
+            why.starts_with(
+                "layup flag 3, FLAG_NO_ROOT_CONVERGED: candidates were produced, none converged \
+                 on the primary interval"
+            ),
+            "{why}"
+        );
+        assert!(why.contains("no fit of the arc"), "{why}");
+        assert!(
+            !why.contains("1.5"),
+            "a failed candidate's chi2 must not appear: {why}"
+        );
+        // The raw numbers stay on the row; only the presentation withholds them.
+        assert_eq!(r.layup_chi2, Some(3.0e12));
+        assert_eq!(r.layup_chi2_shown(), None);
+        assert_eq!(r.layup_reduced_chi2_shown(), None);
+    }
+
+    #[test]
+    fn layup_chi2_is_shown_for_converged_and_converged_with_a_warning_flags() {
+        let ok = layup_row(0, "FLAG_CONVERGED", "converged, and every check passed");
+        assert!(matches!(
+            layup_convergence_cell(&ok),
+            ConvergenceCell::Converged { .. }
+        ));
+        assert_eq!(ok.layup_chi2_shown(), Some(3.0e12));
+        for (flag, name) in [
+            (2, "FLAG_CSQ_TOO_LARGE"),
+            (6, "FLAG_DEGENERATE_COV"),
+            (9, "FLAG_IMPLAUSIBLE_ORBIT"),
+        ] {
+            let r = layup_row(flag, name, "converged; with a warning");
+            let why = not_converged_reason(&r);
+            assert!(
+                why.starts_with(&format!(
+                    "layup flag {flag}, {name}: converged; with a warning"
+                )),
+                "{why}"
+            );
+            assert!(why.contains("a fit of the whole arc"), "{why}");
+            assert!(
+                why.contains("reduced \u{3c7}\u{b2} 1500000000000.0000"),
+                "{why}"
+            );
+            assert_eq!(r.layup_chi2_shown(), Some(3.0e12), "flag {flag}");
+        }
+        for flag in [1, 3, 4, 5, 7, 8] {
+            let r = layup_row(flag, "FLAG_X", "m");
+            assert_eq!(r.layup_chi2_shown(), None, "flag {flag}");
+        }
+    }
+
+    #[test]
+    fn layup_row_from_before_the_flag_was_recorded_is_judged_by_converged() {
+        let mut r = synthetic_core_od_row("Eros");
+        r.layup_flag = None;
+        r.layup_converged = Some(false);
+        r.layup_chi2 = Some(9.0);
+        assert_eq!(r.layup_chi2_shown(), None);
+        assert!(
+            not_converged_reason(&r).contains("carries no flag value"),
+            "an old row says it has no flag"
+        );
+        r.layup_converged = Some(true);
+        assert_eq!(r.layup_chi2_shown(), Some(9.0));
+    }
+
+    #[test]
+    fn convergence_matrix_names_layups_flag_in_the_rendered_cell() {
+        let mut rows = vec![method_row(
+            "Apophis",
+            "rust",
+            "first_order",
+            "orbit_determination",
+        )];
+        rows[0].od_converged = Some(true);
+        let mut apophis = method_row("Apophis", "core", "first_order", "orbit_determination");
+        apophis.layup_flag = Some(3);
+        apophis.layup_flag_name = Some("FLAG_NO_ROOT_CONVERGED".into());
+        apophis.layup_flag_meaning =
+            Some("candidates were produced, none converged on the primary interval".into());
+        apophis.layup_converged = Some(false);
+        apophis.layup_chi2 = Some(5.7e12);
+        apophis.layup_reduced_chi2 = Some(2.1e9);
+        let mut achilles = method_row("Achilles", "core", "first_order", "orbit_determination");
+        achilles.layup_flag = Some(0);
+        achilles.layup_flag_name = Some("FLAG_CONVERGED".into());
+        achilles.layup_flag_meaning = Some("converged, and every check passed".into());
+        achilles.layup_converged = Some(true);
+        achilles.layup_chi2 = Some(6235.6);
+        achilles.layup_reduced_chi2 = Some(0.61);
+        rows.push(apophis);
+        rows.push(achilles);
+        let html = build_convergence_matrix_html(&rows);
+        assert!(
+            html.contains(
+                "did not converge \u{2014} layup flag 3, FLAG_NO_ROOT_CONVERGED: candidates were \
+                 produced, none converged on the primary interval; no fit of the arc, so no \u{3c7}\u{b2} is shown"
+            ),
+            "the flag-3 cell must name the flag and withhold the chi2"
+        );
+        assert!(!html.contains("2.1e9") && !html.contains("2100000000"));
+        assert!(!html.contains("layup&#39;s orbitfit returned flag"));
     }
 
     #[test]
