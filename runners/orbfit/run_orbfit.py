@@ -476,6 +476,17 @@ def _is_nongrav(ic: Dict[str, Any]) -> bool:
 # ───────────────────────────────────────────────────────────────────
 
 
+# OrbFit's configuration, stamped on every row (merge-external carries it to the
+# report's Configurations appendix).
+ORBFIT_SETTINGS = {
+    "program": "neofit2.x from the minorplanetcenter/orbfit image",
+    "options": "the image's unit_tests neofit.nop.std (gravity) or neofit.nop.ngr "
+    "(non-grav objects)",
+    "rejection": "OrbFit's own CMC2003 outlier rejection",
+    "seed": "the plan's initial state, heliocentric where the plan carries the Sun's state",
+}
+
+
 def orbfit_source_version(image: str) -> str:
     """Provenance string stamped on every orbfit-channel row.
 
@@ -523,6 +534,8 @@ def process_od_row(
     out = dict(row)
     out["channel"] = "orbfit"
     out["source_version"] = source_version
+    out["orbfit_version"] = source_version
+    out["orbfit_settings"] = ORBFIT_SETTINGS
     object_name = row.get("object", "")
 
     def fail(msg: str, t_ms: Optional[float] = None) -> Dict[str, Any]:

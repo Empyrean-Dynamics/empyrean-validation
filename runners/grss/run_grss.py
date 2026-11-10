@@ -300,6 +300,19 @@ def _source_version(grss, de_kernel: int, analytic: bool) -> str:
     return f"grss {ver} (DE{de_kernel}+SB441-N16, {partials})"
 
 
+def grss_settings(ctx: dict) -> dict:
+    """GRSS's configuration for this run, stamped on every row."""
+    return {
+        "kernels": f"DE{ctx['de_kernel']} + SB441-N16",
+        "self_perturbers": "the object's own perturber removed with remove_body "
+        "(the plan's excluded_perturbers_naif, or a default perturber of the same name)",
+        "partials": "STM" if ctx["analytic_partials"] else "finite difference",
+        "od_max_iterations": str(ctx["n_iter_max"]),
+        "radar_bounce": "centre of mass (radius 0) for com=0 records",
+        "uncertainty": "state only (covariance rows are not replayed)",
+    }
+
+
 def _angular_sep_arcsec(ra1: float, dec1: float, ra2: float, dec2: float) -> float:
     """Vincenty great-circle separation of two (RA, Dec) in radians → arcsec."""
     cd1, cd2 = math.cos(dec1), math.cos(dec2)
@@ -1043,6 +1056,8 @@ def run_plan_pass(ctx, plan: list[dict], fixtures_dir: Path) -> list[dict]:
         out["channel"] = "grss"
         out["timestamp"] = ctx["timestamp"]
         out["source_version"] = ctx["source_version"]
+        out["grss_version"] = ctx["source_version"]
+        out["grss_settings"] = grss_settings(ctx)
         # Known force-model difference for this object, if any — attached to
         # EVERY affected row (not just once) so no row can be read in isolation
         # as a like-for-like comparison, and logged once per object.
@@ -1178,6 +1193,8 @@ def run_radar_pass(
             "force_model": (ic or {}).get("force_model", force_model),
             "timestamp": ctx["timestamp"],
             "source_version": ctx["source_version"],
+            "grss_version": ctx["source_version"],
+            "grss_settings": grss_settings(ctx),
         }
         if ic is None:
             msg = (

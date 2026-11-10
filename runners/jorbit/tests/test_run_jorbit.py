@@ -130,6 +130,10 @@ def test_each_object_replays_in_its_own_worker_and_rows_keep_plan_order(runner, 
         ("A", "propagation"), ("A", "ephemeris"), ("B", "propagation"),
         ("B", "orbit_determination"), ("B", "propagation"), ("A", "ephemeris")]
     assert out[0]["jorbit_pos_au"] == [0.0, 0.0, 0.0] and out[4]["jorbit_pos_au"] == [4.0, 0.0, 0.0]
+    # Every replayed row states jorbit's version and configuration.
+    for r in out[:5]:
+        assert r["jorbit_version"] == r["source_version"]
+        assert r["jorbit_settings"] == runner.JORBIT_SETTINGS
     assert "jorbit_pos_au" not in out[3]
     assert out[5]["jorbit_not_attempted_rows"] == 1
 

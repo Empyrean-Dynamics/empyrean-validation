@@ -426,6 +426,17 @@ def _executive_summary(rows: list[dict]) -> str:
     return "\n".join(lines)
 
 
+# OpenOrb's configuration, stamped on every row (merge-external carries it to
+# the report's Configurations appendix).
+OORB_SETTINGS = {
+    "dynamical_model": "n-body (the shipped oorb.conf's 2-body forced to n-body)",
+    "perturbers": "planets, Moon and Pluto; asteroid perturbers off",
+    "relativity": "on",
+    "frame": "plan SSB states converted to OpenOrb's heliocentric convention and back",
+    "uncertainty": "state only (covariance rows are not replayed)",
+}
+
+
 def _oorb_source_version(oorb_bin: Path) -> str:
     """Provenance string stamped on every oorb-channel row.
 
@@ -566,6 +577,8 @@ def main() -> int:
         new["channel"] = "oorb"
         new["timestamp"] = timestamp
         new["source_version"] = source_version
+        new["oorb_version"] = source_version
+        new["oorb_settings"] = OORB_SETTINGS
         tt = r.get("test_type")
         if tt == "propagation":
             update = _propagate(r, oorb_bin, env, sun_epoch)

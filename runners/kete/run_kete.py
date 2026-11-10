@@ -126,6 +126,21 @@ def _kete_state(epoch_mjd_tdb: float, pos_au, vel_au_d):
 # measured at ~7e8 km/30 d with ASSIST). Propagate them planets-only.
 _KETE_MASSIVE = {"Vesta", "Pallas", "Hygiea"}
 
+# kete's configuration, stamped on every row (merge-external carries it to the
+# report's Configurations appendix).
+KETE_SETTINGS = {
+    "force_model": "planets from kete's DE440s plus kete's include_asteroids set "
+    "(Ceres, Pallas, Interamnia, Hygiea, Vesta), kete's own masses",
+    "self_perturbers": "Vesta, Pallas, Hygiea run planets-only (each is in kete's "
+    "massive-asteroid set; kete has no per-body exclusion)",
+    "non_grav": "the plan's Marsden A1/A2/A3, g(r) and delay through "
+    "NonGravModel.new_comet",
+    "ephemeris": "light time iterated against the observer from kete's MPC code table",
+    "od": "kete initial_orbit_determination then fit_orbit, the propagation force "
+    "model, EFCC18 debiasing (bias.dat) in kete's ADES ingestion",
+    "uncertainty": "state only (covariance rows are not replayed)",
+}
+
 
 def _kete_prop_opts(row: dict) -> dict:
     """include_asteroids + non_gravs options for one plan row.
@@ -469,6 +484,8 @@ def main() -> int:
         new["channel"] = "kete"
         new["timestamp"] = timestamp
         new["source_version"] = source_version
+        new["kete_version"] = source_version
+        new["kete_settings"] = KETE_SETTINGS
         tt = r.get("test_type")
         if tt == "propagation":
             update = _propagate_with_kete(r)
