@@ -1507,47 +1507,50 @@ fn ladder_css() -> String {
 /// was never handed to `report` gets no OD panel at all, rather than an empty
 /// panel that would imply it was considered and skipped.
 fn od_tool_present(key: &str, results: &[ValidationResult]) -> bool {
-    results.iter().any(|r| match key {
-        "findorb" => {
-            r.findorb_rms_residual.is_some()
-                || r.findorb_n_obs_used.is_some()
-                || r.findorb_vs_horizons_km.is_some()
-                || r.findorb_d_ra_arcsec.is_some()
-                || r.findorb_time_ms.is_some()
-        }
-        "oorb" => {
-            r.channel == "oorb"
-                || r.oorb_vs_horizons_km.is_some()
-                || r.oorb_separation_arcsec.is_some()
-                || r.oorb_time_ms.is_some()
-        }
-        "layup" => {
-            r.layup_converged.is_some()
-                || r.layup_reduced_chi2.is_some()
-                || r.layup_chi2.is_some()
-                || r.layup_n_obs_used.is_some()
-                || r.layup_time_ms.is_some()
-        }
-        "orbfit" => {
-            r.orbfit_rms_arcsec.is_some() || r.orbfit_error.is_some() || r.orbfit_time_ms.is_some()
-        }
-        "grss" => {
-            r.grss_rms_arcsec.is_some()
-                || r.grss_error.is_some()
-                || r.grss_converged.is_some()
-                || r.grss_vs_horizons_km.is_some()
-                || r.grss_separation_arcsec.is_some()
-                || r.grss_time_ms.is_some()
-        }
-        "jorbit" => r.jorbit_time_ms.is_some(),
-        "adam-core" => {
-            r.adam_core_converged.is_some()
-                || r.adam_core_reduced_chi2.is_some()
-                || r.adam_core_unsupported.is_some()
-                || r.adam_core_time_ms.is_some()
-        }
-        _ => false,
-    })
+    // A row the tool named unsupported is a row it was handed: present, whatever the tool.
+    results.iter().any(|r| r.unsupported_by(key).is_some())
+        || results.iter().any(|r| match key {
+            "findorb" => {
+                r.findorb_rms_residual.is_some()
+                    || r.findorb_n_obs_used.is_some()
+                    || r.findorb_vs_horizons_km.is_some()
+                    || r.findorb_d_ra_arcsec.is_some()
+                    || r.findorb_time_ms.is_some()
+            }
+            "oorb" => {
+                r.channel == "oorb"
+                    || r.oorb_vs_horizons_km.is_some()
+                    || r.oorb_separation_arcsec.is_some()
+                    || r.oorb_time_ms.is_some()
+            }
+            "layup" => {
+                r.layup_converged.is_some()
+                    || r.layup_reduced_chi2.is_some()
+                    || r.layup_chi2.is_some()
+                    || r.layup_n_obs_used.is_some()
+                    || r.layup_time_ms.is_some()
+            }
+            "orbfit" => {
+                r.orbfit_rms_arcsec.is_some()
+                    || r.orbfit_error.is_some()
+                    || r.orbfit_time_ms.is_some()
+            }
+            "grss" => {
+                r.grss_rms_arcsec.is_some()
+                    || r.grss_error.is_some()
+                    || r.grss_converged.is_some()
+                    || r.grss_vs_horizons_km.is_some()
+                    || r.grss_separation_arcsec.is_some()
+                    || r.grss_time_ms.is_some()
+            }
+            "jorbit" => r.jorbit_time_ms.is_some(),
+            "adam-core" => {
+                r.adam_core_converged.is_some()
+                    || r.adam_core_reduced_chi2.is_some()
+                    || r.adam_core_time_ms.is_some()
+            }
+            _ => false,
+        })
 }
 
 // ═══════════════════════════════════════════════════════════════════
@@ -1873,8 +1876,15 @@ fn grid_cell(
     is_t0: bool,
     sigma: Option<f64>,
     n_rows: Option<usize>,
+    unsupported: Option<&str>,
 ) -> String {
     match v {
+        // A row the tool named unsupported: the same hatch, its own reason on hover.
+        None if unsupported.is_some() => {
+            let t0 = if is_t0 { " gt0" } else { "" };
+            let why = attr_escape(unsupported.unwrap_or_default());
+            format!("<td class=\"gc hatch gu{t0}\" title=\"unsupported by this tool: {why}\"></td>")
+        }
         None => {
             let t0 = if is_t0 { " gt0" } else { "" };
             // The timing grids' one off-ladder state is an untimed cell; the
@@ -2066,6 +2076,28 @@ struct GridTable<'a> {
     trailing: GridTrailing,
     /// Emit the agreement per-column median footers; the cost heatmaps do not.
     footers: bool,
+    /// `(object, dt) -> reason` for the cells the panel's external tool named
+    /// unsupported (from [`unsupported_cells`]); the hatched cell carries it.
+    unsupported: Option<&'a HashMap<(String, i64), String>>,
+}
+
+/// Every external tool's named unsupported cells on one test type:
+/// tool id -> `(object, dt) -> reason`, read off the folded `tool_unsupported`
+/// maps, so one lookup serves every tool and every panel.
+fn unsupported_cells(
+    results: &[ValidationResult],
+    test_type: &str,
+) -> HashMap<String, HashMap<(String, i64), String>> {
+    let mut out: HashMap<String, HashMap<(String, i64), String>> = HashMap::new();
+    for r in results.iter().filter(|r| r.test_type == test_type) {
+        for (tool, why) in r.tool_unsupported.iter().flatten() {
+            out.entry(tool.clone())
+                .or_default()
+                .entry((r.object.clone(), r.dt_days as i64))
+                .or_insert_with(|| why.clone());
+        }
+    }
+    out
 }
 
 /// Render one prop-like grid table body: the scroll container, header, the
@@ -2110,7 +2142,7 @@ fn render_grid_table(t: &GridTable, block_order: &[(&str, Vec<&str>)]) -> String
             if let Some(mv) = m {
                 row_vals.push(mv);
             }
-            h.push_str(&grid_cell(axis, m, pop_gap, dt == 0, None, None));
+            h.push_str(&grid_cell(axis, m, pop_gap, dt == 0, None, None, None));
         }
         h.push_str(&worst_cell(axis, t.trailing.reduce(row_vals)));
         h.push_str("</tr>");
@@ -2145,7 +2177,11 @@ fn render_grid_table(t: &GridTable, block_order: &[(&str, Vec<&str>)]) -> String
                 let n = t
                     .counts
                     .and_then(|c| c.get(&(obj.to_string(), dt)).copied());
-                h.push_str(&grid_cell(axis, v, is_gap_obj, dt == 0, sg, n));
+                let u = t
+                    .unsupported
+                    .and_then(|m| m.get(&(obj.to_string(), dt)))
+                    .map(String::as_str);
+                h.push_str(&grid_cell(axis, v, is_gap_obj, dt == 0, sg, n, u));
             }
             h.push_str(&worst_cell(axis, t.trailing.reduce(obj_vals)));
             h.push_str("</tr>");
@@ -2194,6 +2230,7 @@ fn render_agreement_grid(
     dts: &[i64],
     tools: &[GridTool],
     marks: &GridMarks,
+    unsupported: &HashMap<String, HashMap<(String, i64), String>>,
 ) -> String {
     // empyrean (tools[0]) fixes the population and within-block object order so
     // every per-tool table — and the Section-1 cost heatmap — line up row for
@@ -2325,6 +2362,12 @@ fn render_agreement_grid(
                 show_model_gap: tool_is_assist,
                 trailing: GridTrailing::Worst,
                 footers: true,
+                // The panel's external side (the tool, or empyrean's reference).
+                unsupported: unsupported.get(if tool_slug == "empyrean" {
+                    ref_slug
+                } else {
+                    tool_slug
+                }),
             },
             &block_order,
         ));
@@ -2858,7 +2901,13 @@ fn render_prop_like_grid(
         model_gap: &model_gap,
         impactors: &impactors,
     };
-    render_agreement_grid(id, axis, &objects, &dts, &tools, &marks)
+    let test_type = if axis == GridAxis::EphMas {
+        "ephemeris"
+    } else {
+        "propagation"
+    };
+    let unsupported = unsupported_cells(results, test_type);
+    render_agreement_grid(id, axis, &objects, &dts, &tools, &marks, &unsupported)
 }
 
 /// SBDB radar-observation counts (delay, Doppler) JPL used in its own fit,
@@ -4308,6 +4357,12 @@ enum ConvergenceCell {
     NotAttempted {
         reason: String,
     },
+    /// The tool was handed the arc and named it unsupported (its own reason,
+    /// e.g. a self-perturber its force model cannot leave out): neither a
+    /// failed fit nor an arc the tool never saw.
+    Unsupported {
+        reason: String,
+    },
 }
 
 /// A column of the convergence matrix: an engine channel reading its own
@@ -4428,31 +4483,26 @@ fn layup_convergence_cell(r: &ValidationResult) -> ConvergenceCell {
     }
 }
 
-/// adam-core's cell for one arc. A row the runner could not fit (a self-perturber,
-/// a refused or failed fit) is NOT "not attempted": it carries the tool's own reason
-/// in `adam_core_unsupported`, which the cell shows verbatim.
+/// adam-core's cell for one arc. A row the runner named unsupported (a
+/// self-perturber, a refused or failed fit) never reaches here: every fitter's
+/// unsupported reason becomes its own cell in [`fitter_convergence_cell`].
 fn adam_core_convergence_cell(r: &ValidationResult) -> ConvergenceCell {
     match r.adam_core_converged {
         Some(true) => ConvergenceCell::Converged { iterations: None },
         Some(false) => ConvergenceCell::NotConverged {
-            reason: Some(
-                r.adam_core_unsupported
-                    .clone()
-                    .unwrap_or_else(|| "adam-core's fit did not converge".to_string()),
-            ),
+            reason: Some("adam-core's fit did not converge".to_string()),
         },
         None => {
-            let produced = r.adam_core_unsupported.is_some()
-                || r.adam_core_chi2.is_some()
+            let produced = r.adam_core_chi2.is_some()
                 || r.adam_core_reduced_chi2.is_some()
                 || r.adam_core_n_obs_used.is_some()
                 || r.adam_core_time_ms.is_some();
             if produced {
                 ConvergenceCell::NotConverged {
-                    reason: Some(r.adam_core_unsupported.clone().unwrap_or_else(|| {
+                    reason: Some(
                         "adam-core emitted a record for this object but no convergence flag"
-                            .to_string()
-                    })),
+                            .to_string(),
+                    ),
                 }
             } else {
                 ConvergenceCell::NotAttempted {
@@ -4518,6 +4568,11 @@ fn fitter_convergence_cell(
             ),
         };
     };
+    if let Some(why) = r.unsupported_by(key) {
+        return ConvergenceCell::Unsupported {
+            reason: why.to_string(),
+        };
+    }
     match key {
         "findorb" => findorb_convergence_cell(r),
         "layup" => layup_convergence_cell(r),
@@ -4628,6 +4683,12 @@ fn build_convergence_matrix_html(results: &[ValidationResult]) -> String {
         ConvergenceCell::NotAttempted { reason } => {
             h.push_str(&format!(
                 "<td class=\"fc\" style=\"color:#8b9198\" title=\"not attempted — {}\">&mdash;</td>",
+                attr_escape(&reason)
+            ));
+        }
+        ConvergenceCell::Unsupported { reason } => {
+            h.push_str(&format!(
+                "<td class=\"fc fu\" style=\"color:#8b9198\" title=\"unsupported by this tool: {}\">&#8856;</td>",
                 attr_escape(&reason)
             ));
         }
@@ -6641,6 +6702,7 @@ fn build_cost_heatmap_panels(
 ) -> String {
     let axis = GridAxis::TimingMs;
     let pairs = timing_pairs(results, test_type);
+    let unsupported = unsupported_cells(results, test_type);
     let (objects, dts, model_gap, impactors) = prop_like_axes(results);
     let marks = GridMarks {
         model_gap: &model_gap,
@@ -6702,6 +6764,7 @@ fn build_cost_heatmap_panels(
                                 show_model_gap: false,
                                 trailing: GridTrailing::Median,
                                 footers: false,
+                                unsupported: unsupported.get(members[mi]),
                             },
                             &block_order,
                         ));
@@ -9246,8 +9309,12 @@ fn cfg_not_recorded() -> String {
         .to_string()
 }
 
-/// True when this external tool has at least one row in the merged inputs.
+/// True when this external tool has at least one row in the merged inputs; a row
+/// it named unsupported counts, whatever the tool.
 fn config_tool_present(results: &[ValidationResult], key: &str) -> bool {
+    if results.iter().any(|r| r.unsupported_by(key).is_some()) {
+        return true;
+    }
     match key {
         "assist" => results
             .iter()
@@ -9275,7 +9342,6 @@ fn config_tool_present(results: &[ValidationResult], key: &str) -> bool {
             r.adam_core_reduced_chi2.is_some()
                 || r.adam_core_vs_horizons_km.is_some()
                 || r.adam_core_separation_arcsec.is_some()
-                || r.adam_core_unsupported.is_some()
         }),
         _ => false,
     }
@@ -9448,63 +9514,47 @@ fn config_recorded_subsection(
 fn config_tool_subsection(results: &[ValidationResult], key: &str) -> String {
     match key {
         "assist" => config_assist_subsection(results),
-        "findorb" => config_generic_subsection(
+        "findorb" => config_recorded_subsection(
+            results,
             "findorb",
             "find_orb",
-            None,
-            &[
-                ("version", None),
-                ("&sigma; source", None),
-                ("over-observing rule", None),
-                ("DE ephemeris file", None),
-            ],
-            "Orbit determination from ADES astrometry (post-fit RMS reference); its fitted orbit is then propagated by find_orb itself to the plan's epochs for a fit-then-propagate comparison, so these diffs include the fit-vs-JPL-orbit difference.",
+            "Orbit determination from ADES astrometry (post-fit RMS reference); its fitted orbit is then propagated by find_orb itself to the plan's epochs for a fit-then-propagate comparison, so these diffs include the fit-vs-JPL-orbit difference. Every value below is what the runner recorded on the rows.",
         ),
-        "layup" => config_generic_subsection(
+        "layup" => config_recorded_subsection(
+            results,
             "layup",
             "layup",
-            None,
-            &[
-                ("version", None),
-                ("weighting mode", None),
-                ("orbitfit flag", None),
-            ],
-            "Orbit determination from ADES; the reduced-&chi;&sup2; reference under Ver&eacute;s-2017 weighting.",
+            "Orbit determination from ADES through layup's Python API at its documented settings: reported sigma kept, a missing one filled from the public Ver&eacute;s 2017 model, EFCC18 debiasing, adaptive non-grav. Every value below is what the runner recorded on the rows.",
         ),
-        "orbfit" => config_generic_subsection(
+        "orbfit" => config_recorded_subsection(
+            results,
             "orbfit",
             "OrbFit",
-            None,
-            &[("version", None), ("rejection", None)],
-            "Orbit determination with the OrbFit Consortium / IAU MPC CMC2003 outlier rejection.",
+            "Orbit determination with the OrbFit Consortium / IAU MPC CMC2003 outlier rejection. Every value below is what the runner recorded on the rows.",
         ),
-        "grss" => config_generic_subsection(
+        "grss" => config_recorded_subsection(
+            results,
             "grss",
             "GRSS",
-            None,
-            &[("version", None), ("perturbers", None)],
-            "Propagation, ephemeris and radar-capable orbit determination (Gauss-Radau Small-body Simulator); replays the plan's initial conditions and reports the suite's only post-fit radar residuals.",
+            "Propagation, ephemeris and radar-capable orbit determination (Gauss-Radau Small-body Simulator); replays the plan's initial conditions and reports the suite's only post-fit radar residuals. Every value below is what the runner recorded on the rows.",
         ),
-        "kete" => config_generic_subsection(
+        "kete" => config_recorded_subsection(
+            results,
             "kete",
             "kete",
-            None,
-            &[("version", None)],
-            "Dar Dahlen's independent Rust/Python NEO toolkit (originally Caltech IPAC / NEO Surveyor). This run records propagation wall-clock only; no comparison or configuration fields.",
+            "Dar Dahlen's independent Rust/Python NEO toolkit (originally Caltech IPAC / NEO Surveyor). This run folds propagation wall-clock only; every value below is what the runner recorded on the rows.",
         ),
-        "jorbit" => config_generic_subsection(
+        "jorbit" => config_recorded_subsection(
+            results,
             "jorbit",
             "jorbit",
-            None,
-            &[("version", None)],
-            "JAX autodiff propagator and orbit determination. This run records propagation wall-clock only; no comparison or configuration fields.",
+            "JAX propagator, one worker process per object. This run folds propagation wall-clock only; every value below is what the runner recorded on the rows.",
         ),
-        "oorb" => config_generic_subsection(
+        "oorb" => config_recorded_subsection(
+            results,
             "oorb",
             "OpenOrb",
-            None,
-            &[("version", None), ("perturbers", None)],
-            "N-body propagation and ephemeris (Bulirsch&ndash;Stoer, planets + Moon + Pluto, relativity on; no asteroid perturbers). Plan SSB states are converted to OpenOrb's heliocentric convention and back.",
+            "N-body propagation and ephemeris. Plan SSB states are converted to OpenOrb's heliocentric convention and back. Every value below is what the runner recorded on the rows.",
         ),
         "adam-core" => config_recorded_subsection(
             results,
@@ -9516,8 +9566,39 @@ fn config_tool_subsection(results: &[ValidationResult], key: &str) -> String {
     }
 }
 
+/// The rows one external tool named unsupported, grouped by the tool's own reason:
+/// each reason once, with the objects and the number of rows it covers. Empty when
+/// the tool ran every row it was handed. One function for every tool: it reads the
+/// folded `tool_unsupported` map by the tool id.
+fn config_unsupported_rows(results: &[ValidationResult], key: &str) -> String {
+    let mut by_reason: BTreeMap<&str, (BTreeSet<&str>, usize)> = BTreeMap::new();
+    for r in results {
+        if let Some(why) = r.unsupported_by(key) {
+            let e = by_reason.entry(why).or_default();
+            e.0.insert(r.object.as_str());
+            e.1 += 1;
+        }
+    }
+    if by_reason.is_empty() {
+        return String::new();
+    }
+    let mut body = String::new();
+    for (why, (objs, n)) in &by_reason {
+        let objs: Vec<&str> = objs.iter().copied().collect();
+        body.push_str(&format!(
+            "<tr><td style=\"text-align:left\">{}</td><td style=\"text-align:left\">{}</td><td>{n}</td></tr>",
+            attr_escape(why),
+            attr_escape(&objs.join(", "))
+        ));
+    }
+    format!(
+        "<div class=\"cfg-unsupported\" data-tool=\"{key}\">\n  <div class=\"heatmap-container\">\n  <table class=\"agrid list\" data-grid=\"list\" style=\"font-size:11px;\">\n    <thead><tr><th style=\"text-align:left\">rows not run: the tool's reason</th><th style=\"text-align:left\">objects</th><th>rows</th></tr></thead>\n    <tbody>{body}</tbody>\n  </table>\n  </div>\n</div>\n"
+    )
+}
+
 /// The whole "Configurations" appendix (A.3, `s05c`): one subsection per present
-/// external tool, in the Part 2 tool order.
+/// external tool, in the Part 2 tool order, each followed by the rows that tool
+/// named unsupported.
 fn render_configurations_section(
     results: &[ValidationResult],
     comparators: &[crate::comparators::ComparatorOutcome],
@@ -9526,6 +9607,7 @@ fn render_configurations_section(
     for (key, _display) in CONFIG_TOOL_ORDER {
         if config_tool_present(results, key) {
             subs.push_str(&config_tool_subsection(results, key));
+            subs.push_str(&config_unsupported_rows(results, key));
         }
     }
     let failed = render_failed_comparators(comparators);
@@ -15188,13 +15270,13 @@ mod tests {
         // The hottest cell path speaks the shared hatch phrases, so a future
         // change to a const can never leave a stale literal behind in a data
         // cell. Output is byte-identical while the values agree; this pins them.
-        let timed = grid_cell(GridAxis::TimingMs, None, false, false, None, None);
+        let timed = grid_cell(GridAxis::TimingMs, None, false, false, None, None, None);
         assert!(
             timed.contains(&format!("title=\"{HATCH_NOT_TIMED}\"")),
             "untimed cell hover must be the shared const: {timed}"
         );
         for axis in [GridAxis::PropKm, GridAxis::EphMas] {
-            let cell = grid_cell(axis, None, false, false, None, None);
+            let cell = grid_cell(axis, None, false, false, None, None, None);
             assert!(
                 cell.contains(&format!("title=\"{HATCH_NOT_COMPARED}\"")),
                 "not-compared cell hover must be the shared const: {cell}"
@@ -15237,7 +15319,8 @@ mod tests {
                 vals: vals.clone(),
                 sigma: HashMap::new(),
             };
-            let html = render_agreement_grid(id, axis, &objects, &dts, &[tool], &marks);
+            let html =
+                render_agreement_grid(id, axis, &objects, &dts, &[tool], &marks, &HashMap::new());
             // The impactor forward cell is the hatched arc-ends mark, empty text,
             // reason on hover; the colspan equals the forward-horizon count (1).
             assert!(
@@ -17292,6 +17375,48 @@ mod tests {
         }
     }
 
+    /// Every external tool's subsection renders the version and settings its
+    /// runner recorded, never a typed placeholder list.
+    #[test]
+    fn configurations_appendix_renders_every_tool_from_its_record() {
+        for tool in [
+            "findorb", "layup", "orbfit", "grss", "kete", "jorbit", "oorb",
+        ] {
+            let mut r = synthetic_rust_prop_row("Eros", 0.0);
+            r.channel = "core".into();
+            match tool {
+                "findorb" => r.findorb_rms_residual = Some(0.4),
+                "layup" => r.layup_converged = Some(true),
+                "orbfit" => r.orbfit_rms_arcsec = Some(0.5),
+                "grss" => r.grss_vs_horizons_km = Some(0.1),
+                "kete" => r.kete_time_ms = Some(3.0),
+                "jorbit" => r.jorbit_time_ms = Some(3.0),
+                _ => r.oorb_vs_horizons_km = Some(1.0),
+            }
+            r.tool_versions = Some([(tool.to_string(), format!("{tool} 9.8.7"))].into());
+            r.tool_settings = Some(
+                [(
+                    tool.to_string(),
+                    [("recorded_knob".to_string(), format!("{tool}-value"))].into(),
+                )]
+                .into(),
+            );
+            let html = render_rows(&[r]);
+            let at = html
+                .find(&format!("id=\"s05c-{tool}\""))
+                .unwrap_or_else(|| panic!("{tool} subsection"));
+            let sub = &html[at..at + html[at..].find("</table>").unwrap()];
+            assert!(
+                sub.contains(&format!("<code>{tool} 9.8.7</code>")),
+                "{tool}: recorded version in the head"
+            );
+            assert!(
+                sub.contains("recorded_knob") && sub.contains(&format!("{tool}-value")),
+                "{tool}: recorded setting rendered"
+            );
+        }
+    }
+
     /// adam-core's subsection renders from the version and settings the merge
     /// folded onto its rows, and shows nothing it was not told. Two rows carry
     /// different settings counts; the fuller record wins.
@@ -17345,18 +17470,90 @@ mod tests {
         assert!(!render_rows(&[other]).contains("id=\"s05c-adam-core\""));
     }
 
+    /// Every external tool's named unsupported rows reach the report: the
+    /// Configurations appendix lists each tool's reason with its objects, and an
+    /// agreement-grid cell the tool did not run carries the reason on hover.
+    /// One row per tool, each tool's reason distinct.
     #[test]
-    fn adam_core_convergence_cell_shows_the_tools_own_reason() {
+    fn every_tools_unsupported_reason_reaches_the_report() {
+        let mut rows = Vec::new();
+        for (key, display) in CONFIG_TOOL_ORDER {
+            let mut r = synthetic_rust_prop_row("Vesta", 30.0);
+            r.channel = "core".into();
+            r.population = "Self-Perturber".into();
+            r.tool_unsupported = Some(
+                [(
+                    key.to_string(),
+                    format!("{display} reason: cannot exclude Vesta"),
+                )]
+                .into(),
+            );
+            rows.push(r);
+        }
+        // OpenOrb ran another object, so its H1 panel exists beside Vesta's cell.
+        let mut eros = synthetic_rust_prop_row("Eros", 30.0);
+        eros.channel = "core".into();
+        eros.oorb_vs_horizons_km = Some(1.0);
+        rows.push(eros);
+        let mut rust = synthetic_rust_prop_row("Vesta", 30.0);
+        rust.population = "Self-Perturber".into();
+        rows.push(rust);
+        rows.push(synthetic_rust_prop_row("Eros", 30.0));
+        let html = render_rows(&rows);
+        for (key, display) in CONFIG_TOOL_ORDER {
+            let block = html
+                .split(&format!(
+                    "<div class=\"cfg-unsupported\" data-tool=\"{key}\">"
+                ))
+                .nth(1)
+                .unwrap_or_else(|| panic!("{key}: no unsupported list in Configurations"));
+            let block = block.split("</table>").next().unwrap();
+            assert!(
+                block.contains(&format!("{display} reason: cannot exclude Vesta"))
+                    && block.contains("Vesta"),
+                "{key}: its reason and object"
+            );
+        }
+        assert!(
+            html.contains("class=\"gc hatch gu\" title=\"unsupported by this tool: OpenOrb reason: cannot exclude Vesta\""),
+            "OpenOrb's Vesta cell in H1 carries its reason"
+        );
+    }
+
+    /// Every OD fitter's named unsupported row is a cell of its own with the
+    /// tool's reason: never a failed fit, never "not attempted", never blank.
+    #[test]
+    fn every_fitters_unsupported_reason_is_its_own_cell() {
+        for (key, label, _) in OD_FITTERS {
+            let mut r = synthetic_core_od_row("Vesta");
+            let why =
+                format!("self-perturber: {label} cannot leave the object out of its own forces");
+            r.tool_unsupported = Some([(key.to_string(), why.clone())].into());
+            match fitter_convergence_cell(key, label, Some(&r)) {
+                ConvergenceCell::Unsupported { reason } => assert_eq!(reason, why, "{key}"),
+                _ => panic!("{key}: an unsupported row must carry the tool's reason"),
+            }
+            // Another tool's reason is not this tool's.
+            let other = OD_FITTERS.iter().find(|(k, _, _)| *k != key).unwrap().0;
+            r.tool_unsupported = Some([(other.to_string(), why)].into());
+            assert!(
+                !matches!(
+                    fitter_convergence_cell(key, label, Some(&r)),
+                    ConvergenceCell::Unsupported { .. }
+                ),
+                "{key}"
+            );
+        }
+    }
+
+    #[test]
+    fn adam_core_convergence_cell_reads_its_own_fields() {
         let mut r = synthetic_core_od_row("Vesta");
         r.adam_core_converged = Some(false);
-        r.adam_core_unsupported =
-            Some("self-perturber: adam-assist 0.6.0 offers no planets-only force model".into());
-        match adam_core_convergence_cell(&r) {
-            ConvergenceCell::NotConverged { reason: Some(why) } => {
-                assert!(why.contains("planets-only"))
-            }
-            _ => panic!("an unsupported row must be NotConverged with the reason, not blank"),
-        }
+        assert!(matches!(
+            adam_core_convergence_cell(&r),
+            ConvergenceCell::NotConverged { reason: Some(_) }
+        ));
         let mut ok = synthetic_core_od_row("Eros");
         ok.adam_core_converged = Some(true);
         assert!(matches!(

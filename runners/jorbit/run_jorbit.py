@@ -92,6 +92,19 @@ OFFLINE_SETUP_EXIT = 3
 OBJECT_TIMEOUT_S = 3600.0
 
 GEOCENTER = "500"
+
+# jorbit's configuration, stamped on every replayed row (merge-external carries
+# it to the report's Configurations appendix).
+JORBIT_SETTINGS = {
+    "gravity": "'default solar system': DE440 + SB441-N16 (the jorbit folder)",
+    "self_perturbers": "Iris, Vesta, Pallas, Hygiea run 'gr planets' (planets only; "
+    "jorbit has no per-body exclusion)",
+    "non_grav": "none: jorbit models gravity only",
+    "observers": "geocentre (500) only, from jorbit's DE440 Earth; ground sites are "
+    "not attempted (one explicit row per object)",
+    "processes": "one worker process per object",
+    "uncertainty": "state only (covariance rows are not replayed)",
+}
 SITE_NOT_ATTEMPTED_REASON = (
     "jorbit's only observer model for a ground site is a live JPL Horizons query "
     "(jorbit.utils.horizons.get_observer_positions); the suite runs sealed from JPL "
@@ -663,6 +676,8 @@ def main() -> int:
         new["channel"] = "jorbit"
         new["timestamp"] = timestamp
         new["source_version"] = source_version
+        new["jorbit_version"] = source_version
+        new["jorbit_settings"] = JORBIT_SETTINGS
         out_rows.append(new)
         if tt in ("propagation", "ephemeris"):
             jobs.setdefault(r["object"], []).append([len(out_rows) - 1, r])

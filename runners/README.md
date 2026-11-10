@@ -103,7 +103,14 @@ existing runners — `kete/` is the simplest full-featured template
    [`ValidationResult`](../src/schema.rs) shape, with `channel` set to
    your tool's name and the fields you can't populate left `null`.
    Copy the reference values (`ref_*`) through from the plan row so
-   your rows are self-contained.
+   your rows are self-contained. Stamp `<tool>_version` (a string) and
+   `<tool>_settings` (an object of setting to value, each value saying
+   where the tool documents it) on every row, and `<tool>_unsupported` (the
+   reason, in the tool's terms) on a row the tool cannot run: `merge-external`
+   folds all three onto the merged rows under the tool id, and the report
+   renders exactly what was recorded (settings in the Configurations appendix,
+   each unsupported reason beside its tool there and on the cell it leaves
+   empty).
 4. **Render**: pass your output alongside the other channel JSONs —
    `empyrean-validation report --results validation_rust.json
    validation_<tool>.json --output report.html` — and your tool shows

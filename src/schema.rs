@@ -1189,11 +1189,6 @@ pub struct ValidationResult {
     /// Whether adam-core's fit converged (`FittedOrbits.success`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub adam_core_converged: Option<bool>,
-    /// The named reason adam-core produced no result for this row (a self-perturber,
-    /// a refused or failed fit, an unsupported non-grav term). A failed row stays
-    /// visible with the tool's own words; it never collapses into a blank.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub adam_core_unsupported: Option<String>,
     /// Observations counted per sigma source on an OD row:
     /// `reported`, `filled` and `filled_by_level.*` (station / catalog /
     /// no_catalog / catalog_unrecognized), as the runner measured them.
@@ -1212,6 +1207,13 @@ pub struct ValidationResult {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tool_settings:
         Option<std::collections::BTreeMap<String, std::collections::BTreeMap<String, String>>>,
+    /// Tool id -> the named reason that tool produced no result for this row (a
+    /// self-perturber its force model cannot leave out, a refused or failed fit,
+    /// an unsupported term), in the tool runner's own words, folded from the
+    /// runner's `<prefix>_unsupported`. A row a tool did not run stays visible with
+    /// its reason; it never collapses into a blank.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_unsupported: Option<std::collections::BTreeMap<String, String>>,
 
     // ── GRSS external reference ─────────────────────────────────────
     // Propagation + ephemeris + OD reference. GRSS — the Gauss-Radau
@@ -1342,6 +1344,15 @@ pub struct ValidationResult {
 }
 
 impl ValidationResult {
+    /// The reason `tool` (its id, e.g. `kete`, `adam-core`) recorded for not
+    /// producing a result on this row, if it recorded one.
+    pub fn unsupported_by(&self, tool: &str) -> Option<&str> {
+        self.tool_unsupported
+            .as_ref()
+            .and_then(|m| m.get(tool))
+            .map(String::as_str)
+    }
+
     /// Construct a row with all `Option` fields set to `None` and
     /// `Vec` fields empty. Convenient for tests; production code should
     /// use the channel-specific runner builders that fill in test
@@ -1492,10 +1503,10 @@ impl ValidationResult {
             adam_core_n_obs_used: None,
             adam_core_n_obs_rejected: None,
             adam_core_converged: None,
-            adam_core_unsupported: None,
             adam_core_sigma_source: None,
             tool_versions: None,
             tool_settings: None,
+            tool_unsupported: None,
             grss_vs_horizons_km: None,
             emp_vs_grss_km: None,
             grss_time_ms: None,
