@@ -21,8 +21,9 @@ OrbFit is particularly valuable as a comparison point because:
 
 ## Container
 
-| Image | `minorplanetcenter/orbfit:latest` |
+| Image | `minorplanetcenter/orbfit@sha256:0a72ed7c2c528e0e3fe24a0f280a251f6ab610eb3d5e1d63dbf0f2bd20104f64` (what `:latest` resolved to on 2026-11-09; the digest also pins OrbFit's own data inside the image, `AST17.bai` / `AST17.bep` and the neofit options) |
 |-------|-----------------------------------|
+| Network | none: every container runs with `--network none` |
 | Source | Docker Hub, official MPC org |
 | Compressed size | ~3.1 GB |
 | Disk size | ~6 GB |
@@ -42,22 +43,40 @@ determination):
 1. **Seed.** Each OD object's IC (Cartesian state at `epoch_mjd_tdb`,
    from the plan's propagation/ephemeris rows — ICRF, SSB-centered) is
    converted to OrbFit's heliocentric ecliptic-J2000 (`ECLM J2000`)
-   frame — subtract the Sun's SSB state (`ref_sun_pos_au`), rotate ICRF
+   frame — subtract the Sun's SSB state at the IC epoch, rotate ICRF
    → ecliptic — and written as an OEF2.0 `CAR` record at
-   `epoch/<desig>.eq0`. The SSB→heliocentric shift matters: for
-   deep-Earth-approaching NEOs (Apophis's 0.029 AU 2020 encounter) the
-   ~0.007 AU Sun–SSB offset is a large fraction of the encounter
-   distance and, left in, corrupts neofit2.x's two-body encounter
-   segments (`ever_pitkin` overflow). Objects with no deep encounter
-   tolerate a raw SSB seed, so when the plan carries no Sun state the
-   runner falls back to SSB, records `orbfit_seed_origin="ssb"`, and
-   warns — the fallback only ever fails *loudly*.
+   `epoch/<desig>.eq0`. The Sun's state comes from the registered DE440
+   (`--de440`, the `orbfit/` folder of the third-party tool set) through
+   the shared helper [`../sunstate`](../sunstate/); the plan the suite
+   runs carries none, and there is no raw-SSB fallback: the runner
+   refuses to start without the file. The SSB→heliocentric shift
+   matters: for deep-Earth-approaching NEOs (Apophis's 0.029 AU 2020
+   encounter) the ~0.007 AU Sun–SSB offset is a large fraction of the
+   encounter distance and, left in, corrupts neofit2.x's two-body
+   encounter segments (`ever_pitkin` overflow).
 2. **Fit.** `neofit2.x < input` with the MPC's production option file
    (`neofit.nop.std`, or `neofit.nop.ngr` when the plan row carries a
    non-gravitational signal — `ic_a1`/`ic_a2`/`ic_a3` — as for Apophis,
    Phaethon, 2024 YR4). Observations come from the ADES PSV fixtures
    (`mpcobs/<desig>.psv`, ingested directly), fit with the `gaiaDR2_mix`
    error model + CMC2003 outlier rejection.
+   The force model holds the planets and the massive asteroids the option
+   file names (`.iast=17`, `.filbe='AST17'`): the first 17 entries of the
+   image's `ast_files/AST17.bai` (Ceres, Pallas, Juno, Vesta, ... Pluto),
+   each named by its number, which the runner reads from the image at
+   start. neofit2.x leaves one of them out by its own self-perturbation
+   check (`selpert` in `src/propag/force_model.f90`, called at
+   `src/neodys/neofit2.f90:277`): the entry whose name equals the name the
+   object runs under. So when the plan excludes an AST17 body from the
+   object's forces (`excluded_perturbers_naif` names 2000000+n), the object
+   runs under that body's name (Vesta as `4`) and the row fails unless
+   neofit2.x prints `self perturbation of <n> avoided`; the rows record it
+   in `orbfit_left_out_naif`. The decision reads the row only, never the
+   designation. An excluded body outside AST17 needs nothing. A row that
+   excludes two AST17 bodies cannot run (selpert leaves out only one), so
+   it is a named unsupported row with the reason in `orbfit_unsupported`.
+   Run under its own name, Vesta perturbed itself: 48 of 3709 observations
+   kept at 1.23″; left out, it keeps 3559 at 0.84″.
 3. **Parse.** The fitted Cartesian state + covariance from the `CAR`
    record of `epoch/<desig>.eq0_postfit`; the weighted RMS + per-obs
    SEL flags (used/rejected) from `mpcobs/<desig>.rwo`. The state is

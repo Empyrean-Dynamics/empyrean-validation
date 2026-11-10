@@ -316,10 +316,19 @@ def run_orbfit(orbfit, monkeypatch, world, *flags, fail=True):
             d.update(orbfit_rms_arcsec=0.5, orbfit_n_obs_used=10, orbfit_n_obs_rejected=0, orbfit_is_nongrav=False)
         return d
 
+    class FakeSun:  # the runner seeds from the registered DE440 Sun; no SPK needed here
+        def __init__(self, path):
+            self.path = path
+
+        def sha256(self):
+            return "0" * 64
+
     monkeypatch.setattr(orbfit, "process_od_row", fake)
     monkeypatch.setattr(orbfit, "orbfit_source_version", lambda image: "orbfit test")
+    monkeypatch.setattr(orbfit, "SunEphemeris", FakeSun)
     out = world["dir"] / "orbfit.json"
-    monkeypatch.setattr(sys, "argv", ["run_orbfit.py", "--plan", str(world["pp"]), "--output", str(out), "--psv-dir", str(world["dir"]), *flags])
+    monkeypatch.setattr(sys, "argv", ["run_orbfit.py", "--plan", str(world["pp"]), "--output", str(out), "--psv-dir", str(world["dir"]),
+                                      "--de440", str(world["dir"] / "de440.bsp"), *flags])
     return orbfit.main(), out
 
 

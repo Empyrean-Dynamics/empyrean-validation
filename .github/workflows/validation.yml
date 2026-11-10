@@ -246,8 +246,8 @@ env:
   # cheap row fans out. Empty = the table's marks only.
   HEAVY_MIN_S: ${{ inputs.heavy_min_s || '' }}
   # The external tools that run (scripts/schedule.py pack-external cuts jorbit
-  # and OrbFit into object legs). `oorb` is off: see the external job.
-  EXTERNAL_TOOLS: ${{ inputs.external_tools || 'assist,findorb,kete,jorbit,layup,adam-core,orbfit,grss' }}
+  # and OrbFit into object legs).
+  EXTERNAL_TOOLS: ${{ inputs.external_tools || 'assist,findorb,oorb,kete,jorbit,layup,adam-core,orbfit,grss' }}
   EXTERNAL_LEG_TARGET_MIN: ${{ inputs.external_leg_minutes || '' }}
   # The external tools whose setup or import still reaches JPL, NAIF or the MPC,
   # and so seal after setup instead of before it. No validation job may reach
@@ -259,9 +259,7 @@ env:
   #           carries them yet
   #   kete    its import fetches kernels from naif.jpl.nasa.gov (its leg leaves
   #           NAIF open); closed by the runner-fixes PR
-  #   oorb    its build fetches its ephemeris; off, re-enabled by empyrean-jg3o
-  #   orbfit  closed by the runner-fixes PR
-  UPSTREAM_FETCH_ALLOWLIST: '["grss","kete","oorb","orbfit"]'
+  UPSTREAM_FETCH_ALLOWLIST: '["grss","kete"]'
   TIER: ${{ inputs.tier || 'standard' }}
   # Shared cache keys — every job restores by these exact keys so the
   # downloads/builds `prep` populates fan out warm. Bump a version suffix
@@ -1257,38 +1255,12 @@ jobs:
     # prep. The layup and adam-core legs' data is synced by prep and only RESTORED here.
     strategy:
       fail-fast: false
-      # About 16 legs (jorbit 9, OrbFit 2, five tools 1 each) of 25 minutes or
-      # less, inside the channel stage's ~52: eight at a time finish them
-      # without taking slots from the channel legs under the 60-job limit.
+      # About 18 legs (jorbit 9, OrbFit 2, seven tools 1 each), all but
+      # OpenOrb's (about 50 minutes) of 25 minutes or less, inside the channel
+      # stage's ~52: eight at a time finish them without taking slots from the
+      # channel legs under the 60-job limit.
       max-parallel: 8
       matrix:
-        # `oorb` is DISABLED, deliberately — it is not missing from
-        # EXTERNAL_TOOLS (the workflow env) by accident, and the oorb-specific steps below are kept in place as
-        # the re-enable path.
-        #
-        # BLOCKER: run_oorb.py needs `ref_sun_pos_au` / `ref_sun_vel_au_d` on
-        # each row to convert OpenOrb's heliocentric convention into the
-        # plan's SSB frame. Only `empyrean-validation plan` populates those;
-        # the plan this workflow uses is stripped from the rust runner's
-        # output, which never does. Measured: 0 of 652 rust rows and 0 of 448
-        # plan rows carry the key, so 100% of oorb's rows skip. The keys
-        # cannot simply be added to the plan whitelist — they are not in the
-        # v0.7.0 schema empyrean-core pins, so carrying them reintroduces the
-        # deny_unknown_fields break the whitelist strip exists to kill.
-        #
-        # The leg was previously green while computing nothing (a pass-through
-        # of untouched plan rows, exit 0). run_oorb.py now exits nonzero on a
-        # 100% skip, which is honest and is deliberately LEFT IN PLACE — but
-        # it makes this leg permanently red, and a permanently-red leg trains
-        # people to ignore red. So the leg is off, by decision, with the
-        # blocker named: neither faking a pass nor crying wolf.
-        #
-        # RE-ENABLE (empyrean-jg3o): tag the validation schema -> re-pin
-        # empyrean-core -> populate ref_sun_* in the rust runner or the strip
-        # -> add `oorb` back to EXTERNAL_TOOLS and set WITH_OORB=1 in the Makefile.
-        # Until then reduce prints a DISABLED line naming this reason, so the
-        # channel's absence from the report is explained rather than guessed
-        # at.
         include: ${{ fromJson(needs.assemble.outputs.external_legs) }}
     steps:
       - name: Checkout empyrean-validation (default)
@@ -1328,16 +1300,17 @@ jobs:
           fi
           rm -rf data && mkdir -p data && cp -a "$src"/. data/
 
-      # layup, adam-core, ASSIST, find_orb, jorbit and GRSS read their data from
-      # the third-party tool set, folders `layup/`, `adam-core/`, `assist/`,
-      # `findorb/`, `jorbit/` and `grss/` (every file each opens, shared kernels
-      # included), not from the engine kernel set and never from JPL or NAIF. find_orb (and the disabled OpenOrb) run
-      # under the ASSIST venv, whose setup checks the `assist/` folder too.
+      # layup, adam-core, ASSIST, find_orb, jorbit, OrbFit, OpenOrb and GRSS read
+      # their data from the third-party tool set, folders `layup/`, `adam-core/`,
+      # `assist/`, `findorb/`, `jorbit/`, `orbfit/`, `oorb/` and `grss/` (every
+      # file each opens, shared kernels included), not from the engine kernel set
+      # and never from JPL or NAIF. find_orb and OpenOrb run under the ASSIST
+      # venv, whose setup checks the `assist/` folder too.
       # prep, the trusted job that already holds the bucket identity, syncs the
       # set and saves it to the cache below; this leg only restores it and
       # refuses a miss by name, with no token, no auth step and no gcloud.
       - name: Restore the third-party tool set
-        if: contains(fromJSON('["layup","adam-core","assist","findorb","jorbit","grss","oorb"]'), matrix.tool) && env.ACT != 'true'
+        if: contains(fromJSON('["layup","adam-core","assist","findorb","jorbit","orbfit","oorb","grss"]'), matrix.tool) && env.ACT != 'true'
         uses: actions/cache/restore@v4
         with:
           path: |
@@ -1350,7 +1323,7 @@ jobs:
       # ACT_THIRD_PARTY_DIR), beside the engine set's /host-data. Only the
       # folders this tool reads are copied.
       - name: Copy the third-party tool set from the host mount (act)
-        if: contains(fromJSON('["layup","adam-core","assist","findorb","jorbit","grss","oorb"]'), matrix.tool) && env.ACT == 'true'
+        if: contains(fromJSON('["layup","adam-core","assist","findorb","jorbit","orbfit","oorb","grss"]'), matrix.tool) && env.ACT == 'true'
         run: |
           src="${ACT_THIRD_PARTY_DIR:-/host-third-party}"
           # The sentinel files each folder must hold, and the folders each tool reads.
@@ -1359,7 +1332,9 @@ jobs:
             adam-core)    dirs="adam-core";      need="adam-core/de440.bsp adam-core/sb441-n16.bsp" ;;
             assist)       dirs="assist";         need="assist/linux_p1550p2650.440 assist/sb441-n16.bsp" ;;
             jorbit)       dirs="jorbit";         need="jorbit/de440.bsp jorbit/sb441-n16.bsp" ;;
-            findorb|oorb) dirs="findorb assist"; need="findorb/bc405.dat findorb/bias.dat findorb/linux_p1550p2650.440 assist/linux_p1550p2650.440" ;;
+            findorb)      dirs="findorb assist"; need="findorb/bc405.dat findorb/bias.dat findorb/linux_p1550p2650.440 assist/linux_p1550p2650.440" ;;
+            orbfit)       dirs="orbfit";         need="orbfit/de440.bsp" ;;
+            oorb)         dirs="oorb assist";    need="oorb/de440.dat oorb/de440.bsp oorb/asteroid_ephemeris.txt assist/linux_p1550p2650.440" ;;
             grss)         dirs="grss";           need="grss/de440.bsp grss/pck00011.tpc grss/sb441-n16s.bsp" ;;
           esac
           for f in $need; do
@@ -1397,9 +1372,6 @@ jobs:
           key: ${{ matrix.tool }}-${{ hashFiles(format('empyrean-validation/runners/{0}/setup.sh', matrix.tool), 'empyrean-validation/runners/assist/setup.sh') }}
 
       # OpenOrb's Fortran build links LAPACK/BLAS, not present by default.
-      # Inert while `oorb` is off the matrix (see the DISABLED note there);
-      # kept so re-enabling is one list edit rather than an archaeology
-      # exercise.
       - name: Install LAPACK/BLAS (OpenOrb only)
         if: matrix.tool == 'oorb'
         run: sudo apt-get update && sudo apt-get install -y --no-install-recommends liblapack-dev libblas-dev
@@ -1432,8 +1404,6 @@ jobs:
       # legs must build it explicitly (their `make run-*` would otherwise
       # trigger an uncached assist pip build mid-run, coupling all three
       # comparators to assist-setup health). Other tools are self-contained.
-      # The `oorb` half of the case is inert while that leg is off the matrix
-      # and, like the LAPACK step, is kept as the re-enable path.
       - name: Setup ${{ matrix.tool }}
         working-directory: empyrean-validation
         env:
@@ -1738,8 +1708,7 @@ jobs:
         run: |
           trigger=0
           # `schedule` is inert while the weekly cron is off (see "Triggers"
-          # at the top) and is kept here ON PURPOSE, the same way the oorb
-          # re-enable path is kept below. This gate is the narrower of the two
+          # at the top) and is kept here ON PURPOSE. This gate is the narrower of the two
           # lists, so a cron restored in `on:` without a matching edit here
           # would run the full suite and then silently decline to publish it.
           case "${{ github.event_name }}" in
@@ -1788,18 +1757,6 @@ jobs:
           # vanishing, which is the one thing the delete bought; the report
           # states which channels ran, and a stale sibling object is a far
           # smaller problem than an empty bucket mid-publish.
-          #
-          # ONE OUTSTANDING CONSEQUENCE of that trade, now that `oorb` is a
-          # deliberately disabled leg: `latest/channels/oorb.json` in the
-          # bucket is whatever the last green-but-computed-nothing run put
-          # there — a pass-through of untouched plan rows tagged
-          # channel="oorb". It is not overwritten because the file is no
-          # longer produced. Nothing in this workflow deletes published
-          # objects, and adding a delete here is a production-data action that
-          # wants a human, so this is recorded rather than automated: the
-          # stale object should be removed out of band as part of
-          # empyrean-jg3o. The loop below is left listing `oorb` so the
-          # re-enable path needs no edit; `[ -f ]` skips it meanwhile.
           gcloud storage cp results/validation.json            ${{ env.GCS_BUCKET }}/latest/validation.json
           gcloud storage cp results/od_validation.json         ${{ env.GCS_BUCKET }}/latest/od_validation.json
           gcloud storage cp results/validation_report.html     ${{ env.GCS_BUCKET }}/latest/validation_report.html

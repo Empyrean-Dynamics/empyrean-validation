@@ -21,10 +21,11 @@ conditions instead of from a previous MPC solution:
      `epoch_mjd_tdb`) is taken from the plan (the object's propagation /
      ephemeris rows carry `ic_pos_au` / `ic_vel_au_d`, ICRF, SSB-centered).
      OrbFit's osculating elements are *heliocentric*, so we subtract the
-     Sun's SSB state at the IC epoch (the plan's `ref_sun_pos_au` /
-     `ref_sun_vel_au_d`, carried on the dt=0 propagation row), then rotate
-     ICRF -> ecliptic-J2000 (OrbFit's `ECLM J2000` reference system) and
-     write an OEF2.0 `CAR` seed at `epoch/<desig>.eq0`.
+     Sun's SSB state at the IC epoch, read from the registered DE440
+     (`--de440`, the orbfit/ folder of the third-party tool set) by the
+     shared helper `runners/sunstate`, then rotate ICRF -> ecliptic-J2000
+     (OrbFit's `ECLM J2000` reference system) and write an OEF2.0 `CAR`
+     seed at `epoch/<desig>.eq0`.
 
      The SSB -> heliocentric shift (<= 0.008 AU) is not cosmetic: for
      deep-Earth-approaching NEOs it is a large fraction of the encounter
@@ -32,12 +33,10 @@ conditions instead of from a previous MPC solution:
      with the raw SSB state corrupts the two-body encounter segments of
      `neofit2.x`'s initial propagation (`ever_pitkin` overflow, singular
      normal matrix) so the differential correction never converges. With
-     the Sun subtracted, Apophis fits cleanly. Objects with no deep
-     encounter (e.g. Eros) tolerate the raw SSB seed, so when the plan
-     lacks a Sun state the runner falls back to SSB, records
-     `orbfit_seed_origin="ssb"`, and warns — a fallback that only ever
-     fails *loudly* (deep encounters overflow and surface as
-     `orbfit_error`), never silently.
+     the Sun subtracted, Apophis fits cleanly. There is no raw-SSB
+     fallback: the plan the suite runs carries no Sun state, so the runner
+     refuses to start without the DE440 file, and every row records the
+     seed's origin and the file's sha256.
 
      This is a *refit from empyrean's IC*, not an independent
      initial-orbit determination: the seed lands the differential
@@ -52,6 +51,23 @@ conditions instead of from a previous MPC solution:
      Observations come from `mpcobs/<desig>.psv` (the ADES PSV fixtures);
      `neofit2.x` ingests `.psv` directly and applies the `gaiaDR2_mix`
      error model + CMC2003 outlier rejection.
+
+     Its force model holds the planets and the massive asteroids the option
+     file names (`.iast=17`, `.filbe='AST17'`): the first 17 entries of the
+     image's `ast_files/AST17.bai`, each named by its number (`4` is Vesta).
+     neofit2.x leaves one of them out by its own self-perturbation check
+     (`selpert`, `src/propag/force_model.f90`, called at
+     `src/neodys/neofit2.f90:277`): the entry whose name equals the name the
+     object is run under (the `input` file, which also names its scratch
+     files). So when the plan excludes an AST17 body from an object's forces
+     (`excluded_perturbers_naif` names 2000000+n), the object runs under that
+     body's AST17 name, and the row fails unless neofit2.x's own output
+     reports leaving it out (`self perturbation of <n> avoided`). The
+     decision reads the row's data only, never its designation. An excluded
+     body outside AST17 needs nothing; two excluded AST17 bodies cannot both
+     be left out (selpert drops only the one the object is named by), so the
+     row is a named unsupported row with the reason in `orbfit_unsupported`
+     and is never run.
 
   3. **Parse** — the fitted Cartesian state + covariance come from the
      `CAR` record of `epoch/<desig>.eq0_postfit`; the weighted RMS and
@@ -80,6 +96,10 @@ OrbFit-specific fields emitted per row:
                               is rotated to ICRF but the covariance is
                               emitted verbatim for reference)
     orbfit_is_nongrav        whether the ngr option file was used
+    orbfit_left_out_naif     the excluded AST17 body neofit2.x reported
+                              leaving out of the object's forces (NAIF id)
+    orbfit_unsupported       set (and the row never run) when the plan
+                              excludes more than one AST17 body
     orbfit_error             set (with the fit fields left unpopulated)
                               on any failure — never a silent skip
 
@@ -108,8 +128,17 @@ import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
-# Container identity. Override via --image for testing alternate tags.
-DEFAULT_IMAGE = "minorplanetcenter/orbfit:latest"
+# Container identity, pinned by digest: the MPC's image carries OrbFit's own
+# data (AST17.bai / AST17.bep, the neofit options), so the digest pins those
+# too. minorplanetcenter/orbfit:latest resolved to this manifest on 2026-11-09
+# (docker buildx imagetools inspect). Override via --image only for testing.
+DEFAULT_IMAGE = (
+    "minorplanetcenter/orbfit@sha256:"
+    "0a72ed7c2c528e0e3fe24a0f280a251f6ab610eb3d5e1d63dbf0f2bd20104f64"
+)
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))  # runners/ -> sunstate
+from sunstate.de440_sun import SpkError, SunEphemeris  # noqa: E402
 
 # OrbFit's WORKDIR inside the container. Its bin/lib/ast_files symlinks are
 # relative to this, so we mount our scratch as a sibling subdirectory
@@ -118,6 +147,107 @@ CONTAINER_WORKDIR = "/sa/god_fit"
 
 # The MPC image is amd64-only; Apple Silicon hosts must emulate.
 DEFAULT_PLATFORM = "linux/amd64"
+
+# A numbered asteroid's NAIF id is 2000000 + its number (below 1000000), the form
+# the plan's `excluded_perturbers_naif` takes.
+NAIF_ASTEROID_OFFSET = 2_000_000
+
+# The option files the fit reads and the massive-asteroid table they name, inside
+# the image (paths relative to CONTAINER_WORKDIR).
+OPTION_FILES = ("unit_tests/neofit.nop.std", "unit_tests/neofit.nop.ngr")
+AST_TABLE_DIR = "ast_files"
+_TABLE_SEPARATOR = "=====orbfit-table====="
+
+
+def parse_massive_asteroids(option_texts: list[str], table_texts: dict[str, str]) -> list[str]:
+    """The massive asteroids in neofit2.x's force model, by the names it matches.
+
+    Every option file must name the same table (`.filbe`) and count (`.iast`); the
+    table (`<filbe>.bai`) opens with its entry count and a header line, then one
+    `<mass> <name>` line per asteroid, and neofit2.x integrates its first `iast`
+    entries under those names (masjpl, src/propag/force_model.f90). Raises
+    ValueError when the files disagree or the table is short, so a run never
+    guesses which bodies OrbFit integrates.
+    """
+    seen = set()
+    for text in option_texts:
+        iast = re.search(r"^\s*\.iast\s*=\s*(\d+)", text, re.MULTILINE)
+        filbe = re.search(r"^\s*\.filbe\s*=\s*'([^']+)'", text, re.MULTILINE)
+        if not iast or not filbe:
+            raise ValueError("an OrbFit option file names no .iast or no .filbe")
+        seen.add((int(iast.group(1)), filbe.group(1)))
+    if len(seen) != 1:
+        raise ValueError(f"OrbFit's option files disagree on the massive asteroids: {sorted(seen)}")
+    ((iast, filbe),) = seen
+    if iast == 0:
+        return []
+    table = table_texts.get(filbe)
+    if table is None:
+        raise ValueError(f"OrbFit's option files name {filbe}.bai, which was not read")
+    lines = [ln for ln in table.splitlines() if ln.strip()]
+    count = int(lines[0].split()[0])
+    names = [ln.split()[1] for ln in lines[2 : 2 + count]]
+    if len(names) != count or iast > count:
+        raise ValueError(f"{filbe}.bai lists {len(names)} of {count} entries, fewer than .iast={iast}")
+    return names[:iast]
+
+
+def read_massive_asteroids(image: str, platform: str) -> list[str]:
+    """Read the massive asteroids neofit2.x integrates from the image itself.
+
+    The runner links the image's AST17 table into every fit, so its option files
+    must name it. The image is pinned by digest, so
+    these are the bodies every fit in a run integrates; reading them (rather than
+    restating them here) keeps the mapping exactly the image's.
+    """
+    files = list(OPTION_FILES) + [f"{AST_TABLE_DIR}/AST17.bai"]
+    script = f" && echo {_TABLE_SEPARATOR} && ".join(f"cat {f}" for f in files)
+    proc = subprocess.run(
+        ["docker", "run", "--rm", "--platform", platform, "--network", "none", image,
+         "-c", f"cd {CONTAINER_WORKDIR} && {script}"],
+        capture_output=True,
+        text=True,
+        timeout=300,
+        check=False,
+    )
+    if proc.returncode != 0:
+        raise ValueError(f"could not read OrbFit's tables from {image}: {(proc.stderr or '').strip()[-300:]}")
+    parts = proc.stdout.split(_TABLE_SEPARATOR + "\n")
+    if len(parts) != len(files):
+        raise ValueError(f"expected {len(files)} OrbFit tables from {image}, read {len(parts)}")
+    return parse_massive_asteroids(parts[:2], {"AST17": parts[2]})
+
+
+def orbfit_exclusion(row: dict[str, Any], massive: list[str]) -> tuple[str | None, str | None]:
+    """How neofit2.x leaves out the bodies the plan excludes from this row's forces.
+
+    Returns `(name, unsupported)`. `name` is the massive asteroid's name to run the
+    object under, so neofit2.x's self-perturbation check leaves that body out; None
+    when no excluded body is among `massive` (nothing to leave out). `unsupported`
+    is the reason the row cannot run: more than one excluded body is among
+    `massive`, and neofit2.x leaves out only the one the object is named by. Reads
+    the row's `excluded_perturbers_naif` only, never its designation.
+    """
+    hits = set()
+    for naif in row.get("excluded_perturbers_naif") or ():
+        number = int(naif) - NAIF_ASTEROID_OFFSET
+        if 0 < number < 1_000_000 and str(number) in massive:
+            hits.add(str(number))
+    ordered = sorted(hits, key=int)
+    if not ordered:
+        return None, None
+    if len(ordered) == 1:
+        return ordered[0], None
+    return None, (
+        f"excluded perturbers {', '.join(ordered)} are all among OrbFit's massive asteroids, and "
+        "neofit2.x leaves out only the one body the object is run under (its self-perturbation "
+        "check), so it would integrate an excluded body"
+    )
+
+
+def neofit_reports_leaving_out(stdout: str, name: str) -> bool:
+    """True when neofit2.x's own output says its self-perturbation check left `name` out."""
+    return re.search(rf"self perturbation of\s+{re.escape(name)}\s+avoided", stdout or "") is not None
 
 # Obliquity at J2000.0 (IAU 1976). empyrean's ICRF (equatorial) Cartesian
 # states rotate to OrbFit's ECLM J2000 (ecliptic) by a rotation about the
@@ -164,9 +294,9 @@ def write_eq0_seed(
 ) -> str:
     """Return the OEF2.0 `CAR` seed-orbit text for `epoch/<desig>.eq0`.
 
-    `ic_pos_au` / `ic_vel_au_d` are the ICRF Cartesian seed state at
-    `epoch_mjd_tdb` — heliocentric where the caller could subtract the
-    Sun's SSB state, else raw SSB (see `process_od_row`). They are
+    `ic_pos_au` / `ic_vel_au_d` are the ICRF Cartesian heliocentric seed
+    state at `epoch_mjd_tdb` (the Sun from the registered DE440, see
+    `process_od_row`). They are
     rotated to ecliptic J2000 and written as a `CAR` record, which
     OrbFit reads as the seed for the differential correction.
     """
@@ -200,8 +330,13 @@ def run_neofit_container(
     image: str,
     platform: str,
     timeout_s: float,
+    leave_out: str | None = None,
 ) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
     """Refit one OD case through `neofit2.x`.
+
+    `leave_out` names the massive asteroid the object runs under so that
+    neofit2.x leaves it out of the forces (`desig` is then that name); the fit
+    fails unless neofit2.x's own output reports doing so.
 
     Sets up a scratch workdir mirroring OrbFit's `unit_tests/` layout,
     mounts it at `/sa/god_fit/work`, and runs `neofit2.x < input`.
@@ -237,6 +372,10 @@ def run_neofit_container(
             "--rm",
             "--platform",
             platform,
+            # OrbFit reads only the image and the mounted scratch; a run
+            # that reached for the network would fail here, not fetch.
+            "--network",
+            "none",
             "-v",
             f"{scratch}:{CONTAINER_WORKDIR}/work",
             image,
@@ -259,6 +398,15 @@ def run_neofit_container(
             )
         except subprocess.TimeoutExpired:
             return None, f"neofit2.x timed out after {timeout_s:.0f}s"
+
+        # The body the plan excludes is out of the forces only when neofit2.x
+        # says so itself; anything else is a failure, never a silent full model.
+        if leave_out is not None and not neofit_reports_leaving_out(result.stdout, leave_out):
+            return None, (
+                f"neofit2.x did not report leaving out massive asteroid {leave_out} "
+                f"(no 'self perturbation of {leave_out} avoided' line), so the body the "
+                "plan excludes may still be in its forces"
+            )
 
         # neofit2.x exits 0 even on a failed fit; judge by output files.
         # A header-only (152-byte) postfit is OrbFit's empty-fit sentinel.
@@ -426,11 +574,8 @@ def _lookup_ic(
     itself (a future plan may add it), else take the first sibling row
     that has one.
 
-    Also finds the Sun's SSB state at the IC epoch (`ref_sun_pos_au` /
-    `ref_sun_vel_au_d` on the dt=0 propagation row, where the target
-    epoch equals the IC epoch) so the caller can build a heliocentric
-    seed. `sun_pos_au` / `sun_vel_au_d` are `None` when the plan carries
-    no Sun state (older plans).
+    The Sun's state at the IC epoch comes from the registered DE440
+    (`process_od_row`), not from the plan.
     """
     ic: Optional[Dict[str, Any]] = None
     for row in rows_by_object.get(object_name, []):
@@ -442,22 +587,7 @@ def _lookup_ic(
                 "ic_a1": row.get("ic_a1"),
                 "ic_a2": row.get("ic_a2"),
                 "ic_a3": row.get("ic_a3"),
-                "sun_pos_au": None,
-                "sun_vel_au_d": None,
             }
-            break
-    if ic is None:
-        return None
-
-    epoch = ic["epoch_mjd_tdb"]
-    for row in rows_by_object.get(object_name, []):
-        if (
-            row.get("ref_sun_pos_au")
-            and row.get("ref_sun_vel_au_d")
-            and abs(row.get("t_mjd_tdb", epoch + 1e9) - epoch) < 1e-6
-        ):
-            ic["sun_pos_au"] = row["ref_sun_pos_au"]
-            ic["sun_vel_au_d"] = row["ref_sun_vel_au_d"]
             break
     return ic
 
@@ -484,6 +614,9 @@ ORBFIT_SETTINGS = {
     "(non-grav objects)",
     "rejection": "OrbFit's own CMC2003 outlier rejection",
     "seed": "the plan's initial state, heliocentric where the plan carries the Sun's state",
+    "perturbers": "the planets and the image's AST17 massive asteroids; a body the plan "
+    "excludes is left out by neofit2.x's own self-perturbation check",
+    "self_perturbers": "",  # the plan's excluded AST17 bodies, left out; set in main()
 }
 
 
@@ -524,12 +657,17 @@ def process_od_row(
     platform: str,
     timeout_s: float,
     source_version: str,
+    sun: SunEphemeris,
+    massive: list[str],
 ) -> Dict[str, Any]:
     """Refit one OD object through OrbFit and decorate its row.
 
-    On any failure the returned row carries `orbfit_error` (a specific,
-    loud message) with the fit fields left unpopulated — never a silent
-    skip or defaulted value.
+    `massive` is neofit2.x's massive-asteroid names (`read_massive_asteroids`):
+    an AST17 body the row excludes is left out by running the object under its
+    name, and a row that excludes more than one is a named unsupported row,
+    never run. On any failure the returned row carries `orbfit_error` (a
+    specific, loud message) with the fit fields left unpopulated — never a
+    silent skip or defaulted value.
     """
     out = dict(row)
     out["channel"] = "orbfit"
@@ -543,6 +681,13 @@ def process_od_row(
         out["orbfit_error"] = msg
         if t_ms is not None:
             out["orbfit_time_ms"] = t_ms
+        return out
+
+    # ── the bodies the plan excludes from this object's forces ──────
+    leave_out, unsupported = orbfit_exclusion(row, massive)
+    if unsupported:
+        print(f"    unsupported [{object_name}]: {unsupported}", file=sys.stderr, flush=True)
+        out["orbfit_unsupported"] = unsupported
         return out
 
     # ── observations ────────────────────────────────────────────────
@@ -559,28 +704,20 @@ def process_od_row(
             "this object's propagation/ephemeris rows)"
         )
 
-    desig = _orbfit_designation(object_name)
+    # Run under the excluded body's own name, so neofit2.x leaves it out.
+    desig = leave_out if leave_out is not None else _orbfit_designation(object_name)
     is_ngr = _is_nongrav(ic)
 
     # OrbFit's osculating elements are heliocentric; empyrean's IC is
-    # SSB-centered. Subtract the Sun's SSB state when the plan carries
-    # it, else fall back to the raw SSB state (works for non-deep
-    # objects; deep-encounter objects then fail loudly — see docstring).
-    if ic["sun_pos_au"] is not None:
-        seed_pos = [p - s for p, s in zip(ic["ic_pos_au"], ic["sun_pos_au"])]
-        seed_vel = [v - s for v, s in zip(ic["ic_vel_au_d"], ic["sun_vel_au_d"])]
-        seed_origin = "heliocentric"
-    else:
-        seed_pos = list(ic["ic_pos_au"])
-        seed_vel = list(ic["ic_vel_au_d"])
-        seed_origin = "ssb"
-        print(
-            f"    WARN [{object_name}]: no Sun SSB state in plan; seeding from "
-            "raw SSB state (deep-encounter objects may fail to converge)",
-            file=sys.stderr,
-            flush=True,
-        )
-    out["orbfit_seed_origin"] = seed_origin
+    # SSB-centred. Subtract the Sun's SSB state at the IC epoch from the
+    # registered DE440 (see the module docstring).
+    try:
+        sun_pos, sun_vel = sun.state(ic["epoch_mjd_tdb"] + 2_400_000.5)
+    except SpkError as e:
+        return fail(f"no Sun state at the IC epoch: {e}")
+    seed_pos = [p - s for p, s in zip(ic["ic_pos_au"], sun_pos)]
+    seed_vel = [v - s for v, s in zip(ic["ic_vel_au_d"], sun_vel)]
+    out["orbfit_seed_origin"] = "heliocentric (Sun from the registered DE440)"
     seed_eq0 = write_eq0_seed(desig, seed_pos, seed_vel, ic["epoch_mjd_tdb"])
 
     t0 = time.monotonic()
@@ -592,6 +729,7 @@ def process_od_row(
         image=image,
         platform=platform,
         timeout_s=timeout_s,
+        leave_out=leave_out,
     )
     elapsed_ms = (time.monotonic() - t0) * 1000.0
 
@@ -609,6 +747,8 @@ def process_od_row(
     out["orbfit_is_nongrav"] = is_ngr
     out["orbfit_nongrav_a"] = res["nongrav_a"]
     out["orbfit_error_model"] = res["error_model"]
+    if leave_out is not None:
+        out["orbfit_left_out_naif"] = [NAIF_ASTEROID_OFFSET + int(leave_out)]
     out["orbfit_time_ms"] = elapsed_ms
     out.pop("orbfit_error", None)
     return out
@@ -658,6 +798,13 @@ def main() -> int:
         default=_default_psv_dir(),
         help="ADES PSV observation fixtures (default: ../../fixtures/psv)",
     )
+    parser.add_argument(
+        "--de440",
+        required=True,
+        type=Path,
+        help="de440.bsp from the orbfit/ folder of the third-party tool set: the "
+        "Sun's barycentric state that makes the seed heliocentric",
+    )
     parser.add_argument("--image", default=DEFAULT_IMAGE)
     parser.add_argument(
         "--platform",
@@ -697,7 +844,18 @@ def main() -> int:
         print(f"error: PSV fixture dir not found at {args.psv_dir}", file=sys.stderr)
         return 2
 
+    try:
+        sun = SunEphemeris(args.de440)
+    except SpkError as e:
+        print(f"error: {e}", file=sys.stderr)
+        return 2
+    de440_sha = sun.sha256()
+    ORBFIT_SETTINGS["seed"] = (
+        "the plan's initial state made heliocentric with the Sun from "
+        f"{args.de440.name} (sha256 {de440_sha[:16]})"
+    )
     print(f"OrbFit runner ({args.image}, --platform {args.platform})")
+    print(f"  sun:  {args.de440} (sha256 {de440_sha})")
     print(f"  plan: {args.plan}")
     print(f"  psv:  {args.psv_dir}")
     with open(args.plan) as f:
@@ -723,9 +881,31 @@ def main() -> int:
     source_version = orbfit_source_version(args.image)
     print(f"  source_version: {source_version}")
 
+    # The massive asteroids every fit integrates, read from the image; the
+    # bodies the plan excludes from an object's forces are mapped onto them.
+    try:
+        massive = read_massive_asteroids(args.image, args.platform)
+    except (ValueError, OSError, subprocess.SubprocessError) as e:
+        print(f"error: {e}", file=sys.stderr)
+        return 2
+    ORBFIT_SETTINGS["perturbers"] = (
+        f"the planets and the {len(massive)} massive asteroids of the image's AST17 table "
+        f"({', '.join(massive)}); a body the plan excludes from an object's forces is left "
+        "out by neofit2.x's own self-perturbation check, the object run under that body's name"
+    )
+    left_out = []
+    for r in od_rows:
+        name, _ = orbfit_exclusion(r, massive)
+        if name is not None:
+            left_out.append(f"{r.get('object')} ({name})")
+    ORBFIT_SETTINGS["self_perturbers"] = ", ".join(left_out) or "none"
+    print(f"  massive asteroids: {', '.join(massive)}")
+    print(f"  left out by neofit2.x's self-perturbation check: {ORBFIT_SETTINGS['self_perturbers']}")
+
     out_rows: List[Dict[str, Any]] = []
     timings: List[float] = []
     failures = 0
+    n_unsupported = 0
     for i, row in enumerate(od_rows):
         name = row.get("object", "?")
         print(f"  [{i + 1}/{len(od_rows)}] {name} ...", flush=True)
@@ -737,10 +917,14 @@ def main() -> int:
             platform=args.platform,
             timeout_s=args.timeout,
             source_version=source_version,
+            sun=sun,
+            massive=massive,
         )
         out_rows.append(decorated)
         if decorated.get("orbfit_error"):
             failures += 1
+        elif decorated.get("orbfit_unsupported"):
+            n_unsupported += 1
         else:
             print(
                 f'        rms={decorated["orbfit_rms_arcsec"]:.4f}" '
@@ -753,10 +937,10 @@ def main() -> int:
         if "orbfit_time_ms" in decorated:
             timings.append(decorated["orbfit_time_ms"])
 
-    fits = len(out_rows) - failures
+    fits = len(out_rows) - failures - n_unsupported
     print(
         f"\nOrbFit runner: {len(out_rows)} rows emitted "
-        f"({fits} fits, {failures} failures)"
+        f"({fits} fits, {failures} failures, {n_unsupported} named unsupported)"
     )
     if timings:
         print(
@@ -779,9 +963,10 @@ def main() -> int:
             raise
         f.write(_payload)
     print(f"  wrote {args.output}")
-    # Non-zero exit only if every object failed — a partial failure set is
-    # still useful output and is surfaced per-row via orbfit_error. One leg of
-    # a chunked run defers the verdict to the merge of all its legs.
+    # Non-zero exit only if no object was fitted — a partial failure set is
+    # still useful output and is surfaced per-row via orbfit_error (or
+    # orbfit_unsupported). One leg of a chunked run defers the verdict to the
+    # merge of all its legs.
     if args.defer_all_failed:
         return 0
     return 1 if out_rows and fits == 0 else 0

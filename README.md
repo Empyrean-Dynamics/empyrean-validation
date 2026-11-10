@@ -82,7 +82,7 @@ plan; their results are folded onto the core channel's rows.
 | [OrbFit](http://adams.dm.unipi.it/orbfit/) | OrbFit Consortium / MPC, `neofit2.x` from the MPC's Docker image | orbit determination with CMC2003 rejection, refit from the plan's initial condition | yes (`WITH_ORBFIT=` skips it) |
 | [kete](https://github.com/dahlend/kete) | Dar Dahlen | propagation, ephemeris, orbit determination | yes |
 | [jorbit](https://github.com/ben-cassese/jorbit) | Ben Cassese, JAX-based | propagation and geocentric ephemeris (gravity only) | yes |
-| [OpenOrb](https://github.com/oorb/oorb) | Granvik et al., University of Helsinki | propagation, ephemeris | no (`WITH_OORB=1`): the plan does not carry the Sun state its heliocentric conversion needs |
+| [OpenOrb](https://github.com/oorb/oorb) | Granvik et al., University of Helsinki | propagation, ephemeris (n-body with its BC430 asteroid perturbers, seeded from the registered DE440 Sun state) | yes (`WITH_OORB=` skips it) |
 
 **JPL is one source of truth in two views.** SBDB supplies the initial
 conditions, the fitted orbit and covariance, and JPL's own reported fit
