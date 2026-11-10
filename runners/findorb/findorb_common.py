@@ -14,11 +14,17 @@ source, so the two runners cannot drift apart:
 * **Integrator.** `ENCKE=0`, Cowell: `environ.def` says "you will probably be
   best off leaving this value at zero, meaning Cowell is used".
 * **Debiasing.** The last field of `SETTINGS2` is 1: "FCCT14 or EFCC18
-  astrometric debiasing ... their use is highly recommended" (`environ.def`).
-  It needs the EFCC18 `bias.dat` (`bias.cpp`: "You should really use the
-  latter"). The walk runner applies catalog debiasing once, centrally, from its
-  manifest, so it passes `debiasing=False` and says why; the OD runner feeds raw
-  ADES and lets find_orb debias.
+  astrometric debiasing ... their use is highly recommended" (`environ.def`). It
+  needs the EFCC18 `bias.dat` (`bias.cpp`: "You should really use the latter").
+  Both runners feed the fixture's ADES and let find_orb debias its fit: the OD
+  runner because find_orb recommends it, the walk because the reference walk's
+  fit debiases (its `debias` axis, default `efcc`). The walk manifest's
+  per-observation debias is a scoring correction to the observed position a
+  prediction is measured against, never applied to a fit's input. find_orb looks
+  each correction up by the observation's catalog code, read from ADES `astCat`;
+  the walk gives find_orb its own spelling of the MPC names its reader misses
+  (`ADES_CATALOG_SPELLING`), since a `Tyc2` observation would otherwise go
+  undebiased without a word.
 * **Outlier rejection.** `OUTLIER_REJECTION_LIMIT=3`, find_orb's default.
 
 `bc405.dat` (the converted BC-405 asteroid ephemeris, exactly 52,617,600 bytes)
@@ -46,6 +52,24 @@ JPL_DE_NOTE = "DE440 (Gray's binary linux_p1550p2650.440, 1550-2650)"
 
 PERTURBERS = "1007fe"  # 0x7fe planets + Moon, bit 20 = asteroids (runge.cpp)
 
+# MPC's ADES astCat names that find_orb's reader does not recognise, each mapped to
+# find_orb's own name for the same catalog. ades2mpc.cpp turns astCat into the
+# one-character catalog code with net_name_to_byte_code (lunar/mpc_fmt.cpp), whose
+# table spells Tycho-2 "Tycho-2", so the ADES name "Tyc2" gets the unknown code '?'.
+# bias.cpp then finds no column for '?' and that observation is fitted undebiased
+# without a word, although EFCC18's bias.dat has a Tycho-2 column ('g'): 2286
+# fixture observations across 18 objects. Each spelling here is the entry of that
+# table for the MPC code the ADES name stands for, so find_orb records the catalog
+# the observation names (codes: f, g, z, G, H, J).
+ADES_CATALOG_SPELLING = {
+    "Tyc1": "Tycho-1",
+    "Tyc2": "Tycho-2",
+    "GSC": "GSC-?",
+    "LickGas": "Lick Gaspra Catalogue",
+    "Ida93": "Ida93 Catalogue",
+    "COSMOS": "COSMOS/UKST Southern Sky Catalogue",
+}
+
 
 def sha256_file(path) -> str:
     h = hashlib.sha256()
@@ -53,6 +77,30 @@ def sha256_file(path) -> str:
         for chunk in iter(lambda: fh.read(1 << 20), b""):
             h.update(chunk)
     return h.hexdigest()
+
+
+def findorb_catalog_spelling(line: str, ast_cat_col: int) -> str:
+    """The ADES PSV ``line`` with its astCat (column ``ast_cat_col``) in find_orb's
+    spelling when find_orb's reader would miss the MPC name; otherwise unchanged."""
+    cols = line.split("|")
+    if ast_cat_col >= len(cols):
+        return line
+    name = cols[ast_cat_col].strip()
+    spelling = ADES_CATALOG_SPELLING.get(name)
+    if spelling is None:
+        return line
+    cols[ast_cat_col] = cols[ast_cat_col].replace(name, spelling, 1)
+    return "|".join(cols)
+
+
+def home_config_dir() -> Path | None:
+    """The directory find_orb falls back to for a config file the ``-x`` directory
+    lacks: the first of ~/.find_orb, /software/.find_orb and /root/.find_orb that
+    holds cospar.txt (``default_config_dir_name``, miscell.cpp)."""
+    for d in (Path.home() / ".find_orb", Path("/software/.find_orb"), Path("/root/.find_orb")):
+        if (d / "cospar.txt").is_file():
+            return d
+    return None
 
 
 def environ_lines(
@@ -127,6 +175,19 @@ def stage_cfg_dir(
                 "find_orb would run undebiased without saying so. Refusing to start."
             )
         needed[BIAS_DAT] = bias
+        # find_fcct_biases (bias.cpp) opens the crunched table biases.bin from the
+        # config directory BEFORE bias.dat, and fopen_ext falls back to the home
+        # config directory when the private one has none, which it never has on a
+        # first run. A biases.bin there would debias with that file, not this one.
+        home = home_config_dir()
+        crunched = home / "biases.bin" if home is not None else None
+        if crunched is not None and crunched.exists():
+            raise SystemExit(
+                f"ERROR: {crunched} exists. find_orb reads a crunched bias table from its "
+                f"config directory before {BIAS_DAT}, falling back to {home}, so it would "
+                f"debias with that file instead of the registered {bias}. Move it aside. "
+                "Refusing to start."
+            )
     cfg = Path(base) / "cfg"
     cfg.mkdir(parents=True, exist_ok=True)
     for name, src in needed.items():
@@ -149,8 +210,9 @@ def settings_record(data_dir: Path, *, debiasing: bool, pert_list: str = "") -> 
         ),
         "perturbers_mask": PERTURBERS,
         "debiasing": (
-            "EFCC18 by find_orb (SETTINGS2 last field 1; environ.def: highly recommended)"
-            if debiasing else "off in find_orb; debiased centrally by the walk manifest"
+            "EFCC18 by find_orb (SETTINGS2 last field 1; environ.def: highly recommended), "
+            "each observation's catalog code read from its ADES astCat"
+            if debiasing else "off (SETTINGS2 last field 0): find_orb fits the raw astrometry"
         ),
         "weighting": "ADES rmsRA/rmsDec honoured (SETTINGS2 first field 1)",
         "outlier_rejection": "3 sigma (OUTLIER_REJECTION_LIMIT=3, find_orb default)",
