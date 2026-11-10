@@ -13,7 +13,7 @@ dated Earth-orientation kernels those downloads began to 404, and every layup
 fit failed.
 
 This script builds that directory from one data folder (``--data-dir``: the
-``layup/`` folder of the ``third-party-tools-2026-11-08`` dataset, which lists
+``layup/`` folder of the ``third-party-tools-2026-11-10`` dataset, which lists
 every file layup reads, shared kernels included) and from nothing else: no download, and never layup's per-user cache. The names come from the
 installed layup's own defaults, so a layup bump that renames a file is staged
 under the new name, and a file the bump adds that no role below fills is a

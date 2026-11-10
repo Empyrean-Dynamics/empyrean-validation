@@ -132,10 +132,10 @@ address the release names. Those addresses move: NAIF's renaming of its
 dated Earth-orientation kernels made every fit fail with a 404. So the
 suite never bootstraps. `stage_data.py` builds the directory (`data/`
 here) from the `layup/` folder of the published third-party tool set
-(`third-party-tools-2026-11-08` in `gs://empyrean-data`), which lists every
+(`third-party-tools-2026-11-10` in `gs://empyrean-data`), which lists every
 file layup opens (10 files, shared kernels included), so layup needs nothing
 from the engine kernel set. Sync it with the bucket's `empyrean-data.py`
-(`sync third-party-tools-2026-11-08 $DATA_DIR/third-party`); the Makefile
+(`sync third-party-tools-2026-11-10 $DATA_DIR/third-party`); the Makefile
 variable `LAYUP_DATA_DIR` (default `$(DATA_DIR)/third-party/layup`) names the
 folder `stage_data.py --data-dir` reads. It takes layup's file names from the
 installed layup itself:

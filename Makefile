@@ -1374,7 +1374,7 @@ LAYUP_PY := $(LAYUP_VENV)/bin/python
 # layup's data directory (its --ar): every kernel, the observatory codes and
 # the debiasing table under layup's own names, staged by stage_data.py from
 # the layup folder of the third-party tool set (dataset
-# third-party-tools-2026-11-08, synced under $(DATA_DIR)/third-party): the
+# third-party-tools-2026-11-10, synced under $(DATA_DIR)/third-party): the
 # folder lists every file layup reads, shared kernels included, so layup needs
 # nothing from the engine kernel set. layup never downloads at run time.
 LAYUP_DATA_DIR ?= $(DATA_DIR)/third-party/layup
@@ -1411,7 +1411,7 @@ $(LAYUP_OUT): | fixtures
 # OD runs the public CORE_OD_V1 profile; its missing per-observation sigma comes
 # from the suite's shared public Veres 2017 model (runners/sigmafill). It reads
 # DE440 and SB441-N16 from the adam-core folder of the third-party tool set
-# (dataset third-party-tools-2026-11-08, synced under $(DATA_DIR)/third-party)
+# (dataset third-party-tools-2026-11-10, synced under $(DATA_DIR)/third-party)
 # and passes them to adam-assist explicitly; it never falls back to the
 # install-time PyPI kernels and fetches nothing at run time.
 ADAM_CORE_VENV := $(EMP_VAL_RUNNERS)/adam-core/.venv
