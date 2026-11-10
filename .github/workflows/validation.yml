@@ -270,12 +270,11 @@ env:
   # The registered kernel set every empyrean repo pins (lang/workflow/gcp-project.md).
   EMPYREAN_DATASET: kernels-full-2026-10-13
   # The third-party tool set (lang/workflow/gcp-project.md): one folder per
-  # suite tool, each listing every file that tool reads. prep syncs it; the
-  # layup, ASSIST, find_orb and GRSS legs read their folders from it (find_orb's
-  # and ASSIST's binary DE440 and GRSS's kernels included), so none of them
-  # downloads from JPL or NAIF. The other tools move to it with the
-  # runner-fixes PR.
-  THIRD_PARTY_DATASET: third-party-tools-2026-11-08
+  # suite tool, each listing every file that tool reads. prep syncs it; every
+  # external leg reads its own folder from it (find_orb's and ASSIST's binary
+  # DE440 and GRSS's kernels included), so none of them downloads from JPL or
+  # NAIF.
+  THIRD_PARTY_DATASET: third-party-tools-2026-11-10
   EMPYREAN_OFFLINE: "1"
 
 jobs:
