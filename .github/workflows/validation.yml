@@ -8,9 +8,17 @@ name: Validation Suite
 #
 # ── Pipeline shape (matrix fan-out) ────────────────────────────────
 #
-#   precheck ─► prep ─► reference ×N ─► assemble ─┬─► empyrean ────┐
-#                       (cost-balanced row legs)   │                ├─► reduce
-#                                                  └─► external ×N ─┘
+#   precheck ─► prep ─┬─► reference ×N ─► assemble ─┬─► empyrean ×N ──────────┐
+#                     │   (light row legs)     │      ├─► external ×N ──────────┤
+#                     │                        └──┐   │   (object legs)         │
+#                     ├─► reference-heavy ×3 ─────┴─► assemble-final ───────────┼─► reduce
+#                     └─► empyrean-heavy ×12 ──────────────────────────────────┘
+#
+#   The heavy propagation row (2020 CD3, dt -5475 d, auto: 42 minutes a run,
+#   timed best of three) is off the critical path: its plan row is built in
+#   prep with no engine call, its rust and channel timing replicas run from
+#   prep in parallel with the light reference, and assemble-final checks the
+#   reference's strip equals the plan everything replayed, failing closed.
 #
 #   • prep   — build the engine and harness binaries, sync the kernel set, and
 #              fetch the pinned inputs snapshot (SBDB, Horizons, ADES PSVs)
@@ -32,15 +40,18 @@ name: Validation Suite
 #              job took 176 min and blew the 180-minute ceiling, discarding
 #              ~3 hours of completed fits (empyrean-qhhw); a leg per object
 #              could not cut the one object holding the 42-minute 2020 CD3
-#              propagation row, which every channel times best of three. The
-#              heavy row's three timing repetitions run on three legs, one
-#              each, and assemble checks them identical and keeps the minimum.
+#              propagation row, which every channel times best of three. That
+#              row is decoupled: its three timing repetitions run on the
+#              reference-heavy legs, one each, and assemble-final checks them
+#              identical and keeps the minimum.
 #              Legs restore prep's caches read-only and fail on a miss rather
 #              than re-downloading 2 GB of kernels per leg. fail-fast:false, so
 #              one slow leg cannot cancel the others.
-#   • assemble — the fan-in: reassemble every leg into the canonical
-#              reference (scripts/assemble-reference.py), then strip it into
-#              validation_plan.json. Checks that every candidate row is a result
+#   • assemble — the fan-in: reassemble the light legs, with the decoupled
+#              heavy rows' emitted plan rows in their places
+#              (scripts/assemble-reference.py), strip that into
+#              validation_plan.json, and schedule the channel and external
+#              legs. Checks that every candidate row is a result
 #              or named as dropped by the leg that ran it and fails NAMING any
 #              missing row or absent leg — a report built from most of the
 #              reference is otherwise indistinguishable from a complete one.
@@ -54,11 +65,21 @@ name: Validation Suite
 #              The rust channel is the reference and is produced by the
 #              `reference` matrix above.
 #   • external — one matrix leg per independent reference implementation
-#              (ASSIST, find_orb, OpenOrb, kete, jorbit, layup, OrbFit).
+#              (ASSIST, find_orb, OpenOrb, kete, jorbit, layup, OrbFit), or one
+#              per object leg for jorbit and OrbFit, each with its own timeout.
 #              Each replays the *prebuilt* plan; needs no secrets and no
 #              private checkout. fail-fast:false so one dead comparator
 #              never sinks the others — its channel just goes missing
 #              from the report, loudly, never faked.
+#   • reference-heavy / empyrean-heavy — the decoupled heavy rows' rust and
+#              channel timing replicas, one per leg, started right after prep
+#              (scripts/schedule.py, "heavy decoupling"). A c or cli heavy leg
+#              opens on a light leader row so the daemon's warm-up never lands
+#              on the heavy row.
+#   • assemble-final — the full reference (light legs plus heavy legs), its
+#              strip checked equal to the published plan apart from the
+#              timestamp (a mismatch fails the run by row and field), and the
+#              prep-plan-and-rust artifact reduce reads.
 #   • reduce — merge every staged channel JSON + render the report +
 #              gate (ci-check) + publish to GCS.
 #
@@ -157,7 +178,15 @@ on:
         type: string
         default: ""
       heavy_min_s:
-        description: "Also fan out any row whose single timing run costs this many seconds (empty = only the rows the cost table marks heavy; a rehearsal passes a small number so a cheap row fans out)"
+        description: "Also decouple any propagation row whose single timing run costs this many seconds in any channel (empty = only the rows the cost table marks heavy; a rehearsal passes a small number so a cheap row decouples)"
+        type: string
+        default: ""
+      external_tools:
+        description: "External tools to run, comma-separated (empty = every enabled tool; a rehearsal names a few)"
+        type: string
+        default: ""
+      external_leg_minutes:
+        description: "Target wall of one external object leg in minutes (empty = the external cost table's; a rehearsal lowers it so two objects make two legs)"
         type: string
         default: ""
   push:
@@ -215,6 +244,24 @@ env:
   # cost table marks the real one (2020 CD3), and a rehearsal lowers this so a
   # cheap row fans out. Empty = the table's marks only.
   HEAVY_MIN_S: ${{ inputs.heavy_min_s || '' }}
+  # The external tools that run (scripts/schedule.py pack-external cuts jorbit
+  # and OrbFit into object legs). `oorb` is off: see the external job.
+  EXTERNAL_TOOLS: ${{ inputs.external_tools || 'assist,findorb,kete,jorbit,layup,orbfit,grss' }}
+  EXTERNAL_LEG_TARGET_MIN: ${{ inputs.external_leg_minutes || '' }}
+  # The external tools whose setup or import still reaches JPL, NAIF or the MPC,
+  # and so seal after setup instead of before it. No validation job may reach
+  # those hosts (the manual mint-inputs run is the only one that does); this
+  # list is what is left to close, and scripts/tests/test_no_upstream_fetch.py
+  # fails if it grows or disagrees with the test's own copy:
+  #   grss    setup fetches the debiasing tables (ssd.jpl.nasa.gov) and the
+  #           observatory codes (data.minorplanetcenter.net); no tool-set folder
+  #           carries them yet
+  #   jorbit  closed by the runner-fixes PR
+  #   kete    its import fetches kernels from naif.jpl.nasa.gov (its leg leaves
+  #           NAIF open); closed by the runner-fixes PR
+  #   oorb    its build fetches its ephemeris; off, re-enabled by empyrean-jg3o
+  #   orbfit  closed by the runner-fixes PR
+  UPSTREAM_FETCH_ALLOWLIST: '["grss","jorbit","kete","oorb","orbfit"]'
   TIER: ${{ inputs.tier || 'standard' }}
   # Shared cache keys — every job restores by these exact keys so the
   # downloads/builds `prep` populates fan out warm. Bump a version suffix
@@ -222,8 +269,11 @@ env:
   # The registered kernel set every empyrean repo pins (lang/workflow/gcp-project.md).
   EMPYREAN_DATASET: kernels-full-2026-10-13
   # The third-party tool set (lang/workflow/gcp-project.md): one folder per
-  # suite tool, each listing every file that tool reads. The layup external
-  # leg syncs it; the other tools move to it with the runner-fixes PR.
+  # suite tool, each listing every file that tool reads. prep syncs it; the
+  # layup, ASSIST, find_orb and GRSS legs read their folders from it (find_orb's
+  # and ASSIST's binary DE440 and GRSS's kernels included), so none of them
+  # downloads from JPL or NAIF. The other tools move to it with the
+  # runner-fixes PR.
   THIRD_PARTY_DATASET: third-party-tools-2026-11-08
   EMPYREAN_OFFLINE: "1"
 
@@ -271,11 +321,11 @@ jobs:
           esac
 
   # ── prep ───────────────────────────────────────────────────────────
-  # Download + cache all shared data ONCE, build the rust reference, and
-  # emit the canonical plan. This is the only job that hits the network
-  # (NAIF/JPL/SBDB) and the only one besides `empyrean` that carries the
-  # private-engine checkout. Everything downstream restores the caches it
-  # populates and consumes the plan artifact it uploads.
+  # Download + cache all shared data ONCE (from our buckets: the kernel set, the
+  # third-party tool set, the inputs snapshot), build every binary, and
+  # schedule the reference. The only job that carries the private-engine
+  # checkout. Everything downstream restores the caches it populates and
+  # consumes the artifacts it uploads.
   prep:
     name: Prep — data + rust reference + plan
     needs: precheck
@@ -290,6 +340,12 @@ jobs:
       # schedule itself (which rows each leg runs) travels in the
       # `reference-schedule` artifact; only this short list is a job output.
       reference_legs: ${{ steps.schedule-reference.outputs.reference_legs }}
+      # The decoupled heavy rows' legs: [{"leg"}] for reference-heavy and
+      # [{"channel","leg"}] for empyrean-heavy, from the heavy schedules in the
+      # `reference-schedule` artifact. `[]` when nothing is heavy (a subset
+      # without 2020 CD3), which skips both jobs.
+      reference_heavy_legs: ${{ steps.schedule-reference.outputs.reference_heavy_legs }}
+      empyrean_heavy_legs: ${{ steps.schedule-reference.outputs.empyrean_heavy_legs }}
       # snapshot_id of the pinned inputs snapshot, read from the manifest.
       # Every downstream job keys the inputs cache on this (prep is the sole
       # writer), so they all restore exactly what prep fetched.
@@ -306,6 +362,14 @@ jobs:
         uses: actions/checkout@v4
         with:
           path: empyrean-validation
+      # No step of this job reaches JPL, NAIF or the MPC: kernels, tool data and
+      # inputs come from our buckets and the actions cache, the engine library
+      # from the authenticated release API. So the seal goes first, before any
+      # setup, and a client that would read past the pinned sets fails at the
+      # socket (scripts/seal-upstream.sh).
+      - name: Seal the job from JPL, NAIF and the MPC
+        working-directory: empyrean-validation
+        run: ./scripts/seal-upstream.sh
 
       # The pinned inputs snapshot id, read once here and exported as a job
       # output so every downstream job keys the inputs cache identically. A
@@ -399,7 +463,11 @@ jobs:
       # The reference schedule: the candidate rows (`validate run --list-rows`,
       # which needs no engine call) and one OD unit per catalog object, packed
       # into cost-balanced legs from the committed cost table
-      # (fixtures/costs.json). `list-objects` shares its filter resolution with
+      # (fixtures/costs.json). The heavy propagation rows are decoupled first:
+      # their plan rows are emitted with no engine call (`validate run
+      # --emit-plan-rows`, the real run's row constructor), and their rust and
+      # channel replicas get legs of their own (the heavy schedules), which
+      # start now instead of after the reference. `list-objects` shares its filter resolution with
       # `plan`, so the objects the legs cover and the plan's objects cannot
       # disagree. The log lists the predicted leg walls and names every row the
       # cost table does not know (priced at a class estimate, never zero). The
@@ -417,12 +485,17 @@ jobs:
           make schedule-reference OBJECTS="${OBJECTS}" TIERS="${TIER}" REFERENCE_LEG_BUDGET="${REFERENCE_LEGS}"
           python3 scripts/schedule.py validate-reference \
             --candidates results/reference-candidates.json --objects results/objects.json \
-            --schedule results/reference-schedule.json --costs fixtures/costs.json
+            --schedule results/reference-schedule.json --costs fixtures/costs.json \
+            --heavy-schedule results/reference-heavy-schedule.json
+          python3 scripts/schedule.py validate-heavy --heavy-plan results/heavy-plan.json \
+            --schedule results/schedule-heavy.json --costs fixtures/costs.json
           matrix="$(cat results/reference-leg-matrix.json)"
           count="$(python3 -c 'import json;print(len(json.load(open("results/reference-leg-matrix.json"))))')"
           test "$count" -gt 0 || { echo "ERROR: the reference leg matrix is empty." >&2; exit 1; }
           echo "reference_legs=$matrix" >> "$GITHUB_OUTPUT"
-          echo "Fanning out $count reference legs."
+          echo "reference_heavy_legs=$(cat results/reference-heavy-leg-matrix.json)" >> "$GITHUB_OUTPUT"
+          echo "empyrean_heavy_legs=$(cat results/heavy-leg-matrix.json)" >> "$GITHUB_OUTPUT"
+          echo "Fanning out $count reference legs, $(python3 -c 'import json;print(len(json.load(open("results/reference-heavy-leg-matrix.json"))))') reference-heavy legs and $(python3 -c 'import json;print(len(json.load(open("results/heavy-leg-matrix.json"))))') empyrean-heavy legs."
       - name: Upload the reference schedule
         uses: actions/upload-artifact@v4
         with:
@@ -431,6 +504,11 @@ jobs:
             empyrean-validation/results/reference-candidates.json
             empyrean-validation/results/reference-schedule.json
             empyrean-validation/results/objects.json
+            empyrean-validation/results/heavy.json
+            empyrean-validation/results/heavy-plan.json
+            empyrean-validation/results/heavy-plan.json.dropped.json
+            empyrean-validation/results/reference-heavy-schedule.json
+            empyrean-validation/results/schedule-heavy.json
           retention-days: 30
           if-no-files-found: error
 
@@ -445,10 +523,10 @@ jobs:
   # 47 s), so the schedule is priced from measured costs
   # (fixtures/costs.json, refreshed by PR from a named run), and an object-level
   # leg cannot hold the one object whose single propagation row costs 42
-  # minutes per run, timed best of three. That row's three timing repetitions
-  # run on three legs, one each; assemble checks them identical and keeps the
-  # minimum. A stale cost table costs balance, never results: every candidate
-  # row still lands exactly once.
+  # minutes per run, timed best of three. That row is decoupled (prep's heavy
+  # file): its three timing repetitions run on the reference-heavy legs, from
+  # prep, so these light legs no longer wait on it. A stale cost table costs
+  # balance, never results: every candidate row still lands exactly once.
   #
   # fail-fast:false so one slow leg does not cancel the others; `assemble` is
   # what turns a missing row or leg into a hard failure, by name.
@@ -456,12 +534,10 @@ jobs:
     name: Reference — leg ${{ matrix.leg.leg }}
     needs: prep
     runs-on: ubuntu-latest
-    # About 3x the longest predicted leg (the heavy row's replica legs, 42
-    # minutes), the margin the slowest measured runner variance asks for: 2020
-    # CD3 took 101.3 minutes on run 40612958887 (2026-10-28) and 175.6 minutes
-    # on run 42506609035 (2026-11-08) when its three timing repetitions shared
-    # one job (bead empyrean-apgbt).
-    timeout-minutes: 180
+    # About 4x the longest predicted light leg (the Eros OD unit, 29.8 minutes;
+    # the heavy row is on its own legs now), the margin runner variance asks
+    # for: 2020 CD3 took 1.7x longer on one hosted run than another.
+    timeout-minutes: 120
     strategy:
       fail-fast: false
       # Headroom under the 60-concurrent-job account limit and a bounded peak on
@@ -474,6 +550,11 @@ jobs:
         uses: actions/checkout@v4
         with:
           path: empyrean-validation
+      # Nothing here reaches JPL, NAIF or the MPC (kernels and inputs come from
+      # prep's caches, verified offline), so the seal goes before any setup.
+      - name: Seal the job from JPL, NAIF and the MPC
+        working-directory: empyrean-validation
+        run: ./scripts/seal-upstream.sh
       - name: Engine setup (reader — must restore prep's caches)
         uses: ./empyrean-validation/.github/actions/engine-setup
         with:
@@ -505,13 +586,6 @@ jobs:
         env:
           DATA_DIR: ${{ env.EMPYREAN_DATA_DIR }}
         run: make build-reference PREBUILT_BIN=1
-      # Reader role: the inputs snapshot is already restored and verified
-      # offline by engine-setup, and this leg downloads nothing from JPL during
-      # setup, so seal before the leg run — a cache miss then fails at the
-      # socket rather than silently querying live.
-      - name: Seal the job from JPL and the MPC
-        working-directory: empyrean-validation
-        run: ./scripts/seal-upstream.sh
       - name: Reference leg ${{ matrix.leg.leg }}
         working-directory: empyrean-validation
         env:
@@ -529,17 +603,104 @@ jobs:
           retention-days: 30
           if-no-files-found: error
 
+  # ── reference-heavy (decoupled heavy rows, from prep) ───────────────
+  # The rust timing replicas of each decoupled heavy row, one per leg, in the
+  # reference leg machinery (`make shard-reference` over the heavy reference
+  # schedule prep wrote). They start right after prep, in parallel with the
+  # light reference, so the 42-minute row no longer sets the reference wall;
+  # assemble-final folds their replicas (identical bit for bit but for the
+  # volatile fields, minimum time kept) into the full reference. The artifact
+  # keeps the reference-leg name so assemble-final downloads every leg with one
+  # pattern; leg ids start with `h`, so they cannot collide with light legs.
+  reference-heavy:
+    name: Reference heavy — leg ${{ matrix.leg.leg }}
+    needs: prep
+    if: needs.prep.outputs.reference_heavy_legs != '[]'
+    runs-on: ubuntu-latest
+    # One timing replica of a decoupled heavy row per leg (42 minutes a run for
+    # 2020 CD3 at dt -5475 d), at about 3x for runner variance, the margin the
+    # slowest measured CD3 run asks for (101.3 and 175.6 minutes for three
+    # repetitions on runs 40612958887 and 42506609035).
+    timeout-minutes: 180
+    strategy:
+      fail-fast: false
+      # Headroom under the 60-concurrent-job account limit and a bounded peak on
+      # the 2 GB kernel-cache restore.
+      max-parallel: 25
+      matrix:
+        leg: ${{ fromJson(needs.prep.outputs.reference_heavy_legs) }}
+    steps:
+      - name: Checkout empyrean-validation (default)
+        uses: actions/checkout@v4
+        with:
+          path: empyrean-validation
+      # Nothing here reaches JPL, NAIF or the MPC (kernels and inputs come from
+      # prep's caches, verified offline), so the seal goes before any setup.
+      - name: Seal the job from JPL, NAIF and the MPC
+        working-directory: empyrean-validation
+        run: ./scripts/seal-upstream.sh
+      - name: Engine setup (reader — must restore prep's caches)
+        uses: ./empyrean-validation/.github/actions/engine-setup
+        with:
+          gh-pat: ${{ secrets.GH_PAT }}
+          python-version: ${{ env.PYTHON_VERSION }}
+          dataset: ${{ env.EMPYREAN_DATASET }}
+          inputs-snapshot-id: ${{ needs.prep.outputs.inputs_id }}
+          role: reader
+          skip-build: "true"
+      - name: Download the reference schedule
+        uses: actions/download-artifact@v4
+        with:
+          name: reference-schedule
+          path: empyrean-validation/results
+      # Nothing is compiled here: the rust runner and the harness are the bytes
+      # prep built (the full `build` measured 375s on a leg). `PREBUILT_BIN=1`
+      # makes `build-reference` assert them against the manifest and refuse, by
+      # name, a missing or altered binary instead of rebuilding.
+      - name: Download the prebuilt binaries
+        uses: actions/download-artifact@v4
+        with:
+          name: prebuilt-bin
+          path: empyrean-validation/prebuilt
+      - name: Unpack the prebuilt binaries
+        working-directory: empyrean-validation
+        run: python3 scripts/prebuilt.py unpack --from prebuilt
+      - name: Assert the prebuilt reference prerequisites
+        working-directory: empyrean-validation
+        env:
+          DATA_DIR: ${{ env.EMPYREAN_DATA_DIR }}
+        run: make build-reference PREBUILT_BIN=1
+      - name: Reference heavy leg ${{ matrix.leg.leg }}
+        working-directory: empyrean-validation
+        env:
+          DATA_DIR: ${{ env.EMPYREAN_DATA_DIR }}
+        run: |
+          make shard-reference PREBUILT_BIN=1 \
+            REFERENCE_LEG_SCHEDULE=results/reference-heavy-schedule.json \
+            LEG="${{ matrix.leg.leg }}" \
+            OBJECTS="${OBJECTS}" \
+            TIERS="${TIER}"
+      - name: Upload reference heavy leg
+        uses: actions/upload-artifact@v4
+        with:
+          name: reference-leg-${{ matrix.leg.leg }}
+          path: empyrean-validation/results/shards/${{ matrix.leg.leg }}/
+          retention-days: 30
+          if-no-files-found: error
+
   # ── assemble ───────────────────────────────────────────────────────
-  # Fan-in: reassemble every reference leg into the canonical reference and
-  # strip it into the plan every replay channel reads.
+  # Fan-in: reassemble the light reference legs and strip them, with the
+  # decoupled heavy rows' emitted plan rows in their canonical places, into the
+  # plan every replay channel and external reads, then schedule the channel and
+  # external legs. The heavy legs are still running; assemble-final checks the
+  # reference they complete strips to this same plan.
   #
   # This is the job that makes the fan-out safe. `assemble-reference` checks
   # that every candidate row is a result or named as dropped by the leg that ran
-  # it, folds the heavy row's replicas, and fails naming any row that is missing
-  # or any leg that did not arrive — a report rendered from most of the
-  # reference is otherwise indistinguishable from a complete one. It runs even
-  # when legs failed (always()) precisely so it can produce that named error
-  # rather than being skipped into silence.
+  # it and fails naming any row that is missing or any leg that did not arrive —
+  # a report rendered from most of the reference is otherwise indistinguishable
+  # from a complete one. It runs even when legs failed (always()) precisely so
+  # it can produce that named error rather than being skipped into silence.
   assemble:
     name: Assemble — reference + plan
     needs: [prep, reference]
@@ -547,15 +708,22 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     outputs:
-      # The channel leg matrix, [{"channel","leg"}], from the schedule below. The
-      # schedule itself (which rows each leg replays) travels in the
-      # prep-plan-and-rust artifact; only this short list is a job output.
+      # The channel leg matrix, [{"channel","leg"}], and the external leg matrix,
+      # [{"tool","leg","timeout"}], from the schedules below. The schedules
+      # themselves (which rows or objects each leg takes) travel in the `plan`
+      # artifact; only these short lists are job outputs.
       leg_matrix: ${{ steps.schedule.outputs.leg_matrix }}
+      external_legs: ${{ steps.schedule-external.outputs.external_legs }}
     steps:
       - name: Checkout empyrean-validation (default)
         uses: actions/checkout@v4
         with:
           path: empyrean-validation
+      # Nothing here reaches JPL, NAIF or the MPC: a Horizons or SBDB key missing
+      # from the snapshot must fail at the socket, not fetch live.
+      - name: Seal the job from JPL, NAIF and the MPC
+        working-directory: empyrean-validation
+        run: ./scripts/seal-upstream.sh
       - uses: actions/setup-python@v5
         with:
           python-version: ${{ env.PYTHON_VERSION }}
@@ -577,6 +745,9 @@ jobs:
         with:
           name: reference-schedule
           path: empyrean-validation/results
+      # The light legs are the ones this job assembles; a heavy leg that has
+      # already finished may download too and is not read (assemble-final reads
+      # every leg).
       - name: Download every reference leg
         uses: actions/download-artifact@v4
         with:
@@ -607,11 +778,8 @@ jobs:
       - name: Verify the pinned inputs snapshot offline
         working-directory: empyrean-validation
         run: make fixtures INPUTS_OFFLINE=1
-      # Seal before the plan step: a Horizons/SBDB key missing from the
-      # snapshot must fail here, not fetch live.
-      - name: Seal the job from JPL and the MPC
-        working-directory: empyrean-validation
-        run: ./scripts/seal-upstream.sh
+      # The reference written here is provisional (the decoupled rows are their
+      # emitted plan rows); it is stripped into the plan and not uploaded.
       # REFERENCE_ASSEMBLED=1 tells `plan` that the unified reference is already
       # on disk (assemble-reference just wrote it from the legs). Without it,
       # make walks $(RUST) -> $(RUST_PROPEPH)/$(RUST_OD) -> $(RUST_BIN), a file
@@ -642,8 +810,102 @@ jobs:
           echo "leg_matrix=$matrix" >> "$GITHUB_OUTPUT"
           echo "Fanning out $count channel legs."
 
-      # Stage the plan + the rust channel outputs for the downstream jobs.
-      #
+      # The external legs: one per tool, or object legs for the tools the
+      # external cost table prices per object (jorbit, OrbFit), each with a
+      # timeout sized to its predicted wall (fixtures/external-costs.json).
+      - name: Schedule the external legs
+        id: schedule-external
+        working-directory: empyrean-validation
+        run: |
+          make schedule-external PLAN_PREBUILT=1 EXTERNAL_TOOLS="${EXTERNAL_TOOLS}" \
+            EXTERNAL_LEG_TARGET_MIN="${EXTERNAL_LEG_TARGET_MIN}"
+          python3 scripts/schedule.py validate-external --plan results/validation_plan.json \
+            --schedule results/external-schedule.json
+          count="$(python3 -c 'import json;print(len(json.load(open("results/external-leg-matrix.json"))))')"
+          test "$count" -gt 0 || { echo "ERROR: the external leg matrix is empty." >&2; exit 1; }
+          echo "external_legs=$(cat results/external-leg-matrix.json)" >> "$GITHUB_OUTPUT"
+          echo "Fanning out $count external legs."
+
+      # The plan and the schedules the channel and external legs read. The rust
+      # reference and its sidecars are uploaded by assemble-final, in the
+      # prep-plan-and-rust artifact, once the heavy legs have completed it.
+      - name: Upload the plan and the leg schedules
+        uses: actions/upload-artifact@v4
+        with:
+          name: plan
+          path: |
+            empyrean-validation/results/validation_plan.json
+            empyrean-validation/results/schedule.json
+            empyrean-validation/results/leg-matrix.json
+            empyrean-validation/results/external-schedule.json
+            empyrean-validation/results/external-leg-matrix.json
+          retention-days: 30
+          if-no-files-found: error
+
+  # ── assemble-final ──────────────────────────────────────────────────
+  # The full reference: every light leg and every heavy leg reassembled (the
+  # heavy row's replicas folded, identical bit for bit but for the volatile
+  # fields, minimum time kept), stripped, and checked against the plan assemble
+  # published, which every channel and external has been replaying meanwhile.
+  # The strip must equal it row for row and field for field apart from the
+  # timestamp, or this job fails naming the first differing row and field, and
+  # with it the run: a drift can never publish. A decoupled row the engine
+  # refuses is written to validation_rust_heavy_dropped.json, and reduce
+  # discards it from every channel and external, as the in-path plan would have;
+  # a missing row that is not decoupled is a hard error. It then uploads the
+  # prep-plan-and-rust artifact under its old name and contents.
+  assemble-final:
+    name: Assemble final — full reference, checked against the plan
+    needs: [prep, reference-heavy, assemble]
+    if: >-
+      always() && needs.assemble.result == 'success'
+      && (needs.reference-heavy.result == 'success' || needs.reference-heavy.result == 'skipped')
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout empyrean-validation (default)
+        uses: actions/checkout@v4
+        with:
+          path: empyrean-validation
+      # Nothing here reaches JPL, NAIF or the MPC.
+      - name: Seal the job from JPL, NAIF and the MPC
+        working-directory: empyrean-validation
+        run: ./scripts/seal-upstream.sh
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+      # Only the harness binary (strip-plan), the one prep built.
+      - name: Engine library (restored from prep; no public release URL)
+        uses: ./empyrean-validation/.github/actions/engine-lib
+      - name: Download the prebuilt binaries
+        uses: actions/download-artifact@v4
+        with:
+          name: prebuilt-bin
+          path: empyrean-validation/prebuilt
+      - name: Unpack the prebuilt harness
+        working-directory: empyrean-validation
+        run: python3 scripts/prebuilt.py unpack --from prebuilt --only harness
+      - name: Download the reference schedule
+        uses: actions/download-artifact@v4
+        with:
+          name: reference-schedule
+          path: empyrean-validation/results
+      - name: Download the published plan and the leg schedules
+        uses: actions/download-artifact@v4
+        with:
+          name: plan
+          path: empyrean-validation/results
+      - name: Download every reference leg, light and heavy
+        uses: actions/download-artifact@v4
+        with:
+          pattern: reference-leg-*
+          path: empyrean-validation/results/shards
+      - name: Show staged legs
+        working-directory: empyrean-validation/results/shards
+        run: find . -maxdepth 1 -mindepth 1 -type d -print | sort
+      - name: Assemble the full reference and check it against the published plan
+        working-directory: empyrean-validation
+        run: make assemble-final PREBUILT_BIN=1 PLAN_PREBUILT=1 OBJECTS="${OBJECTS}"
       # Including the two JSONL sidecars `validate od` writes next to
       # validation_rust_od.json. They are not channel results, they are the
       # per-object fitted/propagated orbits and the fitted-vs-reference
@@ -654,10 +916,9 @@ jobs:
       # empty, not because there was nothing to show but because the data never
       # crossed the job boundary. Same silent-empty family as the OD channel.
       #
-      # Every downstream job pulls this artifact whole (`download-artifact` by
-      # name, or reduce's merge-multiple), so the sidecars arrive wherever
-      # validation_rust_od.json does; there is no per-file download list to
-      # extend. The artifact keeps its original name so no consumer changes.
+      # The plan is the published one, byte for byte (the schedules hash it);
+      # the heavy plan and schedules let reduce take the decoupled rows from the
+      # empyrean-heavy legs. The artifact keeps its original name.
       - name: Upload plan + rust reference
         uses: actions/upload-artifact@v4
         with:
@@ -670,8 +931,13 @@ jobs:
             empyrean-validation/results/validation_rust_od_orbits.jsonl
             empyrean-validation/results/validation_rust_od_compare.jsonl
             empyrean-validation/results/validation_rust_dropped.json
+            empyrean-validation/results/validation_rust_heavy_dropped.json
             empyrean-validation/results/schedule.json
             empyrean-validation/results/leg-matrix.json
+            empyrean-validation/results/external-schedule.json
+            empyrean-validation/results/heavy.json
+            empyrean-validation/results/heavy-plan.json
+            empyrean-validation/results/schedule-heavy.json
           retention-days: 30
           if-no-files-found: error
 
@@ -702,8 +968,10 @@ jobs:
     # leg replayed the whole plan (2026-10-28: all 30,033 rows on every leg).
     # Each leg runs the binaries prep built (it compiles nothing) and uploads
     # one leg file; reduce puts the legs back in plan order per channel before
-    # the merge.
-    timeout-minutes: 240
+    # the merge. The decoupled heavy row is not on these legs (empyrean-heavy
+    # runs it from prep), so the longest predicted leg is about 48 minutes
+    # (cli); the limit is about 3x that.
+    timeout-minutes: 150
     strategy:
       fail-fast: false
       matrix:
@@ -713,6 +981,12 @@ jobs:
         uses: actions/checkout@v4
         with:
           path: empyrean-validation
+      # Nothing here reaches JPL, NAIF or the MPC (the wheel install pulls only
+      # from PyPI; kernels and inputs come from the caches), so the seal goes
+      # before any setup and the replay can never fetch live.
+      - name: Seal the job from JPL, NAIF and the MPC
+        working-directory: empyrean-validation
+        run: ./scripts/seal-upstream.sh
       - uses: actions/setup-python@v5
         with:
           python-version: ${{ env.PYTHON_VERSION }}
@@ -729,7 +1003,7 @@ jobs:
         uses: actions/cache/restore@v4
         with:
           path: data
-          key: empyrean-data-${{ env.EMPYREAN_DATASET }}-set-codes
+          key: empyrean-data-${{ env.EMPYREAN_DATASET }}-set-only
       # Under `gh act` the data directory comes from the host mount when act's
       # cache server had nothing for the key (see engine-setup); never on a
       # hosted run.
@@ -761,10 +1035,10 @@ jobs:
         working-directory: empyrean-validation
         run: make fixtures INPUTS_OFFLINE=1
 
-      - name: Download plan + rust reference
+      - name: Download the plan and the leg schedules
         uses: actions/download-artifact@v4
         with:
-          name: prep-plan-and-rust
+          name: plan
           path: empyrean-validation/results
 
       # Build once, run everywhere: the wheel, the C ABI runner, the CLI runner,
@@ -795,11 +1069,6 @@ jobs:
             core)   make build-core PREBUILT_BIN=1 ;;
             *)      echo "unknown channel ${{ matrix.channel }}" >&2; exit 1 ;;
           esac
-      # Seal after the wheel install (which pulls only from PyPI) and before the
-      # replay, which reads the snapshot and must never fetch live.
-      - name: Seal the job from JPL and the MPC
-        working-directory: empyrean-validation
-        run: ./scripts/seal-upstream.sh
       # LEG is this leg's id in the schedule, so the run-* target replays only
       # its rows (see the job comment); the log's "Plan leg: N rows" line is
       # the row count this leg replays.
@@ -820,9 +1089,151 @@ jobs:
           retention-days: 30
           if-no-files-found: error
 
+  # ── empyrean-heavy (decoupled heavy rows, from prep) ───────────────
+  # The channel timing replicas of each decoupled heavy row, one per leg, over
+  # the heavy plan prep emitted (scripts/schedule.py pack-heavy). They need only
+  # prep's binaries and data, so they start with the reference instead of after
+  # it. reduce folds each channel's replicas (identical bit for bit but for the
+  # volatile fields, minimum time kept) into that channel's file at the row's
+  # place in plan order, keeps no warm-up leader row, and drops the row if
+  # assemble-final found the engine refuses it.
+  empyrean-heavy:
+    name: Empyrean heavy — ${{ matrix.channel }} · ${{ matrix.leg }}
+    needs: prep
+    if: needs.prep.outputs.empyrean_heavy_legs != '[]'
+    runs-on: ubuntu-latest
+    # One timing replica of a decoupled heavy row (about 42 minutes in python
+    # and core, 45 and 49 in c and cli), at about 3x for runner variance.
+    timeout-minutes: 180
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJson(needs.prep.outputs.empyrean_heavy_legs) }}
+    steps:
+      - name: Checkout empyrean-validation (default)
+        uses: actions/checkout@v4
+        with:
+          path: empyrean-validation
+      # Nothing here reaches JPL, NAIF or the MPC (the wheel install pulls only
+      # from PyPI; kernels and inputs come from the caches), so the seal goes
+      # before any setup and the replay can never fetch live.
+      - name: Seal the job from JPL, NAIF and the MPC
+        working-directory: empyrean-validation
+        run: ./scripts/seal-upstream.sh
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      # The engine library, restored from prep's cache and verified offline. The
+      # c and cli runners and the wheel were built against the engine prep built;
+      # nothing here compiles, so there is no sibling checkout, no toolchain and
+      # no uv, and no job in this run reaches the public release URL.
+      - name: Engine library (restored from prep; no public release URL)
+        uses: ./empyrean-validation/.github/actions/engine-lib
+
+      - name: Restore empyrean data kernels
+        id: cache-data
+        uses: actions/cache/restore@v4
+        with:
+          path: data
+          key: empyrean-data-${{ env.EMPYREAN_DATASET }}-set-only
+      # Under `gh act` the data directory comes from the host mount when act's
+      # cache server had nothing for the key (see engine-setup); never on a
+      # hosted run.
+      - name: Copy the registered kernel set from the host mount (act)
+        if: env.ACT == 'true' && steps.cache-data.outputs.cache-hit != 'true'
+        run: |
+          src="${ACT_DATA_DIR:-/host-data}"
+          if [ ! -f "$src/obscodes_extended.json" ] || [ ! -f "$src/de440.bsp" ]; then
+            echo "ERROR: running under act, but no registered kernel set is mounted at $src." >&2
+            exit 1
+          fi
+          rm -rf data && mkdir -p data && cp -a "$src"/. data/
+
+      # Inputs snapshot (prep is the sole fetcher): restore by snapshot id and
+      # verify offline, no credential. The replay channels fit the pinned PSVs
+      # and read the pinned SBDB for the OD comparison.
+      - name: Restore inputs snapshot
+        id: cache-inputs
+        uses: actions/cache/restore@v4
+        with:
+          path: |
+            empyrean-validation/fixtures/psv
+            empyrean-validation/fixtures/psv-radar
+            empyrean-validation/fixtures/horizons
+            empyrean-validation/fixtures/sbdb
+            empyrean-validation/fixtures/snapshot-manifest.json
+          key: inputs-${{ needs.prep.outputs.inputs_id }}
+      - name: Verify the pinned inputs snapshot offline
+        working-directory: empyrean-validation
+        run: make fixtures INPUTS_OFFLINE=1
+
+      # The heavy plan (the emitted plan rows of the decoupled rows and their
+      # leaders) and the heavy channel schedule, from prep.
+      - name: Download the heavy plan and schedule
+        uses: actions/download-artifact@v4
+        with:
+          name: reference-schedule
+          path: empyrean-validation/results
+
+      # Build once, run everywhere: the wheel, the C ABI runner, the CLI runner,
+      # validate-core and the engine's C library are the bytes prep built. The
+      # unpack hash-verifies each against the manifest; `PREBUILT_BIN=1` then
+      # makes each build target ASSERT its artifact (and install the wheel into
+      # this leg's venv) and never compile. A missing or altered binary fails the
+      # leg by name instead of being rebuilt into something prep did not measure.
+      - name: Download the prebuilt binaries
+        uses: actions/download-artifact@v4
+        with:
+          name: prebuilt-bin
+          path: empyrean-validation/prebuilt
+      - name: Unpack the prebuilt binaries
+        working-directory: empyrean-validation
+        run: python3 scripts/prebuilt.py unpack --from prebuilt
+      - name: Assert the prebuilt ${{ matrix.channel }} artifacts
+        working-directory: empyrean-validation
+        env:
+          DATA_DIR: ${{ env.EMPYREAN_DATA_DIR }}
+        run: |
+          # The c and cli drivers run under the wheel's virtualenv (the
+          # Makefile's WHEEL_VENV python), so those legs install the wheel too.
+          case "${{ matrix.channel }}" in
+            python) make build-empyrean-c build-wheel PREBUILT_BIN=1 ;;
+            c)      make build-empyrean-c build-wheel build-c PREBUILT_BIN=1 ;;
+            cli)    make build-empyrean-c build-wheel build-cli PREBUILT_BIN=1 ;;
+            core)   make build-core PREBUILT_BIN=1 ;;
+            *)      echo "unknown channel ${{ matrix.channel }}" >&2; exit 1 ;;
+          esac
+      # The same run-* target as a light leg, over the heavy plan and the heavy
+      # schedule (PLAN_KIND=heavy checks the plan is propagation rows only).
+      # The leg runs one replica of the heavy row (its repetition override is
+      # 1); a c or cli leg opens on its own light leader row.
+      - name: Replay heavy row — ${{ matrix.channel }} leg ${{ matrix.leg }}
+        working-directory: empyrean-validation
+        env:
+          DATA_DIR: ${{ env.EMPYREAN_DATA_DIR }}
+        run: |
+          make run-${{ matrix.channel }} PREBUILT_BIN=1 PLAN_PREBUILT=1 PLAN_KIND=heavy \
+            PLAN=results/heavy-plan.json SCHEDULE=results/schedule-heavy.json \
+            LEG="${{ matrix.leg }}" TIERS="${TIER}"
+          mv results/validation_${{ matrix.channel }}.json \
+             results/validation_${{ matrix.channel }}_heavy.leg${{ matrix.leg }}.json
+
+      - name: Upload ${{ matrix.channel }} heavy leg ${{ matrix.leg }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: channel-heavy-${{ matrix.channel }}-${{ matrix.leg }}
+          path: empyrean-validation/results/validation_${{ matrix.channel }}_heavy.leg${{ matrix.leg }}.json
+          retention-days: 30
+          if-no-files-found: error
+
   # ── external ───────────────────────────────────────────────────────
-  # One matrix leg per independent reference implementation. Each replays
-  # the prebuilt plan through an upstream tool. NO private checkout, NO
+  # One matrix leg per independent reference implementation, or per object leg
+  # for the tools cut by object (jorbit died of memory after 41 to 71 min over
+  # the whole catalog; OrbFit took 44 to 51), from the external schedule
+  # assemble wrote (scripts/schedule.py pack-external). Each replays the
+  # prebuilt plan through an upstream tool; reduce puts a tool's legs back into
+  # its one comparator file before the merge. NO private checkout, NO
   # secrets — these run untrusted-ish upstream code isolated from the PAT
   # and the GCP identity. (The OD fixture fetch below keeps that true:
   # public-read objects over plain HTTPS, no credential involved.)
@@ -830,16 +1241,16 @@ jobs:
   # leaves its channel missing from the report (loudly) without sinking
   # the rest of the matrix.
   external:
-    name: External — ${{ matrix.tool }}
+    name: External — ${{ matrix.tool }} · ${{ matrix.leg }}
     # prep is in `needs` only to read its inputs_id output for the cache key —
     # no credential crosses here; the external legs stay secretless. assemble
     # is the real data dependency (the plan artifact).
     needs: [prep, assemble]
     runs-on: ubuntu-latest
-    # Budget from the measured pace (run 169, 2026-10-19): the longest green
-    # leg was jorbit at 73 min; orbfit, back to one fit per object, is about
-    # 80 min at its 1.6 min/fit.
-    timeout-minutes: 240
+    # Each leg's own limit, from the external schedule: 3x its predicted wall
+    # (fixtures/external-costs.json: measured job walls, OrbFit's per-object fit
+    # times, jorbit's modeled per-object cost), never under 30 minutes.
+    timeout-minutes: ${{ matrix.timeout }}
     # No credentials here: this job inherits the workflow's read-only
     # permissions (no id-token), and none of its legs authenticates or runs
     # gcloud. The legs build and run untrusted upstream code (find_orb, OrbFit,
@@ -847,9 +1258,13 @@ jobs:
     # prep. The layup leg's data is synced by prep and only RESTORED here.
     strategy:
       fail-fast: false
+      # About 16 legs (jorbit 9, OrbFit 2, five tools 1 each) of 25 minutes or
+      # less, inside the channel stage's ~52: eight at a time finish them
+      # without taking slots from the channel legs under the 60-job limit.
+      max-parallel: 8
       matrix:
-        # `oorb` is DISABLED, deliberately — it is not missing from this list
-        # by accident, and the oorb-specific steps below are kept in place as
+        # `oorb` is DISABLED, deliberately — it is not missing from
+        # EXTERNAL_TOOLS (the workflow env) by accident, and the oorb-specific steps below are kept in place as
         # the re-enable path.
         #
         # BLOCKER: run_oorb.py needs `ref_sun_pos_au` / `ref_sun_vel_au_d` on
@@ -871,16 +1286,25 @@ jobs:
         #
         # RE-ENABLE (empyrean-jg3o): tag the validation schema -> re-pin
         # empyrean-core -> populate ref_sun_* in the rust runner or the strip
-        # -> add `oorb` back to this list and set WITH_OORB=1 in the Makefile.
+        # -> add `oorb` back to EXTERNAL_TOOLS and set WITH_OORB=1 in the Makefile.
         # Until then reduce prints a DISABLED line naming this reason, so the
         # channel's absence from the report is explained rather than guessed
         # at.
-        tool: [assist, findorb, kete, jorbit, layup, orbfit, grss]
+        include: ${{ fromJson(needs.assemble.outputs.external_legs) }}
     steps:
       - name: Checkout empyrean-validation (default)
         uses: actions/checkout@v4
         with:
           path: empyrean-validation
+
+      # A tool whose setup and run reach none of JPL, NAIF and the MPC is sealed
+      # before anything else. The tools on UPSTREAM_FETCH_ALLOWLIST (see the
+      # workflow env) still fetch during setup or import and are sealed after
+      # setup instead, below.
+      - name: Seal the job from JPL, NAIF and the MPC (before setup)
+        if: ${{ !contains(fromJSON(env.UPSTREAM_FETCH_ALLOWLIST), matrix.tool) }}
+        working-directory: empyrean-validation
+        run: ./scripts/seal-upstream.sh
 
       - uses: actions/setup-python@v5
         with:
@@ -891,7 +1315,7 @@ jobs:
         uses: actions/cache/restore@v4
         with:
           path: data
-          key: empyrean-data-${{ env.EMPYREAN_DATASET }}-set-codes
+          key: empyrean-data-${{ env.EMPYREAN_DATASET }}-set-only
       # Under `gh act` the data directory comes from the host mount when act's
       # cache server had nothing for the key (see engine-setup); never on a
       # hosted run.
@@ -905,14 +1329,16 @@ jobs:
           fi
           rm -rf data && mkdir -p data && cp -a "$src"/. data/
 
-      # layup reads its data from the third-party tool set, folder `layup/`
-      # (every file it opens, shared kernels included), not from the engine
-      # kernel set. Other tools keep their current staging. prep, the trusted
-      # job that already holds the bucket identity, syncs the set and saves it
-      # to the cache below; this leg only restores it and refuses a miss by
-      # name, with no token, no auth step and no gcloud.
-      - name: Restore the third-party tool set (layup)
-        if: matrix.tool == 'layup' && env.ACT != 'true'
+      # layup, ASSIST, find_orb and GRSS read their data from the third-party
+      # tool set, folders `layup/`, `assist/`, `findorb/` and `grss/` (every file
+      # each opens, shared kernels included), not from the engine kernel set
+      # and never from JPL or NAIF. find_orb (and the disabled OpenOrb) run
+      # under the ASSIST venv, whose setup checks the `assist/` folder too.
+      # prep, the trusted job that already holds the bucket identity, syncs the
+      # set and saves it to the cache below; this leg only restores it and
+      # refuses a miss by name, with no token, no auth step and no gcloud.
+      - name: Restore the third-party tool set
+        if: contains(fromJSON('["layup","assist","findorb","grss","oorb"]'), matrix.tool) && env.ACT != 'true'
         uses: actions/cache/restore@v4
         with:
           path: |
@@ -922,19 +1348,30 @@ jobs:
           fail-on-cache-miss: true
       # Under act there is no cache from prep: the host bind-mounts its
       # synced copy of the third-party set at /host-third-party (override with
-      # ACT_THIRD_PARTY_DIR), beside the engine set's /host-data.
-      - name: Copy the third-party tool set from the host mount (act, layup)
-        if: matrix.tool == 'layup' && env.ACT == 'true'
+      # ACT_THIRD_PARTY_DIR), beside the engine set's /host-data. Only the
+      # folders this tool reads are copied.
+      - name: Copy the third-party tool set from the host mount (act)
+        if: contains(fromJSON('["layup","assist","findorb","grss","oorb"]'), matrix.tool) && env.ACT == 'true'
         run: |
           src="${ACT_THIRD_PARTY_DIR:-/host-third-party}"
-          if [ ! -f "$src/layup/de440.bsp" ] || [ ! -f "$src/layup/debias_hires2018.tgz" ]; then
-            echo "ERROR: running under act, but no third-party tool set is mounted at $src." >&2
-            echo "       Mount the locally synced '$THIRD_PARTY_DATASET' directory, e.g." >&2
-            echo "       --container-options '--mount type=bind,source=<local copy>,target=/host-third-party,readonly'" >&2
-            exit 1
-          fi
-          rm -rf data/third-party && mkdir -p data/third-party && cp -a "$src"/. data/third-party/
-          echo "act: copied $(find data/third-party -type f | wc -l) files of $THIRD_PARTY_DATASET from $src"
+          # The sentinel files each folder must hold, and the folders each tool reads.
+          case "${{ matrix.tool }}" in
+            layup)        dirs="layup";          need="layup/de440.bsp layup/debias_hires2018.tgz" ;;
+            assist)       dirs="assist";         need="assist/linux_p1550p2650.440 assist/sb441-n16.bsp" ;;
+            findorb|oorb) dirs="findorb assist"; need="findorb/linux_p1550p2650.440 assist/linux_p1550p2650.440" ;;
+            grss)         dirs="grss";           need="grss/de440.bsp grss/pck00011.tpc grss/sb441-n16s.bsp" ;;
+          esac
+          for f in $need; do
+            if [ ! -f "$src/$f" ]; then
+              echo "ERROR: running under act, but $src/$f is missing: no third-party tool set is mounted." >&2
+              echo "       Mount the locally synced '$THIRD_PARTY_DATASET' directory, e.g." >&2
+              echo "       --container-options '--mount type=bind,source=<local copy>,target=/host-third-party,readonly'" >&2
+              exit 1
+            fi
+          done
+          rm -rf data/third-party && mkdir -p data/third-party
+          for d in $dirs; do cp -a "$src/$d" data/third-party/; done
+          echo "act: copied $(find data/third-party -type f | wc -l) files ($dirs) of $THIRD_PARTY_DATASET from $src"
 
       # One cache per tool build tree. The path list is a superset (venv /
       # install / build + find_orb's ~/include ~/lib); absent members are
@@ -984,10 +1421,10 @@ jobs:
         working-directory: empyrean-validation
         run: make fixtures INPUTS_OFFLINE=1
 
-      - name: Download plan
+      - name: Download the plan and the leg schedules
         uses: actions/download-artifact@v4
         with:
-          name: prep-plan-and-rust
+          name: plan
           path: empyrean-validation/results
 
       # find_orb and OpenOrb run under the ASSIST venv interpreter, so their
@@ -1006,18 +1443,22 @@ jobs:
             *)            make setup-${{ matrix.tool }} ;;
           esac
 
-      # Seal AFTER tool setup — GRSS's setup.sh still downloads two kernels
-      # from ssd.jpl.nasa.gov — and before the run, which reads only the
-      # pinned snapshot.
-      - name: Seal the job from JPL and the MPC
+      # The allowlisted tools are sealed here, after the setup that still
+      # fetches upstream and before the run, which reads only the pinned sets.
+      # kete's import still fetches its kernels from NAIF, so its leg leaves
+      # NAIF open (`--allow-naif`).
+      - name: Seal the job from JPL, NAIF and the MPC (after setup, allowlisted tools)
+        if: ${{ contains(fromJSON(env.UPSTREAM_FETCH_ALLOWLIST), matrix.tool) }}
         working-directory: empyrean-validation
-        run: ./scripts/seal-upstream.sh
+        run: ./scripts/seal-upstream.sh ${{ matrix.tool == 'kete' && '--allow-naif' || '' }}
 
+      # EXT_LEG is this leg's id in the external schedule: an object leg runs
+      # only its objects (`--only`), a one-leg tool runs the whole plan.
       - name: Run ${{ matrix.tool }}
         working-directory: empyrean-validation
         env:
           DATA_DIR: ${{ env.EMPYREAN_DATA_DIR }}
-        run: make run-${{ matrix.tool }} PLAN_PREBUILT=1 OBJECTS="${OBJECTS}" TIERS="${TIER}"
+        run: make run-${{ matrix.tool }} PLAN_PREBUILT=1 EXT_LEG="${{ matrix.leg }}" OBJECTS="${OBJECTS}" TIERS="${TIER}"
 
       # A malformed or empty file fails ITS OWN leg here, with the tool named,
       # instead of being uploaded and discovered in reduce. (reduce's
@@ -1030,18 +1471,28 @@ jobs:
         working-directory: empyrean-validation
         run: python3 scripts/validate_external.py --tool ${{ matrix.tool }} --results-dir results
 
-      # Upload whatever this leg produced. find_orb emits two files
+      # Each comparator file this leg wrote becomes its leg file
+      # (validation_<stem>.leg<ID>.json), so every leg's files land side by
+      # side in reduce, which merges them (channel-chunks.py concat-external).
+      - name: Name ${{ matrix.tool }}'s output by leg
+        working-directory: empyrean-validation
+        run: |
+          for f in results/validation_${{ matrix.tool }}.json results/validation_${{ matrix.tool }}_radar.json; do
+            if [ -f "$f" ]; then mv "$f" "${f%.json}.leg${{ matrix.leg }}.json"; fi
+          done
+
+      # Upload whatever this leg produced. find_orb and GRSS emit two files
       # (optical + radar); the glob covers per-tool naming without a
       # per-tool branch. if-no-files-found:error so a leg that ran but
       # produced nothing fails visibly rather than uploading an empty
       # artifact the reduce step would silently treat as "channel absent".
-      - name: Upload ${{ matrix.tool }} channel output
+      - name: Upload ${{ matrix.tool }} leg ${{ matrix.leg }}
         uses: actions/upload-artifact@v4
         with:
-          name: channel-${{ matrix.tool }}
+          name: channel-${{ matrix.tool }}-${{ matrix.leg }}
           path: |
-            empyrean-validation/results/validation_${{ matrix.tool }}.json
-            empyrean-validation/results/validation_${{ matrix.tool }}_radar.json
+            empyrean-validation/results/validation_${{ matrix.tool }}.leg${{ matrix.leg }}.json
+            empyrean-validation/results/validation_${{ matrix.tool }}_radar.leg${{ matrix.leg }}.json
           retention-days: 30
           if-no-files-found: error
 
@@ -1051,18 +1502,23 @@ jobs:
   # IF some external legs failed (always() + explicit result checks): the report
   # then simply omits the dead comparators, which is the honest outcome.
   #
-  # The gate names `assemble`, which is what now produces the plan, and which
-  # already refuses to succeed unless prep succeeded and every shard arrived —
-  # so prep is covered transitively. It must name a job that is actually in
-  # `needs`: the `needs` context contains ONLY direct dependencies, so a
-  # leftover `needs.prep.result` here would read null, the ANDed always() could
-  # not rescue it, and reduce would be SKIPPED on every run — dropping the
-  # report, the ci-check row floors and the publish while the workflow still
-  # reported success. `make lint-workflows` catches exactly that mismatch.
+  # The gate names `assemble-final`, which produces the full reference and has
+  # checked it strips to the plan everything replayed, and which already
+  # refuses to succeed unless assemble did and every heavy leg arrived — so prep,
+  # assemble and the reference legs are covered transitively. empyrean-heavy is
+  # either success or skipped (no heavy row in this run's objects). The gate
+  # must name jobs that are actually in `needs`: the `needs` context contains
+  # ONLY direct dependencies, so a leftover reference to a job not listed here
+  # would read null, the ANDed always() could not rescue it, and reduce would be
+  # SKIPPED on every run — dropping the report, the ci-check row floors and the
+  # publish while the workflow still reported success. `make lint-workflows`
+  # catches exactly that mismatch.
   reduce:
     name: Reduce — merge + report + publish
-    needs: [prep, assemble, empyrean, external]
-    if: always() && needs.assemble.result == 'success' && needs.empyrean.result == 'success'
+    needs: [prep, assemble, assemble-final, empyrean, empyrean-heavy, external]
+    if: >-
+      always() && needs.assemble-final.result == 'success' && needs.empyrean.result == 'success'
+      && (needs.empyrean-heavy.result == 'success' || needs.empyrean-heavy.result == 'skipped')
     runs-on: ubuntu-latest
     timeout-minutes: 45
     # The only job that publishes to GCS, so the only one that may mint the
@@ -1076,6 +1532,13 @@ jobs:
         uses: actions/checkout@v4
         with:
           path: empyrean-validation
+
+      # Nothing here reaches JPL, NAIF or the MPC: merge-external reads only the
+      # pinned SBDB snapshot. The later GCS publish uses storage.googleapis.com,
+      # which the seal deliberately does not block.
+      - name: Seal the job from JPL, NAIF and the MPC
+        working-directory: empyrean-validation
+        run: ./scripts/seal-upstream.sh
 
       - uses: actions/setup-python@v5
         with:
@@ -1112,7 +1575,9 @@ jobs:
         working-directory: empyrean-validation
         run: make fixtures INPUTS_OFFLINE=1
 
-      # Pull the plan/reference and the channel artifacts flat into results/.
+      # Pull the plan/reference (assemble-final's prep-plan-and-rust: the plan
+      # everything replayed, the full reference, the leg schedules) and the
+      # channel artifacts (light, heavy and external legs) flat into results/.
       # merge-multiple flattens each single-file artifact into the one results dir.
       #
       # These are two EXPLICIT patterns, not a blanket download, because the run
@@ -1146,6 +1611,9 @@ jobs:
       # schedule's `replicas`) is folded: the copies must be identical bit for
       # bit except the volatile fields or the step fails naming the row, the
       # field and the legs, and the merged row keeps the minimum emp_time_ms.
+      # The decoupled heavy rows come from the empyrean-heavy legs (folded the
+      # same way, warm-up leaders not kept), and a decoupled row assemble-final
+      # found the engine refuses is discarded, as the in-path plan would have.
       - name: Assemble channel legs
         working-directory: empyrean-validation
         run: |
@@ -1154,16 +1622,33 @@ jobs:
               --plan results/validation_plan.json \
               --schedule results/schedule.json \
               --channel "${ch}" \
+              --heavy-plan results/heavy-plan.json \
+              --heavy-schedule results/schedule-heavy.json \
+              --heavy-dir results \
+              --dropped results/validation_rust_heavy_dropped.json \
               --out "results/validation_${ch}.json" \
               results/validation_${ch}.leg*.json
           done
 
-      # Seal before the merge: merge-external reads only the pinned SBDB
-      # snapshot, never JPL live. The later GCS publish uses
-      # storage.googleapis.com, which the seal deliberately does not block.
-      - name: Seal the job from JPL and the MPC
+      # Each external tool arrives as one file per leg (and per comparator
+      # file, for find_orb's and GRSS's radar passes); put each back into the one
+      # file the merge reads, in the order one unchunked run writes. Comparator
+      # isolation holds: a tool whose legs are incomplete or malformed gets no
+      # merged file and a `.absent` note with the reason, which the merge and
+      # the report name; the other tools go on. A decoupled row the engine
+      # refused is discarded here too.
+      - name: Assemble external legs
         working-directory: empyrean-validation
-        run: ./scripts/seal-upstream.sh
+        run: |
+          for tool in $(python3 -c 'import json;print(" ".join(json.load(open("results/external-schedule.json"))["tools"]))'); do
+            python3 scripts/channel-chunks.py concat-external \
+              --plan results/validation_plan.json \
+              --schedule results/external-schedule.json \
+              --tool "${tool}" \
+              --dropped results/validation_rust_heavy_dropped.json \
+              --channel-schedule results/schedule.json \
+              --results-dir results
+          done
 
       # reduce runs only the prebuilt harness, then folds in whichever external
       # channels are present (skipping any that a failed leg left absent, and any

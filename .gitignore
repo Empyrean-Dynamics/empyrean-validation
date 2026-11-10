@@ -48,11 +48,10 @@ runners/*/.venv/
 # and SB441-N16, staged under jorbit's URL keys by runners/jorbit/jorbit_offline.py.
 runners/jorbit/.astropy-cache/
 
-# Python bytecode caches that pop up when the runners are imported
-# directly (e.g. for smoke-testing helpers without going through the
-# venv entry point).
-runners/*/__pycache__/
-runners/*/tests/__pycache__/
+# Python bytecode caches, wherever an interpreter imports a module from
+# the tree: the runners imported directly (smoke-testing helpers without
+# the venv entry point), and scripts/ and scripts/tests/ under pytest.
+__pycache__/
 
 # Validation artifacts produced by runners (output JSONs / reports).
 runners/*/results/

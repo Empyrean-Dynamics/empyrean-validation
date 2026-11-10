@@ -668,6 +668,13 @@ def main() -> int:
         default=0,
         help="cap the number of OD rows processed (0 = all)",
     )
+    parser.add_argument(
+        "--defer-all-failed",
+        action="store_true",
+        help="this run is one object leg of the external schedule: exit 0 once "
+        "the rows are written, and leave the every-object-failed verdict to the "
+        "merge of all legs (scripts/channel-chunks.py concat-external)",
+    )
     args = parser.parse_args()
 
     if not args.plan.exists():
@@ -691,6 +698,10 @@ def main() -> int:
     od_rows = select_od_rows(rows)
     if args.only:
         want = {s.strip() for s in args.only.split(",") if s.strip()}
+        unknown = sorted(want - {str(r.get("object", "")) for r in rows})
+        if not want or unknown:
+            print(f"error: --only names objects the plan does not hold: {unknown}", file=sys.stderr)
+            return 2
         od_rows = [r for r in od_rows if r.get("object") in want]
     if args.limit > 0:
         od_rows = od_rows[: args.limit]
@@ -756,7 +767,10 @@ def main() -> int:
         f.write(_payload)
     print(f"  wrote {args.output}")
     # Non-zero exit only if every object failed — a partial failure set is
-    # still useful output and is surfaced per-row via orbfit_error.
+    # still useful output and is surfaced per-row via orbfit_error. One leg of
+    # a chunked run defers the verdict to the merge of all its legs.
+    if args.defer_all_failed:
+        return 0
     return 1 if out_rows and fits == 0 else 0
 
 

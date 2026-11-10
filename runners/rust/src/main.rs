@@ -252,6 +252,14 @@ struct RunArgs {
     /// repetitions run on three legs, one each.
     #[arg(long)]
     reps_override: Option<PathBuf>,
+    /// Emit the PLAN rows of the selected propagation rows and exit, with no
+    /// engine call: the rows the real run would build, stripped to the plan
+    /// contract, written to --output (and the input-determined drops to
+    /// `<output>.dropped.json`). CI prep builds the decoupled heavy rows' plan
+    /// rows this way so every channel can replay them while the heavy legs
+    /// still compute them. Needs --select, propagation rows only.
+    #[arg(long, requires = "select")]
+    emit_plan_rows: bool,
 }
 
 #[derive(Parser, Debug)]
@@ -728,6 +736,44 @@ fn run(args: RunArgs) -> Result<(), Box<dyn std::error::Error>> {
         if rows.is_empty() {
             return Err("--select lists no rows".into());
         }
+    }
+
+    if args.emit_plan_rows {
+        let cache_dir = expand_tilde(&args.cache_dir);
+        let run = runner::emit_propagation_rows(
+            &in_scope,
+            &config,
+            &cache_dir.join("horizons"),
+            &cache_dir.join("sbdb"),
+        )?;
+        let rows: Vec<serde_json::Value> = run
+            .rows
+            .iter()
+            .map(serde_json::to_value)
+            .collect::<Result<_, _>>()?;
+        let (plan, drops) = empyrean_validation::plan::strip_to_plan(&rows)?;
+        if drops.total() != 0 || plan.len() != rows.len() {
+            return Err(format!(
+                "the strip dropped {} of the {} emitted rows ({drops}); a decoupled row must be a plan row",
+                rows.len() - plan.len(),
+                rows.len()
+            )
+            .into());
+        }
+        if let Some(parent) = args.output.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        std::fs::write(&args.output, serde_json::to_string_pretty(&plan)?)?;
+        let dropped_path = rows::dropped_path(&args.output);
+        std::fs::write(&dropped_path, serde_json::to_string_pretty(&run.dropped)?)?;
+        eprintln!(
+            "Emitted {} plan rows with no engine call to {} ({} dropped for want of an input, named in {})",
+            plan.len(),
+            args.output.display(),
+            run.dropped.len(),
+            dropped_path.display()
+        );
+        return Ok(());
     }
 
     // Only the objects the selection touches are loaded.

@@ -483,6 +483,12 @@ def main() -> int:
         action="store_true",
         help="stage the kernels, import jorbit offline and read DE440, then exit",
     )
+    p.add_argument(
+        "--only",
+        help="comma-separated objects: replay only their rows (one object leg of "
+        "the external schedule). The whole plan is still read, so the geocentre "
+        "ephemeris spans every geocentric row as an unchunked run's does.",
+    )
     args = p.parse_args()
 
     if args.check:
@@ -494,6 +500,18 @@ def main() -> int:
     if not plan:
         print("input plan empty", file=sys.stderr)
         return 1
+    only: set[str] | None = None
+    if args.only is not None:
+        only = {s.strip() for s in args.only.split(",") if s.strip()}
+        unknown = sorted(only - {r.get("object") for r in plan})
+        if not only or unknown:
+            print(
+                f"ERROR: --only names {'no object' if not only else unknown} "
+                f"{'' if not only else 'that the plan does not hold'}; refusing to replay "
+                "a different object set than the leg was given",
+                file=sys.stderr,
+            )
+            return 2
 
     _load_jorbit_offline(args.data_dir)
     print(
@@ -527,7 +545,23 @@ def main() -> int:
     if geo_times:
         geocenter = _Geocenter(min(geo_times), max(geo_times))
 
+    import jax
+
+    previous_object = None
     for r in plan:
+        if only is not None and r.get("object") not in only:
+            continue
+        # Each row compiles its own integration, and JAX keeps every compiled
+        # executable: one process grew by about 3 GB of RSS per object (9.8 GB
+        # over three objects, measured 2026-11-09), which is how the whole
+        # catalog died of memory after 41 to 72 minutes on hosted runners.
+        # Dropping the caches when the object changes holds it at one
+        # object's worth (4.0 GB over the same three objects) and changes no
+        # number: the rows are identical, field for field.
+        if r.get("object") != previous_object:
+            if previous_object is not None:
+                jax.clear_caches()
+            previous_object = r.get("object")
         if not replayed(r):
             n_skipped += 1
             continue
