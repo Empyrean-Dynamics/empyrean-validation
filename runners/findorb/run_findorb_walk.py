@@ -288,7 +288,8 @@ def mjd_utc_to_jd_tt(mjd_utc: float) -> float:
     """MJD UTC → JD TT.
 
     TT = UTC + (TAI − UTC) + 32.184 s. find_orb is handed TT directly (the
-    ephemeris times file carries ``OPTION T`` and ``TT_EPHEMERIS=1`` is set), so
+    ephemeris times file carries ``OPTION T``) and dates its ephemeris in UTC,
+    which this same conversion takes back to TT (``_parse_ephem_file``), so
     unlike the TDB-fed channels this conversion stops at TT and the emitted
     ``epoch_scale_used`` is ``"tt"``. TDB − TT is ≤ 1.7 ms — four orders of
     magnitude inside the manifest's 120-second cut clearance (§2.1) — so the
@@ -489,14 +490,15 @@ def _write_environ(
     # debiasing as the reference walk's fit has it (`debiasing`, from its
     # `debias` axis; see FIT_DEBIAS), and this walk's one difference: the
     # ephemeris epochs come from a file (leading 't' selects that mode), the times
-    # in it TT and TT back out. The manifest's debias is a scoring correction to
+    # in it TT, the dates written back UTC (converted to TT on parse; see
+    # findorb_common on EPHEMERIS_TIMESCALE). The manifest's debias is a scoring correction to
     # the observed position a prediction is measured against, never a fit input,
     # so nothing is corrected twice.
     lines = FC.environ_lines(
         debiasing=debiasing,
         perturbers=perturbers,
         pert_list=pert_list,
-        extra=(f"EPHEM_STEPS={n_times} t{times_name}", "TT_EPHEMERIS=1"),
+        extra=(f"EPHEM_STEPS={n_times} t{times_name}",),
     )
     (work / "environ.dat").write_text("\n".join(lines) + "\n")
 
@@ -597,6 +599,12 @@ _EPHEM_WIDTHS = {
 def _parse_ephem_file(path: Path) -> list[dict] | str:
     """Parse one station's computer-friendly ephemeris written with ``-E 5,16,17``.
 
+    find_orb dates each row in UTC (its default for observables; the TT keyword
+    corrupts total.json at the pinned commit, see findorb_common). Each date is
+    converted to TT here with the pinned leap-second table (``jd_tt``; the UTC
+    date stays as ``jd_utc``), the conversion that made the TT epochs find_orb
+    was handed, so the epoch check compares like with like.
+
     Returns the parsed rows, or a *reason string* when the file cannot be used —
     the caller turns that into a named per-window failure rather than a silent
     gap. An unexpected row width is one of those reasons: a mis-indexed row
@@ -624,8 +632,10 @@ def _parse_ephem_file(path: Path) -> list[dict] | str:
         # Offsets from the right end: [... motion, motionPA (, sigma, sigmaPA)].
         m0 = -4 if has_sigma else -2
         try:
+            jd_utc = float(parts[0])
             row = {
-                "jd_tt": float(parts[0]),
+                "jd_utc": jd_utc,
+                "jd_tt": mjd_utc_to_jd_tt(jd_utc - MJD_TO_JD),
                 "ra_deg": float(parts[1]),
                 "dec_deg": float(parts[2]),
                 "motion_arcmin_hr": float(parts[m0]),
@@ -1443,8 +1453,9 @@ def _walk_object(task: dict) -> tuple[list[dict], list[dict], dict]:
 
             with open(work / "times.txt", "w") as f:
                 # OPTION T: the times below are TD/TT. find_orb converts them to
-                # UTC on read and back to TT for the ephemeris (TT_EPHEMERIS=1),
-                # so what comes back out is what went in.
+                # UTC on read, evaluates each at its TT instant and dates the row
+                # in UTC, which _parse_ephem_file converts back to TT, so what
+                # comes back out is what went in (the epoch check below).
                 f.write("OPTION T\n")
                 f.writelines(f"JD {t:.9f}\n" for t in times)
             _write_environ(work, len(times), "times.txt", perturbers, pert_list, debiasing=debiasing)

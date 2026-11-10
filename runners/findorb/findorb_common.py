@@ -51,6 +51,15 @@ JPL_DE_FILE = "linux_p1550p2650.440"
 JPL_DE_NOTE = "DE440 (Gray's binary linux_p1550p2650.440, 1550-2650)"
 
 PERTURBERS = "1007fe"  # 0x7fe planets + Moon, bit 20 = asteroids (runge.cpp)
+# Ephemeris time scale. find_orb dates an observables ephemeris in UTC by
+# default (vectors in TT). Its keyword for TT dates, EPHEMERIS_TIMESCALE=TT
+# (environ.def; read in ephem0.cpp), cannot be used at the pinned commit: the
+# JSON ephemeris writer keys each column by its header token and takes the token
+# at header offset 5 as the ISO date, and the TT header ("Date (TT) -HH...")
+# has one token more than the UTC one ("Date (UTC)-HH..."), so every column
+# after the date shifts and total.json stops being JSON (measured on 2008 LC18:
+# every window failed fo_total_json_parse_error). Neither runner sets it; the
+# walk converts find_orb's UTC dates to TT itself (run_findorb_walk.py).
 
 # MPC's ADES astCat names that find_orb's reader does not recognise, each mapped to
 # find_orb's own name for the same catalog. ades2mpc.cpp turns astCat into the
