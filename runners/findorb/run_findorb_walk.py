@@ -28,7 +28,21 @@ What find_orb does and does not deliver here
   *filtering the original fixture lines* (§2.4: fit-set identity is a protocol
   invariant, not a per-tool reparse). find_orb reads ADES PSV natively, so the
   fixture bytes reach it unmodified apart from the ``pos1-3`` decimal-point
-  sanitization its ADES reader requires (see ``_sanitize_ades``).
+  sanitization its ADES reader requires (see ``_sanitize_ades``) and find_orb's
+  spelling of the few MPC ``astCat`` names its reader misses (see below).
+* **Debiasing.** find_orb's own EFCC18 star-catalog debiasing is on for the fit,
+  exactly as the reference walk's fit debiases: its ``debias`` axis
+  (``runners/rust/src/walk.rs``, ``"efcc"`` by default, or ``"off"``) is
+  ``"efcc"`` on the ``default`` arm this runner pairs with. The manifest carries
+  no fit-side debias axis; its per-observation correction is applied only in
+  scoring, to the observed position a prediction is measured against. Nothing is
+  corrected twice: the fit corrects its input, scoring corrects the observation,
+  and the prediction is never corrected. find_orb looks each correction up by
+  the observation's catalog code, which its ADES reader takes from ``astCat``;
+  MPC's name ``Tyc2`` is not in its table, so the window file carries find_orb's
+  spelling ``Tycho-2`` instead (``findorb_common.ADES_CATALOG_SPELLING``), and a
+  fixture with no ``astCat`` column is refused by name rather than fitted
+  undebiased. The setting is recorded in ``{stem}_settings.json``.
 * **Predict** — the *same* ``fo`` invocation that fits also writes the
   ephemerides: ``-C <code,code,...>`` with ``-e eph_%c.txt`` runs the fit once
   and then loops over observatory codes (``fo.cpp``, the ``while(*mpc_code_tptr)``
@@ -207,6 +221,13 @@ TOOL = "findorb"
 CONFIG_ARM = "default"
 # find_orb solves the 6-element state; no non-gravs are requested here.
 N_SOLVE_FOR = 6
+# The reference walk's fit-side `debias` axis (runners/rust/src/walk.rs ArmSpec)
+# mapped onto find_orb's own EFCC18 switch (SETTINGS2's last field).
+DEBIAS_AXIS = {"efcc": True, "off": False}
+# The value of that axis on the reference arm CONFIG_ARM pairs with: walk.rs's
+# default_debias() and its builtin "default" arm are both "efcc". The manifest
+# carries no fit-side axis to read per window, so the walk runs this one.
+FIT_DEBIAS = "efcc"
 
 # ── Time scales ─────────────────────────────────────────────
 # (first MJD UTC of validity, TAI − UTC seconds). Provenance: IERS Bulletin C,
@@ -330,26 +351,38 @@ def _fo_binary(explicit: str | None, repo: Path) -> Path | None:
 
 
 def _findorb_version(fo_bin: Path) -> str:
-    """Provenance string for the run banner: the checked-out find_orb commit.
+    """Provenance string for the banner and the settings record: the find_orb commit.
 
-    No-hidden-fallbacks: when the sha cannot be resolved (not a git checkout,
-    git missing) say so explicitly rather than reporting a silent blank.
+    An ``fo`` under setup.sh's install prefix was built from ``build/find_orb``;
+    any other is read from its own directory. Either must be inside a find_orb
+    checkout (one holding ``fo.cpp``): ``git -C`` walks up, and from the install
+    prefix it would otherwise answer with this repository's commit.
+    No-hidden-fallbacks: when the sha cannot be resolved, say so explicitly.
     """
-    src = fo_bin.parent
-    try:
-        proc = subprocess.run(
-            ["git", "-C", str(src), "rev-parse", "--short", "HEAD"],
-            capture_output=True,
-            text=True,
-            timeout=10,
-            check=False,
-        )
-    except Exception as e:  # noqa: BLE001
-        return f"unknown ({e})"
-    if proc.returncode != 0:
+    here = Path(__file__).resolve().parent
+    fo = fo_bin.resolve()
+    src = here / "build" / "find_orb" if fo.is_relative_to(here / "install") else fo.parent
+
+    def git(*a: str) -> tuple[str | None, str]:
+        try:
+            proc = subprocess.run(
+                ["git", "-C", str(src), *a], capture_output=True, text=True, timeout=10, check=False
+            )
+        except Exception as e:  # noqa: BLE001
+            return None, str(e)
         tail = (proc.stderr or "").strip().splitlines()
-        return f"unknown ({tail[-1] if tail else 'git rev-parse failed'})"
-    sha = proc.stdout.strip()
+        if proc.returncode != 0:
+            return None, tail[-1] if tail else f"git {a[0]} failed"
+        return proc.stdout.strip(), ""
+
+    top, why = git("rev-parse", "--show-toplevel")
+    if top is None:
+        return f"unknown ({why})"
+    if not (Path(top) / "fo.cpp").is_file():
+        return f"unknown ({src} is not inside a find_orb checkout)"
+    sha, why = git("rev-parse", "--short", "HEAD")
+    if sha is None:
+        return f"unknown ({why})"
     return sha or "unknown (empty git sha)"
 
 
@@ -388,6 +421,8 @@ class Fixture:
         except ValueError as e:
             raise ValueError(f"{path}: header lacks stn/obsTime: {cols}") from e
         self.pos_cols = [cols.index(k) for k in ("pos1", "pos2", "pos3") if k in cols]
+        # find_orb's debiasing looks each correction up by this column's catalog.
+        self.ast_cat_col: int | None = cols.index("astCat") if "astCat" in cols else None
         for line in raw[i + 1 :]:
             if not line.strip():
                 continue
@@ -428,6 +463,8 @@ def _write_window_ades(fx: Fixture, keep: set[tuple[str, str]], out: Path) -> in
     """
     kept = [line for line, key in zip(fx.lines, fx.keys) if key in keep]
     body = [_sanitize_ades(line, fx.pos_cols) for line in kept]
+    if fx.ast_cat_col is not None:
+        body = [FC.findorb_catalog_spelling(line, fx.ast_cat_col) for line in body]
     with open(out, "w") as f:
         f.writelines(line + "\n" for line in (*fx.pre_header, fx.header, *body))
     return len(kept)
@@ -437,7 +474,8 @@ def _write_window_ades(fx: Fixture, keep: set[tuple[str, str]], out: Path) -> in
 
 
 def _write_environ(
-    work: Path, n_times: int, times_name: str, perturbers: str, pert_list: str
+    work: Path, n_times: int, times_name: str, perturbers: str, pert_list: str,
+    *, debiasing: bool,
 ) -> None:
     """Write find_orb's per-run configuration file.
 
@@ -447,13 +485,15 @@ def _write_environ(
     absolute path under a long scratch directory overflows them — harmlessly on
     macOS, fatally on a ``_FORTIFY_SOURCE`` Linux build.
     """
-    # The shared settings (findorb_common.environ_lines) with this walk's two
-    # differences: find_orb's own debiasing stays OFF, because this family applies
-    # catalog debiasing once, centrally, from the manifest (two passes would
-    # double-correct); and the ephemeris epochs come from a file (leading 't'
-    # selects that mode), the times in it TT and TT back out.
+    # The shared settings (findorb_common.environ_lines), with find_orb's EFCC18
+    # debiasing as the reference walk's fit has it (`debiasing`, from its
+    # `debias` axis; see FIT_DEBIAS), and this walk's one difference: the
+    # ephemeris epochs come from a file (leading 't' selects that mode), the times
+    # in it TT and TT back out. The manifest's debias is a scoring correction to
+    # the observed position a prediction is measured against, never a fit input,
+    # so nothing is corrected twice.
     lines = FC.environ_lines(
-        debiasing=False,
+        debiasing=debiasing,
         perturbers=perturbers,
         pert_list=pert_list,
         extra=(f"EPHEM_STEPS={n_times} t{times_name}", "TT_EPHEMERIS=1"),
@@ -1281,6 +1321,7 @@ def _walk_object(task: dict) -> tuple[list[dict], list[dict], dict]:
     max_reduced_chi2 = task["max_reduced_chi2"]
     pert_list = task["asteroid_pert_list"]
     n_mc = task["mc_samples"]
+    debiasing = task["debiasing"]
 
     name = obj["object"]
     stats = {
@@ -1312,6 +1353,12 @@ def _walk_object(task: dict) -> tuple[list[dict], list[dict], dict]:
     except Exception as e:  # noqa: BLE001
         stats["error"] = f"fixture parse failed: {e}"
         return [], [], stats
+    if debiasing and fx.ast_cat_col is None:
+        stats["error"] = (
+            "fixture has no astCat column: find_orb looks each debias correction up by "
+            "the observation's catalog and would fit undebiased without a word"
+        )
+        return [], [], stats
 
     observations = obj["observations"]
     win_records: list[dict] = []
@@ -1333,7 +1380,7 @@ def _walk_object(task: dict) -> tuple[list[dict], list[dict], dict]:
         # object's windows, and it is what keeps parallel workers off each
         # other's writes.
         cfg_dir = FC.stage_cfg_dir(
-            base, Path(task["data_dir"]), debiasing=False,
+            base, Path(task["data_dir"]), debiasing=debiasing,
             asteroids=bool(int(task["perturbers"], 16) & (1 << 20)),
         )
         for w in windows:
@@ -1400,7 +1447,7 @@ def _walk_object(task: dict) -> tuple[list[dict], list[dict], dict]:
                 # so what comes back out is what went in.
                 f.write("OPTION T\n")
                 f.writelines(f"JD {t:.9f}\n" for t in times)
-            _write_environ(work, len(times), "times.txt", perturbers, pert_list)
+            _write_environ(work, len(times), "times.txt", perturbers, pert_list, debiasing=debiasing)
             for code in codes:
                 stale = work / f"eph_{code}.txt"
                 if stale.exists():
@@ -1628,6 +1675,26 @@ def _write_jsonl(path: Path, records: list[dict]) -> None:
     path.write_text("".join(line + "\n" for line in lines))
 
 
+def walk_settings(fo_bin: Path, data_dir: Path, debiasing: bool, args) -> dict:
+    """The find_orb version and every setting the walk's fits ran at, keyed as the
+    OD runner keys its rows (``fo_version``, ``fo_settings``)."""
+    settings = FC.settings_record(data_dir, debiasing=debiasing, pert_list=args.asteroid_pert_list)
+    settings["perturbers_mask"] = args.perturbers
+    settings["fit_debias_axis"] = (
+        f"{FIT_DEBIAS}: the reference walk's fit-side debias axis on its default arm "
+        "(the manifest's debias is applied only in scoring)"
+    )
+    if debiasing:
+        settings["catalog_names"] = (
+            "MPC astCat names find_orb's reader misses given find_orb's spelling: "
+            + ", ".join(f"{k} -> {v}" for k, v in FC.ADES_CATALOG_SPELLING.items())
+        )
+    settings["warm_start"] = str(bool(args.warm_start))
+    settings["max_reduced_chi2"] = f"{args.max_reduced_chi2:g}"
+    settings["mc_samples"] = str(max(0, int(args.mc_samples)))
+    return {"tool": TOOL, "fo_version": f"find_orb {_findorb_version(fo_bin)}", "fo_settings": settings}
+
+
 def main() -> int:
     here = Path(__file__).resolve().parent
     repo = here.parent.parent  # runners/findorb/ → repo root
@@ -1760,9 +1827,10 @@ def main() -> int:
     # it and integrates on happily with planets only, a silent downgrade of the
     # force model. stage_cfg_dir refuses, naming the file.
     asteroids_on = bool(int(args.perturbers, 16) & (1 << 20))
+    debiasing = DEBIAS_AXIS[FIT_DEBIAS]
     data_dir = Path(args.data_dir).expanduser().resolve() if args.data_dir else None
     with tempfile.TemporaryDirectory(prefix="fo_walk_check_") as chk:
-        FC.stage_cfg_dir(Path(chk), data_dir, debiasing=False, asteroids=asteroids_on)
+        FC.stage_cfg_dir(Path(chk), data_dir, debiasing=debiasing, asteroids=asteroids_on)
     jpl = data_dir / FC.JPL_DE_FILE
     bc405_status = f"{data_dir / FC.BC405_DAT} ({FC.BC405_DAT_BYTES} bytes, intact)"
 
@@ -1821,6 +1889,8 @@ def main() -> int:
             else "(Merc-Pluto + Moon; asteroid perturbations OFF)"
         )
         + "\n"
+        f"  debias: {FIT_DEBIAS} (the reference walk's fit-side axis) -> find_orb EFCC18 "
+        f"{'on' if debiasing else 'off'}\n"
         f"  warm_start: {args.warm_start}  workers: {args.workers}  "
         f"max_reduced_chi2: {args.max_reduced_chi2:g}",
         file=sys.stderr,
@@ -1840,6 +1910,7 @@ def main() -> int:
             "max_reduced_chi2": args.max_reduced_chi2,
             "asteroid_pert_list": args.asteroid_pert_list,
             "mc_samples": max(0, int(args.mc_samples)),
+            "debiasing": debiasing,
         }
         for obj in selected
     ]
@@ -1903,11 +1974,18 @@ def main() -> int:
     stem = out.with_suffix("")
     windows_path = stem.with_name(stem.name + "_windows.jsonl")
     preds_path = stem.with_name(stem.name + "_predictions.jsonl")
+    settings_path = stem.with_name(stem.name + "_settings.json")
 
     # Sidecars first: the thin-row file is what a downstream `make` target keys
     # on, so it must not appear before the payload it stands for exists.
     _write_jsonl(windows_path, all_windows)
     _write_jsonl(preds_path, all_predictions)
+    # The walk's records have no settings field (predict_schema is
+    # deny_unknown_fields), so the settings every window ran at go beside them,
+    # keyed as the OD runner keys them on its rows.
+    settings_path.write_text(
+        json.dumps(walk_settings(fo_bin, data_dir, debiasing, args), indent=2) + "\n"
+    )
     # External tools emit no thin ValidationResult rows; the empty array keeps
     # the pipeline's file shape uniform.
     out.write_text("[]\n")
@@ -1949,7 +2027,8 @@ def main() -> int:
         + mc_block
         + f"  Thin rows:        {out} (empty by design)\n"
         f"  Windows sidecar:  {windows_path}\n"
-        f"  Predictions:      {preds_path}\n" + "─" * 56,
+        f"  Predictions:      {preds_path}\n"
+        f"  Settings:         {settings_path}\n" + "─" * 56,
         file=sys.stderr,
     )
 

@@ -171,19 +171,39 @@ def populate_fo_directory(working_dir: str, data_dir: Optional[pathlib.Path] = N
         f.write('\n'.join(lines) + '\n')
 
 
-def sanitize_psv(psv: str) -> str:
-    """Normalize integer-valued ADES pos1-3 columns to carry a decimal point.
+class FixtureError(ValueError):
+    """An optical fixture find_orb cannot fit as the suite runs it; names why."""
 
-    Space-based / roving observations (TESS C57, WISE C51, rover 247/250/270)
-    legally report integer observer positions (e.g. ``pos2=356814`` km), but
-    find_orb's ADES converter (``ades2mpc.cpp``) asserts on a position value
-    with no decimal point and aborts the whole fit. Appending ``.0`` is
-    numerically identical and keeps fo alive.
+
+NO_AST_CAT = (
+    "fixture has no astCat column: find_orb looks each debias correction up by the "
+    "observation's catalog and would fit undebiased without a word"
+)
+
+
+def sanitize_psv(psv: str) -> str:
+    """Prepare one optical ADES PSV table for find_orb's ADES reader.
+
+    * Integer-valued pos1-3 gain a decimal point. Space-based / roving
+      observations (TESS C57, WISE C51, rover 247/250/270) legally report
+      integer observer positions (e.g. ``pos2=356814`` km), but find_orb's ADES
+      converter (``ades2mpc.cpp``) asserts on a position value with no decimal
+      point and aborts the whole fit. Appending ``.0`` is numerically identical.
+    * Each astCat that find_orb's reader misses takes find_orb's spelling
+      (``findorb_common.ADES_CATALOG_SPELLING``: ``Tyc2`` becomes ``Tycho-2``
+      and so on), so its EFCC18 debiasing finds the catalog instead of leaving
+      the observation undebiased without a word, as the walk runner does.
+
+    The OD runner debiases every fit, so a table without an astCat column is
+    refused by name (``FixtureError``), never fitted undebiased.
     """
     lines = psv.strip().split("\n")
-    if len(lines) < 2 or "pos1" not in lines[1]:
-        return psv
+    if len(lines) < 2:
+        raise FixtureError("fixture has no ADES header and data lines")
     hdr = [h.strip() for h in lines[1].split("|")]
+    if "astCat" not in hdr:
+        raise FixtureError(NO_AST_CAT)
+    ast_cat = hdr.index("astCat")
     idx = [hdr.index(k) for k in ("pos1", "pos2", "pos3") if k in hdr]
     out = lines[:2]
     for ln in lines[2:]:
@@ -193,7 +213,7 @@ def sanitize_psv(psv: str) -> str:
                 v = cols[i].strip()
                 if v and "." not in v and "e" not in v.lower():
                     cols[i] = cols[i].replace(v, v + ".0", 1)
-        out.append("|".join(cols))
+        out.append(FC.findorb_catalog_spelling("|".join(cols), ast_cat))
     return "\n".join(out) + "\n"
 
 
@@ -544,7 +564,22 @@ def main() -> int:
         # then append the 80-column radar records, which have no `|` and so are
         # out of the sanitizer's reach entirely.
         n_radar = len(radar_lines) // 2
-        psv = sanitize_psv(optical_psv)
+        try:
+            psv = sanitize_psv(optical_psv)
+        except FixtureError as e:
+            print(f"  FAIL: {e}")
+            n_failed += 1
+            results.append(
+                {
+                    "object": name.replace("_", "/"),
+                    "test_type": args.test_type,
+                    "timestamp": timestamp,
+                    "source_version": source_version,
+                    "fo_error": str(e),
+                    **tool_meta,
+                }
+            )
+            continue
         if radar_lines:
             psv = psv.rstrip("\n") + "\n" + "".join(ln + "\n" for ln in radar_lines)
         n_optical = len(optical_psv.strip().split("\n")) - 2  # subtract header lines
