@@ -123,37 +123,18 @@ FO_BIN := $(EMP_VAL_RUNNERS)/findorb/install/bin/fo
 CORE_BIN := $(EMPYREAN_CORE_ROOT)/target/release/validate-core
 WITH_CORE := $(if $(or $(wildcard $(EMPYREAN_CORE_ROOT)/Cargo.toml),$(and $(PREBUILT_BIN),$(wildcard $(CORE_BIN)))),1,)
 
-# OpenOrb: DEFAULT-OFF, and that is a decision, not an oversight.
-#
-# run_oorb.py needs ref_sun_pos_au / ref_sun_vel_au_d on each row to convert
-# OpenOrb's heliocentric convention into the plan's SSB frame. Only
-# `empyrean-validation plan` populates those; the plan CI and this Makefile
-# actually use is stripped from the rust runner's output, which never does.
-# Measured: 0 of 652 rust rows and 0 of 448 plan rows carry the key, so 100%
-# of oorb's rows skip. The runner now exits nonzero on that instead of writing
-# a pass-through of untouched plan rows and calling it a green channel — which
-# means running it today is a guaranteed, permanent failure, not a flaky one.
-#
-# It cannot simply be plumbed: ref_sun_* are not among the 70 keys of the
-# v0.7.0 schema empyrean-core pins, so adding them to PLAN_CARRIED_KEYS
-# reintroduces the deny_unknown_fields break the whitelist strip exists to
-# kill. Sequencing (empyrean-jg3o): tag the validation schema -> re-pin
-# empyrean-core -> populate ref_sun_* -> set WITH_OORB=1 here and restore the
-# `oorb` matrix leg in .github/workflows/validation.yml.
-#
-# Turning it off rather than leaving it red is the point: a leg that is always
-# red teaches people to ignore red, and a leg that skips in silence is the
-# defect this whole branch exists to eliminate. Set WITH_OORB=1 to run it
-# anyway — the runner's honest nonzero exit is deliberately intact, so a
-# premature re-enable fails immediately and says why.
+# OpenOrb runs by default. Its runner converts the plan's SSB states to
+# OpenOrb's heliocentric convention with the Sun's state from the registered
+# DE440 (runners/sunstate, the oorb/ folder of the third-party tool set), so it
+# no longer needs a Sun state on the plan rows. WITH_OORB= skips it.
 #
 # Defined here, above every target that references it: GNU make expands a
 # prerequisite list when the rule is READ, so a flag defined below `setup`
 # reads as empty there no matter what it is later assigned.
-WITH_OORB ?=
+WITH_OORB ?= 1
 # Why the OpenOrb channel is absent, in one line, for the reduce log. Empty
 # when WITH_OORB is set, so a re-enabled leg stops claiming to be disabled.
-OORB_DISABLED_REASON := $(if $(WITH_OORB),,the plan carries no ref_sun_pos_au/ref_sun_vel_au_d and cannot until the validation schema is tagged and empyrean-core re-pinned (empyrean-jg3o); leg turned off in .github/workflows/validation.yml and behind WITH_OORB here)
+OORB_DISABLED_REASON := $(if $(WITH_OORB),,skipped by WITH_OORB=)
 
 # DYLD path for runtime linking against libempyrean.dylib (built by
 # empyrean-c into the empyrean repo's target/release).
@@ -540,7 +521,7 @@ WITH_LAYUP ?= 1
 # adam-core: the released adam-core / adam-assist (PyPI wheels, no private data).
 # Default-on; set WITH_ADAM_CORE= (empty) to skip.
 WITH_ADAM_CORE ?= 1
-# OpenOrb is gated on WITH_OORB, defined above with the reason it is off.
+# OpenOrb is gated on WITH_OORB, defined above (on by default).
 run: run-rust run-python run-c run-cli run-assist run-findorb \
      run-kete run-jorbit run-grss \
      $(if $(WITH_OORB),run-oorb,) \
@@ -1189,9 +1170,11 @@ run-findorb: $(ASSIST_PY) check-plan fixtures
 # ── OpenOrb (oorb) external comparison — propagation + ephemeris ─
 # Independent Fortran implementation (Granvik et al., University of
 # Helsinki). Covers the same propagation + ephemeris axes ASSIST does,
-# from a different code base. Setup builds oorb from source via the
-# bundled setup.sh; subsequent runs reuse the installed binary.
+# from a different code base. Setup builds oorb from source at the commit
+# setup.sh pins; every file oorb reads, the BC430 asteroid files included,
+# comes from the oorb/ folder of the third-party tool set at run time.
 OORB_BIN := $(EMP_VAL_RUNNERS)/oorb/install/bin/oorb
+OORB_DATA_DIR ?= $(DATA_DIR)/third-party/oorb
 
 setup-oorb: $(OORB_BIN)
 $(OORB_BIN):
@@ -1202,7 +1185,7 @@ run-oorb: $(OORB_OUT)
 # find_orb's RUN-time rule (OpenOrb's BUILD stays optional): a missing binary
 # at RUN time is a failure. The `echo '[]'` fallback made a leg that compared nothing
 # indistinguishable from a leg that compared everything and agreed.
-$(OORB_OUT): $(PLAN) $(ASSIST_PY) | check-plan
+$(OORB_OUT): $(PLAN) $(ASSIST_PY) | check-plan fixtures
 	@test -x "$(OORB_BIN)" || { \
 	    echo "ERROR: OpenOrb binary not built: $(OORB_BIN)"; \
 	    echo "       Build it with: make setup-oorb"; \
@@ -1210,12 +1193,15 @@ $(OORB_OUT): $(PLAN) $(ASSIST_PY) | check-plan
 	@echo "──── OpenOrb: external prop + ephemeris reference ──────"
 	@$(ASSIST_PY) $(EMP_VAL_RUNNERS)/oorb/run_oorb.py \
 	    --input $(PLAN) --output $(OORB_OUT) \
-	    --prefix $(EMP_VAL_RUNNERS)/oorb/install
+	    --prefix $(EMP_VAL_RUNNERS)/oorb/install --data-dir $(OORB_DATA_DIR) \
+	    --fixtures-dir $(FIXTURES_PSV)
 
 # ── OrbFit external comparison — orbit determination ─────────────
 # OrbFit Consortium (University of Pisa) / IAU Minor Planet Center.
 # Canonical implementation of CMC2003 χ²-with-hysteresis rejection.
-# Setup pulls the MPC's Docker container; runner shells out via docker.
+# Setup pulls the MPC's Docker container by digest; the runner shells out via
+# docker with no network, and seeds from the Sun's DE440 state (orbfit/ folder).
+ORBFIT_DATA_DIR ?= $(DATA_DIR)/third-party/orbfit
 setup-orbfit:
 	@echo "──── Pulling OrbFit container ──────────────────────────"
 	@cd $(EMP_VAL_RUNNERS)/orbfit && ./setup.sh
@@ -1234,7 +1220,8 @@ $(ORBFIT_OUT): $(PLAN) | check-plan fixtures
 	    if [ -n "$$only" ]; then echo "  leg $(EXT_LEG): $$only"; set -- --defer-all-failed --only "$$only"; fi; \
 	fi; \
 	$(EMP_VAL_RUNNERS)/orbfit/run_orbfit.py \
-	    --plan $(PLAN) --output $(ORBFIT_OUT) --psv-dir $(FIXTURES_PSV) "$$@"
+	    --plan $(PLAN) --output $(ORBFIT_OUT) --psv-dir $(FIXTURES_PSV) \
+	    --de440 $(ORBFIT_DATA_DIR)/de440.bsp "$$@"
 
 # Optional: empyrean-core direct (no FFI). Replays the plan in-process so
 # the report's Section 09 can show binding-translation drift (rust wrapper

@@ -37,11 +37,9 @@ ALLOWLIST = {
     "data.minorplanetcenter.net (grss's own get_debiasing_data.py and _download_codes_file); no "
     "third-party tool-set folder carries them yet",
     "kete": "its import fetches kernels from naif.jpl.nasa.gov (its leg leaves NAIF open); closed by the runner-fixes PR",
-    "oorb": "its build fetches its ephemeris; the leg is off (empyrean-jg3o)",
-    "orbfit": "closed by the runner-fixes PR",
 }
 # The list may lose tools, never gain one.
-CEILING = frozenset({"grss", "kete", "oorb", "orbfit"})
+CEILING = frozenset({"grss", "kete"})
 # The one tool whose run itself still reaches NAIF, so its late seal leaves NAIF open.
 NAIF_OPEN = frozenset({"kete"})
 
