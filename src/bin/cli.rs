@@ -268,6 +268,12 @@ struct MergeExternalArgs {
     /// version and settings.
     #[arg(long)]
     adam_core: Option<PathBuf>,
+    /// adam-core Rust-API per-channel JSON (from `runners/adam-core-rust`).
+    /// The same adam-core release through its public Rust crates (adam_core
+    /// 0.8.0 + adam_assist 0.7.0); folds the same fields as `--adam-core`
+    /// under its own tool id, `adam-core-rust`.
+    #[arg(long)]
+    adam_core_rust: Option<PathBuf>,
     /// kete per-channel JSON (from `runners/kete/run_kete.py`). Currently
     /// folds per-row wall-clock timing only (`kete_time_ms`) — kete is not
     /// yet a selectable comparison tool in the report registry.
@@ -907,6 +913,13 @@ fn merge_external(args: MergeExternalArgs) -> Result<(), Box<dyn std::error::Err
         let n = merge_adam_core(&mut rows, path)?;
         eprintln!("Merged {n} adam-core rows");
     }
+    if let Some(path) = &args.adam_core_rust {
+        isolated_merge("adam-core-rust", &mut rows, &mut outcomes, |rows| {
+            let n = merge_adam_core_rust(rows, path)?;
+            eprintln!("Merged {n} adam-core-rust rows");
+            Ok(n)
+        });
+    }
     if let Some(path) = &args.kete {
         isolated_merge("kete", &mut rows, &mut outcomes, |rows| {
             let n = merge_tool_times(rows, path, "kete", "kete_time_ms", |r, v| {
@@ -1537,19 +1550,44 @@ fn record_tool_config(r: &mut ValidationResult, tool: &str, o: &serde_json::Valu
     }
 }
 
-/// Fold adam-core per-channel JSON onto the reference rows.
-///
-/// adam-core (the released 0.7.0 with adam-assist 0.7.0) covers all three axes, so
-/// this merge routes by test type like [`merge_oorb`] and [`merge_grss`]:
-/// propagation by (object, dt), ephemeris by (object, dt, observer), OD by object.
-/// A row the runner could not compute (a self-perturber, a refused or failed fit)
-/// carries `adam_core_unsupported` with the tool's own reason; it is folded into
-/// `tool_unsupported`, never dropped. The runner's version and settings ride along
-/// on every folded row.
+/// Fold adam-core per-channel JSON (the Python package) onto the reference rows.
 fn merge_adam_core(
     rows: &mut [ValidationResult],
     path: &std::path::Path,
 ) -> Result<usize, Box<dyn std::error::Error>> {
+    merge_adam_core_channel(rows, path, "adam-core")
+}
+
+/// Fold adam-core Rust-API per-channel JSON onto the reference rows.
+fn merge_adam_core_rust(
+    rows: &mut [ValidationResult],
+    path: &std::path::Path,
+) -> Result<usize, Box<dyn std::error::Error>> {
+    merge_adam_core_channel(rows, path, "adam-core-rust")
+}
+
+/// Fold one adam-core channel's JSON onto the reference rows.
+///
+/// adam-core (the released 0.8.0 with ASSIST through adam-assist 0.7.0) covers all
+/// three axes, and its two channels (the Python package, `adam-core`, and the Rust
+/// API, `adam-core-rust`) write the same fields under their own prefixes, so one
+/// merge serves both. It routes by test type like [`merge_oorb`] and
+/// [`merge_grss`]: propagation by (object, dt), ephemeris by (object, dt,
+/// observer), OD by object. A row the runner could not compute (a self-perturber,
+/// a refused or failed fit) carries `<prefix>_unsupported` with the tool's own
+/// reason; it is folded into `tool_unsupported`, never dropped. The runner's
+/// version and settings ride along on every folded row.
+fn merge_adam_core_channel(
+    rows: &mut [ValidationResult],
+    path: &std::path::Path,
+    tool: &str,
+) -> Result<usize, Box<dyn std::error::Error>> {
+    let prefix = empyrean_validation::schema::ADAM_CORE_TOOLS
+        .iter()
+        .find(|(t, _)| *t == tool)
+        .map(|(_, p)| *p)
+        .ok_or_else(|| format!("{tool} is not an adam-core channel"))?;
+    let key = |name: &str| format!("{prefix}_{name}");
     let txt = std::fs::read_to_string(path).map_err(|e| format!("read {}: {e}", path.display()))?;
     let ac: Vec<serde_json::Value> = serde_json::from_str(&txt)?;
     let mut prop_idx: std::collections::HashMap<(String, i64), &serde_json::Value> =
@@ -1591,32 +1629,35 @@ fn merge_adam_core(
             _ => None,
         };
         let Some(o) = o else { continue };
-        r.adam_core_time_ms = o["adam_core_time_ms"].as_f64();
-        match r.test_type.as_str() {
+        let test_type = r.test_type.clone();
+        let f = r
+            .adam_core_fields_mut(tool)
+            .expect("an adam-core channel id has fields");
+        *f.time_ms = o[key("time_ms").as_str()].as_f64();
+        match test_type.as_str() {
             "propagation" => {
-                r.adam_core_vs_horizons_km = o["adam_core_vs_horizons_km"].as_f64();
+                *f.vs_horizons_km = o[key("vs_horizons_km").as_str()].as_f64();
             }
             "ephemeris" => {
-                r.adam_core_separation_arcsec = o["adam_core_separation_arcsec"].as_f64();
-                r.adam_core_d_ra_arcsec = o["adam_core_d_ra_arcsec"].as_f64();
-                r.adam_core_d_dec_arcsec = o["adam_core_d_dec_arcsec"].as_f64();
-                r.adam_core_d_rho_km = o["adam_core_d_rho_km"].as_f64();
+                *f.separation_arcsec = o[key("separation_arcsec").as_str()].as_f64();
+                *f.d_ra_arcsec = o[key("d_ra_arcsec").as_str()].as_f64();
+                *f.d_dec_arcsec = o[key("d_dec_arcsec").as_str()].as_f64();
+                *f.d_rho_km = o[key("d_rho_km").as_str()].as_f64();
             }
             _ => {
-                r.adam_core_chi2 = o["adam_core_chi2"].as_f64();
-                r.adam_core_reduced_chi2 = o["adam_core_reduced_chi2"].as_f64();
-                r.adam_core_n_obs_used = o["adam_core_n_obs_used"].as_u64().map(|v| v as u32);
-                r.adam_core_n_obs_rejected =
-                    o["adam_core_n_obs_rejected"].as_u64().map(|v| v as u32);
-                r.adam_core_converged = o["adam_core_converged"].as_bool();
-                r.adam_core_sigma_source = o["adam_core_sigma_source"].as_object().map(|m| {
+                *f.chi2 = o[key("chi2").as_str()].as_f64();
+                *f.reduced_chi2 = o[key("reduced_chi2").as_str()].as_f64();
+                *f.n_obs_used = o[key("n_obs_used").as_str()].as_u64().map(|v| v as u32);
+                *f.n_obs_rejected = o[key("n_obs_rejected").as_str()].as_u64().map(|v| v as u32);
+                *f.converged = o[key("converged").as_str()].as_bool();
+                *f.sigma_source = o[key("sigma_source").as_str()].as_object().map(|m| {
                     m.iter()
                         .map(|(k, v)| (k.clone(), v.clone()))
                         .collect::<std::collections::BTreeMap<_, _>>()
                 });
             }
         }
-        record_tool_config(r, "adam-core", o, "adam_core");
+        record_tool_config(r, tool, o, prefix);
         n += 1;
     }
     Ok(n)
@@ -2439,7 +2480,7 @@ fn catalog_row_floors() -> Vec<RowFloor> {
 /// The `channels` module constants plus the externally-merged comparators that
 /// only ever appear as their own result JSON. Validated against so a typo is
 /// "you typed it wrong", not "that channel produced nothing".
-const KNOWN_CHANNELS: [&str; 14] = [
+const KNOWN_CHANNELS: [&str; 15] = [
     channels::RUST,
     channels::PYTHON,
     channels::C,
@@ -2452,6 +2493,7 @@ const KNOWN_CHANNELS: [&str; 14] = [
     "jorbit",
     "layup",
     "adam-core",
+    "adam-core-rust",
     "orbfit",
     "grss",
 ];
@@ -3922,6 +3964,13 @@ mod tests {
                 merge_adam_core,
                 vec![0, 1, 2],
             ),
+            (
+                "adam-core-rust",
+                "adam_core_rust",
+                vec![prop, eph, od],
+                merge_adam_core_rust,
+                vec![0, 1, 2],
+            ),
             ("kete", "kete", vec![prop, eph, od], kete, vec![0, 1, 2]),
             ("jorbit", "jorbit", vec![prop, eph], jorbit, vec![0, 1]),
         ];
@@ -4050,6 +4099,76 @@ mod tests {
         assert!(
             block.contains(why) && block.contains("Vesta") && !block.contains("Eros"),
             "the reason with its object"
+        );
+    }
+
+    /// The Rust-API channel folds into its own fields and its own tool id, and
+    /// leaves the Python package's untouched (and the reverse): the two channels
+    /// of one release sit side by side on the same reference row.
+    #[test]
+    fn merge_adam_core_rust_folds_into_its_own_fields_beside_the_python_channel() {
+        let mut prop = ValidationResult::empty();
+        prop.object = "Eros".into();
+        prop.test_type = "propagation".into();
+        prop.dt_days = 30.0;
+        let mut eph = ValidationResult::empty();
+        eph.object = "Eros".into();
+        eph.test_type = "ephemeris".into();
+        eph.dt_days = 30.0;
+        eph.observer = Some("W84".into());
+        let mut rows = vec![prop, eph, od_row("Eros")];
+        let mut py = tempfile::NamedTempFile::new().unwrap();
+        write!(
+            py,
+            r#"[{{"object":"Eros","test_type":"propagation","dt_days":30.0,
+                "adam_core_vs_horizons_km":0.25,"adam_core_version":"0.8.0",
+                "adam_core_settings":{{"obscodes_source":"mpc-obscodes 2026.11.7"}}}}]"#
+        )
+        .unwrap();
+        let mut rs = tempfile::NamedTempFile::new().unwrap();
+        write!(
+            rs,
+            r#"[{{"object":"Eros","test_type":"propagation","dt_days":30.0,
+                "adam_core_rust_vs_horizons_km":0.26,"adam_core_rust_time_ms":2.0,
+                "adam_core_rust_version":"0.8.0",
+                "adam_core_rust_settings":{{"obscodes":"mpc-obscodes 2026.4.23"}}}},
+              {{"object":"Eros","test_type":"ephemeris","dt_days":30.0,"observer":"W84",
+                "adam_core_rust_d_rho_km":-0.07}},
+              {{"object":"Eros","test_type":"orbit_determination",
+                "adam_core_rust_converged":true,"adam_core_rust_reduced_chi2":0.4,
+                "adam_core_rust_n_obs_used":100,"adam_core_rust_n_obs_rejected":2,
+                "adam_core_rust_sigma_source":{{"reported":3,"filled":97}},
+                "adam_core_converged":false}}]"#
+        )
+        .unwrap();
+        assert_eq!(merge_adam_core(&mut rows, py.path()).unwrap(), 1);
+        assert_eq!(merge_adam_core_rust(&mut rows, rs.path()).unwrap(), 3);
+        assert_eq!(rows[0].adam_core_vs_horizons_km, Some(0.25));
+        assert_eq!(rows[0].adam_core_rust_vs_horizons_km, Some(0.26));
+        assert_eq!(rows[1].adam_core_rust_d_rho_km, Some(-0.07));
+        assert_eq!(rows[1].adam_core_d_rho_km, None);
+        assert_eq!(rows[2].adam_core_rust_converged, Some(true));
+        assert_eq!(rows[2].adam_core_rust_n_obs_rejected, Some(2));
+        assert_eq!(
+            rows[2].adam_core_converged, None,
+            "a Python-prefixed field in the Rust file is not read"
+        );
+        assert_eq!(
+            rows[2].adam_core_rust_sigma_source.as_ref().unwrap()["filled"],
+            97
+        );
+        let settings = rows[0].tool_settings.as_ref().unwrap();
+        assert_eq!(
+            settings["adam-core"]["obscodes_source"],
+            "mpc-obscodes 2026.11.7"
+        );
+        assert_eq!(
+            settings["adam-core-rust"]["obscodes"],
+            "mpc-obscodes 2026.4.23"
+        );
+        assert_eq!(
+            rows[0].tool_versions.as_ref().unwrap()["adam-core-rust"],
+            "0.8.0"
         );
     }
 

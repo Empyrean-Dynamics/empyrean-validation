@@ -1,5 +1,9 @@
 /target
 Cargo.lock
+# A binary's lock is committed: the adam-core Rust-API runner builds exactly
+# the crates it was validated with.
+!runners/adam-core-rust/Cargo.lock
+runners/adam-core-rust/build/
 
 # Cargo build dirs for the per-channel runners (rust / cli are their
 # own isolated workspaces under runners/).

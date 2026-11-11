@@ -20,6 +20,12 @@ runners (layup's `weight_data="supplied"` uses each observation's `rmsRA` /
 `rmsDec` and gives a missing one its flat C++ default). Both fill from this one
 model, which is why it lives here and not inside either runner.
 
+The `adam-core-rust` runner (the same `CORE_OD_V1` profile through adam-core's
+Rust crates) is not Python, so it reaches the same `fill_missing` through
+`fill_json.py`: one JSON object on stdin (`stn`, `astcat`, `rms_ra`, `rms_dec`)
+and one on stdout (`ra_sigma`, `dec_sigma` and `fill_missing`'s report), standard
+library only. One implementation and one set of labels, not a port.
+
 ## Discipline
 
 - **Reported sigmas are never overwritten.** Only a missing (None / NaN / non-positive)

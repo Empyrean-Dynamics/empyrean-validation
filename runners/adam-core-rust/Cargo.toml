@@ -1,0 +1,26 @@
+[package]
+name = "adam-core-rust-runner"
+version = "0.1.0"
+edition = "2024"
+publish = false
+license = "BSD-3-Clause"
+description = "External reference runner: the empyrean validation plan through adam-core's released public Rust API (adam_core + adam_assist)."
+
+[[bin]]
+name = "run-adam-core-rust"
+path = "src/main.rs"
+
+# The released crates, pinned exactly: adam_core 0.8.0 is the release the
+# Python channel (runners/adam-core) runs, and adam_assist 0.7.0 is the only
+# released ASSIST provider for it (GPL-3.0; linked into this binary only, never
+# into empyrean). adam_assist's default `kernel-data` feature (adam-core's
+# resolver, which can fetch from PyPI) is off: every path is passed explicitly.
+[dependencies]
+adam_core = "=0.8.0"
+adam_assist = { version = "=0.7.0", default-features = false }
+serde_json = { version = "1", features = ["float_roundtrip"] }
+sha2 = "0.10"
+
+# A standalone binary with its own Cargo.lock, never adopted by the suite's
+# crate at the repository root.
+[workspace]

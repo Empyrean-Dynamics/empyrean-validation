@@ -1207,6 +1207,51 @@ pub struct ValidationResult {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub adam_core_sigma_source: Option<std::collections::BTreeMap<String, serde_json::Value>>,
 
+    // ── adam-core external reference, Rust API ──────────────────────
+    // The same adam-core release (0.8.0) run through its public Rust crates
+    // instead of its PyPI wheels: adam_core for OD, observers, SPICE and time,
+    // adam_assist 0.7.0 for ASSIST propagation, every file from the
+    // `adam-core-rust/` folder of the third-party tool set. The fields mirror the
+    // `adam_core_*` block one for one. Populated by `merge-external` from
+    // runners/adam-core-rust.
+    /// adam-core (Rust API) propagated position vs JPL Horizons (km).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub adam_core_rust_vs_horizons_km: Option<f64>,
+    /// adam-core (Rust API) ephemeris angular separation from Horizons (arcsec).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub adam_core_rust_separation_arcsec: Option<f64>,
+    /// adam-core (Rust API) ephemeris RA offset from Horizons, cos(dec) applied (arcsec).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub adam_core_rust_d_ra_arcsec: Option<f64>,
+    /// adam-core (Rust API) ephemeris Dec offset from Horizons (arcsec).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub adam_core_rust_d_dec_arcsec: Option<f64>,
+    /// adam-core (Rust API) ephemeris range offset from Horizons (km).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub adam_core_rust_d_rho_km: Option<f64>,
+    /// adam-core (Rust API) wall clock per row (ms): per call for
+    /// propagation/ephemeris, per `run_od` for OD.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub adam_core_rust_time_ms: Option<f64>,
+    /// adam-core (Rust API) post-fit chi-square (CORE_OD_V1, after the suite's sigma fill).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub adam_core_rust_chi2: Option<f64>,
+    /// adam-core (Rust API) reduced chi-square.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub adam_core_rust_reduced_chi2: Option<f64>,
+    /// adam-core (Rust API) observations used by the fit.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub adam_core_rust_n_obs_used: Option<u32>,
+    /// adam-core (Rust API) observations rejected by its cmc2003 outlier stage.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub adam_core_rust_n_obs_rejected: Option<u32>,
+    /// Whether adam-core's (Rust API) refinement converged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub adam_core_rust_converged: Option<bool>,
+    /// Observations counted per sigma source on an OD row, as for `adam_core_sigma_source`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub adam_core_rust_sigma_source: Option<std::collections::BTreeMap<String, serde_json::Value>>,
+
     // ── tool versions and settings (every external tool) ────────────
     // Tool id -> version string, and tool id -> {setting -> value}, folded by
     // `merge-external` from each runner's own record. Values are exactly what the
@@ -1361,6 +1406,43 @@ pub struct ValidationResult {
 /// writes is a failed candidate's on the primary interval, not a fit of the arc.
 pub const LAYUP_WHOLE_ARC_FIT_FLAGS: [i32; 4] = [0, 2, 6, 9];
 
+/// The two adam-core channels: the Python package (`adam-core`, fields
+/// `adam_core_*`) and the Rust API (`adam-core-rust`, fields
+/// `adam_core_rust_*`). One release, two public surfaces, one field shape.
+pub const ADAM_CORE_TOOLS: [(&str, &str); 2] = [
+    ("adam-core", "adam_core"),
+    ("adam-core-rust", "adam_core_rust"),
+];
+
+/// Mutable access to one adam-core channel's folded fields, so the merge folds
+/// either channel through one code path.
+pub struct AdamCoreFieldsMut<'a> {
+    pub vs_horizons_km: &'a mut Option<f64>,
+    pub separation_arcsec: &'a mut Option<f64>,
+    pub d_ra_arcsec: &'a mut Option<f64>,
+    pub d_dec_arcsec: &'a mut Option<f64>,
+    pub d_rho_km: &'a mut Option<f64>,
+    pub time_ms: &'a mut Option<f64>,
+    pub chi2: &'a mut Option<f64>,
+    pub reduced_chi2: &'a mut Option<f64>,
+    pub n_obs_used: &'a mut Option<u32>,
+    pub n_obs_rejected: &'a mut Option<u32>,
+    pub converged: &'a mut Option<bool>,
+    pub sigma_source: &'a mut Option<std::collections::BTreeMap<String, serde_json::Value>>,
+}
+
+/// A copy of one adam-core channel's scalar fields, for the report.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct AdamCoreFields {
+    pub vs_horizons_km: Option<f64>,
+    pub separation_arcsec: Option<f64>,
+    pub time_ms: Option<f64>,
+    pub chi2: Option<f64>,
+    pub reduced_chi2: Option<f64>,
+    pub n_obs_used: Option<u32>,
+    pub converged: Option<bool>,
+}
+
 impl ValidationResult {
     /// Whether layup's chi-square on this row is a fit of the whole arc. A row
     /// carrying layup's flag answers by [`LAYUP_WHOLE_ARC_FIT_FLAGS`]; a row from
@@ -1385,6 +1467,67 @@ impl ValidationResult {
     pub fn layup_reduced_chi2_shown(&self) -> Option<f64> {
         self.layup_reduced_chi2
             .filter(|_| self.layup_chi2_is_a_fit())
+    }
+
+    /// One adam-core channel's fields by tool id (`adam-core` or
+    /// `adam-core-rust`); None for any other id.
+    pub fn adam_core_fields_mut(&mut self, tool: &str) -> Option<AdamCoreFieldsMut<'_>> {
+        Some(match tool {
+            "adam-core" => AdamCoreFieldsMut {
+                vs_horizons_km: &mut self.adam_core_vs_horizons_km,
+                separation_arcsec: &mut self.adam_core_separation_arcsec,
+                d_ra_arcsec: &mut self.adam_core_d_ra_arcsec,
+                d_dec_arcsec: &mut self.adam_core_d_dec_arcsec,
+                d_rho_km: &mut self.adam_core_d_rho_km,
+                time_ms: &mut self.adam_core_time_ms,
+                chi2: &mut self.adam_core_chi2,
+                reduced_chi2: &mut self.adam_core_reduced_chi2,
+                n_obs_used: &mut self.adam_core_n_obs_used,
+                n_obs_rejected: &mut self.adam_core_n_obs_rejected,
+                converged: &mut self.adam_core_converged,
+                sigma_source: &mut self.adam_core_sigma_source,
+            },
+            "adam-core-rust" => AdamCoreFieldsMut {
+                vs_horizons_km: &mut self.adam_core_rust_vs_horizons_km,
+                separation_arcsec: &mut self.adam_core_rust_separation_arcsec,
+                d_ra_arcsec: &mut self.adam_core_rust_d_ra_arcsec,
+                d_dec_arcsec: &mut self.adam_core_rust_d_dec_arcsec,
+                d_rho_km: &mut self.adam_core_rust_d_rho_km,
+                time_ms: &mut self.adam_core_rust_time_ms,
+                chi2: &mut self.adam_core_rust_chi2,
+                reduced_chi2: &mut self.adam_core_rust_reduced_chi2,
+                n_obs_used: &mut self.adam_core_rust_n_obs_used,
+                n_obs_rejected: &mut self.adam_core_rust_n_obs_rejected,
+                converged: &mut self.adam_core_rust_converged,
+                sigma_source: &mut self.adam_core_rust_sigma_source,
+            },
+            _ => return None,
+        })
+    }
+
+    /// A copy of one adam-core channel's scalar fields by tool id.
+    pub fn adam_core_fields(&self, tool: &str) -> Option<AdamCoreFields> {
+        Some(match tool {
+            "adam-core" => AdamCoreFields {
+                vs_horizons_km: self.adam_core_vs_horizons_km,
+                separation_arcsec: self.adam_core_separation_arcsec,
+                time_ms: self.adam_core_time_ms,
+                chi2: self.adam_core_chi2,
+                reduced_chi2: self.adam_core_reduced_chi2,
+                n_obs_used: self.adam_core_n_obs_used,
+                converged: self.adam_core_converged,
+            },
+            "adam-core-rust" => AdamCoreFields {
+                vs_horizons_km: self.adam_core_rust_vs_horizons_km,
+                separation_arcsec: self.adam_core_rust_separation_arcsec,
+                time_ms: self.adam_core_rust_time_ms,
+                chi2: self.adam_core_rust_chi2,
+                reduced_chi2: self.adam_core_rust_reduced_chi2,
+                n_obs_used: self.adam_core_rust_n_obs_used,
+                converged: self.adam_core_rust_converged,
+            },
+            _ => return None,
+        })
     }
 
     /// The reason `tool` (its id, e.g. `kete`, `adam-core`) recorded for not
@@ -1550,6 +1693,18 @@ impl ValidationResult {
             adam_core_n_obs_rejected: None,
             adam_core_converged: None,
             adam_core_sigma_source: None,
+            adam_core_rust_vs_horizons_km: None,
+            adam_core_rust_separation_arcsec: None,
+            adam_core_rust_d_ra_arcsec: None,
+            adam_core_rust_d_dec_arcsec: None,
+            adam_core_rust_d_rho_km: None,
+            adam_core_rust_time_ms: None,
+            adam_core_rust_chi2: None,
+            adam_core_rust_reduced_chi2: None,
+            adam_core_rust_n_obs_used: None,
+            adam_core_rust_n_obs_rejected: None,
+            adam_core_rust_converged: None,
+            adam_core_rust_sigma_source: None,
             tool_versions: None,
             tool_settings: None,
             tool_unsupported: None,

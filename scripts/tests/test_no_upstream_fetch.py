@@ -232,3 +232,36 @@ def test_the_grss_setup_never_imports_grss_with_its_shell_outs_live():
         if re.search(r"\bimport grss\b|from grss\b|grss\.utils as", ln):
             guarded = any("os.system = lambda" in prev for prev in code[max(0, i - 3) : i])
             assert guarded, f"runners/grss/setup.sh imports grss with its shell-outs live: {ln.strip()}"
+
+
+def test_adam_core_rust_reads_only_its_third_party_folder_by_explicit_path():
+    """adam-core's Rust API resolves data through a chain that ends in a fetch from
+    PyPI (adam_core_rs_kernel_data's Resolver). The runner never calls it: every
+    file comes from the adam-core-rust folder of the third-party tool set by an
+    explicit path, adam_assist's resolver feature is off, the run sets
+    ADAM_CORE_KERNEL_OFFLINE=1, and the leg restores (or, under act, copies) that
+    folder with every file it opens."""
+    make = (ROOT / "Makefile").read_text()
+    assert "ADAM_CORE_RUST_DATA_DIR ?= $(DATA_DIR)/third-party/adam-core-rust" in make
+    assert "ADAM_CORE_KERNEL_OFFLINE=1 ADAM_CORE_KERNEL_PYTHON= $(ADAM_CORE_RUST_BIN)" in make
+    runner = ROOT / "runners" / "adam-core-rust"
+    setup = "\n".join(ln for ln in (runner / "setup.sh").read_text().splitlines() if not ln.lstrip().startswith("#"))
+    assert "curl" not in setup and "wget" not in setup, "the setup downloads"
+    cargo = (runner / "Cargo.toml").read_text()
+    assert 'adam_assist = { version = "=0.7.0", default-features = false }' in cargo, "adam_assist's resolver feature is on"
+    src = "\n".join(
+        ln for p in sorted((runner / "src").glob("*.rs")) for ln in p.read_text().splitlines() if not ln.lstrip().startswith("//")
+    )
+    for call in ("from_default_kernels", "Resolver::", "setup_spice_backend", "assist_ephemeris_paths", "default_spice_kernel_paths", "obscodes_json("):
+        assert call not in src, f"the runner reaches adam-core's resolver through {call}"
+    assert 'set_var("ADAM_CORE_KERNEL_OFFLINE", "1")' in src
+    external = VALIDATION.split("\n  external:\n", 1)[1]
+    restore = re.search(r"- name: Restore the third-party tool set\n\s+if: (.*)\n", external).group(1)
+    assert '"adam-core-rust"' in restore, "the adam-core-rust leg does not restore the third-party set"
+    sentinels = set(re.search(r'adam-core-rust\)\s+dirs="adam-core-rust";\s+need="([^"]+)"', external).group(1).split())
+    needed = {
+        "adam-core-rust/" + n
+        for n in ("latest_leapseconds.tls", "de440.bsp", "earth_200101_990827_predict.bpc", "earth_620120_240827.bpc",
+                  "earth_latest_high_prec.bpc", "earth_assoc_itrf93.tf", "obscodes_extended.json", "sb441-n16.bsp", "bias.dat")
+    }
+    assert sentinels == needed, sentinels ^ needed

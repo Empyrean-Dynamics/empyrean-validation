@@ -1544,11 +1544,9 @@ fn od_tool_present(key: &str, results: &[ValidationResult]) -> bool {
                     || r.grss_time_ms.is_some()
             }
             "jorbit" => r.jorbit_time_ms.is_some(),
-            "adam-core" => {
-                r.adam_core_converged.is_some()
-                    || r.adam_core_reduced_chi2.is_some()
-                    || r.adam_core_time_ms.is_some()
-            }
+            "adam-core" | "adam-core-rust" => r.adam_core_fields(key).is_some_and(|f| {
+                f.converged.is_some() || f.reduced_chi2.is_some() || f.time_ms.is_some()
+            }),
             _ => false,
         })
 }
@@ -4386,10 +4384,11 @@ enum OdColumn<'a> {
 /// The external fitters the plan runs, in display order, with the label and
 /// header colour each uses elsewhere in the report. A small spec local to
 /// this panel — not the removed `OdToolSpec` registry.
-const OD_FITTERS: [(&str, &str, &str); 5] = [
+const OD_FITTERS: [(&str, &str, &str); 6] = [
     ("findorb", "find_orb", "#b5651d"),
     ("layup", "layup", "#6a8caf"),
     ("adam-core", "adam-core", "#3f8f9b"),
+    ("adam-core-rust", "adam-core (Rust)", "#2b6a74"),
     ("orbfit", "OrbFit", "#5a9e6f"),
     ("grss", "GRSS", "#9b6fb0"),
 ];
@@ -4516,32 +4515,35 @@ fn layup_convergence_cell(r: &ValidationResult) -> ConvergenceCell {
     }
 }
 
-/// adam-core's cell for one arc. A row the runner named unsupported (a
-/// self-perturber, a refused or failed fit) never reaches here: every fitter's
-/// unsupported reason becomes its own cell in [`fitter_convergence_cell`].
-fn adam_core_convergence_cell(r: &ValidationResult) -> ConvergenceCell {
-    match r.adam_core_converged {
+/// One adam-core channel's cell for one arc (`key` is `adam-core`, the Python
+/// package, or `adam-core-rust`, the Rust API). A row the runner named
+/// unsupported (a self-perturber, a refused or failed fit) never reaches here:
+/// every fitter's unsupported reason becomes its own cell in
+/// [`fitter_convergence_cell`].
+fn adam_core_convergence_cell(key: &str, label: &str, r: &ValidationResult) -> ConvergenceCell {
+    let f = r.adam_core_fields(key).unwrap_or_default();
+    match f.converged {
         Some(true) => ConvergenceCell::Converged { iterations: None },
         Some(false) => ConvergenceCell::NotConverged {
-            reason: Some("adam-core's fit did not converge".to_string()),
+            reason: Some(format!("{label}'s fit did not converge")),
         },
         None => {
-            let produced = r.adam_core_chi2.is_some()
-                || r.adam_core_reduced_chi2.is_some()
-                || r.adam_core_n_obs_used.is_some()
-                || r.adam_core_time_ms.is_some();
+            let produced = f.chi2.is_some()
+                || f.reduced_chi2.is_some()
+                || f.n_obs_used.is_some()
+                || f.time_ms.is_some();
             if produced {
                 ConvergenceCell::NotConverged {
-                    reason: Some(
-                        "adam-core emitted a record for this object but no convergence flag"
-                            .to_string(),
-                    ),
+                    reason: Some(format!(
+                        "{label} emitted a record for this object but no convergence flag"
+                    )),
                 }
             } else {
                 ConvergenceCell::NotAttempted {
-                    reason: "no adam-core record for this object in the merged input — outside \
-                             the fixture set adam-core was run over"
-                        .to_string(),
+                    reason: format!(
+                        "no {label} record for this object in the merged input — outside \
+                         the fixture set {label} was run over"
+                    ),
                 }
             }
         }
@@ -4609,7 +4611,7 @@ fn fitter_convergence_cell(
     match key {
         "findorb" => findorb_convergence_cell(r),
         "layup" => layup_convergence_cell(r),
-        "adam-core" => adam_core_convergence_cell(r),
+        "adam-core" | "adam-core-rust" => adam_core_convergence_cell(key, label, r),
         "orbfit" => orbfit_convergence_cell(r),
         "grss" => grss_convergence_cell(r),
         _ => ConvergenceCell::NotAttempted {
@@ -9318,7 +9320,7 @@ fn pw_run_label(total: usize, idx: usize) -> String {
 // arms from each arm row's `config=` note; every other tool's version/settings
 // from its recorded fields). A setting the run did not record renders as the one
 // null token below, "not recorded" on hover; nothing is hand-typed.
-const CONFIG_TOOL_ORDER: [(&str, &str); 9] = [
+const CONFIG_TOOL_ORDER: [(&str, &str); 10] = [
     ("assist", "ASSIST"),
     ("findorb", "find_orb"),
     ("layup", "layup"),
@@ -9328,6 +9330,7 @@ const CONFIG_TOOL_ORDER: [(&str, &str); 9] = [
     ("jorbit", "jorbit"),
     ("oorb", "OpenOrb"),
     ("adam-core", "adam-core"),
+    ("adam-core-rust", "adam-core (Rust API)"),
 ];
 
 /// The one null token a configuration table shows for a setting the run did not
@@ -9366,10 +9369,12 @@ fn config_tool_present(results: &[ValidationResult], key: &str) -> bool {
         "oorb" => results
             .iter()
             .any(|r| r.oorb_vs_horizons_km.is_some() || r.oorb_separation_arcsec.is_some()),
-        "adam-core" => results.iter().any(|r| {
-            r.adam_core_reduced_chi2.is_some()
-                || r.adam_core_vs_horizons_km.is_some()
-                || r.adam_core_separation_arcsec.is_some()
+        "adam-core" | "adam-core-rust" => results.iter().any(|r| {
+            r.adam_core_fields(key).is_some_and(|f| {
+                f.reduced_chi2.is_some()
+                    || f.vs_horizons_km.is_some()
+                    || f.separation_arcsec.is_some()
+            })
         }),
         _ => false,
     }
@@ -9589,6 +9594,12 @@ fn config_tool_subsection(results: &[ValidationResult], key: &str) -> String {
             "adam-core",
             "adam-core",
             "Propagation, ephemeris and orbit determination with the released adam-core and adam-assist (ASSIST). OD runs the public CORE_OD_V1 profile; it has no sigma-fill stage, so the suite fills missing per-observation sigma from the public Ver&eacute;s 2017 model before the fit. Every value below is what the runner recorded on the rows; the kernels are the registered set, passed to adam-assist explicitly.",
+        ),
+        "adam-core-rust" => config_recorded_subsection(
+            results,
+            "adam-core-rust",
+            "adam-core (Rust API)",
+            "The same adam-core release run through its public Rust crates instead of its PyPI wheels: adam_core for orbit determination, observers, SPICE and time, adam_assist for ASSIST propagation. OD runs the public CORE_OD_V1 profile with ASSIST as its provider; missing per-observation sigma is filled from the public Ver&eacute;s 2017 model before the fit, as for the Python package. Every file, Earth orientation and observatory codes included, comes from the registered set by explicit path, so its versions differ from the ones pip resolves for the Python package; both are recorded below. Every value below is what the runner recorded on the rows.",
         ),
         _ => String::new(),
     }
@@ -10103,6 +10114,7 @@ pub fn generate_report(
                         || r.orbfit_rms_arcsec.is_some()
                         || r.layup_reduced_chi2_shown().is_some()
                         || r.adam_core_reduced_chi2.is_some()
+                        || r.adam_core_rust_reduced_chi2.is_some()
                         || r.grss_rms_arcsec.is_some()
                         || r.ref_od_reduced_chi2.is_some())
             })
@@ -10837,6 +10849,11 @@ pub fn generate_report(
         <td><b title="Used for: propagation, ephemeris and orbit determination with the released adam-core 0.8.0 and adam-assist 0.7.0. OD runs the public CORE_OD_V1 profile (EFCC18 debias, nightly de-weighting); missing per-observation sigma is filled by the suite's public Vereš 2017 model. Iris, Vesta, Pallas and Hygiea are reported unsupported: adam-assist cannot exclude a body from its own force model.">adam-core</b></td>
         <td>Asteroid Institute &middot; adam-core 0.8.0 + adam-assist 0.7.0 (ASSIST)</td>
         <td><a href="https://github.com/Empyrean-Dynamics/empyrean-validation/blob/main/runners/adam-core/run_adam_core.py" target="_blank" rel="noopener"><code>runners/adam-core/run_adam_core.py</code></a></td>
+      </tr>
+      <tr>
+        <td><b title="Used for: propagation, ephemeris and orbit determination with the same adam-core release through its public Rust API: adam_core 0.8.0 and adam_assist 0.7.0 (ASSIST). OD runs the public CORE_OD_V1 profile with ASSIST as its provider; missing per-observation sigma is filled by the suite's public Vereš 2017 model. Every file comes from the registered set by explicit path. Iris, Vesta, Pallas and Hygiea are reported unsupported: adam_assist cannot exclude a body from its own force model.">adam-core (Rust API)</b></td>
+        <td>Asteroid Institute &middot; adam_core 0.8.0 + adam_assist 0.7.0 (Rust crates)</td>
+        <td><a href="https://github.com/Empyrean-Dynamics/empyrean-validation/blob/main/runners/adam-core-rust/src/main.rs" target="_blank" rel="noopener"><code>runners/adam-core-rust/src/main.rs</code></a></td>
       </tr>
       <tr>
         <td><b>find_orb</b></td>
@@ -17642,27 +17659,89 @@ mod tests {
         let mut r = synthetic_core_od_row("Vesta");
         r.adam_core_converged = Some(false);
         assert!(matches!(
-            adam_core_convergence_cell(&r),
+            adam_core_convergence_cell("adam-core", "adam-core", &r),
             ConvergenceCell::NotConverged { reason: Some(_) }
         ));
         let mut ok = synthetic_core_od_row("Eros");
         ok.adam_core_converged = Some(true);
         assert!(matches!(
-            adam_core_convergence_cell(&ok),
+            adam_core_convergence_cell("adam-core", "adam-core", &ok),
             ConvergenceCell::Converged { .. }
         ));
         // No record at all is "not attempted", never a silent pass.
         assert!(matches!(
-            adam_core_convergence_cell(&synthetic_core_od_row("Bennu")),
+            adam_core_convergence_cell("adam-core", "adam-core", &synthetic_core_od_row("Bennu")),
             ConvergenceCell::NotAttempted { .. }
         ));
         // A record with data but no flag is a failure, not a pass.
         let mut half = synthetic_core_od_row("Bennu");
         half.adam_core_time_ms = Some(5.0);
         assert!(matches!(
-            adam_core_convergence_cell(&half),
+            adam_core_convergence_cell("adam-core", "adam-core", &half),
             ConvergenceCell::NotConverged { .. }
         ));
+    }
+
+    /// The Rust-API channel reads its own fields: a Python-package result on the
+    /// row says nothing about it, and its own result renders as its own cell.
+    #[test]
+    fn adam_core_rust_convergence_cell_reads_only_its_own_fields() {
+        let key = "adam-core-rust";
+        let label = "adam-core (Rust)";
+        let mut r = synthetic_core_od_row("Eros");
+        r.adam_core_converged = Some(true);
+        r.adam_core_reduced_chi2 = Some(0.4);
+        assert!(matches!(
+            fitter_convergence_cell(key, label, Some(&r)),
+            ConvergenceCell::NotAttempted { .. }
+        ));
+        r.adam_core_rust_converged = Some(false);
+        match fitter_convergence_cell(key, label, Some(&r)) {
+            ConvergenceCell::NotConverged { reason: Some(why) } => {
+                assert_eq!(why, "adam-core (Rust)'s fit did not converge")
+            }
+            _ => panic!("the Rust channel's own flag decides its cell"),
+        }
+        r.adam_core_rust_converged = Some(true);
+        assert!(matches!(
+            fitter_convergence_cell(key, label, Some(&r)),
+            ConvergenceCell::Converged { .. }
+        ));
+        assert!(od_tool_present(key, &[r]));
+        assert!(!od_tool_present(key, &[synthetic_core_od_row("Eros")]));
+    }
+
+    /// The Rust-API channel has its own Configurations subsection, rendered from
+    /// its own record (its Earth-orientation and obscodes versions included),
+    /// separate from the Python package's.
+    #[test]
+    fn configurations_appendix_renders_adam_core_rust_from_its_record() {
+        let mut r = synthetic_rust_prop_row("Eros", 0.0);
+        r.channel = "core".into();
+        r.adam_core_rust_vs_horizons_km = Some(0.27);
+        r.tool_versions = Some([("adam-core-rust".to_string(), "0.8.0".to_string())].into());
+        r.tool_settings = Some(
+            [(
+                "adam-core-rust".to_string(),
+                [(
+                    "earth_orientation".to_string(),
+                    "earth_latest_high_prec.bpc naif-eop-high-prec 2026.4.30".to_string(),
+                )]
+                .into(),
+            )]
+            .into(),
+        );
+        let html = render_rows(&[r]);
+        let at = html
+            .find("id=\"s05c-adam-core-rust\"")
+            .expect("adam-core-rust subsection");
+        let sub = &html[at..at + html[at..].find("</table>").unwrap()];
+        assert!(sub.contains("adam-core (Rust API) &middot; <code>0.8.0</code>"));
+        assert!(sub.contains("naif-eop-high-prec 2026.4.30"));
+        assert!(
+            !html.contains("id=\"s05c-adam-core\""),
+            "no Python-package subsection without its rows"
+        );
     }
 
     /// S5a: the appendix "ASSIST configurations" (s05c) is now "Configurations"

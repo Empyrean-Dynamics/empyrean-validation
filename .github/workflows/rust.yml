@@ -58,6 +58,18 @@ jobs:
           cargo fmt -- --check
           cargo clippy --all-targets
 
+      # The adam-core Rust-API runner is its own crate with a committed
+      # Cargo.lock (adam_core 0.8.0 + adam_assist 0.7.0 from crates.io). Its
+      # unit tests need no kernel; the sigma-fill test runs runners/sigmafill
+      # through the system python3.
+      - name: Build + Lint + Test (adam-core-rust runner)
+        working-directory: runners/adam-core-rust
+        run: |
+          cargo build --locked
+          cargo fmt -- --check
+          cargo clippy --locked --all-targets -- -D warnings
+          cargo test --locked
+
   # ── Test ────────────────────────────────────────────────────────
   test:
     name: Test
