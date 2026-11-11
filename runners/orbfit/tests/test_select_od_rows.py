@@ -38,3 +38,15 @@ def test_object_without_an_untagged_row_keeps_its_first_fit(runner):
 
 def test_no_od_rows_selects_nothing(runner):
     assert runner.select_od_rows([{"object": "D", "test_type": "ephemeris"}]) == []
+
+
+def test_every_row_carries_the_version_and_settings_even_a_failed_one(runner, tmp_path):
+    row = od("Eros", None)
+    out = runner.process_od_row(row, {}, tmp_path, image="img", platform="p", timeout_s=1.0,
+                                source_version="orbfit abc123", sun=None,
+                                massive=[])  # fails before the seed
+    assert out["orbfit_error"]  # no fixture: a named failure
+    assert out["orbfit_version"] == "orbfit abc123"
+    assert out["orbfit_settings"] is runner.ORBFIT_SETTINGS
+    for key in ("program", "options", "rejection", "seed", "perturbers"):
+        assert out["orbfit_settings"][key]

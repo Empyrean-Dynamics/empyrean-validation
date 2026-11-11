@@ -22,6 +22,10 @@
    "job_min": 10.1,
    "source": "job wall, max of runs 39726274647 (10.1), 40612958887 (2.0), 42506609035 (1.8)"
   },
+  "oorb": {
+   "job_min": 50.0,
+   "source": "ESTIMATED, not measured on a hosted runner: the leg was off until the runner-fixes PR, so no hosted run has timed it. About 50 min is the full catalog's wall on 4 vCPU with the BC430 asteroid perturbers on (rows run as concurrent oorb processes, about 2 s per call); replace it with the first hosted job wall."
+  },
   "layup": {
    "job_min": 13.7,
    "source": "job wall of run 39726274647, the only full run in which layup completed"

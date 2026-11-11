@@ -114,6 +114,7 @@ Usage (must run under the layup venv's interpreter, see ``layup/setup.sh``):
 from __future__ import annotations
 
 import argparse
+import importlib.util
 import json
 import math
 import sys
@@ -373,7 +374,7 @@ def _refit_mismatch(ref: dict, row: dict) -> str | None:
 
     The LM is deterministic given the same fit set and the same guess, so any
     disagreement means the reference file does not describe this configuration —
-    a mismatched profile, a different weighting flag, a stale sidecar. That must
+    a mismatched profile, a walk made at other settings, a stale sidecar. That must
     surface as a failed window, never be absorbed.
     """
     for field, key in (
@@ -494,7 +495,6 @@ def _walk_object(obj: dict, fixtures_dir: Path, ref_windows: dict | None, opts) 
             outcome = walk._fit_window(
                 window_psv,
                 obj_token,
-                opts.orbitfit_bin,
                 work,
                 guess if opts.warm_start else None,
                 opts,
@@ -805,10 +805,8 @@ def main() -> int:
         "across them; >1 trades cores for wall-clock.",
     )
     p.add_argument("--max-windows", type=int, default=None, help="Cap windows per object (smoke).")
-    p.add_argument("--ar-data-path", type=str, default=None)
+    p.add_argument("--ar-data-path", type=str, default=str(walk.RL._STAGED_DATA))
     p.add_argument("--timeout", type=float, default=900.0)
-    p.add_argument("--weight-data", action=argparse.BooleanOptionalAction, default=True)
-    p.add_argument("--debias", action="store_true")
     p.add_argument("--no-warm-start", action="store_true")
     args = p.parse_args()
 
@@ -823,11 +821,19 @@ def main() -> int:
         print("ERROR: --mc-samples must be at least 2 to form a second moment.", file=sys.stderr)
         return 1
 
-    orbitfit_bin = walk._orbitfit_binary()
-    if orbitfit_bin is None:
+    if importlib.util.find_spec("layup") is None:
         print(
-            "ERROR: `layup-orbitfit` was not found next to this interpreter and not on $PATH.\n"
+            f"ERROR: layup does not import under this interpreter ({sys.executable}).\n"
             "       Run under runners/layup/.venv/bin/python (`make setup-layup`).",
+            file=sys.stderr,
+        )
+        return 1
+    args.ar_data_path = str(Path(args.ar_data_path).absolute())
+    missing = walk.RL.missing_data(args.ar_data_path)
+    if missing:
+        print(
+            f"ERROR: layup's data directory {args.ar_data_path} lacks: {', '.join(missing)}.\n"
+            "       Stage it with stage_data.py first (layup would download it mid-fit).",
             file=sys.stderr,
         )
         return 1
@@ -888,8 +894,6 @@ def main() -> int:
         return 1
 
     opts = Namespace(
-        weight_data=args.weight_data,
-        debias=args.debias,
         ar_data_path=args.ar_data_path,
         timeout=args.timeout,
         warm_start=not args.no_warm_start,
@@ -897,16 +901,14 @@ def main() -> int:
         mc_samples=args.mc_samples,
         predict_workers=args.predict_workers,
         max_windows=args.max_windows,
-        orbitfit_bin=orbitfit_bin,
     )
 
     print(
         f"layup MC sky covariance ({len(selected)} objects, profile {args.profile!r}, "
         f"N={args.mc_samples})\n"
-        f"  layup: {orbitfit_bin} (version {walk._layup_version() or 'unknown'})\n"
+        f"  layup: {walk._layup_version() or 'unknown'} through {walk.RL.FIT_ONE.name} at run_layup.LAYUP_SETTINGS\n"
         f"  reference windows: {args.windows_in or '(standalone — every window refit)'}\n"
-        f"  weighting: {'veres2017' if args.weight_data else 'flat_default'}"
-        f"{'+debias' if args.debias else ''}  warm_start: {not args.no_warm_start}",
+        f"  data: {args.ar_data_path}  warm_start: {not args.no_warm_start}",
         file=sys.stderr,
     )
 

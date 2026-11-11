@@ -73,7 +73,7 @@ rather than smoothed over:
 * **Planetary ephemeris.** GRSS's `PropSimulation` takes a DE kernel case.
   `--de-kernel 440` (default) is DE440 + the short-span SB441-N16, 1550-2650,
   ~235 MB; `--de-kernel 441` is DE441 + the long-span SB441-N16 and needs a
-  4.4 GB download from `setup.sh`. The validation grid lies entirely inside
+  tool-set folder carrying them (`GRSS_DE_KERNEL=441` at setup). The validation grid lies entirely inside
   DE440's span. Whichever is used is stamped into every row's
   `source_version`, and the required kernels are verified present and
   non-empty before a single row is computed.
@@ -162,15 +162,25 @@ _C_AU_PER_DAY = 173.144632674240
 # a name that promises something else.
 _PLAN_TEST_TYPES = ("propagation", "ephemeris", "orbit_determination")
 
-# SPICE kernels GRSS opens, by `--de-kernel` case. setup.sh fetches exactly
-# these; a fit or propagation against a missing or truncated kernel is a hard
-# stop, not a degraded run.
+# SPICE kernels GRSS opens, by `--de-kernel` case. setup.sh stages exactly
+# these from the grss/ folder of the third-party tool set; a fit or propagation
+# against a missing or truncated kernel is a hard stop, not a degraded run.
+# (GRSS's get_kernels.py also downloads pck00011.tpc, which GRSS never opens.)
 _KERNELS_COMMON = (
     "earth_latest.bpc",
     "earth_historic.bpc",
     "earth_predict.bpc",
     "moon_pa_de440.bpc",
-    "pck00011.tpc",
+)
+# The other files GRSS opens under its package directory, which it would
+# otherwise download: the low-resolution EFCC18 debiasing table every optical
+# fit reads, and the observatory tables (`import grss` reads special_codes.json;
+# fits and ephemerides read codes.json). setup.sh copies all three from the same
+# folder.
+_ASTROMETRY_TABLES = (
+    "debias/lowres_data/bias.dat",
+    "fit/codes.json",
+    "fit/special_codes.json",
 )
 _KERNELS_BY_DE = {
     440: ("de440.bsp", "sb441-n16s.bsp"),
@@ -181,34 +191,55 @@ _KERNELS_BY_DE = {
 # ── grss import ─────────────────────────────────────────────
 
 
-def _freshen_observatory_codes() -> None:
-    """Keep GRSS from re-fetching the MPC observatory codes at import time.
-
-    `grss.utils.initialize()` re-downloads `fit/codes.json` from the MPC API
-    whenever the file is more than a day old. `setup.sh` fetched that file when
-    the tool was built, and a validation run is sealed from the MPC, so the
-    refresh can only fail (connection refused) and take the leg with it. The
-    setup-time copy is the input of record for the run: refresh its
-    modification time so GRSS's age check passes, and say so with the copy's
-    age. A missing file is an error naming setup.sh, never a download.
-    """
+def _grss_package_dir() -> Path:
+    """GRSS's package directory, found without importing it (the import runs
+    `grss.utils.initialize()`)."""
     import importlib.util
 
     spec = importlib.util.find_spec("grss")
     if spec is None or not spec.submodule_search_locations:
         raise SystemExit("ERROR: the grss package is not importable; run runners/grss/setup.sh first.")
-    codes = Path(next(iter(spec.submodule_search_locations))) / "fit" / "codes.json"
-    if not codes.is_file() or codes.stat().st_size == 0:
+    return Path(next(iter(spec.submodule_search_locations)))
+
+
+def _check_astrometry_tables(grss_path: Path) -> None:
+    """Fail, naming each one, when a table GRSS opens under its package
+    directory is absent or empty: GRSS would download it, and a validation run
+    downloads nothing."""
+    missing = []
+    for rel in _ASTROMETRY_TABLES:
+        p = grss_path / rel
+        if not p.is_file():
+            missing.append(f"{p} (absent)")
+        elif p.stat().st_size == 0:
+            missing.append(f"{p} (zero bytes)")
+    if missing:
         raise SystemExit(
-            f"ERROR: GRSS observatory-code table missing or empty: {codes}\n"
-            "       setup.sh fetches it when the tool is built; the run is sealed from the\n"
-            "       MPC and will not download it. Rerun runners/grss/setup.sh."
+            "ERROR: GRSS's astrometry tables are not staged:\n"
+            + "".join(f"       - {m}\n" for m in missing)
+            + "       runners/grss/setup.sh copies them from the grss/ folder of the\n"
+            "       third-party tool set; the run never downloads them."
         )
-    age_days = (time.time() - codes.stat().st_mtime) / 86400.0
+
+
+def _freshen_observatory_codes() -> None:
+    """Keep GRSS from re-fetching the MPC observatory codes at import time.
+
+    `grss.utils.initialize()` re-downloads `fit/codes.json` from the MPC API
+    whenever the file is more than a day old. `setup.sh` copied that file from
+    the third-party tool set, which is the input of record for the run, and a
+    validation run is sealed from the MPC, so the refresh can only fail and take
+    the leg with it. Every table is checked first, by name; then codes.json's
+    modification time is refreshed (on the copy, never the pooled bytes) so
+    GRSS's age check passes, and the log says so.
+    """
+    grss_path = _grss_package_dir()
+    _check_astrometry_tables(grss_path)
+    codes = grss_path / "fit" / "codes.json"
     os.utime(codes, None)
     print(
-        f"  observatory codes: using the setup-time copy of {codes.name} (age {age_days:.1f} d); "
-        "GRSS's daily refresh is suppressed, the run is sealed from the MPC",
+        f"  observatory codes: {codes} from the third-party tool set; GRSS's daily "
+        "refresh is suppressed, the run is sealed from the MPC",
         file=sys.stderr,
     )
 
@@ -218,7 +249,7 @@ def _import_grss():
 
     `grss.utils.initialize()` runs on import and shells out to the package's
     own `get_kernels.py`, which pulls the FULL 4.4 GB kernel set — including
-    DE441 — regardless of what this run needs. `setup.sh` has already fetched
+    DE441 — regardless of what this run needs. `setup.sh` has already staged
     exactly the kernels for the requested `--de-kernel` case and verified
     their sizes, so the shell-outs are blocked here and what they would have
     provided is asserted instead by `_check_kernels`.
@@ -246,7 +277,7 @@ def _import_grss():
         script = cmd.split()[-1] if cmd.split() else cmd
         print(
             f"  note: suppressed grss's import-time shell-out to {script} "
-            "(setup.sh owns the kernel/debias fetch)",
+            "(setup.sh stages the kernels and tables from the third-party tool set)",
             file=sys.stderr,
         )
     return grss
@@ -274,7 +305,7 @@ def _check_kernels(kernel_dir: Path, de_kernel: int) -> None:
             + "".join(f"       - {m}\n" for m in missing)
             + "       Run runners/grss/setup.sh"
             + (f" with GRSS_DE_KERNEL={de_kernel}" if de_kernel != 440 else "")
-            + " to fetch and verify them.\n"
+            + " to stage and verify them.\n"
             "       Propagating against a missing kernel yields a wrong state, "
             "not an error, so this is a hard stop.",
             file=sys.stderr,
@@ -298,6 +329,19 @@ def _source_version(grss, de_kernel: int, analytic: bool) -> str:
         ver = f"unknown ({e})"
     partials = "STM partials" if analytic else "finite-difference partials"
     return f"grss {ver} (DE{de_kernel}+SB441-N16, {partials})"
+
+
+def grss_settings(ctx: dict) -> dict:
+    """GRSS's configuration for this run, stamped on every row."""
+    return {
+        "kernels": f"DE{ctx['de_kernel']} + SB441-N16",
+        "self_perturbers": "the object's own perturber removed with remove_body "
+        "(the plan's excluded_perturbers_naif, or a default perturber of the same name)",
+        "partials": "STM" if ctx["analytic_partials"] else "finite difference",
+        "od_max_iterations": str(ctx["n_iter_max"]),
+        "radar_bounce": "centre of mass (radius 0) for com=0 records",
+        "uncertainty": "state only (covariance rows are not replayed)",
+    }
 
 
 def _angular_sep_arcsec(ra1: float, dec1: float, ra2: float, dec2: float) -> float:
@@ -716,8 +760,8 @@ def ephemeris_row(ctx, row: dict) -> dict:
         return {
             "grss_error": (
                 f"observatory code {code!r} is not in GRSS's MPC code table "
-                "(runners/grss/.venv/.../grss/fit/codes.json); rerun setup.sh "
-                "to refresh it"
+                "(runners/grss/.venv/.../grss/fit/codes.json, from the third-party "
+                "tool set's grss/ folder)"
             )
         }
     lon, lat, rho_site = site
@@ -1043,6 +1087,8 @@ def run_plan_pass(ctx, plan: list[dict], fixtures_dir: Path) -> list[dict]:
         out["channel"] = "grss"
         out["timestamp"] = ctx["timestamp"]
         out["source_version"] = ctx["source_version"]
+        out["grss_version"] = ctx["source_version"]
+        out["grss_settings"] = grss_settings(ctx)
         # Known force-model difference for this object, if any — attached to
         # EVERY affected row (not just once) so no row can be read in isolation
         # as a like-for-like comparison, and logged once per object.
@@ -1178,6 +1224,8 @@ def run_radar_pass(
             "force_model": (ic or {}).get("force_model", force_model),
             "timestamp": ctx["timestamp"],
             "source_version": ctx["source_version"],
+            "grss_version": ctx["source_version"],
+            "grss_settings": grss_settings(ctx),
         }
         if ic is None:
             msg = (
@@ -1403,7 +1451,7 @@ def main() -> int:
         default=440,
         choices=sorted(_KERNELS_BY_DE),
         help="GRSS DE kernel case. 440 = DE440 + short-span SB441-N16 "
-        "(1550-2650, ~235 MB, the default and what setup.sh fetches); "
+        "(1550-2650, ~235 MB, the default and what setup.sh stages); "
         "441 = DE441 + long-span SB441-N16 (~4.4 GB, needs "
         "GRSS_DE_KERNEL=441 at setup).",
     )

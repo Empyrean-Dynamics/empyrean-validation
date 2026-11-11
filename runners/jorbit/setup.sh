@@ -9,17 +9,17 @@
 # validation suite's dep tree.
 #
 # Usage:
-#   DATA_DIR=~/.empyrean/data ./jorbit/setup.sh
+#   DATA_DIR=~/.empyrean/data/third-party/jorbit ./jorbit/setup.sh
 #
 # Kernels: jorbit reads DE440 and SB441-N16 through astropy's download cache,
 # and merely importing it runs initialize_jorbit(), which downloads both from
 # ssd.jpl.nasa.gov plus its 630 MB mpchecker bundle from Hugging Face (about
 # 1.4 GB) into ~/.astropy/cache. This script never imports jorbit directly:
 # its smoke test is `run_jorbit.py --check`, which stages the two kernels from
-# the registered kernel set in DATA_DIR (the files every empyrean repo pins,
-# under the same names) into a runner-private cache with astropy's internet
-# access off, imports jorbit and reads DE440. A missing kernel is a hard stop
-# that names the file, never a download.
+# DATA_DIR, the jorbit folder of the third-party tool set (the engine set's own
+# bytes, under the same names), into a runner-private cache with astropy's
+# internet access off, imports jorbit and reads DE440. A missing kernel is a
+# hard stop that names the file, never a download.
 #
 # Note: JAX has platform-specific install (CPU vs GPU vs Metal). This
 # script installs the CPU build by default, which matches what
@@ -65,7 +65,7 @@ PY="$VENV_DIR/bin/python"
 # Offline smoke test (see the header): stages the registered set's kernels and
 # imports jorbit with astropy's internet access off. Never `import jorbit`
 # here: that is the 1.4 GB download this runner exists to avoid.
-DATA_DIR="${DATA_DIR:-$HOME/.empyrean/data}"
+DATA_DIR="${DATA_DIR:-$HOME/.empyrean/data/third-party/jorbit}"
 "$PY" "$SCRIPT_DIR/run_jorbit.py" --check --data-dir "$DATA_DIR"
 
 echo

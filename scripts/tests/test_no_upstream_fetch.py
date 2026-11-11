@@ -31,20 +31,11 @@ VALIDATION = (WF / "validation.yml").read_text()
 SEAL = ROOT / "scripts" / "seal-upstream.sh"
 
 # The external tools that still fetch from JPL, NAIF or the MPC, with what they
-# fetch. Each is sealed after its setup instead of before it.
-ALLOWLIST = {
-    "grss": "setup fetches the debiasing tables from ssd.jpl.nasa.gov and the observatory codes from "
-    "data.minorplanetcenter.net (grss's own get_debiasing_data.py and _download_codes_file); no "
-    "third-party tool-set folder carries them yet",
-    "jorbit": "closed by the runner-fixes PR",
-    "kete": "its import fetches kernels from naif.jpl.nasa.gov (its leg leaves NAIF open); closed by the runner-fixes PR",
-    "oorb": "its build fetches its ephemeris; the leg is off (empyrean-jg3o)",
-    "orbfit": "closed by the runner-fixes PR",
-}
-# The list may lose tools, never gain one.
-CEILING = frozenset({"grss", "jorbit", "kete", "oorb", "orbfit"})
-# The one tool whose run itself still reaches NAIF, so its late seal leaves NAIF open.
-NAIF_OPEN = frozenset({"kete"})
+# fetch. Each would be sealed after its setup instead of before it. Every tool
+# now reads its files from the third-party tool set, so the list is empty.
+ALLOWLIST: dict[str, str] = {}
+# The list may lose tools, never gain one: it is empty and stays so.
+CEILING: frozenset[str] = frozenset()
 
 HOSTS = ("ssd.jpl.nasa.gov", "ssd-api.jpl.nasa.gov", "naif.jpl.nasa.gov", "minorplanetcenter.net")
 # A URL: a scheme, or a host followed by a path. A host named in prose ("reads
@@ -148,7 +139,6 @@ def test_the_scan_covers_the_files_that_used_to_fetch():
 
 def test_the_allowlist_only_shrinks_and_the_workflow_agrees():
     assert set(ALLOWLIST) <= CEILING, f"the upstream-fetch allowlist grew: {sorted(set(ALLOWLIST) - CEILING)}"
-    assert NAIF_OPEN <= set(ALLOWLIST)
     m = re.search(r"^  UPSTREAM_FETCH_ALLOWLIST: '(\[.*\])'$", VALIDATION, re.MULTILINE)
     assert m, "the workflow env names no UPSTREAM_FETCH_ALLOWLIST"
     assert sorted(json.loads(m.group(1))) == sorted(ALLOWLIST), "the workflow's allowlist and this file's disagree"
@@ -183,16 +173,17 @@ def test_external_legs_seal_before_setup_unless_allowlisted():
     i_run = next(i for i, n in enumerate(names) if n.startswith("name: Run ${{ matrix.tool }}"))
     i_late = st.index(late)
     assert i_setup < i_late < i_run, "the allowlisted tools seal after setup and before the run"
-    naif = re.search(r"seal-upstream\.sh \$\{\{ matrix\.tool == '(\w+)' && '--allow-naif' \|\| '' \}\}", late)
-    assert naif and {naif.group(1)} == set(NAIF_OPEN), "only kete's leg leaves NAIF open"
+    assert re.search(r"run: \./scripts/seal-upstream\.sh\s*$", late, re.MULTILINE), "the late seal covers all six hosts too"
+    assert "--allow-naif" not in VALIDATION, "no leg leaves NAIF open"
 
 
-def test_the_seal_script_covers_naif_unless_told_otherwise():
+def test_the_seal_script_always_covers_all_six_hosts():
     text = SEAL.read_text()
     hosts = re.search(r"HOSTS=\(\n(.*?)\n\)", text, re.DOTALL).group(1).split()
-    assert sorted(hosts) == sorted(["ssd.jpl.nasa.gov", "ssd-api.jpl.nasa.gov", "data.minorplanetcenter.net", "minorplanetcenter.net", "www.minorplanetcenter.net"])
-    assert '"") HOSTS+=(naif.jpl.nasa.gov) ;;' in text, "the default seal adds NAIF"
-    assert "--allow-naif) ;;" in text
+    assert sorted(hosts) == sorted(
+        ["ssd.jpl.nasa.gov", "ssd-api.jpl.nasa.gov", "naif.jpl.nasa.gov", "data.minorplanetcenter.net", "minorplanetcenter.net", "www.minorplanetcenter.net"]
+    )
+    assert "HOSTS+=" not in text and "--allow-naif" not in text, "the seal has no way to leave a host open"
 
 
 def test_find_orb_assist_and_grss_read_the_third_party_set():
@@ -209,6 +200,24 @@ def test_find_orb_assist_and_grss_read_the_third_party_set():
     restore = re.search(r"- name: Restore the third-party tool set\n\s+if: (.*)\n", VALIDATION.split("\n  external:\n", 1)[1]).group(1)
     for tool in ("layup", "assist", "findorb", "grss"):
         assert f'"{tool}"' in restore, f"the {tool} leg does not restore the third-party set"
+
+
+def test_the_grss_setup_stages_every_table_grss_would_download_from_its_folder():
+    """GRSS's debiasing table and observatory tables come from its folder of the
+    third-party tool set, copied under the package directory where GRSS opens them;
+    nothing in the setup fetches them, and the run checks each by name."""
+    text = (ROOT / "runners" / "grss" / "setup.sh").read_text()
+    code = "\n".join(ln for ln in text.splitlines() if not ln.lstrip().startswith("#"))
+    for name, under in (("bias.dat", "debias/lowres_data"), ("codes.json", "fit"), ("special_codes.json", "fit")):
+        assert re.search(rf'stage_from_set "{re.escape(name)}"\s+"{re.escape(name)}"\s+"\$GRSS_PKG/{under}"', code), name
+    for fetch in ("get_debiasing_data", "_download_codes_file", "import grss", "from grss"):
+        assert fetch not in code, f"runners/grss/setup.sh still runs {fetch}"
+    run = (ROOT / "runners" / "grss" / "run_grss.py").read_text()
+    for rel in ("debias/lowres_data/bias.dat", "fit/codes.json", "fit/special_codes.json"):
+        assert f'"{rel}"' in run, f"run_grss.py does not check {rel}"
+    restore = VALIDATION.split("\n  external:\n", 1)[1]
+    sentinels = re.search(r'grss\)\s+dirs="grss";\s+need="([^"]+)"', restore).group(1).split()
+    assert {"grss/bias.dat", "grss/codes.json", "grss/special_codes.json"} <= set(sentinels)
 
 
 def test_the_grss_setup_never_imports_grss_with_its_shell_outs_live():

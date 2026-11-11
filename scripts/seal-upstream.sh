@@ -10,15 +10,10 @@
 # in /etc/hosts and then PROVES the override took, failing the job if any host
 # still resolves off-box.
 #
-#   seal-upstream.sh               all six hosts. Every engine job (prep,
-#                                  reference, reference-heavy, assemble,
-#                                  assemble-final, empyrean, empyrean-heavy,
-#                                  reduce) runs this before any setup, and so
-#                                  does every external leg whose tool is not on
-#                                  the upstream-fetch allowlist.
-#   seal-upstream.sh --allow-naif  the five JPL SSD and MPC hosts, NAIF left
-#                                  open: kete's import still fetches its kernels
-#                                  from naif.jpl.nasa.gov at run time.
+# It takes no arguments and always seals all six hosts. Every engine job (prep,
+# reference, reference-heavy, assemble, assemble-final, empyrean,
+# empyrean-heavy, reduce) runs it before any setup, and so does every external
+# leg whose tool is not on the upstream-fetch allowlist.
 #
 # The tools whose setup or import still reaches one of these hosts are named in
 # the workflow's UPSTREAM_FETCH_ALLOWLIST and in
@@ -30,15 +25,15 @@ set -euo pipefail
 HOSTS=(
   ssd.jpl.nasa.gov
   ssd-api.jpl.nasa.gov
+  naif.jpl.nasa.gov
   data.minorplanetcenter.net
   minorplanetcenter.net
   www.minorplanetcenter.net
 )
-case "${1:-}" in
-  "") HOSTS+=(naif.jpl.nasa.gov) ;;
-  --allow-naif) ;;
-  *) echo "usage: seal-upstream.sh [--allow-naif]" >&2; exit 2 ;;
-esac
+if [ "$#" -ne 0 ]; then
+  echo "usage: seal-upstream.sh (no arguments: every host is sealed)" >&2
+  exit 2
+fi
 
 echo "Sealing the job from ${#HOSTS[@]} JPL, NAIF and MPC hosts (pinned inputs only):"
 # A container-generated hosts file need not end with a newline. Appending to

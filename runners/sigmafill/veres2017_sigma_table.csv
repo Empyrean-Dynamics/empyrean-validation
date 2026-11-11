@@ -1,0 +1,103 @@
+# Vereš, Farnocchia, Chesley & Chamberlin (2017), "Statistical analysis of
+# astrometric errors for the most productive asteroid surveys", Icarus 296, 139-149.
+#   DOI: 10.1016/j.icarus.2017.05.021   arXiv: 1703.03479v2 (2017-06-01)
+#
+# PUBLIC per-observation astrometric sigma table — the suite's shared Vereš et al.
+# (2017) sigma-fill, applied by any external OD runner whose tool refuses
+# observations without reported per-observation uncertainties (adam-core's public
+# CORE_OD_V1 profile now; layup next). It is PUBLIC and derived from the published
+# paper ONLY; it is NOT the proprietary Asteroid-Institute v2_sigma_fill table.
+#
+# Schema (one row per rule):
+#   obs_code, astcat, sigma_ra_arcsec, sigma_dec_arcsec
+#   - station row  : obs_code set, astcat empty  -> fill level "station"
+#   - catalog row  : obs_code empty, astcat set  -> fill level "catalog"
+#                    (astcat UNK: the paper's unknown-catalog weight, level "no_catalog")
+# Lines beginning with '#' are provenance and are skipped by the loader.
+# sigma_ra and sigma_dec are set equal: the paper reports a single per-source
+# RMS sigma_{RA,DEC} and does not split RA vs Dec in Tables 2-3.
+#
+# TRANSCRIPTION SCOPE: Tables 2 and 3 (station rules) and the Section 3 generic
+# rules. Table 4 (selected NEO follow-up observers) is OUT OF SCOPE / NOT used.
+#
+# RE-CHECKED against the paper 2026-11-08 (builder, worktree adam-core):
+#   Table 2 (epoch-dependent) — the latest epoch (value in force today) is used:
+#     703 = 0.8"  (>2014-01-01; was 1.0" in 2003-2014, 0.6" <2003-01-01)
+#     691 = 0.5"  (>2003-01-01; was 0.6" <2003-01-01)
+#     644 = 0.4"  (>2003-09-01; was 0.6" <2003-09-01)
+#   Table 3 (10 stations): 704=1.0 C51=1.0 G96=0.5 E12=0.75 F51=0.2 608=0.6
+#     G45=0.6 J75=1.0 699=0.8 D29=0.75  (D29 IS listed in Table 3 at 0.75).
+#   Section 3 / Table 3 generic rules: known star catalog -> 1.0 ("other w/ catalog"),
+#     unknown / no star catalog -> 1.5 ("other w/o catalog", encoded astcat="UNK").
+#
+# RESOLUTION (see README.md for the paper sentence behind each branch):
+#   1. station rule (Tables 2-3)                      -> level "station"
+#   2. empty / UNK star catalog (Section 3, "if the catalog is unknown"
+#      1.5")                                          -> level "no_catalog"
+#   3. star catalog named in this table (Section 3, "if the star catalog is
+#      known" 1.0")                                   -> level "catalog"
+#   4. non-empty catalog code outside this table: the paper does not say; the
+#      conservative UNK weight (1.5") is used and the observation is labelled
+#      -> level "catalog_unrecognized"
+# There is NO global row: the 0.75" adam_core structural fallback of the
+# October transcription is not in the paper and was removed.
+obs_code,astcat,sigma_ra_arcsec,sigma_dec_arcsec
+703,,0.8,0.8
+691,,0.5,0.5
+644,,0.4,0.4
+704,,1.0,1.0
+G96,,0.5,0.5
+F51,,0.2,0.2
+G45,,0.6,0.6
+699,,0.8,0.8
+D29,,0.75,0.75
+C51,,1.0,1.0
+E12,,0.75,0.75
+608,,0.6,0.6
+J75,,1.0,1.0
+,2MASS,1.0,1.0
+,AC,1.0,1.0
+,ACRS,1.0,1.0
+,ACT,1.0,1.0
+,AGK3,1.0,1.0
+,AGK3R,1.0,1.0
+,ATLAS2,1.0,1.0
+,CMC14,1.0,1.0
+,CMC15,1.0,1.0
+,COSMOS,1.0,1.0
+,GSC,1.0,1.0
+,GSC1.0,1.0,1.0
+,GSC1.1,1.0,1.0
+,GSC1.2,1.0,1.0
+,GSC2.2,1.0,1.0
+,GSCACT,1.0,1.0
+,Gaia1,1.0,1.0
+,Gaia2,1.0,1.0
+,Gaia3,1.0,1.0
+,Gaia3E,1.0,1.0
+,LickGas,1.0,1.0
+,MPOSC3,1.0,1.0
+,NOMAD,1.0,1.0
+,PPM,1.0,1.0
+,PPMXL,1.0,1.0
+,PS1_DR1,1.0,1.0
+,Perth70,1.0,1.0
+,SAO,1.0,1.0
+,SAO1984,1.0,1.0
+,SDSS7,1.0,1.0
+,SDSS8,1.0,1.0
+,SSTRC4,1.0,1.0
+,Tyc2,1.0,1.0
+,UCAC1,1.0,1.0
+,UCAC2,1.0,1.0
+,UCAC3,1.0,1.0
+,UCAC4,1.0,1.0
+,UCAC5,1.0,1.0
+,URAT1,1.0,1.0
+,USNOA1,1.0,1.0
+,USNOA2,1.0,1.0
+,USNOB1,1.0,1.0
+,USNOSA1,1.0,1.0
+,USNOSA2,1.0,1.0
+,Yale,1.0,1.0
+,UNK,1.5,1.5

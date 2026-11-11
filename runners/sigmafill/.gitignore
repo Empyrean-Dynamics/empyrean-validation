@@ -1,0 +1,4 @@
+# Python caches (never tracked).
+__pycache__/
+.pytest_cache/
+*.pyc

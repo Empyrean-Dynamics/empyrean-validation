@@ -43,8 +43,9 @@
 //!   `excluded_perturbers_naif`) so older JSON files round-trip cleanly.
 //! - `#[serde(deny_unknown_fields)]` is enabled so a renamed or added field
 //!   surfaces as a deserialization error rather than silent data loss.
-//!   Schema bumps require a coordinated PR across this crate and the
-//!   consuming repos.
+//!   Schema changes require a coordinated PR across this crate and the
+//!   consuming repos. They do not change this crate's version, which follows
+//!   the empyrean release the suite validates (see the README, "Versioning").
 
 use serde::{Deserialize, Serialize};
 
@@ -503,8 +504,10 @@ pub mod uncertainty_modes {
 ///
 /// The schema is contract-tight: `#[serde(deny_unknown_fields)]` rejects
 /// JSON files that carry fields this crate version does not know about.
-/// When you add a field, bump this crate's minor version and update every
-/// consumer in the same PR cycle.
+/// When you add a field, update every consumer in the same PR cycle. Adding a
+/// field does not bump this crate's version: the version follows the empyrean
+/// distribution the suite validates, and moves only when the suite tracks a new
+/// empyrean release (README, "Versioning").
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct ValidationResult {
@@ -1146,6 +1149,72 @@ pub struct ValidationResult {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub layup_time_ms: Option<f64>,
 
+    // ── adam-core external reference ────────────────────────────────
+    // Propagation + ephemeris + OD reference. The released adam-core 0.7.0 with
+    // adam-assist 0.6.0 (ASSIST), OD through the public CORE_OD_V1 profile; its
+    // missing per-observation sigmas are filled by the suite's shared public
+    // Veres 2017 model. Populated by `merge-external` from the adam-core runner.
+    /// adam-core propagated position vs JPL Horizons (km). Compare to
+    /// `emp_vs_horizons_km`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub adam_core_vs_horizons_km: Option<f64>,
+    /// adam-core ephemeris angular separation from Horizons (arcsec).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub adam_core_separation_arcsec: Option<f64>,
+    /// adam-core ephemeris RA offset from Horizons, cos(dec) applied (arcsec).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub adam_core_d_ra_arcsec: Option<f64>,
+    /// adam-core ephemeris Dec offset from Horizons (arcsec).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub adam_core_d_dec_arcsec: Option<f64>,
+    /// adam-core ephemeris range offset from Horizons (km).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub adam_core_d_rho_km: Option<f64>,
+    /// adam-core wall clock per row (ms): per call for propagation/ephemeris,
+    /// per fit for OD.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub adam_core_time_ms: Option<f64>,
+    /// adam-core post-fit chi-square (CORE_OD_V1, after the suite's sigma fill).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub adam_core_chi2: Option<f64>,
+    /// adam-core reduced chi-square.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub adam_core_reduced_chi2: Option<f64>,
+    /// adam-core observations used by the fit.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub adam_core_n_obs_used: Option<u32>,
+    /// adam-core observations rejected by its cmc2003 outlier stage.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub adam_core_n_obs_rejected: Option<u32>,
+    /// Whether adam-core's fit converged (`FittedOrbits.success`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub adam_core_converged: Option<bool>,
+    /// Observations counted per sigma source on an OD row:
+    /// `reported`, `filled` and `filled_by_level.*` (station / catalog /
+    /// no_catalog / catalog_unrecognized), as the runner measured them.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub adam_core_sigma_source: Option<std::collections::BTreeMap<String, serde_json::Value>>,
+
+    // ── tool versions and settings (every external tool) ────────────
+    // Tool id -> version string, and tool id -> {setting -> value}, folded by
+    // `merge-external` from each runner's own record. Values are exactly what the
+    // runner recorded; a setting the run did not record is absent, and the report
+    // shows that as "not recorded".
+    /// Tool id -> the version the runner recorded for that tool.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_versions: Option<std::collections::BTreeMap<String, String>>,
+    /// Tool id -> its recorded settings (name -> value, all strings).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_settings:
+        Option<std::collections::BTreeMap<String, std::collections::BTreeMap<String, String>>>,
+    /// Tool id -> the named reason that tool produced no result for this row (a
+    /// self-perturber its force model cannot leave out, a refused or failed fit,
+    /// an unsupported term), in the tool runner's own words, folded from the
+    /// runner's `<prefix>_unsupported`. A row a tool did not run stays visible with
+    /// its reason; it never collapses into a blank.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_unsupported: Option<std::collections::BTreeMap<String, String>>,
+
     // ── GRSS external reference ─────────────────────────────────────
     // Propagation + ephemeris + OD reference. GRSS — the Gauss-Radau
     // Small-body Simulator (Makadia et al.; github.com/rahil-makadia/grss)
@@ -1275,6 +1344,15 @@ pub struct ValidationResult {
 }
 
 impl ValidationResult {
+    /// The reason `tool` (its id, e.g. `kete`, `adam-core`) recorded for not
+    /// producing a result on this row, if it recorded one.
+    pub fn unsupported_by(&self, tool: &str) -> Option<&str> {
+        self.tool_unsupported
+            .as_ref()
+            .and_then(|m| m.get(tool))
+            .map(String::as_str)
+    }
+
     /// Construct a row with all `Option` fields set to `None` and
     /// `Vec` fields empty. Convenient for tests; production code should
     /// use the channel-specific runner builders that fill in test
@@ -1414,6 +1492,21 @@ impl ValidationResult {
             layup_n_obs_used: None,
             layup_converged: None,
             layup_time_ms: None,
+            adam_core_vs_horizons_km: None,
+            adam_core_separation_arcsec: None,
+            adam_core_d_ra_arcsec: None,
+            adam_core_d_dec_arcsec: None,
+            adam_core_d_rho_km: None,
+            adam_core_time_ms: None,
+            adam_core_chi2: None,
+            adam_core_reduced_chi2: None,
+            adam_core_n_obs_used: None,
+            adam_core_n_obs_rejected: None,
+            adam_core_converged: None,
+            adam_core_sigma_source: None,
+            tool_versions: None,
+            tool_settings: None,
+            tool_unsupported: None,
             grss_vs_horizons_km: None,
             emp_vs_grss_km: None,
             grss_time_ms: None,
