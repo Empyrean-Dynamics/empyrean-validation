@@ -43,7 +43,7 @@ use empyrean_validation::{
     comparators::{self, ComparatorOutcome, read_tool_records},
     inputs::{InputProduct, cache_file_name, missing_input},
     plan::{PlanConfig, build_plan},
-    report::{SUMMARY_TEST_TYPES, generate_report},
+    report::{FLOOR_EXCEPTIONS, SUMMARY_TEST_TYPES, generate_report, normalize_engine},
     schema::{OrbitComparison, ValidationResult, channels, test_types},
 };
 
@@ -2456,10 +2456,13 @@ fn parse_min_rows(specs: &[String]) -> Result<Vec<RowFloor>, String> {
 /// - `orbit_determination_radar` — one row per object with a manifest-pinned radar
 ///   fixture, scoped to `rust`. The radar rows ride the plan and the python
 ///   and cli drivers replay them, but the reference channel has no
-///   optical+radar arm and emits no row for the arc, so no channel's radar
-///   row is ever compared (`n_compared` is structurally 0 there) and the
-///   floor can only live where the rows are produced for certain
-///   (`empyrean-s1ab`).
+///   optical+radar arm: at the bound tag it writes the row back empty, and
+///   the summary drops that declined row from the pairing (as empyrean-core
+///   #26 does at the source, in no tag yet), so no channel's radar row is
+///   ever compared (`n_compared` is structurally 0 there) and the floor can
+///   only live where the rows are produced for certain (`empyrean-s1ab`).
+///   One fit is excused from its converged count by name, keyed to the rc1
+///   engine ([`FLOOR_EXCEPTIONS`], `empyrean-a7f5f`).
 fn catalog_row_floors() -> Vec<RowFloor> {
     vec![
         RowFloor {
@@ -2503,13 +2506,35 @@ const KNOWN_CHANNELS: [&str; 15] = [
 /// Split out from [`ci_check`] so the gate's logic is testable without a
 /// process exit — a gate nobody can write a test against is a gate nobody
 /// notices has stopped checking anything.
+#[cfg(test)]
 fn ci_check_failures(
     channels: &[serde_json::Value],
     strict_channels: &[String],
     min_rows: &[RowFloor],
     summary_path: &std::path::Path,
 ) -> Vec<String> {
+    ci_check_outcome(channels, strict_channels, min_rows, summary_path).failures
+}
+
+/// What the channel and floor checks found: the failures, and the NOTEs for
+/// every row a floor excused or an exception left unused. Notes never change
+/// the verdict; they exist so an excused row is printed rather than hidden.
+#[derive(Debug, Default)]
+struct GateOutcome {
+    failures: Vec<String>,
+    notes: Vec<String>,
+}
+
+/// [`ci_check_failures`] with the notes the floors produce (see
+/// [`floor_outcome`]).
+fn ci_check_outcome(
+    channels: &[serde_json::Value],
+    strict_channels: &[String],
+    min_rows: &[RowFloor],
+    summary_path: &std::path::Path,
+) -> GateOutcome {
     let mut failures = Vec::new();
+    let mut notes = Vec::new();
     for want in strict_channels {
         // Absence check FIRST. The previous gate iterated the summary and
         // `continue`d past any channel not in --strict-channels, which meant
@@ -2632,7 +2657,9 @@ fn ci_check_failures(
         // Unscoped per-axis floors apply to every strict channel. Scoped
         // floors are handled below, against the one channel they name.
         for f in min_rows.iter().filter(|f| f.channel.is_none()) {
-            failures.extend(floor_failures(ch, want, f, true));
+            let o = floor_outcome(ch, want, f, true);
+            failures.extend(o.failures);
+            notes.extend(o.notes);
         }
     }
 
@@ -2660,9 +2687,11 @@ fn ci_check_failures(
             continue;
         };
         let strict = strict_channels.iter().any(|s| s == want);
-        failures.extend(floor_failures(ch, want, f, strict));
+        let o = floor_outcome(ch, want, f, strict);
+        failures.extend(o.failures);
+        notes.extend(o.notes);
     }
-    failures
+    GateOutcome { failures, notes }
 }
 
 /// The distinct objects a plan names, in plan order.
@@ -2682,6 +2711,53 @@ fn planned_objects(path: &std::path::Path) -> Result<Vec<String>, String> {
         .into_iter()
         .filter_map(|r| seen.insert(r.object.clone()).then_some(r.object))
         .collect())
+}
+
+/// The reference's declined radar rows the summary dropped from the pairing
+/// (`n_reference_declined`, `reference_declined_rows`), as a NOTE, or a failure
+/// when the summary carries no count.
+///
+/// A summary without the count predates the rule: its radar rows were paired
+/// against the reference's empty ones and read as unjudged, so it must not
+/// pass silently as though nothing had been dropped.
+fn reference_declined_outcome(summary: &serde_json::Value) -> GateOutcome {
+    let Some(n) = summary["n_reference_declined"].as_u64() else {
+        return GateOutcome {
+            failures: vec![
+                "the summary carries no n_reference_declined; it predates the declined \
+                 reference radar row rule, so regenerate it with this build of `report`"
+                    .to_string(),
+            ],
+            notes: Vec::new(),
+        };
+    };
+    if n == 0 {
+        return GateOutcome::default();
+    }
+    let named: Vec<String> = summary["reference_declined_rows"]
+        .as_array()
+        .map(|rows| {
+            rows.iter()
+                .map(|r| {
+                    format!(
+                        "{} / {}",
+                        r["object"].as_str().unwrap_or("?"),
+                        r["test_type"].as_str().unwrap_or("?")
+                    )
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    GateOutcome {
+        failures: Vec::new(),
+        notes: vec![format!(
+            "ci-check: NOTE {n} reference (core) radar row(s) were declined by the reference \
+             (neither a comparable metric nor a delivery signal) and dropped from the pairing, \
+             as empyrean-core #26 does at the source; every channel's radar row reads as \
+             unreferenced [{}]",
+            named.join(", ")
+        )],
+    }
 }
 
 /// Why the summary fails the `--plan` check: planned objects with no
@@ -2736,29 +2812,33 @@ fn reference_coverage_failures(summary: &serde_json::Value, planned: &[String]) 
 /// - `n_compared` — this many of them paired with a reference row and were
 ///   actually diffed. Checked only for `--strict-channels`, whose whole job is
 ///   to match the reference. It is meaningless for an axis the reference does
-///   not run: the reference channel has no optical+radar arm and emits no
-///   `orbit_determination_radar` row (empyrean-s1ab), so every channel's
-///   `n_compared` on that axis is structurally 0 and a floor on it would fail
-///   forever no matter how much radar work ran.
+///   not run: the reference channel has no optical+radar arm and its empty
+///   `orbit_determination_radar` row is dropped from the pairing
+///   (empyrean-s1ab), so every channel's `n_compared` on that axis is
+///   structurally 0 and a floor on it would fail forever no matter how much
+///   radar work ran.
 ///
 /// `by_test_type` is keyed by test type; a missing key and a zero count are the
 /// same failure — the axis was not exercised — and are reported as such rather
 /// than skipped.
-fn floor_failures(
-    ch: &serde_json::Value,
-    channel: &str,
-    f: &RowFloor,
-    strict: bool,
-) -> Vec<String> {
+///
+/// A fit named in [`FLOOR_EXCEPTIONS`] for this channel and axis is excused
+/// from the CONVERGED check, by object, only while the engine that ran it is
+/// the one the exception is keyed to; see [`apply_floor_exceptions`].
+fn floor_outcome(ch: &serde_json::Value, channel: &str, f: &RowFloor, strict: bool) -> GateOutcome {
     let (tt, floor) = (&f.test_type, f.floor);
     let entry = &ch["by_test_type"][tt];
     if entry.is_null() {
-        return vec![format!(
-            "{channel}: {tt} is absent from the summary (floor is {floor}) — \
-             that axis was never exercised"
-        )];
+        return GateOutcome {
+            failures: vec![format!(
+                "{channel}: {tt} is absent from the summary (floor is {floor}) — \
+                 that axis was never exercised"
+            )],
+            notes: Vec::new(),
+        };
     }
     let mut out = Vec::new();
+    let excused = apply_floor_exceptions(entry, channel, tt, &mut out);
     // `n_rows` predates nothing — it was added with the scoped floors. Treat a
     // summary that lacks it as a hard error rather than skipping the check: a
     // stale summary silently passing a floor is the defect, not the fix.
@@ -2790,11 +2870,12 @@ fn floor_failures(
     // twice — worse, it would claim the pass ran when it may not have.
     if rows_ok {
         match entry["n_converged"].as_u64() {
-            Some(n) if n >= floor => {}
+            Some(n) if n + excused.count >= floor => {}
             Some(n) => out.push(format!(
-                "{channel}: {tt} produced {} rows but only {n} CONVERGED, floor is {floor} — \
-                 the pass ran and emitted failure rows rather than being skipped",
-                entry["n_rows"].as_u64().unwrap_or(0)
+                "{channel}: {tt} produced {} rows but only {n} CONVERGED ({} excused by name), \
+                 floor is {floor} — the pass ran and emitted failure rows rather than being skipped",
+                entry["n_rows"].as_u64().unwrap_or(0),
+                excused.count
             )),
             None => out.push(format!(
                 "{channel}: {tt} carries no n_converged count (floor is {floor}) — the summary \
@@ -2813,6 +2894,92 @@ fn floor_failures(
             )),
         }
     }
+    GateOutcome {
+        failures: out,
+        notes: excused.notes,
+    }
+}
+
+/// What [`apply_floor_exceptions`] found on one axis.
+#[derive(Default)]
+struct Excused {
+    /// Unconverged fits excused from the CONVERGED check.
+    count: u64,
+    /// One NOTE per exception that applied or went unused.
+    notes: Vec<String>,
+}
+
+/// Apply [`FLOOR_EXCEPTIONS`] to one channel and axis of the summary.
+///
+/// For each exception on this channel and test type, read the summary's
+/// `fit_rows` for the excepted object:
+///
+/// - the row ran on any engine but the one the exception is keyed to: the
+///   exception itself FAILS, converged or not, saying it must be re-examined;
+/// - the engine matches and the fit did not converge: excused, NOTE names the
+///   fit and the engine, one more row counts toward the CONVERGED floor;
+/// - the engine matches and the fit converged (it is platform-marginal): the
+///   NOTE says the exception went unused.
+///
+/// No row for the object (a subset run) leaves the exception silent: nothing
+/// ran that it could excuse. A summary with no `fit_rows` for an axis that has
+/// an exception predates the field, which is a failure, never a pass.
+fn apply_floor_exceptions(
+    entry: &serde_json::Value,
+    channel: &str,
+    tt: &str,
+    failures: &mut Vec<String>,
+) -> Excused {
+    let mut out = Excused::default();
+    for e in FLOOR_EXCEPTIONS
+        .iter()
+        .filter(|e| e.channel == channel && e.test_type == tt)
+    {
+        let Some(rows) = entry["fit_rows"].as_array() else {
+            failures.push(format!(
+                "{channel}: {tt} carries no fit_rows, which the floor exception for {} needs; \
+                 the summary predates it, so regenerate it with this build of `report`",
+                e.object
+            ));
+            continue;
+        };
+        for row in rows
+            .iter()
+            .filter(|r| r["object"].as_str() == Some(e.object))
+        {
+            let ran_on = row["source_version"]
+                .as_str()
+                .map(normalize_engine)
+                .unwrap_or_default();
+            if ran_on != e.engine {
+                failures.push(format!(
+                    "{channel}: floor exception FAILED: {} / {tt} is excused only on the rc1 \
+                     engine [{}], but this row ran on [{}]; the exception is keyed to the rc1 \
+                     engine and must be re-examined",
+                    e.object,
+                    e.engine,
+                    if ran_on.is_empty() {
+                        "no source_version"
+                    } else {
+                        &ran_on
+                    }
+                ));
+            } else if row["converged"].as_bool() == Some(false) {
+                out.count += 1;
+                out.notes.push(format!(
+                    "ci-check: {channel}: NOTE the {} / {tt} fit did not converge and is excused \
+                     from the converged floor by name on the rc1 engine [{}]: {}",
+                    e.object, e.engine, e.reason
+                ));
+            } else {
+                out.notes.push(format!(
+                    "ci-check: {channel}: NOTE the floor exception for {} / {tt} went unused: \
+                     the fit converged on the rc1 engine [{}]",
+                    e.object, e.engine
+                ));
+            }
+        }
+    }
     out
 }
 
@@ -2827,7 +2994,18 @@ fn ci_check(args: CiCheckArgs) -> Result<(), Box<dyn std::error::Error>> {
     if args.catalog_floors {
         min_rows.extend(catalog_row_floors());
     }
-    let mut failures = ci_check_failures(channels, &args.strict_channels, &min_rows, &args.summary);
+    let GateOutcome {
+        mut failures,
+        mut notes,
+    } = ci_check_outcome(channels, &args.strict_channels, &min_rows, &args.summary);
+    let declined = reference_declined_outcome(&summary);
+    failures.extend(declined.failures);
+    notes.extend(declined.notes);
+    // Printed before the verdict, pass or fail: an excused or dropped row is
+    // never hidden behind a green.
+    for note in &notes {
+        eprintln!("{note}");
+    }
     let planned = match &args.plan {
         Some(plan) => Some(planned_objects(plan)?),
         None => None,
@@ -3017,6 +3195,7 @@ mod tests {
                         "n_rows": rows,
                         "n_converged": converged,
                         "n_compared": compared,
+                        "fit_rows": [],
                     }),
                 )
             })
@@ -3067,11 +3246,11 @@ mod tests {
     /// signal — so a one-row shortfall is actionable from the log alone.
     #[test]
     fn ci_check_names_every_unjudged_row() {
-        let mut ch = summary_channel("core", &[("orbit_determination_radar", 1)]);
+        let mut ch = summary_channel("core", &[("orbit_determination", 1)]);
         ch["n_passing"] = serde_json::json!(0);
         ch["unjudged_rows"] = serde_json::json!([{
             "object": "Apophis",
-            "test_type": "orbit_determination_radar",
+            "test_type": "orbit_determination",
             "dt_days": 0.0,
             "observer": null,
             "method": "—",
@@ -3085,7 +3264,7 @@ mod tests {
         );
         assert!(
             failures[1].contains(
-                "unjudged — Apophis / orbit_determination_radar / dt +0 d / —: \
+                "unjudged — Apophis / orbit_determination / dt +0 d / —: \
                  the reference row carries neither a comparable metric nor a delivery signal"
             ),
             "{failures:?}"
@@ -3414,7 +3593,7 @@ mod tests {
         //
         // Note the (rows, compared) split on the rust radar axis: 5 rows
         // produced, 0 compared. That is not a degenerate case, it is THE
-        // case — the reference channel carries no radar rows to pair with,
+        // case — the reference channel's radar rows are declined and dropped,
         // so a compared-count floor could never pass. Non-strict channels are
         // floored on rows produced for exactly this reason.
         let channels = vec![
@@ -3527,6 +3706,212 @@ mod tests {
             failures[0].contains("rust:orbit_determination_radar>=5"),
             "names the floor that could not be evaluated: {failures:?}"
         );
+    }
+
+    // ── ci-check: the declined radar rows and the floor exception ────
+
+    /// The rc1 engine stamp as the rust runner writes it: one multi-line
+    /// string, columns padded with spaces.
+    const RC1_STAMP: &str = "empyrean-core 0.11.1\nvilleneuve    1.26.5+72dc426\n\
+                             scott         1.19.5+f6d217a\nnolan         1.15.0";
+
+    /// A rust channel with the radar axis carrying `rows` fits: (object,
+    /// converged, engine stamp). The axis counts follow the rows.
+    fn rust_radar(rows: &[(&str, bool, &str)]) -> serde_json::Value {
+        let n = rows.len() as u64;
+        let converged = rows.iter().filter(|r| r.1).count() as u64;
+        let mut ch =
+            summary_channel_split_conv("rust", &[("orbit_determination_radar", n, converged, 0)]);
+        ch["by_test_type"]["orbit_determination_radar"]["fit_rows"] = rows
+            .iter()
+            .map(|(o, c, v)| serde_json::json!({"object": o, "converged": c, "source_version": v}))
+            .collect::<Vec<_>>()
+            .into();
+        ch
+    }
+
+    fn radar_outcome(ch: serde_json::Value, floor: u64) -> GateOutcome {
+        let spec = format!("rust:orbit_determination_radar={floor}");
+        let min_rows = parse_min_rows(&strict(&[spec.as_str()])).expect("floor parses");
+        ci_check_outcome(
+            &[ch],
+            &[],
+            &min_rows,
+            std::path::Path::new("results/validation_summary.json"),
+        )
+    }
+
+    const FIVE: [(&str, bool, &str); 4] = [
+        ("Eros", true, RC1_STAMP),
+        ("Bennu", true, RC1_STAMP),
+        ("Didymos", true, RC1_STAMP),
+        ("Toutatis", true, RC1_STAMP),
+    ];
+
+    fn five_with(apophis: (bool, &str)) -> serde_json::Value {
+        let mut rows: Vec<(&str, bool, &str)> = FIVE.to_vec();
+        rows.push(("Apophis", apophis.0, apophis.1));
+        rust_radar(&rows)
+    }
+
+    /// The Apophis fit unconverged on the rc1 engine is excused by name: the
+    /// 4/5 floor passes, the NOTE names the fit and the engine.
+    #[test]
+    fn floor_exception_excuses_the_apophis_fit_on_the_rc1_engine() {
+        let o = radar_outcome(five_with((false, RC1_STAMP)), 5);
+        assert!(o.failures.is_empty(), "{:?}", o.failures);
+        assert_eq!(o.notes.len(), 1, "{:?}", o.notes);
+        assert_eq!(
+            o.notes[0],
+            "ci-check: rust: NOTE the Apophis / orbit_determination_radar fit did not converge \
+             and is excused from the converged floor by name on the rc1 engine \
+             [empyrean-core 0.11.1 villeneuve 1.26.5+72dc426 scott 1.19.5+f6d217a nolan 1.15.0]: \
+             the optical+radar fit exhausts damping on the rc.1 engine on every platform \
+             (beads a7f5f, slpum, wka0f)"
+        );
+    }
+
+    /// Any other engine fails the exception itself, converged or not.
+    #[test]
+    fn floor_exception_fails_on_any_other_engine_converged_or_not() {
+        for converged in [false, true] {
+            let o = radar_outcome(
+                five_with((converged, "empyrean-core 0.12.0\nscott 1.20.0")),
+                5,
+            );
+            assert!(
+                o.failures.iter().any(|f| f.starts_with(
+                    "rust: floor exception FAILED: Apophis / orbit_determination_radar is excused only on the rc1 engine"
+                ) && f.contains("must be re-examined")
+                    && f.contains("[empyrean-core 0.12.0 scott 1.20.0]")),
+                "converged={converged}: {:?}",
+                o.failures
+            );
+            assert!(o.notes.is_empty(), "{:?}", o.notes);
+        }
+        // A row with no engine stamp at all is not the rc1 engine either.
+        let mut rows: Vec<(&str, bool, &str)> = FIVE.to_vec();
+        rows.push(("Apophis", false, ""));
+        let o = radar_outcome(rust_radar(&rows), 5);
+        assert!(
+            o.failures.iter().any(|f| f.contains("[no source_version]")),
+            "{:?}",
+            o.failures
+        );
+    }
+
+    /// The fit converged on the rc1 engine (it is platform-marginal): the gate
+    /// passes and says the exception went unused.
+    #[test]
+    fn floor_exception_notes_when_unused_on_the_rc1_engine() {
+        let o = radar_outcome(five_with((true, RC1_STAMP)), 5);
+        assert!(o.failures.is_empty(), "{:?}", o.failures);
+        assert_eq!(o.notes.len(), 1, "{:?}", o.notes);
+        assert_eq!(
+            o.notes[0],
+            "ci-check: rust: NOTE the floor exception for Apophis / orbit_determination_radar \
+             went unused: the fit converged on the rc1 engine \
+             [empyrean-core 0.11.1 villeneuve 1.26.5+72dc426 scott 1.19.5+f6d217a nolan 1.15.0]"
+        );
+    }
+
+    /// The exception excuses Apophis and nothing else: a second unconverged
+    /// radar object still fails the converged floor.
+    #[test]
+    fn floor_exception_does_not_excuse_a_second_unconverged_object() {
+        let rows = [
+            ("Eros", true, RC1_STAMP),
+            ("Bennu", true, RC1_STAMP),
+            ("Didymos", true, RC1_STAMP),
+            ("Toutatis", false, RC1_STAMP),
+            ("Apophis", false, RC1_STAMP),
+        ];
+        let o = radar_outcome(rust_radar(&rows), 5);
+        assert_eq!(o.failures.len(), 1, "{:?}", o.failures);
+        assert!(
+            o.failures[0].contains("only 3 CONVERGED (1 excused by name), floor is 5"),
+            "{:?}",
+            o.failures
+        );
+        // Without Apophis in the summary the exception is silent and a
+        // Toutatis failure fails alone.
+        let o = radar_outcome(
+            rust_radar(&[("Eros", true, RC1_STAMP), ("Toutatis", false, RC1_STAMP)]),
+            2,
+        );
+        assert_eq!(o.failures.len(), 1, "{:?}", o.failures);
+        assert!(o.notes.is_empty(), "{:?}", o.notes);
+    }
+
+    /// The exception only applies to the axis and channel it names: Apophis
+    /// unconverged on another test type is not excused.
+    #[test]
+    fn floor_exception_is_scoped_to_its_channel_and_axis() {
+        let mut ch = summary_channel_split_conv("rust", &[("orbit_determination", 5, 4, 0)]);
+        ch["by_test_type"]["orbit_determination"]["fit_rows"] = serde_json::json!([
+            {"object": "Apophis", "converged": false, "source_version": RC1_STAMP}
+        ]);
+        let min_rows = parse_min_rows(&strict(&["rust:orbit_determination=5"])).unwrap();
+        let o = ci_check_outcome(
+            &[ch],
+            &[],
+            &min_rows,
+            std::path::Path::new("results/validation_summary.json"),
+        );
+        assert_eq!(o.failures.len(), 1, "{:?}", o.failures);
+        assert!(
+            o.failures[0].contains("only 4 CONVERGED"),
+            "{:?}",
+            o.failures
+        );
+    }
+
+    /// A summary with no `fit_rows` on the excepted axis predates the field:
+    /// it fails rather than passing as though no fit had failed.
+    #[test]
+    fn floor_exception_refuses_a_summary_without_fit_rows() {
+        let mut ch = five_with((false, RC1_STAMP));
+        ch["by_test_type"]["orbit_determination_radar"]
+            .as_object_mut()
+            .unwrap()
+            .remove("fit_rows");
+        let o = radar_outcome(ch, 5);
+        assert!(
+            o.failures.iter().any(|f| f.contains("carries no fit_rows")),
+            "{:?}",
+            o.failures
+        );
+    }
+
+    /// The NOTE for the reference's declined radar rows, and the refusal of a
+    /// summary that carries no count.
+    #[test]
+    fn declined_reference_rows_are_a_note_and_a_missing_count_fails() {
+        let summary = serde_json::json!({
+            "n_reference_declined": 1,
+            "reference_declined_rows": [
+                {"object": "Apophis", "test_type": "orbit_determination_radar"}
+            ],
+        });
+        let o = reference_declined_outcome(&summary);
+        assert!(o.failures.is_empty(), "{:?}", o.failures);
+        assert_eq!(
+            o.notes,
+            vec![
+                "ci-check: NOTE 1 reference (core) radar row(s) were declined by the reference \
+                 (neither a comparable metric nor a delivery signal) and dropped from the pairing, \
+                 as empyrean-core #26 does at the source; every channel's radar row reads as \
+                 unreferenced [Apophis / orbit_determination_radar]"
+                    .to_string()
+            ]
+        );
+        // Nothing declined: silent.
+        let none = reference_declined_outcome(&serde_json::json!({"n_reference_declined": 0}));
+        assert!(none.failures.is_empty() && none.notes.is_empty());
+        // An older summary has no count: it must not pass.
+        let old = reference_declined_outcome(&serde_json::json!({}));
+        assert_eq!(old.failures.len(), 1, "{:?}", old.failures);
+        assert!(old.failures[0].contains("no n_reference_declined"));
     }
 
     // ── ci-check --plan: reference rows per planned object ───────────

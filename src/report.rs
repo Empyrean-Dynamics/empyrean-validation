@@ -609,6 +609,15 @@ struct MissingRow {
     method: String,
 }
 
+/// One fit of a test type a floor exception covers: what `ci-check` needs to
+/// excuse it (did it converge) and to check the exception's key (the engine).
+#[derive(Debug, Clone)]
+struct FitRow {
+    object: String,
+    converged: bool,
+    source_version: Option<String>,
+}
+
 #[derive(Debug, Clone, Default)]
 struct TestTypeRollup {
     /// Rows of this test type the channel EMITTED, whether or not a
@@ -647,6 +656,11 @@ struct TestTypeRollup {
     /// Rows of this test type the channel emitted with no reference row to
     /// pair against; not compared (see [`ChannelRollup::n_unreferenced`]).
     n_unreferenced: usize,
+    /// The channel's fits of this test type that a [`FLOOR_EXCEPTIONS`] entry
+    /// scoped to this channel and test type may excuse: one record per row
+    /// (object, converged, engine stamp), so `ci-check` can apply the excuse
+    /// and check the engine it is keyed to. Empty for every other axis.
+    fit_rows: Vec<FitRow>,
     p50_dr_km: f64,
     p95_dr_km: f64,
     p99_dr_km: f64,
@@ -764,6 +778,77 @@ fn judged_delivery(r: &ValidationResult) -> Delivery {
     }
 }
 
+/// A reference radar row the reference declined: a core-channel
+/// `orbit_determination_radar` row that carries neither a comparable metric nor
+/// a delivery signal ([`judged_delivery`] is [`Delivery::NotApplicable`]).
+///
+/// `validate-core` at the bound tag has no optical+radar arm, so it writes the
+/// plan's radar row back empty. empyrean-core #26 ("Leave the plan rows the
+/// core runner declines out of its output", merged 2026-10-27, in no tag yet)
+/// drops such a row at the source; this predicate does the same in the
+/// summary, so the two readings agree before and after a core tag carries #26.
+///
+/// The ONE predicate for the rule: the rollup pairs against the reference rows
+/// that are not declined, the summary names the declined ones, and the
+/// per-object reference count leaves them out. It covers the radar axis only:
+/// an empty core row on any other axis is a defect, stays in the pairing and
+/// fails the gate as unjudged.
+fn is_declined_reference_radar_row(r: &ValidationResult) -> bool {
+    r.channel == crate::schema::channels::CORE
+        && r.test_type == crate::schema::test_types::ORBIT_DETERMINATION_RADAR
+        && judged_delivery(r) == Delivery::NotApplicable
+}
+
+/// A fit `ci-check` excuses from a row floor by name, keyed to the engine that
+/// ran it. Exceptions are data: this table is the only place one is declared.
+pub struct FloorException {
+    /// The channel whose floor excuses the fit.
+    pub channel: &'static str,
+    /// The object whose fit is excused.
+    pub object: &'static str,
+    /// The test type (axis) the fit belongs to.
+    pub test_type: &'static str,
+    /// The engine stack the exception is keyed to: the channel row's
+    /// `source_version` with its whitespace runs collapsed to one space (see
+    /// [`normalize_engine`]). Any other engine fails the gate on the exception
+    /// itself, so it is re-examined instead of aging into a standing waiver.
+    pub engine: &'static str,
+    /// Why the fit is excused, printed beside the NOTE.
+    pub reason: &'static str,
+}
+
+/// The floor exceptions.
+///
+/// The Apophis optical+radar fit fails in every channel under empyrean
+/// 0.11.0-rc.1 (hosted x86_64, run 42940569667 reference-leg-10, and act arm64
+/// alike): "damping exhausted" after 30 iterations. Eros, Bennu, Didymos and
+/// Toutatis converge. The engine half is scott's undamped Gauss-Newton rescue
+/// (adf9c81), which does not rescue this fit on the rc.1 stack. Beads: a7f5f
+/// (history and decision), slpum and wka0f (the convergence criterion), s1ab
+/// (why radar is gated on the rust channel).
+///
+/// The engine string is what crates.io empyrean 0.11.0-rc.1 resolves to
+/// (`runners/rust/Cargo.lock`: empyrean and empyrean-sys 0.11.0-rc.1; the
+/// engine versions are those of the rc.1 release's libempyrean).
+pub const FLOOR_EXCEPTIONS: &[FloorException] = &[FloorException {
+    channel: crate::schema::channels::RUST,
+    object: "Apophis",
+    test_type: crate::schema::test_types::ORBIT_DETERMINATION_RADAR,
+    engine: "empyrean-core 0.11.1 villeneuve 1.26.5+72dc426 scott 1.19.5+f6d217a nolan 1.15.0",
+    reason: "the optical+radar fit exhausts damping on the rc.1 engine on every platform \
+             (beads a7f5f, slpum, wka0f)",
+}];
+
+/// An engine `source_version` string with its whitespace runs collapsed to one
+/// space, so the multi-line stamp the rust runner writes compares equal to the
+/// single-line spelling in [`FLOOR_EXCEPTIONS`].
+pub fn normalize_engine(source_version: &str) -> String {
+    source_version
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
 /// The uncertainty method a row ran under, named the way the report names it
 /// (reusing [`method_label`]): the human label for the row's
 /// `propagation_uncertainty` tag, or `—` when the row carries no method.
@@ -786,6 +871,16 @@ fn rollup_channels(results: &[ValidationResult]) -> Vec<ChannelRollup> {
     let Some(core_rows) = by_channel.get("core") else {
         return Vec::new();
     };
+    // The reference's declined radar rows are not reference rows: they are
+    // left out of the pairing (see [`is_declined_reference_radar_row`]), so
+    // every channel's radar row reads as unreferenced, and the summary names
+    // what was dropped ([`reference_declined_rows`]).
+    let core_rows: Vec<&ValidationResult> = core_rows
+        .iter()
+        .copied()
+        .filter(|r| !is_declined_reference_radar_row(r))
+        .collect();
+    let core_rows = &core_rows;
     // Key includes `propagation_uncertainty` so that a row produced under
     // the Jet1 STM path (`first_order_detection_on`) is matched against the
     // same-mode core baseline rather than the `none_detection_on` baseline
@@ -805,7 +900,7 @@ fn rollup_channels(results: &[ValidationResult]) -> Vec<ChannelRollup> {
         )
     }
     let mut core_by_key: HashMap<RowKey, &ValidationResult> = HashMap::new();
-    for r in core_rows {
+    for &r in core_rows {
         core_by_key.insert(row_key(r), r);
     }
     // The reference's keys in row order, each once, for the converse walk
@@ -813,7 +908,7 @@ fn rollup_channels(results: &[ValidationResult]) -> Vec<ChannelRollup> {
     let mut core_keys: Vec<(RowKey, &ValidationResult)> = Vec::new();
     {
         let mut seen: HashSet<RowKey> = HashSet::new();
-        for r in core_rows {
+        for &r in core_rows {
             let k = row_key(r);
             if seen.insert(k.clone()) {
                 core_keys.push((k, r));
@@ -876,12 +971,26 @@ fn rollup_channels(results: &[ValidationResult]) -> Vec<ChannelRollup> {
         // converged so their rollup reads n_converged == n_rows and a
         // floor on them behaves exactly as before.
         let mut by_tt_converged: BTreeMap<String, usize> = BTreeMap::new();
+        let mut by_tt_fit_rows: BTreeMap<String, Vec<FitRow>> = BTreeMap::new();
 
         let mut channel_keys: HashSet<RowKey> = HashSet::new();
         for r in rows {
             *by_tt_rows.entry(r.test_type.clone()).or_default() += 1;
             if r.od_converged.unwrap_or(true) {
                 *by_tt_converged.entry(r.test_type.clone()).or_default() += 1;
+            }
+            if FLOOR_EXCEPTIONS
+                .iter()
+                .any(|e| e.channel == channel.as_str() && e.test_type == r.test_type)
+            {
+                by_tt_fit_rows
+                    .entry(r.test_type.clone())
+                    .or_default()
+                    .push(FitRow {
+                        object: r.object.clone(),
+                        converged: r.od_converged.unwrap_or(true),
+                        source_version: r.source_version.clone(),
+                    });
             }
             let key = row_key(r);
             channel_keys.insert(key.clone());
@@ -1033,8 +1142,10 @@ fn rollup_channels(results: &[ValidationResult]) -> Vec<ChannelRollup> {
                     // and out of `n_passing` — exactly as the silent arm this
                     // replaces counted them — but each is NAMED, so the gate's
                     // shortfall points at a row. The optical+radar arc sat
-                    // here for every channel: its reference row was one the
-                    // core runner had skipped and written back hollow.
+                    // here for every channel until its declined reference row
+                    // was dropped from the pairing
+                    // ([`is_declined_reference_radar_row`]); an empty
+                    // reference row on any other axis still lands here.
                     (Delivery::Delivered, Delivery::Delivered) => unjudged(
                         "both sides delivered an orbit but no fidelity metric was comparable",
                     ),
@@ -1121,6 +1232,7 @@ fn rollup_channels(results: &[ValidationResult]) -> Vec<ChannelRollup> {
                     n_refusal_mismatch: by_tt_refusal_mismatch.get(tt).copied().unwrap_or(0),
                     n_unjudged: by_tt_unjudged.get(tt).copied().unwrap_or(0),
                     n_unreferenced: by_tt_unreferenced.get(tt).copied().unwrap_or(0),
+                    fit_rows: by_tt_fit_rows.remove(tt).unwrap_or_default(),
                     p50_dr_km: p50,
                     p95_dr_km: p95,
                     p99_dr_km: p99,
@@ -1280,11 +1392,36 @@ fn reference_rows_by_object(results: &[ValidationResult]) -> BTreeMap<String, us
     for r in results {
         if r.channel == crate::schema::channels::CORE
             && !is_timing_only_uncertainty(r.propagation_uncertainty.as_deref())
+            && !is_declined_reference_radar_row(r)
         {
             *out.entry(r.object.clone()).or_default() += 1;
         }
     }
     out
+}
+
+/// The reference radar rows [`rollup_channels`] drops from the pairing
+/// ([`is_declined_reference_radar_row`]), named, in row order. Written into
+/// the summary as `reference_declined_rows` with their count so `ci-check`
+/// can print what was dropped; a summary without the count predates the rule
+/// and the gate refuses it.
+fn reference_declined_rows(results: &[ValidationResult]) -> Vec<serde_json::Value> {
+    results
+        .iter()
+        .filter(|r| {
+            !is_timing_only_uncertainty(r.propagation_uncertainty.as_deref())
+                && is_declined_reference_radar_row(r)
+        })
+        .map(|r| {
+            serde_json::json!({
+                "object": r.object,
+                "test_type": r.test_type,
+                "dt_days": r.dt_days,
+                "observer": r.observer,
+                "method": refused_method_name(r),
+            })
+        })
+        .collect()
 }
 
 fn write_summary(
@@ -1318,6 +1455,15 @@ fn write_summary(
                             "n_refusal_mismatch": x.n_refusal_mismatch,
                             "n_unjudged": x.n_unjudged,
                             "n_unreferenced": x.n_unreferenced,
+                            "fit_rows": x
+                                .fit_rows
+                                .iter()
+                                .map(|f| serde_json::json!({
+                                    "object": f.object,
+                                    "converged": f.converged,
+                                    "source_version": f.source_version,
+                                }))
+                                .collect::<Vec<_>>(),
                             "p50_dr_km": nan_or(x.p50_dr_km),
                             "p95_dr_km": nan_or(x.p95_dr_km),
                             "p99_dr_km": nan_or(x.p99_dr_km),
@@ -1386,12 +1532,15 @@ fn write_summary(
             })
         })
         .collect();
+    let declined = reference_declined_rows(results);
     let summary = serde_json::json!({
         "fidelity_threshold": FIDELITY_THRESHOLD,
         "channels": arr,
         "by_method": method_summary_json(results),
         "reference_channel": crate::schema::channels::CORE,
         "reference_rows_by_object": reference_rows_by_object(results),
+        "n_reference_declined": declined.len(),
+        "reference_declined_rows": declined,
         "comparators": comparators,
     });
     if let Some(parent) = path.parent() {
@@ -13580,10 +13729,11 @@ mod tests {
     }
 
     // (e) A reference row with neither a comparable metric nor a delivery
-    // signal — the shape the core runner wrote back for the optical+radar fit
-    // it had skipped — cannot be judged against a channel that refused the
-    // fit. The pair stays compared and unpassed, exactly as before, but is
-    // NAMED: the gate's shortfall points at the row.
+    // signal cannot be judged against a channel that refused the fit. The
+    // pair stays compared and unpassed, but is NAMED: the gate's shortfall
+    // points at the row. Only the radar axis is exempt (the declined-radar
+    // tests below); this one is the plain `orbit_determination` axis, where an
+    // empty reference row is a defect.
     #[test]
     fn unjudged_pair_is_counted_and_named() {
         // Hollow reference: no metrics, no delivery fields, od_converged None.
@@ -13629,6 +13779,152 @@ mod tests {
             py_r.unjudged_rows[0].reason,
             "the channel row carries neither a comparable metric nor a delivery signal"
         );
+    }
+
+    /// A reference radar row as the core runner at the bound tag writes it
+    /// back for the optical+radar fit it declines: no metric, no delivery
+    /// signal, `od_converged` unset.
+    fn declined_core_radar_row() -> ValidationResult {
+        let mut r = parity_od_row("core", "first_order_detection_on");
+        r.object = "Apophis".to_string();
+        r.test_type = "orbit_determination_radar".to_string();
+        r
+    }
+
+    fn radar_row(channel: &str, converged: bool) -> ValidationResult {
+        let mut r = declined_core_radar_row();
+        r.channel = channel.to_string();
+        r.od_converged = Some(converged);
+        r
+    }
+
+    // (e2) The declined reference radar row is dropped from the pairing and
+    // counted: a channel's radar row reads as UNREFERENCED (the existing
+    // note), not as an unjudged pair, and the reference's own empty row is no
+    // longer judged against itself. The summary names what was dropped.
+    #[test]
+    fn declined_reference_radar_row_is_dropped_named_and_counted() {
+        let results = vec![
+            declined_core_radar_row(),
+            radar_row("python", false),
+            radar_row("rust", true),
+        ];
+        let rollups = rollup_channels(&results);
+        for ch in ["python", "core"] {
+            let r = rollup_for(&rollups, ch);
+            assert_eq!(r.n_unjudged, 0, "{ch}: {:?}", r.unjudged_rows);
+            assert_eq!(r.n_total_compared, 0, "{ch}");
+            assert_eq!(r.n_unreferenced, 1, "{ch}");
+            assert_eq!(
+                r.by_test_type["orbit_determination_radar"].n_unreferenced, 1,
+                "{ch}"
+            );
+            assert_eq!(
+                r.by_test_type["orbit_determination_radar"].n_rows, 1,
+                "{ch}: the row is still produced, only the pairing drops it"
+            );
+        }
+        let declined = reference_declined_rows(&results);
+        assert_eq!(declined.len(), 1, "{declined:?}");
+        assert_eq!(declined[0]["object"], "Apophis");
+        assert_eq!(declined[0]["test_type"], "orbit_determination_radar");
+        // The per-object reference count leaves the declined row out too.
+        assert_eq!(reference_rows_by_object(&results).get("Apophis"), None);
+    }
+
+    // (e3) The rule covers the radar axis ONLY: an empty core row on any other
+    // axis is a defect, stays in the pairing, and is still unjudged.
+    #[test]
+    fn empty_core_row_on_another_axis_is_still_unjudged() {
+        let core = parity_od_row("core", "first_order_detection_on");
+        let py = radar_row("python", false);
+        let mut py_od = parity_od_row("python", "first_order_detection_on");
+        py_od.od_converged = Some(false);
+        let results = vec![core, declined_core_radar_row(), py, py_od];
+        let rollups = rollup_channels(&results);
+        let py_r = rollup_for(&rollups, "python");
+        assert_eq!(py_r.n_unjudged, 1, "{:?}", py_r.unjudged_rows);
+        assert_eq!(py_r.unjudged_rows[0].test_type, "orbit_determination");
+        // The reference judged against itself: the empty orbit_determination
+        // row fails there too, the dropped radar row does not add to it.
+        assert_eq!(rollup_for(&rollups, "core").n_unjudged, 1);
+        assert_eq!(reference_declined_rows(&results).len(), 1);
+
+        // Ephemeris and propagation likewise.
+        for tt in ["ephemeris", "propagation"] {
+            let mut core = parity_od_row("core", "first_order_detection_on");
+            core.test_type = tt.to_string();
+            let mut py = core.clone();
+            py.channel = "python".to_string();
+            py.od_converged = Some(false);
+            let rollups = rollup_channels(&[core.clone(), py]);
+            assert_eq!(rollup_for(&rollups, "python").n_unjudged, 1, "{tt}");
+            assert!(reference_declined_rows(&[core]).is_empty(), "{tt}");
+        }
+    }
+
+    // (e4) A core radar row that DID speak (a refusal or a delivery) is a
+    // reference row: the predicate drops only the row with neither a metric
+    // nor a delivery signal.
+    #[test]
+    fn a_core_radar_row_with_a_verdict_is_not_declined() {
+        let mut refused = declined_core_radar_row();
+        refused.od_converged = Some(false);
+        assert!(!is_declined_reference_radar_row(&refused));
+        let mut delivered = declined_core_radar_row();
+        delivered.emp_pos_au = Some([1.0, 0.0, 0.0]);
+        assert!(!is_declined_reference_radar_row(&delivered));
+        assert!(is_declined_reference_radar_row(&declined_core_radar_row()));
+        // A channel's own empty radar row is not the reference's.
+        let mut py = declined_core_radar_row();
+        py.channel = "python".to_string();
+        assert!(!is_declined_reference_radar_row(&py));
+
+        // A refused reference row pairs with a refused channel row as parity.
+        let rollups = rollup_channels(&[refused, radar_row("python", false)]);
+        let py_r = rollup_for(&rollups, "python");
+        assert_eq!(py_r.n_refused_identically, 1);
+        assert_eq!(py_r.n_unreferenced, 0);
+    }
+
+    // (e5) The summary JSON carries the count, the named rows, and for the axis
+    // a floor exception covers (rust radar) the fits with their engine stamp.
+    #[test]
+    fn summary_carries_the_declined_rows_and_the_exception_fits() {
+        let mut rust = radar_row("rust", false);
+        rust.source_version =
+            Some("empyrean-core 0.11.1\nvilleneuve    1.26.5+72dc426".to_string());
+        let mut py = radar_row("python", false);
+        py.source_version = Some("0.11.0rc1".to_string());
+        let results = vec![declined_core_radar_row(), rust, py];
+        let rollups = rollup_channels(&results);
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("summary.json");
+        write_summary(&rollups, &results, &[], &path).unwrap();
+        let v: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(v["n_reference_declined"], 1);
+        assert_eq!(v["reference_declined_rows"][0]["object"], "Apophis");
+        let chan = |name: &str| {
+            v["channels"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|c| c["channel"] == name)
+                .unwrap()
+                .clone()
+        };
+        let fits = &chan("rust")["by_test_type"]["orbit_determination_radar"]["fit_rows"];
+        assert_eq!(fits.as_array().unwrap().len(), 1, "{fits}");
+        assert_eq!(fits[0]["object"], "Apophis");
+        assert_eq!(fits[0]["converged"], false);
+        assert_eq!(
+            fits[0]["source_version"],
+            "empyrean-core 0.11.1\nvilleneuve    1.26.5+72dc426"
+        );
+        // Only the channel and axis the exception names carry fits.
+        let py_fits = &chan("python")["by_test_type"]["orbit_determination_radar"]["fit_rows"];
+        assert!(py_fits.as_array().unwrap().is_empty(), "{py_fits}");
     }
 
     // (f2) The converse of (g): a reference row the channel emitted nothing

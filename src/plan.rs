@@ -801,9 +801,11 @@ pub const PLAN_UNCERTAINTY_AXES: [&str; 7] = [
 ///   psv-radar fixture (the runner reads radar through `read_ades`).
 ///
 /// The reference channel has not: empyrean-core's `validate-core` has no
-/// optical+radar arm, declines the row and emits none for it. The strip keeps
-/// the row because the channels that can replay it should, and the report
-/// shows every attempt; but with no reference row to pair against, no
+/// optical+radar arm and writes the row back empty (empyrean-core #26 stops
+/// writing it, in no tag yet). The strip keeps the row because the channels
+/// that can replay it should, and the report shows every attempt; but the
+/// summary drops the declined reference row from the pairing, so with no
+/// reference row to pair against, no
 /// channel's radar row is compared by the gate, and its floor stays scoped to
 /// `rust` (`empyrean-s1ab`; remaining work: a radar arm in `validate-core`,
 /// then move the floor onto the strict channels).

@@ -132,7 +132,12 @@ the run, naming what failed, when:
   delivered nothing for it, so no other channel's rows for it were compared.
   It fails as `reference leg missing: <objects>`. Rows a channel emits on an
   axis the reference does not run are reported per axis as unreferenced and
-  do not fail the run.
+  do not fail the run. The one axis the reference declines is radar: its empty
+  `orbit_determination_radar` rows are dropped from the pairing and counted in
+  a NOTE (an empty reference row on any other axis still fails as unjudged),
+  and the radar floor excuses one fit by name, the Apophis optical+radar fit,
+  only while the rust row's `source_version` is the rc1 engine. On any other
+  engine the exception itself fails the gate, converged or not.
 
 ## How CI runs it
 
