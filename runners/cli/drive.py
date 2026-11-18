@@ -650,6 +650,31 @@ def _context_rows(context: Path | None, input_rows: list) -> list:
     return rows
 
 
+# How long the runner may take to exit once its input closes. Every row has
+# been answered by then, so the bound only has to catch a runner that never
+# exits. The earlier five seconds failed a finished heavy C leg in an act
+# rehearsal whose runner took longer than that to exit under memory pressure.
+RUNNER_EXIT_TIMEOUT_S = 120
+
+
+def _close_runner(proc: subprocess.Popen, channel: str) -> None:
+    """Close the runner's input and wait for it to exit, draining its output
+    pipes meanwhile so a runner writing at exit cannot block on a full pipe.
+    A runner still running ``RUNNER_EXIT_TIMEOUT_S`` seconds later is killed
+    and the leg fails by name."""
+    try:
+        proc.communicate(timeout=RUNNER_EXIT_TIMEOUT_S)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        _, err = proc.communicate()
+        tail = (err or "").strip().splitlines()[-5:]
+        raise SystemExit(
+            f"ERROR: the {channel} runner answered every row but had not exited "
+            f"{RUNNER_EXIT_TIMEOUT_S} s after its input closed, so it was killed."
+            + (f"\n       Its last stderr lines: {' | '.join(tail)}" if tail else "")
+        ) from None
+
+
 def main() -> int:
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument(
@@ -1154,8 +1179,7 @@ def main() -> int:
             # writes): no row here; the row account settles it.
             continue
 
-    proc.stdin.close()
-    proc.wait(timeout=5)
+    _close_runner(proc, "CLI")
 
     args.output.parent.mkdir(parents=True, exist_ok=True)
     _n_nonfinite = sum(_mark_nonfinite_fail(r) for r in out_rows)
