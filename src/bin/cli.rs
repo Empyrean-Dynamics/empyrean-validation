@@ -40,7 +40,7 @@ use empyrean_validation::{
     catalog::{
         RADAR_FIXTURE_OBJECTS, ValidationObject, all_objects, filter_by_name, filter_by_population,
     },
-    comparators::{self, ComparatorOutcome, read_tool_records},
+    comparators::{self, ComparatorOutcome, Folded, read_tool_records},
     inputs::{InputProduct, cache_file_name, missing_input},
     plan::{PlanConfig, build_plan},
     report::{FLOOR_EXCEPTIONS, SUMMARY_TEST_TYPES, generate_report, normalize_engine},
@@ -407,6 +407,18 @@ struct CiCheckArgs {
     /// unreferenced, and the strict-channel check passed on the rest.
     #[arg(long)]
     plan: Option<PathBuf>,
+    /// The external comparators this run requested (the workflow's
+    /// `EXTERNAL_TOOLS`, comma-separated, plus `jpl-sbdb`, the pinned SBDB OD
+    /// reference every reduce merges). Every one must have merged, and every
+    /// one of its merge paths must have landed more than 0 rows
+    /// ([`COMPARATOR_MERGE_PATHS`]); a failure names the comparator, the path
+    /// and the reason (absent, failed with its error, or 0 rows). Only valid
+    /// for a FULL-catalog run: a subset can legitimately produce 0 on a path
+    /// (act's find_orb leg writes no propagation rows), so a subset run omits
+    /// the flag and keeps the NOTE on a failed comparator. A summary that
+    /// carries no per-path counts fails the requirement rather than passing it.
+    #[arg(long, value_delimiter = ',')]
+    require_comparators: Vec<String>,
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -790,11 +802,11 @@ fn isolated_merge(
     tool: &str,
     rows: &mut Vec<ValidationResult>,
     outcomes: &mut Vec<ComparatorOutcome>,
-    fold: impl FnOnce(&mut Vec<ValidationResult>) -> Result<usize, Box<dyn std::error::Error>>,
+    fold: impl FnOnce(&mut Vec<ValidationResult>) -> Result<Folded, Box<dyn std::error::Error>>,
 ) {
     let snapshot = rows.clone();
     match fold(rows) {
-        Ok(n) => outcomes.push(ComparatorOutcome::merged(tool, n)),
+        Ok(folded) => outcomes.push(ComparatorOutcome::folded(tool, folded)),
         Err(e) => {
             *rows = snapshot;
             let outcome = ComparatorOutcome::failed(tool, e.to_string());
@@ -837,21 +849,24 @@ fn merge_external(args: MergeExternalArgs) -> Result<(), Box<dyn std::error::Err
         isolated_merge("core-stm", &mut rows, &mut outcomes, |rows| {
             let n = merge_core_stm(rows, path)?;
             eprintln!("Merged {n} core first-order STM rows (emp_stm)");
-            Ok(n)
+            Ok(Folded::single("stm", n))
         });
     }
     if let Some(path) = &args.core_fd_stm {
         isolated_merge("core-fd-stm", &mut rows, &mut outcomes, |rows| {
             let n = merge_core_fd_stm(rows, path)?;
             eprintln!("Merged {n} finite-difference STM reference rows (fd_stm)");
-            Ok(n)
+            Ok(Folded::single("fd-stm", n))
         });
     }
     if let Some(path) = &args.assist {
         isolated_merge("assist", &mut rows, &mut outcomes, |rows| {
-            let n = merge_assist(rows, path)?;
+            let (n, n_standalone) = merge_assist(rows, path)?;
             eprintln!("Merged {n} ASSIST rows");
-            Ok(n)
+            Ok(Folded::with_paths(
+                n,
+                &[("folded", n), ("standalone", n_standalone)],
+            ))
         });
     }
     if let Some(path) = &args.findorb {
@@ -862,7 +877,10 @@ fn merge_external(args: MergeExternalArgs) -> Result<(), Box<dyn std::error::Err
             if np + ne > 0 {
                 eprintln!("Merged {np} find_orb propagation + {ne} ephemeris reference rows");
             }
-            Ok(n)
+            Ok(Folded::with_paths(
+                n,
+                &[("od", n), ("propagation", np), ("ephemeris", ne)],
+            ))
         });
     }
     if let Some(path) = &args.findorb_radar {
@@ -885,39 +903,42 @@ fn merge_external(args: MergeExternalArgs) -> Result<(), Box<dyn std::error::Err
                     path.display()
                 );
             }
-            Ok(n)
+            Ok(Folded::single("radar", n))
         });
     }
     if let Some(path) = &args.oorb {
         isolated_merge("oorb", &mut rows, &mut outcomes, |rows| {
             let n = merge_oorb(rows, path)?;
             eprintln!("Merged {n} OpenOrb rows");
-            Ok(n)
+            Ok(Folded::single("rows", n))
         });
     }
     if let Some(path) = &args.orbfit {
         isolated_merge("orbfit", &mut rows, &mut outcomes, |rows| {
             let n = merge_orbfit(rows, path)?;
             eprintln!("Merged {n} OrbFit rows");
-            Ok(n)
+            Ok(Folded::single("rows", n))
         });
     }
     if let Some(path) = &args.layup {
         isolated_merge("layup", &mut rows, &mut outcomes, |rows| {
             let n = merge_layup(rows, path)?;
             eprintln!("Merged {n} layup rows");
-            Ok(n)
+            Ok(Folded::single("rows", n))
         });
     }
     if let Some(path) = &args.adam_core {
-        let n = merge_adam_core(&mut rows, path)?;
-        eprintln!("Merged {n} adam-core rows");
+        isolated_merge("adam-core", &mut rows, &mut outcomes, |rows| {
+            let n = merge_adam_core(rows, path)?;
+            eprintln!("Merged {n} adam-core rows");
+            Ok(Folded::single("rows", n))
+        });
     }
     if let Some(path) = &args.adam_core_rust {
         isolated_merge("adam-core-rust", &mut rows, &mut outcomes, |rows| {
             let n = merge_adam_core_rust(rows, path)?;
             eprintln!("Merged {n} adam-core-rust rows");
-            Ok(n)
+            Ok(Folded::single("rows", n))
         });
     }
     if let Some(path) = &args.kete {
@@ -926,7 +947,7 @@ fn merge_external(args: MergeExternalArgs) -> Result<(), Box<dyn std::error::Err
                 r.kete_time_ms = v
             })?;
             eprintln!("Merged {n} kete timing rows");
-            Ok(n)
+            Ok(Folded::single("timing", n))
         });
     }
     if let Some(path) = &args.jorbit {
@@ -935,14 +956,14 @@ fn merge_external(args: MergeExternalArgs) -> Result<(), Box<dyn std::error::Err
                 r.jorbit_time_ms = v
             })?;
             eprintln!("Merged {n} jorbit timing rows");
-            Ok(n)
+            Ok(Folded::single("timing", n))
         });
     }
     if let Some(path) = &args.grss {
         isolated_merge("grss", &mut rows, &mut outcomes, |rows| {
             let n = merge_grss(rows, path)?;
             eprintln!("Merged {n} GRSS rows");
-            Ok(n)
+            Ok(Folded::single("rows", n))
         });
     }
     if let Some(path) = &args.grss_radar {
@@ -964,14 +985,14 @@ fn merge_external(args: MergeExternalArgs) -> Result<(), Box<dyn std::error::Err
                     path.display()
                 );
             }
-            Ok(n)
+            Ok(Folded::single("radar", n))
         });
     }
     if let Some(dir) = &args.jpl_sbdb_cache {
         isolated_merge("jpl-sbdb", &mut rows, &mut outcomes, |rows| {
             let n = merge_jpl(rows, dir)?;
             eprintln!("Merged {n} JPL SBDB OD-reference rows");
-            Ok(n)
+            Ok(Folded::single("od-reference", n))
         });
     }
 
@@ -1162,11 +1183,12 @@ type CoreF64Snapshot = ([f64; 3], Option<f64>, String);
 /// for it, since an arm row without a time reads as a capped FAIL.
 ///
 /// Returns the number of rows folded onto the core reference (the backward-compat
-/// count); the standalone-append count is logged separately by the caller path.
+/// count) and the number of standalone per-arm rows appended; the outcome
+/// records both as merge paths.
 fn merge_assist(
     rows: &mut Vec<ValidationResult>,
     path: &std::path::Path,
-) -> Result<usize, Box<dyn std::error::Error>> {
+) -> Result<(usize, usize), Box<dyn std::error::Error>> {
     let assist = read_tool_records(path)?;
     let au_km = empyrean_validation::compare::AU_KM;
 
@@ -1315,7 +1337,7 @@ fn merge_assist(
     rows.append(&mut appended);
     eprintln!("  (appended {n_appended} standalone per-arm ASSIST rows across six arms)");
 
-    Ok(n_folded)
+    Ok((n_folded, n_appended))
 }
 
 fn merge_findorb(
@@ -2478,6 +2500,134 @@ fn catalog_row_floors() -> Vec<RowFloor> {
     ]
 }
 
+/// The merge paths each requested comparator must fill on a full-catalog run:
+/// `(tool id as EXTERNAL_TOOLS spells it, the comparator outcome it lands on,
+/// the merge path)`. One tool id can land on more than one outcome (find_orb's
+/// and GRSS's radar passes are their own comparators) and one outcome can have
+/// more than one path (find_orb's OD, propagation and ephemeris references;
+/// ASSIST's folded reference rows and its standalone per-arm rows). The names
+/// are the ones `merge-external` records in [`ComparatorOutcome::paths`].
+/// `jpl-sbdb` is not a tool of `EXTERNAL_TOOLS`: the workflow adds it, because
+/// every reduce merges the pinned SBDB OD reference.
+const COMPARATOR_MERGE_PATHS: [(&str, &str, &str); 16] = [
+    ("assist", "assist", "folded"),
+    ("assist", "assist", "standalone"),
+    ("findorb", "findorb", "od"),
+    ("findorb", "findorb", "propagation"),
+    ("findorb", "findorb", "ephemeris"),
+    ("findorb", "findorb-radar", "radar"),
+    ("grss", "grss", "rows"),
+    ("grss", "grss-radar", "radar"),
+    ("oorb", "oorb", "rows"),
+    ("orbfit", "orbfit", "rows"),
+    ("layup", "layup", "rows"),
+    ("adam-core", "adam-core", "rows"),
+    ("adam-core-rust", "adam-core-rust", "rows"),
+    ("kete", "kete", "timing"),
+    ("jorbit", "jorbit", "timing"),
+    ("jpl-sbdb", "jpl-sbdb", "od-reference"),
+];
+
+/// Merge paths that legitimately land 0 rows on a full catalog, each with its
+/// reason: `(comparator outcome, path, reason)`. A path in this table is
+/// excused by name and printed as a NOTE; it is never skipped silently. It is
+/// empty: on the full-catalog hosted run 44355534056 every path of every
+/// comparator landed rows (find_orb's propagation and ephemeris references and
+/// both radar passes included). The act legs' empty find_orb propagation path
+/// is a subset-run property, and a subset run does not apply the requirement.
+const LEGITIMATELY_EMPTY_PATHS: [(&str, &str, &str); 0] = [];
+
+/// Why the full-catalog comparator requirement fails for this summary, one line
+/// per comparator and path, plus the NOTEs for excused paths.
+///
+/// `requested` are tool ids; one the table does not know is an error (a typo
+/// must not read as "required nothing"). A summary with no `comparators` array
+/// fails every requested path, and a merged comparator whose outcome carries no
+/// per-path counts fails with the count missing, never passes.
+fn comparator_requirement_outcome(
+    summary: &serde_json::Value,
+    requested: &[String],
+    empty_ok: &[(&str, &str, &str)],
+) -> Result<GateOutcome, String> {
+    let mut out = GateOutcome::default();
+    let mut seen: Vec<&str> = Vec::new();
+    for id in requested.iter().map(|s| s.trim()).filter(|s| !s.is_empty()) {
+        if !COMPARATOR_MERGE_PATHS
+            .iter()
+            .any(|(tool, _, _)| *tool == id)
+        {
+            let known: Vec<&str> = COMPARATOR_MERGE_PATHS
+                .iter()
+                .map(|(tool, _, _)| *tool)
+                .fold(Vec::new(), |mut acc, t| {
+                    if !acc.contains(&t) {
+                        acc.push(t);
+                    }
+                    acc
+                });
+            return Err(format!(
+                "--require-comparators names `{id}`, which is not a comparator this suite merges (known: {})",
+                known.join(", ")
+            ));
+        }
+        if !seen.contains(&id) {
+            seen.push(id);
+        }
+    }
+    let comparators = summary["comparators"].as_array();
+    for id in seen {
+        for (_, outcome_tool, path) in COMPARATOR_MERGE_PATHS.iter().filter(|(t, _, _)| *t == id) {
+            let who = format!("comparator {id} ({outcome_tool}), merge path {path}");
+            let Some(comparators) = comparators else {
+                out.failures.push(format!(
+                    "{who}: the summary has no `comparators` array, so the merge outcome cannot be read"
+                ));
+                continue;
+            };
+            let Some(c) = comparators
+                .iter()
+                .find(|c| c["tool"].as_str() == Some(*outcome_tool))
+            else {
+                out.failures.push(format!(
+                    "{who}: ABSENT: it was requested but no merge outcome was recorded for `{outcome_tool}` (its leg staged nothing and nothing named why)"
+                ));
+                continue;
+            };
+            if c["status"].as_str() == Some("failed") {
+                out.failures.push(format!(
+                    "{who}: FAILED: {}",
+                    c["reason"].as_str().unwrap_or("no reason recorded")
+                ));
+                continue;
+            }
+            let Some(rows) = c["paths"]
+                .as_array()
+                .and_then(|ps| ps.iter().find(|p| p["path"].as_str() == Some(*path)))
+                .and_then(|p| p["rows"].as_u64())
+            else {
+                out.failures.push(format!(
+                    "{who}: the summary records no row count for this path (a summary written before per-path counts, or a merge that did not record it), so the requirement cannot be verified"
+                ));
+                continue;
+            };
+            if rows == 0 {
+                match empty_ok
+                    .iter()
+                    .find(|(t, p, _)| t == outcome_tool && p == path)
+                {
+                    Some((_, _, why)) => out.notes.push(format!(
+                        "ci-check: NOTE {who}: merged 0 rows, excused by name: {why}"
+                    )),
+                    None => out.failures.push(format!(
+                        "{who}: merged 0 rows (a full-catalog run must land rows on every path)"
+                    )),
+                }
+            }
+        }
+    }
+    Ok(out)
+}
+
 /// Channel names a `--min-rows` floor (or `--strict-channels`) may name.
 ///
 /// The `channels` module constants plus the externally-merged comparators that
@@ -3014,10 +3164,27 @@ fn ci_check(args: CiCheckArgs) -> Result<(), Box<dyn std::error::Error>> {
         failures.extend(reference_coverage_failures(&summary, planned));
     }
 
-    // A comparator `merge-external` skipped is never a gate failure (an external
-    // reference that did not deliver does not make the engine wrong), but it is
-    // named here beside the verdict so the gate's green is not read as "every
-    // comparator ran".
+    // On a full-catalog run the workflow names the comparators it requested; every
+    // one of them and every one of its merge paths must have landed rows. This is
+    // the one place an external reference's absence fails the gate: a full
+    // run that quietly lost a comparator (as run 44355534056 lost find_orb) has
+    // not been the validation of record, whatever else it passed.
+    if !args.require_comparators.is_empty() {
+        let required = comparator_requirement_outcome(
+            &summary,
+            &args.require_comparators,
+            &LEGITIMATELY_EMPTY_PATHS,
+        )?;
+        for note in &required.notes {
+            eprintln!("{note}");
+        }
+        failures.extend(required.failures);
+    }
+
+    // A comparator `merge-external` skipped is never a gate failure unless the
+    // run required it (above): an external reference that did not deliver does
+    // not make the engine wrong. It is named here beside the verdict so the
+    // gate's green is not read as "every comparator ran".
     if let Some(comparators) = summary["comparators"].as_array() {
         for c in comparators
             .iter()
@@ -3101,6 +3268,12 @@ fn ci_check(args: CiCheckArgs) -> Result<(), Box<dyn std::error::Error>> {
                 "ci-check: every object in {} ({}) has reference rows",
                 plan.display(),
                 planned.len()
+            );
+        }
+        if !args.require_comparators.is_empty() {
+            eprintln!(
+                "ci-check: every requested comparator [{}] merged, and every one of its merge paths landed rows",
+                args.require_comparators.join(", ")
             );
         }
         if min_rows.is_empty() {
@@ -4446,7 +4619,7 @@ mod tests {
         std::fs::write(&path, serde_json::to_string(&records).unwrap()).unwrap();
 
         assert_eq!(
-            merge_assist(&mut rows, &path).unwrap(),
+            merge_assist(&mut rows, &path).unwrap().0,
             8,
             "four reference rows per object"
         );
@@ -5258,7 +5431,13 @@ mod tests {
         let layup = good_layup(dir.path());
         merge_external(merge_args(dir.path(), &[("layup", layup.as_path())])).unwrap();
         let outcomes = comparators::read_sidecar(&merged).unwrap().unwrap();
-        assert_eq!(outcomes, vec![ComparatorOutcome::merged("layup", 1)]);
+        assert_eq!(
+            outcomes,
+            vec![ComparatorOutcome::folded(
+                "layup",
+                Folded::single("rows", 1)
+            )]
+        );
     }
 
     #[test]
@@ -5337,5 +5516,384 @@ mod tests {
         let sum: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(&summary).unwrap()).unwrap();
         assert_eq!(sum["comparators"].as_array().unwrap().len(), 0);
+    }
+
+    // ── the full-catalog comparator requirement (ci-check) ─────────────────
+
+    /// The run's `EXTERNAL_TOOLS` on the full-catalog hosted run 44355534056,
+    /// plus `jpl-sbdb`, which the workflow adds.
+    const FULL_RUN_TOOLS: [&str; 11] = [
+        "assist",
+        "findorb",
+        "oorb",
+        "kete",
+        "jorbit",
+        "layup",
+        "adam-core",
+        "adam-core-rust",
+        "orbfit",
+        "grss",
+        "jpl-sbdb",
+    ];
+
+    fn tools(ids: &[&str]) -> Vec<String> {
+        ids.iter().map(|s| s.to_string()).collect()
+    }
+
+    /// A summary whose comparators carry every path of `COMPARATOR_MERGE_PATHS`
+    /// with `rows` rows, the way a clean full-catalog merge writes it.
+    fn full_summary(rows: usize) -> serde_json::Value {
+        let mut by_outcome: std::collections::BTreeMap<&str, Vec<(&str, usize)>> =
+            Default::default();
+        for (_, outcome_tool, path) in COMPARATOR_MERGE_PATHS {
+            by_outcome
+                .entry(outcome_tool)
+                .or_default()
+                .push((path, rows));
+        }
+        let outcomes: Vec<ComparatorOutcome> = by_outcome
+            .into_iter()
+            .map(|(tool, paths)| {
+                ComparatorOutcome::folded(tool, Folded::with_paths(paths[0].1, &paths))
+            })
+            .collect();
+        serde_json::json!({ "comparators": outcomes })
+    }
+
+    fn requirement(summary: &serde_json::Value, requested: &[&str]) -> GateOutcome {
+        comparator_requirement_outcome(summary, &tools(requested), &[]).unwrap()
+    }
+
+    fn set_path_rows(summary: &mut serde_json::Value, outcome: &str, path: &str, rows: usize) {
+        let c = summary["comparators"]
+            .as_array_mut()
+            .unwrap()
+            .iter_mut()
+            .find(|c| c["tool"] == outcome)
+            .unwrap();
+        let p = c["paths"]
+            .as_array_mut()
+            .unwrap()
+            .iter_mut()
+            .find(|p| p["path"] == path)
+            .unwrap();
+        p["rows"] = serde_json::json!(rows);
+    }
+
+    #[test]
+    fn a_full_run_with_every_comparator_and_every_path_nonzero_passes() {
+        let out = requirement(&full_summary(7), &FULL_RUN_TOOLS);
+        assert!(out.failures.is_empty(), "{:?}", out.failures);
+        assert!(out.notes.is_empty());
+    }
+
+    #[test]
+    fn a_requested_comparator_absent_from_the_summary_fails_naming_it_and_its_paths() {
+        let mut s = full_summary(7);
+        s["comparators"]
+            .as_array_mut()
+            .unwrap()
+            .retain(|c| c["tool"] != "findorb");
+        let out = requirement(&s, &FULL_RUN_TOOLS);
+        // find_orb's three paths, each named; findorb-radar (the other
+        // comparator of the same tool id) is still there.
+        assert_eq!(out.failures.len(), 3, "{:?}", out.failures);
+        for path in ["od", "propagation", "ephemeris"] {
+            assert!(
+                out.failures
+                    .iter()
+                    .any(|f| f.contains("comparator findorb (findorb)")
+                        && f.contains(&format!("merge path {path}"))
+                        && f.contains("ABSENT")),
+                "{path}: {:?}",
+                out.failures
+            );
+        }
+    }
+
+    #[test]
+    fn a_requested_comparator_that_failed_fails_with_its_error() {
+        let mut s = full_summary(7);
+        let arr = s["comparators"].as_array_mut().unwrap();
+        arr.retain(|c| c["tool"] != "findorb");
+        arr.push(serde_json::to_value(ComparatorOutcome::failed(
+            "findorb",
+            "merge --findorb: engine context for Earth SSB state: Missing data files: de440.bsp",
+        ))
+        .unwrap());
+        let out = requirement(&s, &FULL_RUN_TOOLS);
+        assert_eq!(out.failures.len(), 3, "{:?}", out.failures);
+        assert!(
+            out.failures
+                .iter()
+                .all(|f| f.contains("FAILED: merge --findorb: engine context")
+                    && f.contains("Missing data files: de440.bsp"))
+        );
+    }
+
+    #[test]
+    fn a_path_at_zero_fails_naming_the_comparator_and_the_path() {
+        for (_, outcome_tool, path) in COMPARATOR_MERGE_PATHS {
+            let mut s = full_summary(7);
+            set_path_rows(&mut s, outcome_tool, path, 0);
+            let out = requirement(&s, &FULL_RUN_TOOLS);
+            assert_eq!(
+                out.failures.len(),
+                1,
+                "{outcome_tool}/{path}: {:?}",
+                out.failures
+            );
+            assert!(
+                out.failures[0].contains(&format!(
+                    "({outcome_tool}), merge path {path}: merged 0 rows"
+                )),
+                "{:?}",
+                out.failures
+            );
+        }
+    }
+
+    #[test]
+    fn a_path_excused_by_name_is_noted_not_failed_and_only_that_path() {
+        let mut s = full_summary(7);
+        set_path_rows(&mut s, "findorb", "propagation", 0);
+        set_path_rows(&mut s, "kete", "timing", 0);
+        let excused = [(
+            "findorb",
+            "propagation",
+            "the leg writes no propagation rows",
+        )];
+        let out = comparator_requirement_outcome(&s, &tools(&FULL_RUN_TOOLS), &excused).unwrap();
+        assert_eq!(out.failures.len(), 1, "{:?}", out.failures);
+        assert!(out.failures[0].contains("kete"));
+        assert_eq!(out.notes.len(), 1);
+        assert!(
+            out.notes[0].contains("findorb")
+                && out.notes[0].contains("excused by name: the leg writes no propagation rows")
+        );
+        // The shipped table excuses nothing: every path is required.
+        assert!(LEGITIMATELY_EMPTY_PATHS.is_empty());
+    }
+
+    #[test]
+    fn a_summary_without_the_counts_is_refused_not_passed() {
+        // A merged comparator with no per-path counts (a harness that predates them).
+        let mut s = serde_json::json!({ "comparators": [ComparatorOutcome::merged("layup", 354)] });
+        let out = requirement(&s, &["layup"]);
+        assert_eq!(out.failures.len(), 1, "{:?}", out.failures);
+        assert!(
+            out.failures[0].contains("no row count for this path"),
+            "{:?}",
+            out.failures
+        );
+        // A comparator whose paths lack the one the table requires.
+        s["comparators"][0]["paths"] = serde_json::json!([{ "path": "other", "rows": 3 }]);
+        assert_eq!(requirement(&s, &["layup"]).failures.len(), 1);
+        // A summary with no comparators array at all.
+        let none = serde_json::json!({ "channels": [] });
+        let out = requirement(&none, &["layup", "grss"]);
+        assert_eq!(
+            out.failures.len(),
+            3,
+            "layup + grss + grss-radar: {:?}",
+            out.failures
+        );
+        assert!(
+            out.failures
+                .iter()
+                .all(|f| f.contains("no `comparators` array"))
+        );
+    }
+
+    #[test]
+    fn the_tool_id_mapping_covers_every_comparator_and_radar_path() {
+        let paths_of = |id: &str| -> Vec<(&str, &str)> {
+            COMPARATOR_MERGE_PATHS
+                .iter()
+                .filter(|(t, _, _)| *t == id)
+                .map(|(_, o, p)| (*o, *p))
+                .collect()
+        };
+        assert_eq!(
+            paths_of("findorb"),
+            [
+                ("findorb", "od"),
+                ("findorb", "propagation"),
+                ("findorb", "ephemeris"),
+                ("findorb-radar", "radar"),
+            ]
+        );
+        assert_eq!(
+            paths_of("grss"),
+            [("grss", "rows"), ("grss-radar", "radar")]
+        );
+        assert_eq!(
+            paths_of("assist"),
+            [("assist", "folded"), ("assist", "standalone")]
+        );
+        for id in ["oorb", "orbfit", "layup", "adam-core", "adam-core-rust"] {
+            assert_eq!(paths_of(id), [(id, "rows")], "{id}");
+        }
+        assert_eq!(paths_of("kete"), [("kete", "timing")]);
+        assert_eq!(paths_of("jorbit"), [("jorbit", "timing")]);
+        assert_eq!(paths_of("jpl-sbdb"), [("jpl-sbdb", "od-reference")]);
+        // Every tool the run requests is mapped, and the radar passes ride their tool id.
+        for id in FULL_RUN_TOOLS {
+            assert!(!paths_of(id).is_empty(), "{id} is unmapped");
+        }
+        // The radar rows of find_orb and GRSS are required when their tool is requested.
+        let mut s = full_summary(7);
+        set_path_rows(&mut s, "findorb-radar", "radar", 0);
+        assert_eq!(requirement(&s, &["findorb"]).failures.len(), 1);
+        let mut s = full_summary(7);
+        set_path_rows(&mut s, "grss-radar", "radar", 0);
+        assert_eq!(requirement(&s, &["grss"]).failures.len(), 1);
+        // A tool that was not requested is not required.
+        let mut s = full_summary(7);
+        s["comparators"]
+            .as_array_mut()
+            .unwrap()
+            .retain(|c| c["tool"] != "kete");
+        assert!(requirement(&s, &["assist", "findorb"]).failures.is_empty());
+    }
+
+    #[test]
+    fn an_unknown_or_empty_request_is_a_usage_error_or_nothing() {
+        let err =
+            comparator_requirement_outcome(&full_summary(1), &tools(&["findorb", "findorbb"]), &[])
+                .unwrap_err();
+        assert!(
+            err.contains("`findorbb`") && err.contains("known:"),
+            "{err}"
+        );
+        // Blank entries (a trailing comma in EXTERNAL_TOOLS) require nothing.
+        assert!(
+            requirement(&full_summary(1), &["", " "])
+                .failures
+                .is_empty()
+        );
+        // A subset run passes no flag and so requires nothing, whatever the summary holds.
+        assert!(requirement(&serde_json::json!({}), &[]).failures.is_empty());
+    }
+
+    /// The table and the merge agree: feed every comparator flag an empty
+    /// per-row file and the sidecar must carry every (outcome, path) the table
+    /// requires, so a path renamed in `merge-external` cannot leave the gate
+    /// requiring a name nothing records; every path the merge records is either
+    /// in the table or one of the two STM paths that are not comparators.
+    #[test]
+    fn the_required_paths_are_exactly_the_paths_merge_external_records() {
+        let dir = tempfile::tempdir().unwrap();
+        let empty = dir.path().join("empty.json");
+        std::fs::write(&empty, "[]").unwrap();
+        let sbdb = dir.path().join("sbdb");
+        std::fs::create_dir(&sbdb).unwrap();
+        let mut args = merge_args(
+            dir.path(),
+            &[
+                ("core-stm", empty.as_path()),
+                ("core-fd-stm", empty.as_path()),
+                ("assist", empty.as_path()),
+                ("findorb", empty.as_path()),
+                ("findorb-radar", empty.as_path()),
+                ("oorb", empty.as_path()),
+                ("orbfit", empty.as_path()),
+                ("layup", empty.as_path()),
+                ("adam-core", empty.as_path()),
+                ("adam-core-rust", empty.as_path()),
+                ("kete", empty.as_path()),
+                ("jorbit", empty.as_path()),
+                ("grss", empty.as_path()),
+                ("grss-radar", empty.as_path()),
+            ],
+        );
+        args.jpl_sbdb_cache = Some(sbdb);
+        // No OD row, so the SBDB merge reads no cache file and lands 0 rows.
+        let mut prop = ValidationResult::empty();
+        prop.object = "Eros".into();
+        prop.channel = "rust".into();
+        prop.test_type = "propagation".into();
+        args.input = write_results(dir.path(), "base-prop.json", &[prop]);
+        merge_external(args).unwrap();
+        let outcomes = comparators::read_sidecar(&dir.path().join("merged.json"))
+            .unwrap()
+            .unwrap();
+        let mut recorded: Vec<(String, String)> = Vec::new();
+        for o in &outcomes {
+            assert!(!o.is_failed(), "{o:?}");
+            assert!(!o.paths.is_empty(), "{} records no merge path", o.tool);
+            for p in &o.paths {
+                recorded.push((o.tool.clone(), p.path.clone()));
+            }
+        }
+        for (_, outcome_tool, path) in COMPARATOR_MERGE_PATHS {
+            assert!(
+                recorded.contains(&(outcome_tool.to_string(), path.to_string())),
+                "the table requires {outcome_tool}/{path}, which merge-external never records: {recorded:?}"
+            );
+        }
+        for (tool, path) in &recorded {
+            let required = COMPARATOR_MERGE_PATHS
+                .iter()
+                .any(|(_, o, p)| o == tool && p == path);
+            let stm = matches!(
+                (tool.as_str(), path.as_str()),
+                ("core-stm", "stm") | ("core-fd-stm", "fd-stm")
+            );
+            assert!(
+                required || stm,
+                "{tool}/{path} is recorded but neither required nor an STM path"
+            );
+        }
+    }
+
+    #[test]
+    fn the_summary_carries_every_merge_path_count_next_to_the_outcome() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut prop = ValidationResult::empty();
+        prop.object = "Eros".into();
+        prop.channel = "rust".into();
+        prop.test_type = "propagation".into();
+        let results = write_results(dir.path(), "validation_core_merged.json", &[prop]);
+        comparators::write_sidecar(
+            &results,
+            &[ComparatorOutcome::folded(
+                "findorb",
+                Folded::with_paths(
+                    354,
+                    &[("od", 354), ("propagation", 800), ("ephemeris", 4005)],
+                ),
+            )],
+        )
+        .unwrap();
+        let summary = dir.path().join("summary.json");
+        report(ReportArgs {
+            results: vec![results],
+            output: dir.path().join("r.html"),
+            summary: Some(summary.clone()),
+            predict_agg: vec![],
+            predict_run: vec![],
+        })
+        .unwrap();
+        let sum: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&summary).unwrap()).unwrap();
+        let fo = &sum["comparators"][0];
+        assert_eq!(fo["tool"], "findorb");
+        assert_eq!(fo["rows"], 354);
+        assert_eq!(
+            fo["paths"],
+            serde_json::json!([
+                { "path": "od", "rows": 354 },
+                { "path": "propagation", "rows": 800 },
+                { "path": "ephemeris", "rows": 4005 },
+            ])
+        );
+        // The gate reads exactly that summary.
+        assert!(
+            requirement(&sum, &["findorb"])
+                .failures
+                .iter()
+                .all(|f| f.contains("findorb-radar") || !f.contains("findorb (findorb)"))
+        );
     }
 }

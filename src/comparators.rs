@@ -26,6 +26,53 @@ pub enum ComparatorStatus {
     Failed,
 }
 
+/// One merge path of a comparator and the rows it landed on.
+///
+/// A comparator can fold onto the report along several paths that fail
+/// independently: find_orb's OD fits, its propagation and ephemeris references
+/// (the one that needs an engine context), ASSIST's folded reference rows and
+/// its standalone per-arm rows. The outcome's headline `rows` cannot say which
+/// of them is empty, so each path's count is recorded by name and carried into
+/// the CI summary, where `ci-check` can require it.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct MergePath {
+    /// The path's name (`od`, `propagation`, `ephemeris`, `radar`, `rows`,
+    /// `folded`, `standalone`, `timing`, `od-reference`, ...).
+    pub path: String,
+    /// Rows the path landed on or appended.
+    pub rows: usize,
+}
+
+/// What one comparator's fold produced: the headline row count (unchanged
+/// from before per-path counts) and every merge path's count.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Folded {
+    pub rows: usize,
+    pub paths: Vec<MergePath>,
+}
+
+impl Folded {
+    /// A comparator with one merge path: its headline count is the path's.
+    pub fn single(path: &str, rows: usize) -> Self {
+        Self::with_paths(rows, &[(path, rows)])
+    }
+
+    /// A headline count and its paths, in the order the merge ran them.
+    pub fn with_paths(rows: usize, paths: &[(&str, usize)]) -> Self {
+        Self {
+            rows,
+            paths: paths
+                .iter()
+                .map(|(path, rows)| MergePath {
+                    path: (*path).to_string(),
+                    rows: *rows,
+                })
+                .collect(),
+        }
+    }
+}
+
 /// One comparator's outcome in a `merge-external` run.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
@@ -39,15 +86,33 @@ pub struct ComparatorOutcome {
     /// Why it failed; `None` when merged.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
+    /// Every merge path's row count, by name (empty for a failed comparator,
+    /// and for a sidecar written before per-path counts existed).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub paths: Vec<MergePath>,
 }
 
 impl ComparatorOutcome {
+    /// A comparator that merged with only its headline count (no per-path
+    /// counts); the production merges use [`ComparatorOutcome::folded`].
     pub fn merged(tool: &str, rows: usize) -> Self {
         Self {
             tool: tool.to_string(),
             status: ComparatorStatus::Merged,
             rows,
             reason: None,
+            paths: Vec::new(),
+        }
+    }
+
+    /// A comparator that merged, with every merge path's count.
+    pub fn folded(tool: &str, folded: Folded) -> Self {
+        Self {
+            tool: tool.to_string(),
+            status: ComparatorStatus::Merged,
+            rows: folded.rows,
+            reason: None,
+            paths: folded.paths,
         }
     }
 
@@ -57,6 +122,7 @@ impl ComparatorOutcome {
             status: ComparatorStatus::Failed,
             rows: 0,
             reason: Some(reason.into()),
+            paths: Vec::new(),
         }
     }
 
@@ -237,5 +303,45 @@ mod tests {
         let merged = d.path().join("m.json");
         std::fs::write(sidecar_path(&merged), "not json").unwrap();
         assert!(read_sidecar(&merged).unwrap_err().contains("parse"));
+    }
+
+    #[test]
+    fn the_sidecar_carries_every_merge_path_and_reads_an_older_one_without() {
+        let d = tempfile::tempdir().unwrap();
+        let merged = d.path().join("m.json");
+        let outcomes = vec![ComparatorOutcome::folded(
+            "findorb",
+            Folded::with_paths(354, &[("od", 354), ("propagation", 800), ("ephemeris", 0)]),
+        )];
+        write_sidecar(&merged, &outcomes).unwrap();
+        let back = read_sidecar(&merged).unwrap().unwrap();
+        assert_eq!(back, outcomes);
+        assert_eq!(back[0].rows, 354);
+        assert_eq!(
+            back[0].paths,
+            vec![
+                MergePath {
+                    path: "od".into(),
+                    rows: 354
+                },
+                MergePath {
+                    path: "propagation".into(),
+                    rows: 800
+                },
+                MergePath {
+                    path: "ephemeris".into(),
+                    rows: 0
+                },
+            ]
+        );
+        // A sidecar from before per-path counts still reads, with none.
+        std::fs::write(
+            sidecar_path(&merged),
+            r#"[{"tool":"layup","status":"merged","rows":354}]"#,
+        )
+        .unwrap();
+        let old = read_sidecar(&merged).unwrap().unwrap();
+        assert_eq!(old, vec![ComparatorOutcome::merged("layup", 354)]);
+        assert!(old[0].paths.is_empty());
     }
 }

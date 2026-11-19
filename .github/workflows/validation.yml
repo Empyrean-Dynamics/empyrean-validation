@@ -1662,6 +1662,16 @@ jobs:
       # with an OBJECTS subset legitimately produces fewer rows, and a floor
       # that fires on a deliberate subset would train everyone to ignore it.
       #
+      # The requested comparators are required on a full-catalog run only, for
+      # the same reason (a subset can legitimately land 0 rows on a path: act's
+      # find_orb leg writes no propagation rows). `--require-comparators` takes
+      # the run's EXTERNAL_TOOLS plus `jpl-sbdb`: each must have merged and every
+      # merge path of each (find_orb's OD, propagation, ephemeris and radar
+      # passes, ASSIST's folded and standalone rows, ...) must have landed more
+      # than 0 rows, or the gate fails naming the comparator, the path and why.
+      # Run 44355534056 went 112/112 green and passed ci-check with find_orb
+      # absent from the report, because a failed comparator was only a NOTE.
+      #
       # `--plan` applies on every run, subset or not: every object the plan
       # names (results/validation_plan.json, from the prep-plan-and-rust
       # artifact staged above) must have at least one reference (core) row in
@@ -1669,21 +1679,27 @@ jobs:
       # missing: ..."). Without it an object the reference never replayed
       # left every other channel's rows for it unreferenced, which the gate
       # only notes, and the run passed with that object never compared.
-      - name: ci-check (gate on python + core parity, OD row floors, reference rows per object)
+      - name: ci-check (gate on python + core parity, OD row floors, reference rows per object, requested comparators)
         working-directory: empyrean-validation
         run: |
           if [ -z "${OBJECTS}" ]; then
             FLOORS="--catalog-floors"
-            echo "Full catalog run — enforcing the catalog-derived per-axis floors."
+            # Every requested comparator must have merged, and every one of its merge
+            # paths must have landed rows (find_orb's OD, propagation, ephemeris and
+            # radar passes among them); jpl-sbdb is the pinned SBDB OD reference every
+            # reduce merges. Full catalog only, see the comment above.
+            REQUIRE="--require-comparators ${EXTERNAL_TOOLS},jpl-sbdb"
+            echo "Full catalog run — enforcing the catalog-derived per-axis floors and the requested comparators (${EXTERNAL_TOOLS},jpl-sbdb)."
           else
             FLOORS=""
-            echo "::warning title=OD row floors not enforced::OBJECTS='${OBJECTS}' is a subset, so the per-axis ci-check floors are skipped for this run."
+            REQUIRE=""
+            echo "::warning title=OD row floors not enforced::OBJECTS='${OBJECTS}' is a subset, so the per-axis ci-check floors and the requested-comparator requirement are skipped for this run."
           fi
           ./target/release/empyrean-validation ci-check \
             --summary results/validation_summary.json \
             --plan results/validation_plan.json \
             --strict-channels python,core \
-            ${FLOORS}
+            ${FLOORS} ${REQUIRE}
 
       # ── GCS upload ─────────────────────────────────────────────
       # Publish on every real trigger (a pin-bump push or a manual dispatch;

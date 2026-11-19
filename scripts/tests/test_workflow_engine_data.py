@@ -146,3 +146,14 @@ def test_the_registered_set_holds_every_file_the_step_requires_when_it_is_on_thi
         return  # the set is a local mirror; CI proves it by running the step
     for f in ENGINE_REQUIRED:
         assert (d / f).is_file(), f"the registered set lacks {f}, which the engine requires"
+
+
+def test_ci_check_requires_the_requested_comparators_on_a_full_catalog_run_only():
+    gate = code(jobs(VALIDATION)["reduce"]).split("name: ci-check", 1)[1].split("GCS upload", 1)[0]
+    full, subset = gate.split("else", 1)
+    # The flag is built from the run's EXTERNAL_TOOLS plus the SBDB reference, inside
+    # the full-catalog branch, empty in the subset branch, and passed to ci-check.
+    assert 'REQUIRE="--require-comparators ${EXTERNAL_TOOLS},jpl-sbdb"' in full
+    assert 'REQUIRE=""' in subset and "--require-comparators" not in subset
+    assert "${FLOORS} ${REQUIRE}" in gate
+    assert 'FLOORS="--catalog-floors"' in full
