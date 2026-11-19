@@ -82,7 +82,9 @@ name: Validation Suite
 #              timestamp (a mismatch fails the run by row and field), and the
 #              prep-plan-and-rust artifact reduce reads.
 #   • reduce — merge every staged channel JSON + render the report +
-#              gate (ci-check) + publish to GCS.
+#              gate (ci-check) + publish to GCS. Runs the prebuilt harness
+#              with the engine library and the engine kernel set restored
+#              (merge-external builds an engine context for find_orb).
 #
 # Every leg restores the same keyed caches (data kernels, JPL API
 # responses, cargo, per-tool build trees) that `prep` populates, so the
@@ -993,24 +995,12 @@ jobs:
       - name: Engine library (restored from prep; no public release URL)
         uses: ./empyrean-validation/.github/actions/engine-lib
 
-      - name: Restore empyrean data kernels
-        id: cache-data
-        uses: actions/cache/restore@v4
+      # The registered engine kernel set, restored from prep's cache and
+      # verified; a hosted cache miss fails here by name (see the action).
+      - name: Engine data (restored from prep; refused by name when missing)
+        uses: ./empyrean-validation/.github/actions/engine-data
         with:
-          path: data
-          key: empyrean-data-${{ env.EMPYREAN_DATASET }}-set-only
-      # Under `gh act` the data directory comes from the host mount when act's
-      # cache server had nothing for the key (see engine-setup); never on a
-      # hosted run.
-      - name: Copy the registered kernel set from the host mount (act)
-        if: env.ACT == 'true' && steps.cache-data.outputs.cache-hit != 'true'
-        run: |
-          src="${ACT_DATA_DIR:-/host-data}"
-          if [ ! -f "$src/obscodes_extended.json" ] || [ ! -f "$src/de440.bsp" ]; then
-            echo "ERROR: running under act, but no registered kernel set is mounted at $src." >&2
-            exit 1
-          fi
-          rm -rf data && mkdir -p data && cp -a "$src"/. data/
+          dataset: ${{ env.EMPYREAN_DATASET }}
 
       # Inputs snapshot (prep is the sole fetcher): restore by snapshot id and
       # verify offline, no credential. The replay channels fit the pinned PSVs
@@ -1126,24 +1116,12 @@ jobs:
       - name: Engine library (restored from prep; no public release URL)
         uses: ./empyrean-validation/.github/actions/engine-lib
 
-      - name: Restore empyrean data kernels
-        id: cache-data
-        uses: actions/cache/restore@v4
+      # The registered engine kernel set, restored from prep's cache and
+      # verified; a hosted cache miss fails here by name (see the action).
+      - name: Engine data (restored from prep; refused by name when missing)
+        uses: ./empyrean-validation/.github/actions/engine-data
         with:
-          path: data
-          key: empyrean-data-${{ env.EMPYREAN_DATASET }}-set-only
-      # Under `gh act` the data directory comes from the host mount when act's
-      # cache server had nothing for the key (see engine-setup); never on a
-      # hosted run.
-      - name: Copy the registered kernel set from the host mount (act)
-        if: env.ACT == 'true' && steps.cache-data.outputs.cache-hit != 'true'
-        run: |
-          src="${ACT_DATA_DIR:-/host-data}"
-          if [ ! -f "$src/obscodes_extended.json" ] || [ ! -f "$src/de440.bsp" ]; then
-            echo "ERROR: running under act, but no registered kernel set is mounted at $src." >&2
-            exit 1
-          fi
-          rm -rf data && mkdir -p data && cp -a "$src"/. data/
+          dataset: ${{ env.EMPYREAN_DATASET }}
 
       # Inputs snapshot (prep is the sole fetcher): restore by snapshot id and
       # verify offline, no credential. The replay channels fit the pinned PSVs
@@ -1282,24 +1260,12 @@ jobs:
         with:
           python-version: ${{ env.PYTHON_VERSION }}
 
-      - name: Restore empyrean data kernels
-        id: cache-data
-        uses: actions/cache/restore@v4
+      # The registered engine kernel set, restored from prep's cache and
+      # verified; a hosted cache miss fails here by name (see the action).
+      - name: Engine data (restored from prep; refused by name when missing)
+        uses: ./empyrean-validation/.github/actions/engine-data
         with:
-          path: data
-          key: empyrean-data-${{ env.EMPYREAN_DATASET }}-set-only
-      # Under `gh act` the data directory comes from the host mount when act's
-      # cache server had nothing for the key (see engine-setup); never on a
-      # hosted run.
-      - name: Copy the registered kernel set from the host mount (act)
-        if: env.ACT == 'true' && steps.cache-data.outputs.cache-hit != 'true'
-        run: |
-          src="${ACT_DATA_DIR:-/host-data}"
-          if [ ! -f "$src/obscodes_extended.json" ] || [ ! -f "$src/de440.bsp" ]; then
-            echo "ERROR: running under act, but no registered kernel set is mounted at $src." >&2
-            exit 1
-          fi
-          rm -rf data && mkdir -p data && cp -a "$src"/. data/
+          dataset: ${{ env.EMPYREAN_DATASET }}
 
       # Every external tool reads its data from the third-party tool set, its
       # own folder (`layup/`, `adam-core/`, `adam-core-rust/`, `assist/`,
@@ -1519,9 +1485,10 @@ jobs:
         with:
           path: empyrean-validation
 
-      # Nothing here reaches JPL, NAIF or the MPC: merge-external reads only the
-      # pinned SBDB snapshot. The later GCS publish uses storage.googleapis.com,
-      # which the seal deliberately does not block.
+      # Nothing here reaches JPL, NAIF or the MPC: merge-external reads the
+      # pinned SBDB snapshot and the engine kernel set restored below, and the
+      # engine runs offline (EMPYREAN_OFFLINE). The later GCS publish uses
+      # storage.googleapis.com, which the seal deliberately does not block.
       - name: Seal the job from JPL, NAIF and the MPC
         working-directory: empyrean-validation
         run: ./scripts/seal-upstream.sh
@@ -1531,9 +1498,19 @@ jobs:
           python-version: ${{ env.PYTHON_VERSION }}
 
       # The harness is the binary prep built (no toolchain, no compile), run
-      # against the engine library prep fetched once and cached.
+      # against the engine library prep fetched once and cached, and against the
+      # engine kernel set prep synced: merge-external builds an engine context to
+      # put find_orb's geocentric propagation vectors on the SSB with Earth's
+      # DE440 state, and the engine, offline and sealed, cannot fetch a kernel.
+      # The kernel set is a restore of prep's cache and refuses a miss by name;
+      # it holds no credential, so this job's id-token grant is unchanged (the
+      # publish's alone).
       - name: Engine library (restored from prep; no public release URL)
         uses: ./empyrean-validation/.github/actions/engine-lib
+      - name: Engine data (restored from prep; refused by name when missing)
+        uses: ./empyrean-validation/.github/actions/engine-data
+        with:
+          dataset: ${{ env.EMPYREAN_DATASET }}
       - name: Download the prebuilt binaries
         uses: actions/download-artifact@v4
         with:
@@ -1636,7 +1613,8 @@ jobs:
               --results-dir results
           done
 
-      # reduce runs only the prebuilt harness, then folds in whichever external
+      # reduce runs the prebuilt harness against the engine library and kernel
+      # set restored above, then folds in whichever external
       # channels are present (skipping any that a failed leg left absent, and any
       # whose file is unusable: merge-external isolates each comparator and the
       # report names every one it skipped as "failed: <reason>").

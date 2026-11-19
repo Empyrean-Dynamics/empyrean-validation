@@ -1,0 +1,94 @@
+name: Engine data
+description: >
+  Puts the registered engine kernel set (the `data` directory, ~1.3 GB) where
+  every job that RUNS the engine expects it, and refuses by name when it is not
+  there. The workflow runs offline and sealed (EMPYREAN_OFFLINE=1, the upstream
+  seal), so an engine context built in a job without the set fails with
+  "Missing data files". That is exactly how the full-catalog run 44355534056
+  lost find_orb: `reduce` merges find_orb's geocentric propagation vectors
+  through `empyrean::Context::from_data_dir`, never staged the set, and the
+  comparator was isolated out of the report while the gate stayed green.
+
+  prep (engine-setup, writer role) syncs the set from the registered bucket
+  slug and saves it keyed by that slug; this action is the one reader. It is
+  used by every job that builds an engine context: the channel legs, the heavy
+  legs, the external legs (which read the shared kernels) and `reduce`.
+
+  On a hosted run a cache miss FAILS this step by name; nothing falls back to a
+  download, and the engine never fails later with a bare "Missing data files".
+  Under `gh act` there is no cache from prep (act's cache server starts empty),
+  so the host's synced copy, bind-mounted at /host-data (override with
+  ACT_DATA_DIR), is the only fallback, as in engine-setup.
+
+  After restoring, the action verifies that every file the engine names as
+  required is present and non-empty and prints what it staged (names, sizes,
+  the dataset slug). The files were hash-verified when prep synced them from
+  the registered set (empyrean-data.py sync checks every file against the set's
+  manifest); the cache is keyed by that slug, so restoring it is restoring those
+  bytes. The set itself ships no manifest file to re-verify against here.
+
+inputs:
+  dataset:
+    description: >
+      Registered kernel-set slug (the workflow's EMPYREAN_DATASET). Keys the
+      cache prep saved. Passed in, as engine-setup takes it.
+    required: true
+
+runs:
+  using: composite
+  steps:
+    - name: Restore empyrean data kernels
+      id: cache
+      uses: actions/cache/restore@v4
+      with:
+        path: data
+        key: empyrean-data-${{ inputs.dataset }}-set-only
+
+    - name: Require a warm kernel cache (hosted run)
+      if: env.ACT != 'true' && steps.cache.outputs.cache-hit != 'true'
+      shell: bash
+      run: |
+        echo "ERROR: engine-data: cache miss on key empyrean-data-${{ inputs.dataset }}-set-only." >&2
+        echo "       prep is the sole writer of this cache (engine-setup, writer role). A miss means prep" >&2
+        echo "       did not run, its sync failed, the cache was evicted, or EMPYREAN_DATASET changed" >&2
+        echo "       between jobs of the same run. This job runs the engine offline and sealed, so it" >&2
+        echo "       has no way to fetch the kernels itself; refusing to continue without them." >&2
+        exit 1
+
+    # Under act the data directory comes from the host mount when act's cache
+    # server had nothing for the key (see engine-setup); never on a hosted run.
+    - name: Copy the registered kernel set from the host mount (act)
+      if: env.ACT == 'true' && steps.cache.outputs.cache-hit != 'true'
+      shell: bash
+      run: |
+        src="${ACT_DATA_DIR:-/host-data}"
+        if [ ! -f "$src/obscodes_extended.json" ] || [ ! -f "$src/de440.bsp" ]; then
+          echo "ERROR: engine-data: running under act, but no registered kernel set is mounted at $src." >&2
+          exit 1
+        fi
+        rm -rf data && mkdir -p data && cp -a "$src"/. data/
+
+    # The files the engine names when it refuses ("Missing data files: ..."):
+    # every kernel and table `empyrean::Context::from_data_dir` requires of an
+    # offline context, in the order it names them.
+    - name: Verify and list the staged kernel set
+      shell: bash
+      run: |
+        dir="${EMPYREAN_DATA_DIR:-}"
+        if [ -z "$dir" ]; then
+          echo "ERROR: engine-data: EMPYREAN_DATA_DIR is not set; the workflow sets it for the whole run." >&2
+          exit 1
+        fi
+        required="de440.bsp gm_de440.tpc earth_latest_high_prec.bpc earth_620120_260806.bpc earth_2026_260806_2126_predict.bpc moon_pa_de440_200625.bpc sb441-n16.bsp obscodes_extended.json bias.dat"
+        missing=""
+        for f in $required; do
+          [ -s "$dir/$f" ] || missing="$missing $f"
+        done
+        if [ -n "$missing" ]; then
+          echo "ERROR: engine-data: ${{ inputs.dataset }} restored into $dir but these required files are missing or empty:$missing" >&2
+          exit 1
+        fi
+        echo "engine-data: dataset ${{ inputs.dataset }} staged in $dir ($(ls "$dir" | wc -l | tr -d ' ') entries, all $(echo $required | wc -w | tr -d ' ') required files present):"
+        for f in $required; do
+          printf '  %-40s %12s bytes\n' "$f" "$(wc -c < "$dir/$f" | tr -d ' ')"
+        done
