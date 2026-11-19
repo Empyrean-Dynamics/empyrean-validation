@@ -148,6 +148,61 @@ def test_the_external_validator_refuses_each_broken_shape(sc, world):
     assert sc.validate_external(p, "0" * 64, s) == ["the external schedule was built for a different plan (hash mismatch)"]
 
 
+# ── GitHub's job limit ──────────────────────────────────────────────────────
+
+
+def with_job_min(world, tool, job_min):
+    costs = json.loads(world["cp"].read_text())
+    costs["tools"][tool] = {"job_min": job_min}
+    world["cp"].write_text(json.dumps(costs))
+
+
+def test_a_timeout_above_githubs_job_limit_is_capped_at_it_and_the_cap_is_recorded(sc, world):
+    with_job_min(world, "assist", 150.0)  # 3 x 150 = 450, above the 360-minute limit
+    with_job_min(world, "findorb", 100.0)  # 3 x 100 = 300, under it
+    s, _ = sched(sc, world, tools=("assist", "findorb"))
+    assert sc.JOB_LIMIT_MIN == 360
+    capped = s["tools"]["assist"]["legs"][0]
+    assert capped["timeout_min"] == 360 and capped["timeout_capped_from_min"] == 450
+    assert s["tools"]["findorb"]["legs"][0]["timeout_min"] == 300
+    assert "timeout_capped_from_min" not in s["tools"]["findorb"]["legs"][0], "only a capped leg carries the record"
+    assert s["timeout_cap_min"] == 360
+    assert sc.external_leg_matrix(s)[0] == {"tool": "assist", "leg": "01", "timeout": 360}
+    assert sc.validate_external(plan(), s["plan_sha256"], s) == []
+
+
+def test_a_leg_predicted_to_reach_the_job_limit_is_refused_naming_the_limit(sc, world, capsys):
+    with_job_min(world, "assist", 360.0)  # the cap would leave a timeout equal to the predicted wall
+    s, _ = sched(sc, world, tools=("assist",))
+    bad = sc.validate_external(plan(), s["plan_sha256"], s)
+    assert len(bad) == 1 and "reaches GitHub's 360-minute job limit" in bad[0] and "assist leg 01" in bad[0]
+    with pytest.raises(SystemExit) as e:
+        sc.main(["pack-external", "--plan", str(world["pp"]), "--costs", str(world["cp"]), "--tools", "assist", "--out", str(world["dir"] / "o.json")])
+    assert "360-minute job limit" in str(e.value)
+    # below the limit the same tool is accepted, its timeout capped
+    with_job_min(world, "assist", 359.5)
+    s, _ = sched(sc, world, tools=("assist",))
+    assert sc.validate_external(plan(), s["plan_sha256"], s) == []
+    assert s["tools"]["assist"]["legs"][0]["timeout_min"] == 360
+
+
+def test_a_hand_edited_timeout_above_the_job_limit_is_refused(sc, world):
+    s, _ = sched(sc, world)
+    s["tools"]["assist"]["legs"][0]["timeout_min"] = 400
+    assert any("above GitHub's 360-minute job limit" in b for b in sc.validate_external(plan(), s["plan_sha256"], s))
+
+
+def test_pack_external_prints_the_cap_and_each_capped_leg(sc, world, capsys):
+    with_job_min(world, "assist", 150.0)
+    with_job_min(world, "findorb", 100.0)
+    rc = sc.main(["pack-external", "--plan", str(world["pp"]), "--costs", str(world["cp"]), "--tools", "assist,findorb", "--out", str(world["dir"] / "o.json")])
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert "timeouts capped at 360 min (GitHub's hosted job limit)" in out
+    assert "assist" in out and "timeouts 360 (capped from 450) min" in out
+    assert "findorb" in out and "timeouts 300 min" in out and "300 (capped" not in out
+
+
 # ── external-objects ────────────────────────────────────────────────────────
 
 

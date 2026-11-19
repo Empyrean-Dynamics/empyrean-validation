@@ -1223,8 +1223,9 @@ jobs:
     runs-on: ubuntu-latest
     # Each leg's own limit, from the external schedule: 3x its predicted wall
     # (fixtures/external-costs.json: measured job walls, OrbFit's per-object fit
-    # times, kete's measured per-object cost, jorbit's modeled per-object cost),
-    # never under 30 minutes.
+    # times, and the per-object walls kete, jorbit and both adam-core channels
+    # measured on hosted runs), never under 30 minutes and never over GitHub's
+    # 360-minute job limit.
     timeout-minutes: ${{ matrix.timeout }}
     # No credentials here: this job inherits the workflow's read-only
     # permissions (no id-token), and none of its legs authenticates or runs
@@ -1233,11 +1234,11 @@ jobs:
     # prep. The third-party tool set every leg reads is synced by prep and only RESTORED here.
     strategy:
       fail-fast: false
-      # Jorbit, OrbFit, kete, adam-core and adam-core-rust in object legs and
-      # the other tools one leg each, all but OpenOrb's (about 50 minutes) of
-      # 25 minutes or less (scripts/schedule.py pack-external), inside the
-      # channel stage's ~52: eight at a time finish them without taking slots
-      # from the channel legs under the 60-job limit.
+      # Jorbit, OrbFit, kete, adam-core and adam-core-rust in object legs of
+      # about 25 minutes (a 30-minute capped adam-core fit is a leg of its own)
+      # and the other tools one leg each, OpenOrb's the longest at about 133
+      # minutes (scripts/schedule.py pack-external): eight at a time, without
+      # taking slots from the channel legs under the 60-job limit.
       max-parallel: 8
       matrix:
         include: ${{ fromJson(needs.assemble.outputs.external_legs) }}

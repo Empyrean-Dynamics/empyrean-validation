@@ -57,7 +57,8 @@ bytes, so a schedule can be reproduced, diffed and tested.
         --out results/external-schedule.json --matrix results/external-leg-matrix.json
         the external legs (S7): object legs for a tool priced per object,
         longest object first, one leg for every other tool, each with a timeout
-        sized to its predicted wall; validate-external checks one.
+        sized to its predicted wall and capped at GitHub's 360-minute job
+        limit; validate-external checks one.
 
 Heavy rows (S4). A row whose single timing run costs HEAVY_MIN_S or more is
 fanned out: its timing repetitions run on that many distinct legs, one each,
@@ -1049,11 +1050,18 @@ def heavy_leg_matrix(sched: dict) -> list[dict]:
 # of memory after 41 to 71 min on two hosted runs, OrbFit took 44 to 51, kete
 # with the sixteen SB441-N16 masses outran its 31-minute leg, and adam-core's
 # fits outran its 150-minute leg. Every other tool runs as one leg.
-# Each leg's timeout is a multiple of its predicted wall, never a flat budget.
+# Each leg's timeout is a multiple of its predicted wall, never a flat budget,
+# and never more than GitHub's job limit (JOB_LIMIT_MIN): a leg that needs more
+# than that cannot run on a hosted runner, so it is refused by name, not given
+# a timeout it could never reach.
 # reduce puts a tool's legs back into its one comparator file
 # (channel-chunks.py concat-external) before the merge.
 
 EXTERNAL_SCHEMA = 1
+# GitHub's limit on a hosted-runner job: 360 minutes, whatever timeout-minutes
+# asks for (GitHub Actions usage limits, "Job execution time"). A leg's timeout
+# is capped at it, and a leg whose predicted wall reaches it is refused.
+JOB_LIMIT_MIN = 360
 EXTERNAL_TOOLS = ("assist", "findorb", "kete", "jorbit", "layup", "orbfit", "grss", "adam-core", "adam-core-rust")
 # The comparator files a tool's leg writes, by stem (validation_<stem>.json).
 EXTERNAL_STEMS = {"findorb": ["findorb", "findorb_radar"], "grss": ["grss", "grss_radar"]}
@@ -1117,7 +1125,11 @@ def build_external_schedule(plan_path: Path, costs_path: Path, tools: list[str],
             legs.append({"leg": "01", "objects": None, "predicted_min": round(job, 3)})
             chunked = False
         for leg in legs:
-            leg["timeout_min"] = max(floor, math.ceil(factor * leg["predicted_min"]))
+            want = max(floor, math.ceil(factor * leg["predicted_min"]))
+            leg["timeout_min"] = min(JOB_LIMIT_MIN, want)
+            if want > JOB_LIMIT_MIN:
+                # Visible in the schedule and in what pack-external prints.
+                leg["timeout_capped_from_min"] = want
         body = {"chunked": chunked, "stems": EXTERNAL_STEMS.get(tool, [tool]), "legs": legs, "estimated": estimated}
         if tool in EXTERNAL_ALL_FAILED:
             body["all_failed_field"] = EXTERNAL_ALL_FAILED[tool]
@@ -1131,6 +1143,7 @@ def build_external_schedule(plan_path: Path, costs_path: Path, tools: list[str],
         "target_leg_min": target,
         "timeout_factor": factor,
         "timeout_floor_min": floor,
+        "timeout_cap_min": JOB_LIMIT_MIN,
         "tools": out_tools,
     }
 
@@ -1141,7 +1154,8 @@ def external_leg_matrix(sched: dict) -> list[dict]:
 
 def validate_external(plan: list, plan_sha256: str, sched: dict) -> list[str]:
     """A chunked tool covers every plan object exactly once; every leg has a
-    timeout of at least the floor and above its predicted wall."""
+    timeout of at least the floor and above its predicted wall, and no timeout
+    is above GitHub's job limit (a leg predicted to reach it is refused)."""
     if sched.get("schema") != EXTERNAL_SCHEMA or sched.get("kind") != "external":
         return ["not an external schedule"]
     if sched["plan_sha256"] != plan_sha256:
@@ -1155,7 +1169,14 @@ def validate_external(plan: list, plan_sha256: str, sched: dict) -> list[str]:
         if not ids or len(set(ids)) != len(ids):
             bad.append(f"{tool}: leg ids are empty or repeated")
         for leg in body["legs"]:
-            if leg["timeout_min"] < sched["timeout_floor_min"] or leg["timeout_min"] <= leg["predicted_min"]:
+            if leg["timeout_min"] > JOB_LIMIT_MIN:
+                bad.append(f"{tool} leg {leg['leg']}: timeout {leg['timeout_min']} min is above GitHub's {JOB_LIMIT_MIN}-minute job limit")
+            if leg["predicted_min"] >= JOB_LIMIT_MIN:
+                bad.append(
+                    f"{tool} leg {leg['leg']}: predicted {leg['predicted_min']} min reaches GitHub's {JOB_LIMIT_MIN}-minute job limit, "
+                    "so no timeout can cover it; cut the tool into smaller legs or reprice it"
+                )
+            elif leg["timeout_min"] < sched["timeout_floor_min"] or leg["timeout_min"] <= leg["predicted_min"]:
                 bad.append(f"{tool} leg {leg['leg']}: timeout {leg['timeout_min']} min is below the floor or the predicted {leg['predicted_min']} min")
         if body["chunked"]:
             seen: dict[str, str] = {}
@@ -1270,6 +1291,25 @@ def refresh_costs(src: Path, run_id: str, engine_pin: str) -> dict:
 
 
 # ── cli ─────────────────────────────────────────────────────────────────────
+
+
+def summarize_external(sched: dict) -> list[str]:
+    """The lines pack-external prints: each tool's legs and timeouts, with the
+    job-limit cap named and every capped leg shown with the timeout it wanted."""
+    lines = [
+        (
+            f"External schedule: {len(sched['objects'])} objects, target leg {sched['target_leg_min']} min, "
+            f"timeouts capped at {sched['timeout_cap_min']} min (GitHub's hosted job limit)"
+        )
+    ]
+    for tool, body in sched["tools"].items():
+        walls = [leg["predicted_min"] for leg in body["legs"]]
+        touts = ",".join(
+            f"{leg['timeout_min']} (capped from {leg['timeout_capped_from_min']})" if "timeout_capped_from_min" in leg else str(leg["timeout_min"])
+            for leg in body["legs"]
+        )
+        lines.append(f"  {tool:8s} {len(walls):3d} leg(s)  max {max(walls):6.1f} min  timeouts {touts} min")
+    return lines
 
 
 def summarize(sched: dict) -> str:
@@ -1439,13 +1479,10 @@ def main(argv: list[str] | None = None) -> int:
         write_json(sched, args.out)
         if args.matrix:
             write_json(external_leg_matrix(sched), args.matrix)
-        print(f"External schedule: {len(sched['objects'])} objects, target leg {sched['target_leg_min']} min -> {args.out}")
-        for tool, body in sched["tools"].items():
-            walls = [leg["predicted_min"] for leg in body["legs"]]
-            print(
-                f"  {tool:8s} {len(walls):3d} leg(s)  max {max(walls):6.1f} min  timeouts "
-                f"{','.join(str(leg['timeout_min']) for leg in body['legs'])} min"
-            )
+        for line in summarize_external(sched):
+            print(line)
+        print(f"  -> {args.out}")
+        for body in sched["tools"].values():
             for line in body["estimated"]:
                 print(f"    ESTIMATED: {line}", file=sys.stderr)
         return 0
