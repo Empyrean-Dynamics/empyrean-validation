@@ -21,7 +21,29 @@ multi-stage pipeline that doesn't fit the per-row replay model. find_orb
 covers cross-tool OD comparison.
 
 oorb is GPL-3.0 licensed and never linked into empyrean. The runner
-shells out to the upstream CLI binary built by `setup.sh`.
+shells out to the upstream CLI binary built by `setup.sh` at a pinned commit.
+
+Data and model (each tool at its own best practice on the suite's data
+products). Everything oorb reads comes from the oorb/ folder of the
+third-party tool set (`--data-dir`), linked into a private OORB_DATA
+directory: de440.dat (OpenOrb's binary form of DE440), OBSCODE.dat, ET-UT.dat,
+TAI-UTC.dat, and the BC430 asteroid files asteroid_indices.txt,
+asteroid_ephemeris.txt and asteroid_masses.txt (Baer & Chesley 2017,
+"BC430 Asteroid Ephemerides", doi:10.5281/zenodo.3558850, CC-BY-4.0). The
+shipped oorb.conf is run with its dynamical model set to n-body and
+`perturber.asteroids: T`: planets, Moon, Pluto, relativity, and every BC430
+asteroid the indices file lists (all 300), rows run as concurrent oorb
+processes (`--jobs`).
+An object that is itself a BC430 perturber (its number, the fixture's permID,
+is in the indices file: Eros, Lutetia, Nysa, Iris, Vesta, Pallas and Hygiea in
+this catalog) would perturb itself, and OpenOrb cannot leave one out of its
+force model, so each of its rows is a named unsupported row carrying the reason
+in `oorb_unsupported` and is never run: the rule the adam-core and layup runners
+follow, and no row runs a different force model.
+OpenOrb models no non-gravitational acceleration; rows whose plan carries
+A1/A2/A3 say so. OpenOrb works in heliocentric coordinates; the
+Sun's barycentric state at each epoch comes from the folder's de440.bsp
+through the shared helper `runners/sunstate`, never from the plan.
 """
 
 from __future__ import annotations
@@ -36,10 +58,77 @@ import subprocess
 import sys
 import tempfile
 import time
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 from pathlib import Path
 
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))  # runners/ -> sunstate
+from sunstate.de440_sun import SpkError, SunEphemeris  # noqa: E402
+
 _AU_KM = 149_597_870.700
+
+# Every file oorb opens from OORB_DATA, as the oorb/ folder of the third-party
+# tool set names it. de440.bsp in the same folder feeds the Sun-state helper.
+OORB_DATA_FILES = (
+    "de440.dat",
+    "OBSCODE.dat",
+    "ET-UT.dat",
+    "TAI-UTC.dat",
+    "asteroid_indices.txt",
+    "asteroid_ephemeris.txt",
+    "asteroid_masses.txt",
+)
+# A BC430 body integrated with the BC430 perturbers on is pulled toward its own
+# ephemeris (a 1/r^2 self-singularity: Eros 1.8e8 km from Horizons at p50), and
+# OpenOrb's conf switches the asteroids for every body at once. Such an object's
+# rows are named unsupported rows, never run, the rule the adam-core and layup
+# runners follow (owner ruling 2026-11-10: no per-object switch of force model).
+SELF_PERTURBER_UNSUPPORTED = (
+    "self-perturber: BC430 includes the object and OpenOrb's n-body force model "
+    "cannot leave a body out, so the object would perturb itself"
+)
+NONGRAV_NOTE = (
+    "OpenOrb models no non-gravitational acceleration; the plan's A1/A2/A3 are not applied"
+)
+
+
+def bc430_numbers(data_dir: Path) -> set[int]:
+    """The asteroid numbers OpenOrb integrates as perturbers: the active
+    (uncommented) lines of the folder's asteroid_indices.txt."""
+    nums = set()
+    for line in (data_dir / "asteroid_indices.txt").read_text().splitlines():
+        tok = line.split()
+        if tok and not line.lstrip().startswith("#") and tok[0].isdigit():
+            nums.add(int(tok[0]))
+    return nums
+
+
+def fixture_number(fixtures_dir: Path, name: str) -> int | None:
+    """The object's asteroid number from its fixture's permID, or None (unnumbered)."""
+    psv = fixtures_dir / f"{name.replace('/', '_')}.psv"
+    if not psv.is_file():
+        return None
+    header = None
+    for line in psv.read_text().splitlines():
+        if line.startswith(("#", "!")) or not line.strip():
+            continue
+        cols = [c.strip() for c in line.split("|")]
+        if header is None:
+            header = cols
+            if "permID" not in header:
+                return None
+            continue
+        perm = cols[header.index("permID")] if len(cols) > header.index("permID") else ""
+        return int(perm) if perm.isdigit() else None
+    return None
+
+
+def self_perturbers(objects, fixtures_dir: Path, data_dir: Path) -> set[str]:
+    """The objects that are themselves BC430 perturbers: the fixture's permID is
+    an active number of the folder's asteroid_indices.txt."""
+    perturbers = bc430_numbers(data_dir)
+    return {o for o in objects if fixture_number(fixtures_dir, o) in perturbers}
+
 
 # Obliquity at J2000.0 (IAU 1976), used to rotate oorb's ecliptic-J2000
 # Cartesian output back to ICRF / equatorial-J2000 to match empyrean.
@@ -208,7 +297,7 @@ def _run_oorb(
     return proc.stdout, proc.stderr, proc.returncode
 
 
-def _heliocentric_ic(row: dict, sun_epoch: dict) -> tuple | None:
+def _heliocentric_ic(row: dict, sun: SunEphemeris) -> tuple | None:
     """Convert the plan's SSB-centered IC to heliocentric for oorb.
 
     OpenOrb's Cartesian orbit convention is HELIOCENTRIC (center 11 — the
@@ -216,39 +305,25 @@ def _heliocentric_ic(row: dict, sun_epoch: dict) -> tuple | None:
     `ic_pos_au`/`ic_vel_au_d` are SSB-centered. Feeding SSB coordinates in
     unconverted biases the initial state by the Sun's barycentric offset
     (~1e6 km) and — worse — its ~12 m/s barycentric velocity, a
-    semi-major-axis error worth ~1e6 km/yr of along-track drift.
+    semi-major-axis error worth ~1e6 km/yr of along-track drift. The Sun's
+    state at the IC epoch comes from the registered DE440.
     """
-    sun = sun_epoch.get(row.get("object"))
     ic_pos = row.get("ic_pos_au")
     ic_vel = row.get("ic_vel_au_d")
     if ic_pos is None or ic_vel is None:
         return None
-    if sun is None:
-        print(
-            f"  {row.get('object')}: SKIP — plan carries no Sun SSB state "
-            "(ref_sun_pos_au/ref_sun_vel_au_d); regenerate the plan",
-            file=sys.stderr,
-        )
-        return None
-    sun_pos, sun_vel = sun
+    sun_pos, sun_vel = sun.state(row["epoch_mjd_tdb"] + 2_400_000.5)
     helio_pos = [ic_pos[i] - sun_pos[i] for i in range(3)]
     helio_vel = [ic_vel[i] - sun_vel[i] for i in range(3)]
     return helio_pos, helio_vel
 
 
-def _propagate(row: dict, oorb_bin: Path, env: dict[str, str], sun_epoch: dict) -> dict | None:
-    helio = _heliocentric_ic(row, sun_epoch)
+def _propagate(row: dict, oorb_bin: Path, env: dict[str, str], sun: SunEphemeris) -> dict | None:
+    helio = _heliocentric_ic(row, sun)
     if helio is None:
         return None
     ic_pos, ic_vel = helio
-    sun_t = row.get("ref_sun_pos_au")
-    if sun_t is None:
-        print(
-            f"  {row.get('object')} dt={row.get('dt_days', 0):+.0f}: SKIP — "
-            "row carries no ref_sun_pos_au; regenerate the plan",
-            file=sys.stderr,
-        )
-        return None
+    sun_t, _ = sun.state(row["t_mjd_tdb"] + 2_400_000.5)
 
     with tempfile.TemporaryDirectory(prefix="oorb_run_") as td:
         in_path = Path(td) / "in.des"
@@ -285,7 +360,7 @@ def _propagate(row: dict, oorb_bin: Path, env: dict[str, str], sun_epoch: dict) 
 
     # Rotate ecliptic-J2000 → equatorial-J2000 to match empyrean's frame,
     # then recenter heliocentric → SSB with the Sun's state at the target
-    # epoch (carried on the plan row).
+    # epoch from the registered DE440.
     helio_eq = _ecl_to_eq((x_e, y_e, z_e))
     pos = [helio_eq[i] + sun_t[i] for i in range(3)]
     res: dict = {"oorb_pos_au": pos, "oorb_time_ms": ms}
@@ -296,11 +371,11 @@ def _propagate(row: dict, oorb_bin: Path, env: dict[str, str], sun_epoch: dict) 
     return res
 
 
-def _ephemeris(row: dict, oorb_bin: Path, env: dict[str, str], sun_epoch: dict) -> dict | None:
+def _ephemeris(row: dict, oorb_bin: Path, env: dict[str, str], sun: SunEphemeris) -> dict | None:
     obs_code = row.get("observer")
     if not obs_code:
         return None
-    helio = _heliocentric_ic(row, sun_epoch)
+    helio = _heliocentric_ic(row, sun)
     if helio is None:
         return None
     ic_pos, ic_vel = helio
@@ -426,6 +501,55 @@ def _executive_summary(rows: list[dict]) -> str:
     return "\n".join(lines)
 
 
+# OpenOrb's configuration, stamped on every row (merge-external carries it to
+# the report's Configurations appendix).
+OORB_SETTINGS = {
+    "commit": "",  # filled from the build (setup.sh's pin) in main()
+    "dynamical_model": "n-body (the shipped oorb.conf's 2-body set to n-body), "
+    "Bulirsch-Stoer as shipped",
+    "perturbers": "planets, Moon, Pluto and every BC430 asteroid the indices file "
+    "lists (300; Baer & Chesley 2017)",
+    "self_perturbers": "",  # the plan's BC430 bodies, named unsupported; set in main()
+    "non_grav": NONGRAV_NOTE,
+    "relativity": "on (as shipped)",
+    "planetary_ephemeris": "de440.dat from the oorb/ folder",
+    "frame": "plan SSB states made heliocentric with the Sun from the oorb/ "
+    "folder's de440.bsp, and back",
+    "uncertainty": "state only (covariance rows are not replayed)",
+}
+
+
+def write_conf(shipped: Path, conf_dir: Path) -> Path:
+    """The shipped oorb.conf with n-body dynamics and the asteroid perturbers on,
+    the one force model every row runs. Refuses a conf whose lines it cannot
+    find, naming them, rather than running a different model."""
+    text = shipped.read_text()
+    for key in ("dynamical_model", "perturber.asteroids"):
+        if len(re.findall(rf"(?m)^{re.escape(key)}:", text)) != 1:
+            raise ValueError(f"{shipped}: expected one '{key}:' line")
+    nbody = re.sub(r"(?m)^dynamical_model:.*$", "dynamical_model:      n-body", text)
+    full = re.sub(r"(?m)^perturber\.asteroids:.*$", "perturber.asteroids: T", nbody)
+    conf_dir.mkdir(parents=True, exist_ok=True)
+    (conf_dir / "oorb.conf").write_text(full)
+    return conf_dir / "oorb.conf"
+
+
+def stage_data(data_dir: Path, dest: Path) -> list[str]:
+    """Link every file oorb opens from the oorb/ folder into ``dest`` (its
+    OORB_DATA). Returns the files the folder lacks (empty: ready)."""
+    missing = [n for n in OORB_DATA_FILES if not (data_dir / n).is_file()
+               or (data_dir / n).stat().st_size == 0]
+    if missing:
+        return missing
+    dest.mkdir(parents=True, exist_ok=True)
+    for n in OORB_DATA_FILES:
+        link = dest / n
+        if link.is_symlink() or link.exists():
+            link.unlink()
+        link.symlink_to((data_dir / n).resolve())
+    return []
+
+
 def _oorb_source_version(oorb_bin: Path) -> str:
     """Provenance string stamped on every oorb-channel row.
 
@@ -479,48 +603,71 @@ def main() -> int:
         default=Path(__file__).parent / "install",
         help="oorb install prefix (defaults to setup.sh's output dir)",
     )
+    p.add_argument(
+        "--fixtures-dir",
+        type=Path,
+        required=True,
+        help="ADES PSV fixtures: each object's permID says whether it is itself a BC430 perturber",
+    )
+    p.add_argument(
+        "--jobs",
+        type=int,
+        default=os.cpu_count() or 1,
+        help="oorb processes run at once (default: the CPU count); results keep plan order",
+    )
+    p.add_argument(
+        "--data-dir",
+        type=Path,
+        required=True,
+        help="the oorb/ folder of the third-party tool set: every file oorb reads, "
+        "plus de440.bsp for the Sun's barycentric state",
+    )
     args = p.parse_args()
 
     oorb_bin = args.prefix / "bin" / "oorb"
-    oorb_data = args.prefix / "data"
     oorb_conf = args.prefix / "oorb.conf"
-    if not oorb_bin.exists():
+    if not oorb_bin.exists() or not oorb_conf.exists():
         print(
-            f"ERROR: oorb binary not found at {oorb_bin}. Run ./setup.sh first.",
+            f"ERROR: oorb binary or conf not found under {args.prefix}. Run ./setup.sh first.",
             file=sys.stderr,
         )
         return 1
-
-    env = os.environ.copy()
-    if oorb_data.exists():
-        env["OORB_DATA"] = str(oorb_data)
-    if oorb_conf.exists():
-        # The stock oorb.conf ships `dynamical_model: 2-body` — no planetary
-        # perturbations at all, which is catastrophically wrong over the
-        # ±15 yr grid (~10⁴ km/month of missing perturbation signal; 10⁷ km
-        # over 15 yr). Force full n-body (the conf's perturber list is
-        # already all-planets + Moon + Pluto, relativity on). Asteroid
-        # perturbers stay off (BC430 not installed) — OpenOrb's residual vs
-        # Horizons therefore retains the km-scale asteroid-perturbation
-        # signal, which is honest and documented, not a bug.
-        conf_text = oorb_conf.read_text()
-        patched, n_sub = re.subn(
-            r"(?m)^dynamical_model:\s+2-body\s*$",
-            "dynamical_model:      n-body",
-            conf_text,
+    try:
+        sun = SunEphemeris(args.data_dir / "de440.bsp")
+    except SpkError as e:
+        print(f"ERROR: {e}", file=sys.stderr)
+        return 1
+    work = Path(tempfile.mkdtemp(prefix="oorb_data_"))
+    missing = stage_data(args.data_dir, work / "data")
+    if missing:
+        print(
+            f"ERROR: the oorb folder {args.data_dir} lacks {', '.join(missing)}; "
+            "oorb would read another file or none.",
+            file=sys.stderr,
         )
-        if n_sub != 1 and not re.search(r"(?m)^dynamical_model:\s+n-body\s*$", conf_text):
-            print(
-                f"ERROR: could not force n-body dynamics in {oorb_conf} "
-                f"(matched {n_sub} 'dynamical_model: 2-body' lines)",
-                file=sys.stderr,
-            )
-            return 1
-        conf_dir = Path(tempfile.mkdtemp(prefix="oorb_conf_"))
-        nbody_conf = conf_dir / "oorb_nbody.conf"
-        nbody_conf.write_text(patched)
-        env["OORB_CONF"] = str(nbody_conf)
-        print("oorb dynamics: n-body (planets + Moon + Pluto, relativity on; asteroid perturbers off)")
+        return 1
+    try:
+        conf = write_conf(oorb_conf, work / "conf")
+    except ValueError as e:
+        print(f"ERROR: {e}", file=sys.stderr)
+        return 1
+    plan_objects = {r.get("object") for r in json.loads(args.input.read_text()) if r.get("object")}
+    unsupported = self_perturbers(plan_objects, args.fixtures_dir, args.data_dir)
+    OORB_SETTINGS["self_perturbers"] = (
+        f"{', '.join(sorted(unsupported)) or 'none'}: named unsupported (BC430 includes "
+        "each; OpenOrb cannot leave a body out of its force model)"
+    )
+    commit_file = args.prefix / "COMMIT"
+    OORB_SETTINGS["commit"] = (
+        commit_file.read_text().strip() if commit_file.exists() else "unknown (no COMMIT from setup.sh)"
+    )
+    env = os.environ.copy()
+    env["OORB_DATA"] = str(work / "data")
+    env["OORB_CONF"] = str(conf)
+    print(f"oorb data: {args.data_dir} -> {work / 'data'}", file=sys.stderr)
+    print("oorb dynamics: n-body, planets + Moon + Pluto + BC430 asteroids, relativity on; "
+          f"named unsupported (self-perturbers): {', '.join(sorted(unsupported)) or 'none'}",
+          file=sys.stderr)
 
     plan = json.loads(args.input.read_text())
     if not plan:
@@ -528,16 +675,6 @@ def main() -> int:
         return 1
 
     print(f"Loaded {len(plan)} plan rows; running through oorb...", file=sys.stderr)
-
-    # Sun SSB state at each object's IC epoch (the dt=0 propagation row).
-    sun_epoch: dict = {}
-    for r in plan:
-        if (
-            r.get("test_type") == "propagation"
-            and r.get("dt_days") == 0.0
-            and r.get("ref_sun_pos_au") is not None
-        ):
-            sun_epoch[r["object"]] = (r["ref_sun_pos_au"], r["ref_sun_vel_au_d"])
 
     timestamp = datetime.now(timezone.utc).isoformat()
     source_version = _oorb_source_version(oorb_bin)
@@ -549,6 +686,9 @@ def main() -> int:
     # appends a pass-through, so the two are not a single arithmetic
     # relationship.
     n_computed = 0
+    # Rows of a self-perturber: emitted with their reason, never run.
+    n_unsupported = 0
+    jobs: list[tuple] = []
 
     for r in plan:
         # Uncertainty axis: skip covariance-bearing rows. oorb supports
@@ -566,19 +706,37 @@ def main() -> int:
         new["channel"] = "oorb"
         new["timestamp"] = timestamp
         new["source_version"] = source_version
+        new["oorb_version"] = source_version
+        new["oorb_settings"] = OORB_SETTINGS
+        out_rows.append(new)
+        if r.get("object") in unsupported:
+            # A named unsupported row: never run, never dropped.
+            new["oorb_unsupported"] = SELF_PERTURBER_UNSUPPORTED
+            n_unsupported += 1
+            continue
+        if any(r.get(k) for k in ("ic_a1", "ic_a2", "ic_a3")):
+            new["oorb_model_note"] = NONGRAV_NOTE
+        jobs.append((r, new))
+    if n_unsupported:
+        print(f"{n_unsupported} rows named unsupported: {SELF_PERTURBER_UNSUPPORTED}", file=sys.stderr)
+
+    def compute(job: tuple) -> dict | None:
+        r, _new = job
         tt = r.get("test_type")
         if tt == "propagation":
-            update = _propagate(r, oorb_bin, env, sun_epoch)
-        elif tt == "ephemeris":
-            update = _ephemeris(r, oorb_bin, env, sun_epoch)
-        else:
-            update = None
+            return _propagate(r, oorb_bin, env, sun)
+        if tt == "ephemeris":
+            return _ephemeris(r, oorb_bin, env, sun)
+        return None
+
+    with ThreadPoolExecutor(max_workers=max(1, args.jobs)) as pool:
+        updates = list(pool.map(compute, jobs))
+    for (_r, new), update in zip(jobs, updates):
         if update is None:
             n_skipped += 1
         else:
             new.update(update)
             n_computed += 1
-        out_rows.append(new)
 
     args.output.parent.mkdir(parents=True, exist_ok=True)
     try:
@@ -594,34 +752,21 @@ def main() -> int:
         raise
     args.output.write_text(_payload)
     print(
-        f"Wrote {len(out_rows)} oorb rows to {args.output} ({n_skipped} skipped)",
+        f"Wrote {len(out_rows)} oorb rows to {args.output} ({n_skipped} skipped, "
+        f"{n_unsupported} named unsupported)",
         file=sys.stderr,
     )
     print(_executive_summary(out_rows), file=sys.stderr)
 
-    # A run in which EVERY row skipped computed nothing. Until now that exited
-    # 0 after writing a full pass-through of untouched plan rows — a file that
-    # looks exactly like a successful oorb channel, tagged channel="oorb", with
-    # not one oorb-computed number in it. The merge then folded zero fields and
-    # the report showed OpenOrb as present-and-agreeing.
-    #
-    # The live cause is a genuine gap, and this is how it becomes visible: the
-    # plan is derived from the rust runner's output, and the rust runner never
-    # populates ref_sun_pos_au / ref_sun_vel_au_d (only `empyrean-validation
-    # plan` does). Both _propagate and _ephemeris need the Sun's SSB state to
-    # convert OpenOrb's heliocentric convention, so every row skips. Failing
-    # here is the honest report of that, not a new defect.
+    # A run in which every row skipped computed nothing: a pass-through of
+    # untouched plan rows must never look like a successful channel.
     if n_computed == 0:
         print(
-            f"ERROR: oorb computed ZERO rows — all {n_skipped} candidate rows "
-            "were skipped.\n"
+            f"ERROR: oorb computed ZERO rows ({n_skipped} skipped, {n_unsupported} "
+            "named unsupported).\n"
             "       The output is a pass-through of untouched plan rows; nothing "
             "in it came from OpenOrb.\n"
-            "       If the skips are 'plan carries no Sun SSB state', the plan is "
-            "missing ref_sun_pos_au /\n"
-            "       ref_sun_vel_au_d — the rust runner does not populate them, so a "
-            "rust-derived plan never\n"
-            "       carries them. See the per-row SKIP lines above for the reason.",
+            "       See the per-row FAIL lines above for the reason.",
             file=sys.stderr,
         )
         return 1

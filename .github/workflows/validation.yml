@@ -65,8 +65,9 @@ name: Validation Suite
 #              The rust channel is the reference and is produced by the
 #              `reference` matrix above.
 #   • external — one matrix leg per independent reference implementation
-#              (ASSIST, find_orb, OpenOrb, kete, jorbit, layup, OrbFit), or one
-#              per object leg for jorbit and OrbFit, each with its own timeout.
+#              (ASSIST, find_orb, OpenOrb, kete, jorbit, layup, adam-core, adam-core-rust, OrbFit),
+#              or one per object leg for jorbit, OrbFit, kete, adam-core and
+#              adam-core-rust, each with its own timeout.
 #              Each replays the *prebuilt* plan; needs no secrets and no
 #              private checkout. fail-fast:false so one dead comparator
 #              never sinks the others — its channel just goes missing
@@ -81,7 +82,9 @@ name: Validation Suite
 #              timestamp (a mismatch fails the run by row and field), and the
 #              prep-plan-and-rust artifact reduce reads.
 #   • reduce — merge every staged channel JSON + render the report +
-#              gate (ci-check) + publish to GCS.
+#              gate (ci-check) + publish to GCS. Runs the prebuilt harness
+#              with the engine library and the engine kernel set restored
+#              (merge-external builds an engine context for find_orb).
 #
 # Every leg restores the same keyed caches (data kernels, JPL API
 # responses, cargo, per-tool build trees) that `prep` populates, so the
@@ -244,24 +247,18 @@ env:
   # cost table marks the real one (2020 CD3), and a rehearsal lowers this so a
   # cheap row fans out. Empty = the table's marks only.
   HEAVY_MIN_S: ${{ inputs.heavy_min_s || '' }}
-  # The external tools that run (scripts/schedule.py pack-external cuts jorbit
-  # and OrbFit into object legs). `oorb` is off: see the external job.
-  EXTERNAL_TOOLS: ${{ inputs.external_tools || 'assist,findorb,kete,jorbit,layup,orbfit,grss' }}
+  # The external tools that run (scripts/schedule.py pack-external cuts jorbit,
+  # OrbFit, kete, adam-core and adam-core-rust into object legs).
+  EXTERNAL_TOOLS: ${{ inputs.external_tools || 'assist,findorb,oorb,kete,jorbit,layup,adam-core,adam-core-rust,orbfit,grss' }}
   EXTERNAL_LEG_TARGET_MIN: ${{ inputs.external_leg_minutes || '' }}
   # The external tools whose setup or import still reaches JPL, NAIF or the MPC,
   # and so seal after setup instead of before it. No validation job may reach
-  # those hosts (the manual mint-inputs run is the only one that does); this
-  # list is what is left to close, and scripts/tests/test_no_upstream_fetch.py
-  # fails if it grows or disagrees with the test's own copy:
-  #   grss    setup fetches the debiasing tables (ssd.jpl.nasa.gov) and the
-  #           observatory codes (data.minorplanetcenter.net); no tool-set folder
-  #           carries them yet
-  #   jorbit  closed by the runner-fixes PR
-  #   kete    its import fetches kernels from naif.jpl.nasa.gov (its leg leaves
-  #           NAIF open); closed by the runner-fixes PR
-  #   oorb    its build fetches its ephemeris; off, re-enabled by empyrean-jg3o
-  #   orbfit  closed by the runner-fixes PR
-  UPSTREAM_FETCH_ALLOWLIST: '["grss","jorbit","kete","oorb","orbfit"]'
+  # those hosts (the manual mint-inputs run is the only one that does), and
+  # since every tool reads its files from the third-party tool set the list is
+  # empty: every external leg seals before setup.
+  # scripts/tests/test_no_upstream_fetch.py fails if it grows or disagrees with
+  # the test's own copy.
+  UPSTREAM_FETCH_ALLOWLIST: '[]'
   TIER: ${{ inputs.tier || 'standard' }}
   # Shared cache keys — every job restores by these exact keys so the
   # downloads/builds `prep` populates fan out warm. Bump a version suffix
@@ -269,12 +266,11 @@ env:
   # The registered kernel set every empyrean repo pins (lang/workflow/gcp-project.md).
   EMPYREAN_DATASET: kernels-full-2026-10-13
   # The third-party tool set (lang/workflow/gcp-project.md): one folder per
-  # suite tool, each listing every file that tool reads. prep syncs it; the
-  # layup, ASSIST, find_orb and GRSS legs read their folders from it (find_orb's
-  # and ASSIST's binary DE440 and GRSS's kernels included), so none of them
-  # downloads from JPL or NAIF. The other tools move to it with the
-  # runner-fixes PR.
-  THIRD_PARTY_DATASET: third-party-tools-2026-11-08
+  # suite tool, each listing every file that tool reads. prep syncs it; every
+  # external leg reads its own folder from it (find_orb's and ASSIST's binary
+  # DE440 and GRSS's kernels included), so none of them downloads from JPL or
+  # NAIF.
+  THIRD_PARTY_DATASET: third-party-tools-2026-11-11
   EMPYREAN_OFFLINE: "1"
 
 jobs:
@@ -811,8 +807,9 @@ jobs:
           echo "Fanning out $count channel legs."
 
       # The external legs: one per tool, or object legs for the tools the
-      # external cost table prices per object (jorbit, OrbFit), each with a
-      # timeout sized to its predicted wall (fixtures/external-costs.json).
+      # external cost table prices per object (jorbit, OrbFit, kete, adam-core,
+      # adam-core-rust), each with a timeout sized to its predicted wall
+      # (fixtures/external-costs.json).
       - name: Schedule the external legs
         id: schedule-external
         working-directory: empyrean-validation
@@ -998,24 +995,12 @@ jobs:
       - name: Engine library (restored from prep; no public release URL)
         uses: ./empyrean-validation/.github/actions/engine-lib
 
-      - name: Restore empyrean data kernels
-        id: cache-data
-        uses: actions/cache/restore@v4
+      # The registered engine kernel set, restored from prep's cache and
+      # verified; a hosted cache miss fails here by name (see the action).
+      - name: Engine data (restored from prep; refused by name when missing)
+        uses: ./empyrean-validation/.github/actions/engine-data
         with:
-          path: data
-          key: empyrean-data-${{ env.EMPYREAN_DATASET }}-set-only
-      # Under `gh act` the data directory comes from the host mount when act's
-      # cache server had nothing for the key (see engine-setup); never on a
-      # hosted run.
-      - name: Copy the registered kernel set from the host mount (act)
-        if: env.ACT == 'true' && steps.cache-data.outputs.cache-hit != 'true'
-        run: |
-          src="${ACT_DATA_DIR:-/host-data}"
-          if [ ! -f "$src/obscodes_extended.json" ] || [ ! -f "$src/de440.bsp" ]; then
-            echo "ERROR: running under act, but no registered kernel set is mounted at $src." >&2
-            exit 1
-          fi
-          rm -rf data && mkdir -p data && cp -a "$src"/. data/
+          dataset: ${{ env.EMPYREAN_DATASET }}
 
       # Inputs snapshot (prep is the sole fetcher): restore by snapshot id and
       # verify offline, no credential. The replay channels fit the pinned PSVs
@@ -1131,24 +1116,12 @@ jobs:
       - name: Engine library (restored from prep; no public release URL)
         uses: ./empyrean-validation/.github/actions/engine-lib
 
-      - name: Restore empyrean data kernels
-        id: cache-data
-        uses: actions/cache/restore@v4
+      # The registered engine kernel set, restored from prep's cache and
+      # verified; a hosted cache miss fails here by name (see the action).
+      - name: Engine data (restored from prep; refused by name when missing)
+        uses: ./empyrean-validation/.github/actions/engine-data
         with:
-          path: data
-          key: empyrean-data-${{ env.EMPYREAN_DATASET }}-set-only
-      # Under `gh act` the data directory comes from the host mount when act's
-      # cache server had nothing for the key (see engine-setup); never on a
-      # hosted run.
-      - name: Copy the registered kernel set from the host mount (act)
-        if: env.ACT == 'true' && steps.cache-data.outputs.cache-hit != 'true'
-        run: |
-          src="${ACT_DATA_DIR:-/host-data}"
-          if [ ! -f "$src/obscodes_extended.json" ] || [ ! -f "$src/de440.bsp" ]; then
-            echo "ERROR: running under act, but no registered kernel set is mounted at $src." >&2
-            exit 1
-          fi
-          rm -rf data && mkdir -p data && cp -a "$src"/. data/
+          dataset: ${{ env.EMPYREAN_DATASET }}
 
       # Inputs snapshot (prep is the sole fetcher): restore by snapshot id and
       # verify offline, no credential. The replay channels fit the pinned PSVs
@@ -1230,7 +1203,8 @@ jobs:
   # ── external ───────────────────────────────────────────────────────
   # One matrix leg per independent reference implementation, or per object leg
   # for the tools cut by object (jorbit died of memory after 41 to 71 min over
-  # the whole catalog; OrbFit took 44 to 51), from the external schedule
+  # the whole catalog; OrbFit took 44 to 51; kete with the sixteen masses outran
+  # 30), from the external schedule
   # assemble wrote (scripts/schedule.py pack-external). Each replays the
   # prebuilt plan through an upstream tool; reduce puts a tool's legs back into
   # its one comparator file before the merge. NO private checkout, NO
@@ -1249,47 +1223,24 @@ jobs:
     runs-on: ubuntu-latest
     # Each leg's own limit, from the external schedule: 3x its predicted wall
     # (fixtures/external-costs.json: measured job walls, OrbFit's per-object fit
-    # times, jorbit's modeled per-object cost), never under 30 minutes.
+    # times, and the per-object walls kete, jorbit and both adam-core channels
+    # measured on hosted runs), never under 30 minutes and never over GitHub's
+    # 360-minute job limit.
     timeout-minutes: ${{ matrix.timeout }}
     # No credentials here: this job inherits the workflow's read-only
     # permissions (no id-token), and none of its legs authenticates or runs
     # gcloud. The legs build and run untrusted upstream code (find_orb, OrbFit,
     # jorbit, OpenOrb), so anything that could mint a bucket token stays in
-    # prep. The layup leg's data is synced by prep and only RESTORED here.
+    # prep. The third-party tool set every leg reads is synced by prep and only RESTORED here.
     strategy:
       fail-fast: false
-      # About 16 legs (jorbit 9, OrbFit 2, five tools 1 each) of 25 minutes or
-      # less, inside the channel stage's ~52: eight at a time finish them
-      # without taking slots from the channel legs under the 60-job limit.
+      # Jorbit, OrbFit, kete, adam-core and adam-core-rust in object legs of
+      # about 25 minutes (a 30-minute capped adam-core fit is a leg of its own)
+      # and the other tools one leg each, OpenOrb's the longest at about 133
+      # minutes (scripts/schedule.py pack-external): eight at a time, without
+      # taking slots from the channel legs under the 60-job limit.
       max-parallel: 8
       matrix:
-        # `oorb` is DISABLED, deliberately — it is not missing from
-        # EXTERNAL_TOOLS (the workflow env) by accident, and the oorb-specific steps below are kept in place as
-        # the re-enable path.
-        #
-        # BLOCKER: run_oorb.py needs `ref_sun_pos_au` / `ref_sun_vel_au_d` on
-        # each row to convert OpenOrb's heliocentric convention into the
-        # plan's SSB frame. Only `empyrean-validation plan` populates those;
-        # the plan this workflow uses is stripped from the rust runner's
-        # output, which never does. Measured: 0 of 652 rust rows and 0 of 448
-        # plan rows carry the key, so 100% of oorb's rows skip. The keys
-        # cannot simply be added to the plan whitelist — they are not in the
-        # v0.7.0 schema empyrean-core pins, so carrying them reintroduces the
-        # deny_unknown_fields break the whitelist strip exists to kill.
-        #
-        # The leg was previously green while computing nothing (a pass-through
-        # of untouched plan rows, exit 0). run_oorb.py now exits nonzero on a
-        # 100% skip, which is honest and is deliberately LEFT IN PLACE — but
-        # it makes this leg permanently red, and a permanently-red leg trains
-        # people to ignore red. So the leg is off, by decision, with the
-        # blocker named: neither faking a pass nor crying wolf.
-        #
-        # RE-ENABLE (empyrean-jg3o): tag the validation schema -> re-pin
-        # empyrean-core -> populate ref_sun_* in the rust runner or the strip
-        # -> add `oorb` back to EXTERNAL_TOOLS and set WITH_OORB=1 in the Makefile.
-        # Until then reduce prints a DISABLED line naming this reason, so the
-        # channel's absence from the report is explained rather than guessed
-        # at.
         include: ${{ fromJson(needs.assemble.outputs.external_legs) }}
     steps:
       - name: Checkout empyrean-validation (default)
@@ -1310,35 +1261,25 @@ jobs:
         with:
           python-version: ${{ env.PYTHON_VERSION }}
 
-      - name: Restore empyrean data kernels
-        id: cache-data
-        uses: actions/cache/restore@v4
+      # The registered engine kernel set, restored from prep's cache and
+      # verified; a hosted cache miss fails here by name (see the action).
+      - name: Engine data (restored from prep; refused by name when missing)
+        uses: ./empyrean-validation/.github/actions/engine-data
         with:
-          path: data
-          key: empyrean-data-${{ env.EMPYREAN_DATASET }}-set-only
-      # Under `gh act` the data directory comes from the host mount when act's
-      # cache server had nothing for the key (see engine-setup); never on a
-      # hosted run.
-      - name: Copy the registered kernel set from the host mount (act)
-        if: env.ACT == 'true' && steps.cache-data.outputs.cache-hit != 'true'
-        run: |
-          src="${ACT_DATA_DIR:-/host-data}"
-          if [ ! -f "$src/obscodes_extended.json" ] || [ ! -f "$src/de440.bsp" ]; then
-            echo "ERROR: running under act, but no registered kernel set is mounted at $src." >&2
-            exit 1
-          fi
-          rm -rf data && mkdir -p data && cp -a "$src"/. data/
+          dataset: ${{ env.EMPYREAN_DATASET }}
 
-      # layup, ASSIST, find_orb and GRSS read their data from the third-party
-      # tool set, folders `layup/`, `assist/`, `findorb/` and `grss/` (every file
-      # each opens, shared kernels included), not from the engine kernel set
-      # and never from JPL or NAIF. find_orb (and the disabled OpenOrb) run
-      # under the ASSIST venv, whose setup checks the `assist/` folder too.
+      # Every external tool reads its data from the third-party tool set, its
+      # own folder (`layup/`, `adam-core/`, `adam-core-rust/`, `assist/`,
+      # `findorb/`, `jorbit/`, `orbfit/`, `oorb/`, `kete/`, `grss/`) listing
+      # every file it opens,
+      # shared kernels included, not the engine kernel set and never JPL, NAIF
+      # or the MPC. find_orb and OpenOrb run under the ASSIST
+      # venv, whose setup checks the `assist/` folder too.
       # prep, the trusted job that already holds the bucket identity, syncs the
       # set and saves it to the cache below; this leg only restores it and
       # refuses a miss by name, with no token, no auth step and no gcloud.
       - name: Restore the third-party tool set
-        if: contains(fromJSON('["layup","assist","findorb","grss","oorb"]'), matrix.tool) && env.ACT != 'true'
+        if: contains(fromJSON('["layup","adam-core","adam-core-rust","assist","findorb","jorbit","orbfit","oorb","kete","grss"]'), matrix.tool) && env.ACT != 'true'
         uses: actions/cache/restore@v4
         with:
           path: |
@@ -1351,15 +1292,21 @@ jobs:
       # ACT_THIRD_PARTY_DIR), beside the engine set's /host-data. Only the
       # folders this tool reads are copied.
       - name: Copy the third-party tool set from the host mount (act)
-        if: contains(fromJSON('["layup","assist","findorb","grss","oorb"]'), matrix.tool) && env.ACT == 'true'
+        if: contains(fromJSON('["layup","adam-core","adam-core-rust","assist","findorb","jorbit","orbfit","oorb","kete","grss"]'), matrix.tool) && env.ACT == 'true'
         run: |
           src="${ACT_THIRD_PARTY_DIR:-/host-third-party}"
           # The sentinel files each folder must hold, and the folders each tool reads.
           case "${{ matrix.tool }}" in
             layup)        dirs="layup";          need="layup/de440.bsp layup/debias_hires2018.tgz" ;;
+            adam-core)    dirs="adam-core";      need="adam-core/de440.bsp adam-core/sb441-n16.bsp" ;;
+            adam-core-rust) dirs="adam-core-rust"; need="adam-core-rust/de440.bsp adam-core-rust/sb441-n16.bsp adam-core-rust/bias.dat adam-core-rust/obscodes_extended.json adam-core-rust/latest_leapseconds.tls adam-core-rust/earth_200101_990827_predict.bpc adam-core-rust/earth_620120_240827.bpc adam-core-rust/earth_latest_high_prec.bpc adam-core-rust/earth_assoc_itrf93.tf" ;;
             assist)       dirs="assist";         need="assist/linux_p1550p2650.440 assist/sb441-n16.bsp" ;;
-            findorb|oorb) dirs="findorb assist"; need="findorb/linux_p1550p2650.440 assist/linux_p1550p2650.440" ;;
-            grss)         dirs="grss";           need="grss/de440.bsp grss/pck00011.tpc grss/sb441-n16s.bsp" ;;
+            jorbit)       dirs="jorbit";         need="jorbit/de440.bsp jorbit/sb441-n16.bsp" ;;
+            findorb)      dirs="findorb assist"; need="findorb/bc405.dat findorb/bias.dat findorb/linux_p1550p2650.440 assist/linux_p1550p2650.440" ;;
+            orbfit)       dirs="orbfit";         need="orbfit/de440.bsp" ;;
+            oorb)         dirs="oorb assist";    need="oorb/de440.dat oorb/de440.bsp oorb/asteroid_ephemeris.txt assist/linux_p1550p2650.440" ;;
+            kete)         dirs="kete";           need="kete/de440s.bsp kete/20000001.bsp kete/bias.dat kete/sb441-n16.bsp" ;;
+            grss)         dirs="grss";           need="grss/de440.bsp grss/sb441-n16s.bsp grss/bias.dat grss/codes.json grss/special_codes.json" ;;
           esac
           for f in $need; do
             if [ ! -f "$src/$f" ]; then
@@ -1393,15 +1340,24 @@ jobs:
             empyrean-validation/runners/assist/.venv
             ~/include
             ~/lib
-          key: ${{ matrix.tool }}-${{ hashFiles(format('empyrean-validation/runners/{0}/setup.sh', matrix.tool), 'empyrean-validation/runners/assist/setup.sh') }}
+          key: ${{ matrix.tool }}-${{ hashFiles(format('empyrean-validation/runners/{0}/setup.sh', matrix.tool), format('empyrean-validation/runners/{0}/Cargo.lock', matrix.tool), 'empyrean-validation/runners/assist/setup.sh') }}
 
       # OpenOrb's Fortran build links LAPACK/BLAS, not present by default.
-      # Inert while `oorb` is off the matrix (see the DISABLED note there);
-      # kept so re-enabling is one list edit rather than an archaeology
-      # exercise.
       - name: Install LAPACK/BLAS (OpenOrb only)
         if: matrix.tool == 'oorb'
         run: sudo apt-get update && sudo apt-get install -y --no-install-recommends liblapack-dev libblas-dev
+
+      # adam-core-rust is the one external leg that compiles: its crate builds
+      # from its committed Cargo.lock with the toolchain action engine-setup
+      # uses (no credential; crates.io only), rather than whatever Rust the
+      # runner image ships (act's image ships none). The tool-build cache above
+      # holds its target directory, so the action's own cache is off.
+      - name: Install the Rust toolchain (adam-core-rust only)
+        if: matrix.tool == 'adam-core-rust'
+        uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          rustflags: ""
+          cache: false
 
       # Inputs snapshot (prep is the sole fetcher): restore by snapshot id and
       # verify offline. No gcloud, no PAT, no GCP identity — this leg stays
@@ -1431,8 +1387,6 @@ jobs:
       # legs must build it explicitly (their `make run-*` would otherwise
       # trigger an uncached assist pip build mid-run, coupling all three
       # comparators to assist-setup health). Other tools are self-contained.
-      # The `oorb` half of the case is inert while that leg is off the matrix
-      # and, like the LAPACK step, is kept as the re-enable path.
       - name: Setup ${{ matrix.tool }}
         working-directory: empyrean-validation
         env:
@@ -1445,12 +1399,11 @@ jobs:
 
       # The allowlisted tools are sealed here, after the setup that still
       # fetches upstream and before the run, which reads only the pinned sets.
-      # kete's import still fetches its kernels from NAIF, so its leg leaves
-      # NAIF open (`--allow-naif`).
+      # The seal covers all six hosts; no leg leaves NAIF open.
       - name: Seal the job from JPL, NAIF and the MPC (after setup, allowlisted tools)
         if: ${{ contains(fromJSON(env.UPSTREAM_FETCH_ALLOWLIST), matrix.tool) }}
         working-directory: empyrean-validation
-        run: ./scripts/seal-upstream.sh ${{ matrix.tool == 'kete' && '--allow-naif' || '' }}
+        run: ./scripts/seal-upstream.sh
 
       # EXT_LEG is this leg's id in the external schedule: an object leg runs
       # only its objects (`--only`), a one-leg tool runs the whole plan.
@@ -1533,9 +1486,10 @@ jobs:
         with:
           path: empyrean-validation
 
-      # Nothing here reaches JPL, NAIF or the MPC: merge-external reads only the
-      # pinned SBDB snapshot. The later GCS publish uses storage.googleapis.com,
-      # which the seal deliberately does not block.
+      # Nothing here reaches JPL, NAIF or the MPC: merge-external reads the
+      # pinned SBDB snapshot and the engine kernel set restored below, and the
+      # engine runs offline (EMPYREAN_OFFLINE). The later GCS publish uses
+      # storage.googleapis.com, which the seal deliberately does not block.
       - name: Seal the job from JPL, NAIF and the MPC
         working-directory: empyrean-validation
         run: ./scripts/seal-upstream.sh
@@ -1545,9 +1499,19 @@ jobs:
           python-version: ${{ env.PYTHON_VERSION }}
 
       # The harness is the binary prep built (no toolchain, no compile), run
-      # against the engine library prep fetched once and cached.
+      # against the engine library prep fetched once and cached, and against the
+      # engine kernel set prep synced: merge-external builds an engine context to
+      # put find_orb's geocentric propagation vectors on the SSB with Earth's
+      # DE440 state, and the engine, offline and sealed, cannot fetch a kernel.
+      # The kernel set is a restore of prep's cache and refuses a miss by name;
+      # it holds no credential, so this job's id-token grant is unchanged (the
+      # publish's alone).
       - name: Engine library (restored from prep; no public release URL)
         uses: ./empyrean-validation/.github/actions/engine-lib
+      - name: Engine data (restored from prep; refused by name when missing)
+        uses: ./empyrean-validation/.github/actions/engine-data
+        with:
+          dataset: ${{ env.EMPYREAN_DATASET }}
       - name: Download the prebuilt binaries
         uses: actions/download-artifact@v4
         with:
@@ -1650,7 +1614,8 @@ jobs:
               --results-dir results
           done
 
-      # reduce runs only the prebuilt harness, then folds in whichever external
+      # reduce runs the prebuilt harness against the engine library and kernel
+      # set restored above, then folds in whichever external
       # channels are present (skipping any that a failed leg left absent, and any
       # whose file is unusable: merge-external isolates each comparator and the
       # report names every one it skipped as "failed: <reason>").
@@ -1677,16 +1642,36 @@ jobs:
       # The radar floor lands on `rust` alone — DELIBERATE and TEMPORARY, see
       # empyrean-s1ab. The radar rows ride the plan and the python and cli
       # drivers replay them, but the reference channel (empyrean-core's
-      # validate-core) has no optical+radar arm: it declines the row and emits
-      # none, so no channel's radar row is ever compared, and a strict-channel
-      # floor on the axis would fail forever for work the reference cannot
-      # judge. Gating the rows where they are produced for certain keeps the
-      # radar work under a floor instead of quietly un-gating it. When the
-      # reference grows a radar arm, move the floor back.
+      # validate-core) has no optical+radar arm: at the bound tag it writes the
+      # plan's radar row back empty (empyrean-core #26 stops writing it, in no
+      # tag yet). The summary drops that declined reference row from the
+      # pairing and ci-check prints a NOTE with the count, so no channel's
+      # radar row is ever compared, and a strict-channel floor on the axis
+      # would fail forever for work the reference cannot judge. Gating the
+      # rows where they are produced for certain keeps the radar work under a
+      # floor instead of quietly un-gating it. When the reference grows a
+      # radar arm, move the floor back.
+      #
+      # The rust radar floor excuses exactly one fit, by name: the Apophis
+      # optical+radar fit, which exhausts damping under empyrean 0.11.0-rc.1
+      # on every platform (empyrean-a7f5f). The excuse is keyed to the rc1
+      # engine stack in the rust row's source_version (the FLOOR_EXCEPTIONS
+      # table in src/report.rs). ci-check prints it as a NOTE; on any other
+      # engine the exception itself fails the gate, so a new pin re-examines it.
       #
       # Floors are only applied on a full-catalog run: a workflow_dispatch
       # with an OBJECTS subset legitimately produces fewer rows, and a floor
       # that fires on a deliberate subset would train everyone to ignore it.
+      #
+      # The requested comparators are required on a full-catalog run only, for
+      # the same reason (a subset can legitimately land 0 rows on a path: act's
+      # find_orb leg writes no propagation rows). `--require-comparators` takes
+      # the run's EXTERNAL_TOOLS plus `jpl-sbdb`: each must have merged and every
+      # merge path of each (find_orb's OD, propagation, ephemeris and radar
+      # passes, ASSIST's folded and standalone rows, ...) must have landed more
+      # than 0 rows, or the gate fails naming the comparator, the path and why.
+      # Run 44355534056 went 112/112 green and passed ci-check with find_orb
+      # absent from the report, because a failed comparator was only a NOTE.
       #
       # `--plan` applies on every run, subset or not: every object the plan
       # names (results/validation_plan.json, from the prep-plan-and-rust
@@ -1695,21 +1680,27 @@ jobs:
       # missing: ..."). Without it an object the reference never replayed
       # left every other channel's rows for it unreferenced, which the gate
       # only notes, and the run passed with that object never compared.
-      - name: ci-check (gate on python + core parity, OD row floors, reference rows per object)
+      - name: ci-check (gate on python + core parity, OD row floors, reference rows per object, requested comparators)
         working-directory: empyrean-validation
         run: |
           if [ -z "${OBJECTS}" ]; then
             FLOORS="--catalog-floors"
-            echo "Full catalog run — enforcing the catalog-derived per-axis floors."
+            # Every requested comparator must have merged, and every one of its merge
+            # paths must have landed rows (find_orb's OD, propagation, ephemeris and
+            # radar passes among them); jpl-sbdb is the pinned SBDB OD reference every
+            # reduce merges. Full catalog only, see the comment above.
+            REQUIRE="--require-comparators ${EXTERNAL_TOOLS},jpl-sbdb"
+            echo "Full catalog run — enforcing the catalog-derived per-axis floors and the requested comparators (${EXTERNAL_TOOLS},jpl-sbdb)."
           else
             FLOORS=""
-            echo "::warning title=OD row floors not enforced::OBJECTS='${OBJECTS}' is a subset, so the per-axis ci-check floors are skipped for this run."
+            REQUIRE=""
+            echo "::warning title=OD row floors not enforced::OBJECTS='${OBJECTS}' is a subset, so the per-axis ci-check floors and the requested-comparator requirement are skipped for this run."
           fi
           ./target/release/empyrean-validation ci-check \
             --summary results/validation_summary.json \
             --plan results/validation_plan.json \
             --strict-channels python,core \
-            ${FLOORS}
+            ${FLOORS} ${REQUIRE}
 
       # ── GCS upload ─────────────────────────────────────────────
       # Publish on every real trigger (a pin-bump push or a manual dispatch;
@@ -1737,8 +1728,7 @@ jobs:
         run: |
           trigger=0
           # `schedule` is inert while the weekly cron is off (see "Triggers"
-          # at the top) and is kept here ON PURPOSE, the same way the oorb
-          # re-enable path is kept below. This gate is the narrower of the two
+          # at the top) and is kept here ON PURPOSE. This gate is the narrower of the two
           # lists, so a cron restored in `on:` without a matching edit here
           # would run the full suite and then silently decline to publish it.
           case "${{ github.event_name }}" in
@@ -1787,18 +1777,6 @@ jobs:
           # vanishing, which is the one thing the delete bought; the report
           # states which channels ran, and a stale sibling object is a far
           # smaller problem than an empty bucket mid-publish.
-          #
-          # ONE OUTSTANDING CONSEQUENCE of that trade, now that `oorb` is a
-          # deliberately disabled leg: `latest/channels/oorb.json` in the
-          # bucket is whatever the last green-but-computed-nothing run put
-          # there — a pass-through of untouched plan rows tagged
-          # channel="oorb". It is not overwritten because the file is no
-          # longer produced. Nothing in this workflow deletes published
-          # objects, and adding a delete here is a production-data action that
-          # wants a human, so this is recorded rather than automated: the
-          # stale object should be removed out of band as part of
-          # empyrean-jg3o. The loop below is left listing `oorb` so the
-          # re-enable path needs no edit; `[ -f ]` skips it meanwhile.
           gcloud storage cp results/validation.json            ${{ env.GCS_BUCKET }}/latest/validation.json
           gcloud storage cp results/od_validation.json         ${{ env.GCS_BUCKET }}/latest/od_validation.json
           gcloud storage cp results/validation_report.html     ${{ env.GCS_BUCKET }}/latest/validation_report.html
@@ -1809,7 +1787,7 @@ jobs:
             gcloud storage cp results/validation_report.predict.json "${{ env.GCS_BUCKET }}/latest/validation_report.predict.json"
           fi
           gcloud storage cp results/validation_summary.json    ${{ env.GCS_BUCKET }}/latest/validation_summary.json
-          for ch in rust python c cli core assist findorb oorb kete jorbit layup orbfit; do
+          for ch in rust python c cli core assist findorb oorb kete jorbit layup adam-core adam-core-rust orbfit; do
             f="results/validation_${ch}.json"
             [ -f "$f" ] && gcloud storage cp "$f" "${{ env.GCS_BUCKET }}/latest/channels/${ch}.json"
           done
@@ -1824,7 +1802,7 @@ jobs:
             gcloud storage cp results/validation_report.predict.json "${{ env.GCS_BUCKET }}/archive/${TIMESTAMP}/validation_report.predict.json"
           fi
           gcloud storage cp results/validation_summary.json    ${{ env.GCS_BUCKET }}/archive/${TIMESTAMP}/validation_summary.json
-          for ch in rust python c cli core assist findorb oorb kete jorbit layup orbfit; do
+          for ch in rust python c cli core assist findorb oorb kete jorbit layup adam-core adam-core-rust orbfit; do
             f="results/validation_${ch}.json"
             [ -f "$f" ] && gcloud storage cp "$f" "${{ env.GCS_BUCKET }}/archive/${TIMESTAMP}/channels/${ch}.json"
           done

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Setup OpenOrb (Fortran) for propagation comparison.
+# Build OpenOrb (Fortran) at a pinned commit, for propagation comparison.
 #
 # Clones and builds oorb (Granvik et al.'s Fortran orbit-computation
 # library) from source. The pip-installable Python wrapper (`pyoorb`)
@@ -12,10 +12,17 @@
 # oorb is GPL-3.0 licensed and never linked into empyrean. This script
 # builds it as an external reference tool only.
 #
-# Usage:
-#   ./oorb/setup.sh [--prefix DIR]
+# Data: this script builds the binary and nothing else. Everything oorb
+# reads at run time (de440.dat, OBSCODE.dat, ET-UT.dat, TAI-UTC.dat and the
+# BC430 asteroid files) comes from the oorb/ folder of the third-party tool
+# set, staged by run_oorb.py into a private OORB_DATA directory. `make
+# ephem`, which downloads JPL's ASCII ephemeris, is never run.
 #
-# Default install prefix: oorb/install/
+# Usage:
+#   ./oorb/setup.sh [PREFIX]          # default prefix: oorb/install/
+#   OORB_COMMIT=<sha> ./oorb/setup.sh # another commit (deliberately)
+#
+# A failed build fails this script: the leg only runs when asked for.
 
 set -euo pipefail
 
@@ -23,85 +30,50 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PREFIX="${1:-$SCRIPT_DIR/install}"
 BUILD_DIR="$SCRIPT_DIR/build"
 NPROC="$(sysctl -n hw.ncpu 2>/dev/null || nproc 2>/dev/null || echo 4)"
+# Pinned: the commit whose OBSCODE.dat, ET-UT.dat and TAI-UTC.dat the oorb/
+# folder of the third-party tool set carries (master of 2026-08-20).
+OORB_COMMIT="${OORB_COMMIT:-02278424f6c13a5c653a5e3ab021aa4ccc537966}"
 
 echo "OpenOrb setup"
 echo "  build dir: $BUILD_DIR"
 echo "  prefix:    $PREFIX"
+echo "  commit:    $OORB_COMMIT"
 echo
 
-# oorb is an optional external comparator built from Fortran source. Any
-# failure — missing toolchain (gfortran / LAPACK), an upstream change,
-# or the ephemeris build — is non-fatal: the function returns non-zero,
-# we warn loudly, and leave no binary, so the suite runs without this one
-# comparator rather than failing the whole validation. The absence is
-# surfaced by the runner skip and by the report, never silently
-# substituted. (Invoked as an `if` condition, so `set -e` is suspended
-# inside it and the explicit `|| return 1` guards drive the flow.)
-build_oorb() {
-    if ! command -v gfortran &>/dev/null; then
-        echo "gfortran not found on PATH (install gfortran / gcc-gfortran)."
-        return 1
-    fi
+command -v gfortran >/dev/null || { echo "ERROR: gfortran not found on PATH (install gfortran / gcc-gfortran)." >&2; exit 1; }
 
-    mkdir -p "$BUILD_DIR" "$PREFIX/bin"
-
-    cd "$BUILD_DIR"
-    if [ ! -d oorb ]; then
-        echo "Cloning oorb..."
-        git clone https://github.com/oorb/oorb.git || return 1
-    else
-        echo "oorb: already cloned"
-        ( cd oorb && git pull --ff-only ) || return 1
-    fi
-
-    cd "$BUILD_DIR/oorb"
-
-    # `./configure` writes a make.config that drives the rest of the
-    # build. Pass an explicit toolchain ("gfortran") and the "opt" build
-    # profile so the resulting binary is optimized rather than a debug
-    # build.
-    echo
-    echo "Configuring oorb..."
-    ./configure gfortran opt --prefix="$PREFIX" || return 1
-
-    echo
-    echo "Building oorb..."
-    make -j"$NPROC" || return 1
-
-    # `make ephem` builds the SPK→DCB conversion that produces the binary
-    # JPL ephemeris files oorb expects at runtime. Skip if data is already
-    # present. Non-critical even within a successful build.
-    if [ ! -f "$BUILD_DIR/oorb/data/de440.dat" ] \
-       && [ ! -f "$BUILD_DIR/oorb/data/de430.dat" ]; then
-        echo
-        echo "Building JPL ephemeris (de430/de440)..."
-        make ephem || echo "WARNING: 'make ephem' failed — runner will fall back to bundled JPL data if available"
-    fi
-
-    # The `main/oorb` binary is the CLI we drive from Python. Copy it (and
-    # its data directory) into the install prefix so the runner can find
-    # them without depending on the build tree layout.
-    cp "$BUILD_DIR/oorb/main/oorb" "$PREFIX/bin/oorb" || return 1
-    mkdir -p "$PREFIX/data"
-    cp -R "$BUILD_DIR/oorb/data/." "$PREFIX/data/" || return 1
-
-    local conf="$BUILD_DIR/oorb/main/oorb.conf"
-    [ -f "$conf" ] && cp "$conf" "$PREFIX/oorb.conf"
-    return 0
-}
-
-if build_oorb; then
-    echo
-    echo "oorb built successfully."
-    echo "  binary:    $PREFIX/bin/oorb"
-    echo "  data dir:  $PREFIX/data"
-else
-    echo
-    echo "############################################################"
-    echo "WARNING: OpenOrb (oorb) build FAILED."
-    echo "The oorb external propagation/ephemeris comparison will be"
-    echo "SKIPPED; all other channels and comparators are unaffected."
-    echo "############################################################"
-    echo
-    rm -f "$PREFIX/bin/oorb"
+mkdir -p "$BUILD_DIR" "$PREFIX/bin"
+cd "$BUILD_DIR"
+if [ ! -d oorb ]; then
+    echo "Cloning oorb..."
+    git clone --quiet https://github.com/oorb/oorb.git
 fi
+cd "$BUILD_DIR/oorb"
+if ! git cat-file -e "${OORB_COMMIT}^{commit}" 2>/dev/null; then
+    git fetch --quiet origin
+fi
+git checkout --quiet --detach "$OORB_COMMIT"
+head="$(git rev-parse HEAD)"
+if [ "$head" != "$OORB_COMMIT" ]; then
+    echo "ERROR: oorb checkout is at $head, not the pinned $OORB_COMMIT." >&2
+    exit 1
+fi
+
+# `./configure` writes a make.config that drives the rest of the build:
+# an explicit toolchain ("gfortran") and the optimized "opt" profile.
+echo "Configuring oorb..."
+./configure gfortran opt --prefix="$PREFIX"
+echo "Building oorb..."
+make -j"$NPROC"
+
+# The `main/oorb` binary is the CLI the runner drives, and the shipped
+# oorb.conf is its configuration (the runner sets the dynamical model and
+# the perturbers from it, per row).
+cp "$BUILD_DIR/oorb/main/oorb" "$PREFIX/bin/oorb"
+cp "$BUILD_DIR/oorb/main/oorb.conf" "$PREFIX/oorb.conf"
+printf '%s\n' "$OORB_COMMIT" > "$PREFIX/COMMIT"
+
+echo
+echo "oorb built at $OORB_COMMIT."
+echo "  binary: $PREFIX/bin/oorb"
+echo "  conf:   $PREFIX/oorb.conf"

@@ -8,6 +8,13 @@ Horizons).
 ASSIST is GPL-licensed and never linked into empyrean. This script runs
 independently in its own virtual environment.
 
+Every row ASSIST runs uses one force model: the planets file plus the sixteen
+SB441-N16 asteroid perturbers of sb441-n16.bsp. An object that is itself one of
+the sixteen (the plan names it in `excluded_perturbers_naif`) is never run: each
+of its rows is written for every arm with the reason in `assist_unsupported`
+and no propagation, Horizons lookup or timing, because ASSIST has no per-body
+exclusion.
+
 Usage:
     python run_assist.py --data-dir ~/.empyrean/data --output assist_results.json
     python run_assist.py --objects Apophis,Bennu --output assist_results.json
@@ -98,6 +105,61 @@ ASSIST_ARMS = [
     ("assist_asteroid_institute", False, "assist_asteroid_institute_variational_off"),
     ("assist_asteroid_institute", True, "assist_asteroid_institute_variational_on"),
 ]
+
+
+# ── Self-perturbers ─────────────────────────────────────
+#
+# ASSIST integrates every body of the asteroid file it loads, sb441-n16.bsp: the
+# sixteen SB441-N16 perturbers, by asteroid number below. It has no per-body
+# exclusion, so an object that is itself one of the sixteen starts on its own
+# 1/r² singularity and is ejected (~7e8 km within 30 days, measured). The plan
+# names such an object by NAIF id 2000000+n in excluded_perturbers_naif: each of
+# its rows is a named unsupported row with the reason in assist_unsupported,
+# never propagated, and no row switches force model, as the adam-core, layup,
+# OpenOrb, kete and jorbit runners do.
+SB441_N16 = (1, 2, 3, 4, 7, 10, 15, 16, 31, 52, 65, 87, 88, 107, 511, 704)
+SELF_PERTURBER_NAIF = frozenset(2_000_000 + n for n in SB441_N16)
+SELF_PERTURBER_UNSUPPORTED = (
+    "self-perturber: ASSIST integrates the sixteen SB441-N16 perturbers of "
+    "sb441-n16.bsp and has no per-body exclusion, so the object would sit on "
+    "its own 1/r² singularity"
+)
+
+
+def assist_unsupported_reason(row: dict) -> str | None:
+    """Why ASSIST does not run this plan row, or None. Decided from the row's
+    `excluded_perturbers_naif`, never from the object's name or population."""
+    if SELF_PERTURBER_NAIF & set(row.get("excluded_perturbers_naif") or ()):
+        return SELF_PERTURBER_UNSUPPORTED
+    return None
+
+
+def unsupported_rows(name, data, dt, reason, timestamp, source_version, config_prov):
+    """The rows of one (object, dt) ASSIST does not run: one per arm, each
+    carrying the reason in `assist_unsupported` and no position, comparison or
+    timing, so `merge-external` folds the reason into `tool_unsupported`."""
+    return [
+        {
+            "object": name,
+            "population": data["population"],
+            "epoch_mjd_tdb": data["epoch"],
+            "dt_days": dt,
+            "t_mjd_tdb": data["epoch"] + dt,
+            "force_model": "full",
+            "test_type": "assist",
+            "propagation_uncertainty": arm,
+            "assist_config": config,
+            "variational": with_stm,
+            "assist_unsupported": reason,
+            "timestamp": timestamp,
+            "notes": data["notes"],
+            "source_version": source_version,
+            "assist_version": assist.__version__,
+            "rebound_version": rebound.__version__,
+            "assist_config_settings": config_prov[config],
+        }
+        for config, with_stm, arm in ASSIST_ARMS
+    ]
 
 
 def apply_config(sim, config):
@@ -639,16 +701,10 @@ def main():
         print("Run: ./setup.sh")
         sys.exit(1)
 
+    # The one force model every row ASSIST runs: planets + the sixteen SB441-N16
+    # perturbers. A self-perturber is named unsupported instead (see
+    # assist_unsupported_reason), never run under another model.
     ephem = assist.Ephem(planets_path=str(planets_path), asteroids_path=str(asteroids_path))
-    # Self-perturber objects (SB441-N16 members: Iris/Vesta/Pallas/Hygiea)
-    # CANNOT be propagated with the asteroid-perturber set loaded: ASSIST has
-    # no per-body exclusion, so the test particle starts on top of its own
-    # 1/r² singularity and is ejected (~7e8 km error within 30 days,
-    # measured). Empyrean excludes only the self body; ASSIST's closest
-    # honest equivalent is a planets-only force model for these objects —
-    # their residual therefore retains the other-15-asteroid signal, which
-    # is stated, not hidden.
-    ephem_planets_only = assist.Ephem(planets_path=str(planets_path))
 
     # Horizons cache (read empyrean's cache directly)
     cache_dir = Path(args.horizons_cache) if args.horizons_cache else Path.home() / ".empyrean" / "cache" / "horizons_assist"
@@ -664,6 +720,7 @@ def main():
         "epoch": None, "population": "", "notes": "", "dt_days": [],
         "a1": 0.0, "a2": 0.0, "a3": 0.0,
         "gr_alpha": None, "gr_r0": None, "gr_m": None, "gr_n": None, "gr_k": None,
+        "unsupported": {},
     })
     for r in emp_results:
         if r.get("test_type") != "propagation":
@@ -673,6 +730,10 @@ def main():
         obj_data[name]["population"] = r["population"]
         obj_data[name]["notes"] = r.get("notes", "")
         obj_data[name]["dt_days"].append(r["dt_days"])
+        # dt -> why ASSIST does not run this horizon (a self-perturber).
+        reason = assist_unsupported_reason(r)
+        if reason is not None:
+            obj_data[name]["unsupported"][r["dt_days"]] = reason
         # Pick up non-grav params from empyrean results. The schema uses
         # `ic_*` keys (set by the rust runner from SBDB) — older versions
         # of this runner read `non_grav_*` which never matched anything,
@@ -741,6 +802,7 @@ def main():
     n_capped = 0
     capped_rows = []
     capped_by_arm = {arm: 0 for _, _, arm in ASSIST_ARMS}
+    unsupported_by_object = {}
 
     for name, data in sorted(obj_data.items()):
         epoch = data["epoch"]
@@ -751,20 +813,17 @@ def main():
             print(f"{name}: SKIP (not in ASSIST object catalog)")
             continue
 
-        # Self-perturbers: planets-only forces (see ephem_planets_only note).
-        if data["population"] == "Self-Perturber":
-            obj_ephem = ephem_planets_only
-            print(f"{name}: self-perturber — ASSIST runs planets-only "
-                  "(no per-body exclusion; asteroid set would include the object itself)")
-        else:
-            obj_ephem = ephem
-
         print(f"{name} ({data['population']})")
+        unsupported = data["unsupported"]
+        for reason in sorted(set(unsupported.values())):
+            print(f"  UNSUPPORTED, not run: {reason}")
 
-        # Initial conditions from the pinned Horizons snapshot. A miss is a
-        # gap in the sealed inputs, not a skip: query_horizons raises and the
-        # leg fails, naming the object/product/key.
-        pos0, vel0 = query_horizons(cache, obj_def.horizons_command, epoch, name)
+        # Initial conditions from the pinned Horizons snapshot, read at the
+        # first horizon ASSIST runs (an object it names unsupported at every
+        # horizon reads nothing). A miss is a gap in the sealed inputs, not a
+        # skip: query_horizons raises and the leg fails, naming the
+        # object/product/key.
+        pos0 = vel0 = None
 
         # Non-grav params from empyrean validation results
         a1 = data["a1"]
@@ -784,6 +843,17 @@ def main():
 
         for dt in dt_days:
             target = epoch + dt
+
+            reason = unsupported.get(dt)
+            if reason is not None:
+                # A named unsupported row per arm: never propagated or timed.
+                results.extend(unsupported_rows(
+                    name, data, dt, reason, timestamp, source_version, config_prov,
+                ))
+                unsupported_by_object[name] = unsupported_by_object.get(name, 0) + len(ASSIST_ARMS)
+                continue
+            if pos0 is None:
+                pos0, vel0 = query_horizons(cache, obj_def.horizons_command, epoch, name)
 
             # Horizons reference at target from the pinned snapshot (a miss
             # raises MissingInputError and fails the leg — never a skip).
@@ -808,7 +878,7 @@ def main():
                 try:
                     # warmup (carries the wall-clock cap)
                     propagate_assist(
-                        pos0, vel0, epoch, target, obj_ephem,
+                        pos0, vel0, epoch, target, ephem,
                         a1=a1, a2=a2, a3=a3,
                         gr_alpha=gr_alpha, gr_nk=gr_nk, gr_nm=gr_nm,
                         gr_nn=gr_nn, gr_r0=gr_r0,
@@ -822,7 +892,7 @@ def main():
                     ast_stm = None
                     for _ in range(n_runs):
                         ast_pos, ast_vel, ms, call_ms, ast_stm = propagate_assist(
-                            pos0, vel0, epoch, target, obj_ephem,
+                            pos0, vel0, epoch, target, ephem,
                             a1=a1, a2=a2, a3=a3,
                             gr_alpha=gr_alpha, gr_nk=gr_nk, gr_nm=gr_nm,
                             gr_nn=gr_nn, gr_r0=gr_r0,
@@ -940,6 +1010,9 @@ def main():
     for c in ASSIST_CONFIGS:
         print(f"  config {c}: {json.dumps(config_prov[c])}")
     print(f"  Horizons cache: {cache.hits} hits")
+    print(f"  UNSUPPORTED (named, not run): {sum(unsupported_by_object.values())} row(s)")
+    for obj, n in unsupported_by_object.items():
+        print(f"    {obj:<14} {n} row(s)")
     print(f"  WALL-CLOCK CAP FAILURES: {n_capped} row(s) total")
     for arm, n in capped_by_arm.items():
         print(f"    {arm:<44} {n} capped")

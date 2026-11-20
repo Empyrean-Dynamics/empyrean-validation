@@ -4,14 +4,16 @@ comparator file before the merge, in the order one unchunked run writes, with
 comparator isolation intact.
 
 Covers scripts/schedule.py (pack-external, validate-external),
-scripts/channel-chunks.py (external-objects, concat-external) and the two
-runner flags the object legs use (run_jorbit.py --only, run_orbfit.py
---only / --defer-all-failed)."""
+scripts/channel-chunks.py (external-objects, concat-external), the runner flags
+the object legs use (run_jorbit.py --only, run_orbfit.py --only /
+--defer-all-failed, run_kete.py --only), `make run-kete EXT_LEG=` and
+`make run-adam-core EXT_LEG=` / `make run-adam-core-rust EXT_LEG=`."""
 
 import importlib.util
 import json
 import math
 import pathlib
+import shutil
 import subprocess
 import sys
 
@@ -144,6 +146,61 @@ def test_the_external_validator_refuses_each_broken_shape(sc, world):
     assert any("below the floor" in b for b in bad(lambda t: t["tools"]["assist"]["legs"][0].update(timeout_min=12)))
     assert any("one leg over every object" in b for b in bad(lambda t: t["tools"]["assist"]["legs"][0].update(objects=["A"])))
     assert sc.validate_external(p, "0" * 64, s) == ["the external schedule was built for a different plan (hash mismatch)"]
+
+
+# ── GitHub's job limit ──────────────────────────────────────────────────────
+
+
+def with_job_min(world, tool, job_min):
+    costs = json.loads(world["cp"].read_text())
+    costs["tools"][tool] = {"job_min": job_min}
+    world["cp"].write_text(json.dumps(costs))
+
+
+def test_a_timeout_above_githubs_job_limit_is_capped_at_it_and_the_cap_is_recorded(sc, world):
+    with_job_min(world, "assist", 150.0)  # 3 x 150 = 450, above the 360-minute limit
+    with_job_min(world, "findorb", 100.0)  # 3 x 100 = 300, under it
+    s, _ = sched(sc, world, tools=("assist", "findorb"))
+    assert sc.JOB_LIMIT_MIN == 360
+    capped = s["tools"]["assist"]["legs"][0]
+    assert capped["timeout_min"] == 360 and capped["timeout_capped_from_min"] == 450
+    assert s["tools"]["findorb"]["legs"][0]["timeout_min"] == 300
+    assert "timeout_capped_from_min" not in s["tools"]["findorb"]["legs"][0], "only a capped leg carries the record"
+    assert s["timeout_cap_min"] == 360
+    assert sc.external_leg_matrix(s)[0] == {"tool": "assist", "leg": "01", "timeout": 360}
+    assert sc.validate_external(plan(), s["plan_sha256"], s) == []
+
+
+def test_a_leg_predicted_to_reach_the_job_limit_is_refused_naming_the_limit(sc, world, capsys):
+    with_job_min(world, "assist", 360.0)  # the cap would leave a timeout equal to the predicted wall
+    s, _ = sched(sc, world, tools=("assist",))
+    bad = sc.validate_external(plan(), s["plan_sha256"], s)
+    assert len(bad) == 1 and "reaches GitHub's 360-minute job limit" in bad[0] and "assist leg 01" in bad[0]
+    with pytest.raises(SystemExit) as e:
+        sc.main(["pack-external", "--plan", str(world["pp"]), "--costs", str(world["cp"]), "--tools", "assist", "--out", str(world["dir"] / "o.json")])
+    assert "360-minute job limit" in str(e.value)
+    # below the limit the same tool is accepted, its timeout capped
+    with_job_min(world, "assist", 359.5)
+    s, _ = sched(sc, world, tools=("assist",))
+    assert sc.validate_external(plan(), s["plan_sha256"], s) == []
+    assert s["tools"]["assist"]["legs"][0]["timeout_min"] == 360
+
+
+def test_a_hand_edited_timeout_above_the_job_limit_is_refused(sc, world):
+    s, _ = sched(sc, world)
+    s["tools"]["assist"]["legs"][0]["timeout_min"] = 400
+    assert any("above GitHub's 360-minute job limit" in b for b in sc.validate_external(plan(), s["plan_sha256"], s))
+
+
+def test_pack_external_prints_the_cap_and_each_capped_leg(sc, world, capsys):
+    with_job_min(world, "assist", 150.0)
+    with_job_min(world, "findorb", 100.0)
+    rc = sc.main(["pack-external", "--plan", str(world["pp"]), "--costs", str(world["cp"]), "--tools", "assist,findorb", "--out", str(world["dir"] / "o.json")])
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert "timeouts capped at 360 min (GitHub's hosted job limit)" in out
+    assert "assist" in out and "timeouts 360 (capped from 450) min" in out
+    assert "findorb" in out and "timeouts 300 min" in out and "300 (capped" not in out
 
 
 # ── external-objects ────────────────────────────────────────────────────────
@@ -316,10 +373,19 @@ def run_orbfit(orbfit, monkeypatch, world, *flags, fail=True):
             d.update(orbfit_rms_arcsec=0.5, orbfit_n_obs_used=10, orbfit_n_obs_rejected=0, orbfit_is_nongrav=False)
         return d
 
+    class FakeSun:  # the runner seeds from the registered DE440 Sun; no SPK needed here
+        def __init__(self, path):
+            self.path = path
+
+        def sha256(self):
+            return "0" * 64
+
     monkeypatch.setattr(orbfit, "process_od_row", fake)
     monkeypatch.setattr(orbfit, "orbfit_source_version", lambda image: "orbfit test")
+    monkeypatch.setattr(orbfit, "SunEphemeris", FakeSun)
     out = world["dir"] / "orbfit.json"
-    monkeypatch.setattr(sys, "argv", ["run_orbfit.py", "--plan", str(world["pp"]), "--output", str(out), "--psv-dir", str(world["dir"]), *flags])
+    monkeypatch.setattr(sys, "argv", ["run_orbfit.py", "--plan", str(world["pp"]), "--output", str(out), "--psv-dir", str(world["dir"]),
+                                      "--de440", str(world["dir"] / "de440.bsp"), *flags])
     return orbfit.main(), out
 
 
@@ -330,3 +396,107 @@ def test_an_orbfit_leg_defers_the_every_object_failed_verdict_to_the_merge(orbfi
     assert rc == 0 and [r["object"] for r in json.loads(out.read_text())] == ["A", "B"]
     rc, _ = run_orbfit(orbfit, monkeypatch, world, "--only", "A,Nope", "--defer-all-failed")
     assert rc == 2
+
+
+def test_kete_refuses_an_only_naming_an_object_outside_the_plan_before_loading_kete(world):
+    """Refused before kete is imported, so it holds without kete installed."""
+    for only, said in (("A,Nope", "['Nope']"), (" , ", "no object")):
+        r = subprocess.run(
+            [sys.executable, str(ROOT / "runners/kete/run_kete.py"), "--input", str(world["pp"]), "--only", only,
+             "--output", str(world["dir"] / "x.json"), "--data-dir", str(world["dir"] / "no-kete-folder")],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        assert r.returncode == 2 and said in r.stderr, r.stderr
+
+
+# A stand-in for a tool's python that records the argv make handed it.
+ARGV_STUB = """#!{py}
+import json, sys
+a = sys.argv[1:]
+json.dump(a, open(a[a.index("--output") + 1], "w"))
+"""
+
+
+@pytest.mark.skipif(shutil.which("make") is None, reason="make unavailable")
+@pytest.mark.parametrize("leg", ["01", "02", ""])
+def test_make_run_kete_replays_only_its_legs_objects(sc, world, leg):
+    """An object leg hands run_kete.py its objects as --only; with no EXT_LEG
+    the whole plan runs, as before the chunking."""
+    costs = json.loads(world["cp"].read_text())
+    costs["tools"]["kete"] = {"setup_min": 1.0, "leg_overhead_min": 0.5, "default_object_min": 3.0, "object_min": {"A": 9.0}}
+    world["cp"].write_text(json.dumps(costs))
+    s, sp = sched(sc, world, tools=("kete",))
+    results = world["dir"] / "results"
+    results.mkdir()
+    (results / "validation_plan.json").write_text(world["pp"].read_text())
+    s["plan_sha256"] = sc.file_sha256(results / "validation_plan.json")
+    sp.write_text(json.dumps(s))
+    stub = world["dir"] / "kete-python"
+    stub.write_text(ARGV_STUB.format(py=sys.executable))
+    stub.chmod(0o755)
+    r = subprocess.run(
+        ["make", "-o", "fixtures", "run-kete", "PLAN_PREBUILT=1", f"EXT_LEG={leg}", f"RESULTS_DIR={results}",
+         f"EXTERNAL_SCHEDULE={sp}", f"KETE_PY={stub}"],
+        cwd=ROOT,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert r.returncode == 0, r.stdout + r.stderr
+    argv = json.loads((results / "validation_kete.json").read_text())
+    want = {leg_["leg"]: leg_["objects"] for leg_ in s["tools"]["kete"]["legs"]}
+    if leg:
+        assert argv[argv.index("--only") + 1] == ",".join(want[leg])
+    else:
+        assert "--only" not in argv
+
+
+@pytest.mark.skipif(shutil.which("make") is None, reason="make unavailable")
+@pytest.mark.parametrize("leg", ["01", "02", ""])
+@pytest.mark.parametrize("tool,runner_var", [("adam-core", "ADAM_CORE_PY"), ("adam-core-rust", "ADAM_CORE_RUST_BIN")])
+def test_make_run_adam_core_replays_only_its_legs_objects_under_the_cap(sc, world, leg, tool, runner_var):
+    """An object leg hands each adam-core channel its objects as --objects, and
+    both take their per-object cap from the one ADAM_CORE_TIMEOUT_MIN; with no
+    EXT_LEG the whole plan runs."""
+    costs = json.loads(world["cp"].read_text())
+    costs["tools"][tool] = {"setup_min": 1.0, "leg_overhead_min": 0.5, "default_object_min": 3.0, "object_min": {"A": 9.0}}
+    world["cp"].write_text(json.dumps(costs))
+    s, sp = sched(sc, world, tools=(tool,))
+    assert len(s["tools"][tool]["legs"]) >= 2
+    results = world["dir"] / "results"
+    results.mkdir()
+    (results / "validation_plan.json").write_text(world["pp"].read_text())
+    s["plan_sha256"] = sc.file_sha256(results / "validation_plan.json")
+    sp.write_text(json.dumps(s))
+    stub = world["dir"] / f"{tool}-runner"
+    stub.write_text(ARGV_STUB.format(py=sys.executable))
+    stub.chmod(0o755)
+    r = subprocess.run(
+        ["make", "-o", "fixtures", f"run-{tool}", "PLAN_PREBUILT=1", f"EXT_LEG={leg}", f"RESULTS_DIR={results}",
+         f"EXTERNAL_SCHEDULE={sp}", f"{runner_var}={stub}", "ADAM_CORE_TIMEOUT_MIN=7"],
+        cwd=ROOT,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert r.returncode == 0, r.stdout + r.stderr
+    argv = json.loads((results / f"validation_{tool}.json").read_text())
+    assert argv[argv.index("--timeout-min") + 1] == "7"
+    want = {leg_["leg"]: leg_["objects"] for leg_ in s["tools"][tool]["legs"]}
+    if leg:
+        assert argv[argv.index("--objects") + 1] == ",".join(want[leg])
+    else:
+        assert "--objects" not in argv
+
+
+def test_the_committed_table_prices_adam_core_per_object_at_most_its_cap():
+    """A fit is killed at the 30-minute cap both adam-core channels share, so no
+    object is priced above it, and every object the table names is priced (a
+    capped one at the cap)."""
+    tools = json.loads((ROOT / "fixtures" / "external-costs.json").read_text())["tools"]
+    for tool in ("adam-core", "adam-core-rust"):
+        t = tools[tool]
+        assert len(t["object_min"]) >= 50, tool
+        assert all(0.0 <= v <= 30.0 for v in t["object_min"].values()), tool

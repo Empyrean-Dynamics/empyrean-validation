@@ -77,11 +77,13 @@ plan; their results are folded onto the core channel's rows.
 | [ASSIST](https://github.com/matthewholman/assist) | Holman et al., ephemeris-driven REBOUND (pinned 1.2.3, rebound 4.6.0) | propagation (f64 and first-order STM modes), timing | yes |
 | [find_orb](https://github.com/Bill-Gray/find_orb) | Bill Gray / Project Pluto | orbit determination and fitted orbits; propagation and ephemeris of its own fitted orbit (fit, then propagate); **radar OD** | yes |
 | [GRSS](https://github.com/rahil-makadia/grss) | Makadia et al., small-body propagation and OD with radar | propagation, ephemeris, orbit determination (χ², reduced χ², rms, n_obs), **radar OD** (delay and Doppler residuals) | yes |
+| [adam-core](https://github.com/B612-Asteroid-Institute/adam_core) | Asteroid Institute, the released adam-core and adam-assist (ASSIST) | propagation, ephemeris, orbit determination (public `CORE_OD_V1` profile) | yes (`WITH_ADAM_CORE=` skips it) |
+| [adam-core (Rust API)](https://crates.io/crates/adam_core) | Asteroid Institute, the same release through its public Rust crates (`adam_core` 0.8.0 + `adam_assist` 0.7.0) | propagation, ephemeris, orbit determination (public `CORE_OD_V1` profile), every file from the registered set | yes (`WITH_ADAM_CORE_RUST=` skips it) |
 | [layup](https://github.com/Smithsonian/layup) | Holman / Smithsonian, an ASSIST-backed orbit fitter | orbit determination (χ², reduced χ², n_obs, convergence) | yes (`WITH_LAYUP=` skips it) |
 | [OrbFit](http://adams.dm.unipi.it/orbfit/) | OrbFit Consortium / MPC, `neofit2.x` from the MPC's Docker image | orbit determination with CMC2003 rejection, refit from the plan's initial condition | yes (`WITH_ORBFIT=` skips it) |
 | [kete](https://github.com/dahlend/kete) | Dar Dahlen | propagation, ephemeris, orbit determination | yes |
 | [jorbit](https://github.com/ben-cassese/jorbit) | Ben Cassese, JAX-based | propagation and geocentric ephemeris (gravity only) | yes |
-| [OpenOrb](https://github.com/oorb/oorb) | Granvik et al., University of Helsinki | propagation, ephemeris | no (`WITH_OORB=1`): the plan does not carry the Sun state its heliocentric conversion needs |
+| [OpenOrb](https://github.com/oorb/oorb) | Granvik et al., University of Helsinki | propagation, ephemeris (n-body with its BC430 asteroid perturbers, seeded from the registered DE440 Sun state) | yes (`WITH_OORB=` skips it) |
 
 **JPL is one source of truth in two views.** SBDB supplies the initial
 conditions, the fitted orbit and covariance, and JPL's own reported fit
@@ -130,7 +132,12 @@ the run, naming what failed, when:
   delivered nothing for it, so no other channel's rows for it were compared.
   It fails as `reference leg missing: <objects>`. Rows a channel emits on an
   axis the reference does not run are reported per axis as unreferenced and
-  do not fail the run.
+  do not fail the run. The one axis the reference declines is radar: its empty
+  `orbit_determination_radar` rows are dropped from the pairing and counted in
+  a NOTE (an empty reference row on any other axis still fails as unjudged),
+  and the radar floor excuses one fit by name, the Apophis optical+radar fit,
+  only while the rust row's `source_version` is the rc1 engine. On any other
+  engine the exception itself fails the gate, converged or not.
 
 ## How CI runs it
 

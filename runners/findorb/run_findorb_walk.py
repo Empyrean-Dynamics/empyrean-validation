@@ -28,7 +28,21 @@ What find_orb does and does not deliver here
   *filtering the original fixture lines* (§2.4: fit-set identity is a protocol
   invariant, not a per-tool reparse). find_orb reads ADES PSV natively, so the
   fixture bytes reach it unmodified apart from the ``pos1-3`` decimal-point
-  sanitization its ADES reader requires (see ``_sanitize_ades``).
+  sanitization its ADES reader requires (see ``_sanitize_ades``) and find_orb's
+  spelling of the few MPC ``astCat`` names its reader misses (see below).
+* **Debiasing.** find_orb's own EFCC18 star-catalog debiasing is on for the fit,
+  exactly as the reference walk's fit debiases: its ``debias`` axis
+  (``runners/rust/src/walk.rs``, ``"efcc"`` by default, or ``"off"``) is
+  ``"efcc"`` on the ``default`` arm this runner pairs with. The manifest carries
+  no fit-side debias axis; its per-observation correction is applied only in
+  scoring, to the observed position a prediction is measured against. Nothing is
+  corrected twice: the fit corrects its input, scoring corrects the observation,
+  and the prediction is never corrected. find_orb looks each correction up by
+  the observation's catalog code, which its ADES reader takes from ``astCat``;
+  MPC's name ``Tyc2`` is not in its table, so the window file carries find_orb's
+  spelling ``Tycho-2`` instead (``findorb_common.ADES_CATALOG_SPELLING``), and a
+  fixture with no ``astCat`` column is refused by name rather than fitted
+  undebiased. The setting is recorded in ``{stem}_settings.json``.
 * **Predict** — the *same* ``fo`` invocation that fits also writes the
   ephemerides: ``-C <code,code,...>`` with ``-e eph_%c.txt`` runs the fit once
   and then loops over observatory codes (``fo.cpp``, the ``while(*mpc_code_tptr)``
@@ -103,11 +117,12 @@ What find_orb does and does not deliver here
   - ``mu1.txt`` — asteroid numbers and masses. Ships with find_orb.
   - ``bc405.dat`` — Baer & Chesley's BC-405 ephemeris: 300 asteroids, 6 elements,
     3654 40-day chunks spanning 1800–2200, as raw doubles. Exactly
-    52,617,600 bytes. Obtained by downloading the 131 MB
-    ``asteroid_ephemeris.txt`` linked from
-    https://www.projectpluto.com/ast_pert.htm and letting ``fo`` convert it once.
+    52,617,600 bytes. Staged from the registered set's ``findorb/`` folder
+    (find_orb's own conversion of Gray's ``asteroid_ephemeris.txt``, see
+    https://www.projectpluto.com/ast_pert.htm) into a private config directory
+    by ``findorb_common.stage_cfg_dir``; the walk refuses to start without it.
   - ``bc405pre.dat`` — memoized int16 asteroid positions (AU × 1000).
-    Auto-created, and the one config file find_orb *writes*; see ``_make_cfg_dir``.
+    Auto-created, and the one config file find_orb *writes*; see ``findorb_common.stage_cfg_dir``.
 
   The ``PERTURBERS`` mask asks for asteroids; only the data turns them on. A
   missing ``bc405.dat`` costs one line of find_orb output and silently changes
@@ -197,12 +212,22 @@ import tempfile
 import time
 from pathlib import Path
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import findorb_common as FC  # noqa: E402
+
 # Tool tag on every emitted record (matches the §4.4 runner table).
 TOOL = "findorb"
 # Externals run their defaults only — one arm.
 CONFIG_ARM = "default"
 # find_orb solves the 6-element state; no non-gravs are requested here.
 N_SOLVE_FOR = 6
+# The reference walk's fit-side `debias` axis (runners/rust/src/walk.rs ArmSpec)
+# mapped onto find_orb's own EFCC18 switch (SETTINGS2's last field).
+DEBIAS_AXIS = {"efcc": True, "off": False}
+# The value of that axis on the reference arm CONFIG_ARM pairs with: walk.rs's
+# default_debias() and its builtin "default" arm are both "efcc". The manifest
+# carries no fit-side axis to read per window, so the walk runs this one.
+FIT_DEBIAS = "efcc"
 
 # ── Time scales ─────────────────────────────────────────────
 # (first MJD UTC of validity, TAI − UTC seconds). Provenance: IERS Bulletin C,
@@ -263,7 +288,8 @@ def mjd_utc_to_jd_tt(mjd_utc: float) -> float:
     """MJD UTC → JD TT.
 
     TT = UTC + (TAI − UTC) + 32.184 s. find_orb is handed TT directly (the
-    ephemeris times file carries ``OPTION T`` and ``TT_EPHEMERIS=1`` is set), so
+    ephemeris times file carries ``OPTION T``) and dates its ephemeris in UTC,
+    which this same conversion takes back to TT (``_parse_ephem_file``), so
     unlike the TDB-fed channels this conversion stops at TT and the emitted
     ``epoch_scale_used`` is ``"tt"``. TDB − TT is ≤ 1.7 ms — four orders of
     magnitude inside the manifest's 120-second cut clearance (§2.1) — so the
@@ -326,106 +352,39 @@ def _fo_binary(explicit: str | None, repo: Path) -> Path | None:
 
 
 def _findorb_version(fo_bin: Path) -> str:
-    """Provenance string for the run banner: the checked-out find_orb commit.
+    """Provenance string for the banner and the settings record: the find_orb commit.
 
-    No-hidden-fallbacks: when the sha cannot be resolved (not a git checkout,
-    git missing) say so explicitly rather than reporting a silent blank.
+    An ``fo`` under setup.sh's install prefix was built from ``build/find_orb``;
+    any other is read from its own directory. Either must be inside a find_orb
+    checkout (one holding ``fo.cpp``): ``git -C`` walks up, and from the install
+    prefix it would otherwise answer with this repository's commit.
+    No-hidden-fallbacks: when the sha cannot be resolved, say so explicitly.
     """
-    src = fo_bin.parent
-    try:
-        proc = subprocess.run(
-            ["git", "-C", str(src), "rev-parse", "--short", "HEAD"],
-            capture_output=True,
-            text=True,
-            timeout=10,
-            check=False,
-        )
-    except Exception as e:  # noqa: BLE001
-        return f"unknown ({e})"
-    if proc.returncode != 0:
+    here = Path(__file__).resolve().parent
+    fo = fo_bin.resolve()
+    src = here / "build" / "find_orb" if fo.is_relative_to(here / "install") else fo.parent
+
+    def git(*a: str) -> tuple[str | None, str]:
+        try:
+            proc = subprocess.run(
+                ["git", "-C", str(src), *a], capture_output=True, text=True, timeout=10, check=False
+            )
+        except Exception as e:  # noqa: BLE001
+            return None, str(e)
         tail = (proc.stderr or "").strip().splitlines()
-        return f"unknown ({tail[-1] if tail else 'git rev-parse failed'})"
-    sha = proc.stdout.strip()
+        if proc.returncode != 0:
+            return None, tail[-1] if tail else f"git {a[0]} failed"
+        return proc.stdout.strip(), ""
+
+    top, why = git("rev-parse", "--show-toplevel")
+    if top is None:
+        return f"unknown ({why})"
+    if not (Path(top) / "fo.cpp").is_file():
+        return f"unknown ({src} is not inside a find_orb checkout)"
+    sha, why = git("rev-parse", "--short", "HEAD")
+    if sha is None:
+        return f"unknown ({why})"
     return sha or "unknown (empty git sha)"
-
-
-# find_orb's config directory: where every `fopen_ext(..., "c...")` file is
-# resolved from. `default_config_dir_name` probes ~, /software, /root and an alt
-# dir for cospar.txt; on this platform that is always ~/.find_orb.
-FO_CONFIG_DIR = Path.home() / ".find_orb"
-# The BC-405 asteroid ephemeris, converted to binary: 300 asteroids x 3654
-# 40-day chunks x 6 elements x 8 bytes. bc405.cpp fixes every one of those
-# numbers, so the size is an exact integrity check, not an approximation.
-BC405_DAT = "bc405.dat"
-BC405_DAT_BYTES = 6 * 300 * 3654 * 8  # 52_617_600
-# find_orb's memoized int16 asteroid positions (AU x 1000), 3 per asteroid per
-# chunk. Auto-created if absent, and the ONLY config file find_orb writes.
-BC405_PRE = "bc405pre.dat"
-
-
-def _bc405_status() -> tuple[Path | None, str]:
-    """Locate ``bc405.dat`` and report whether it is intact.
-
-    Returns (path or None, human-readable status). The size check matters: a
-    truncated or half-converted file does not make find_orb fail, it makes the
-    asteroid positions wrong somewhere in the middle of the file.
-    """
-    path = FO_CONFIG_DIR / BC405_DAT
-    if not path.exists():
-        return None, f"absent from {FO_CONFIG_DIR}"
-    size = path.stat().st_size
-    if size != BC405_DAT_BYTES:
-        return None, f"WRONG SIZE {size} bytes (expected {BC405_DAT_BYTES})"
-    return path, f"{path} ({size} bytes, intact)"
-
-
-def _make_cfg_dir(base: Path) -> Path:
-    """Create a private find_orb config directory for this process.
-
-    Only one file goes in it. ``bc405pre.dat`` is opened ``"cr+b"`` — read-WRITE
-    in the config directory — and `find_and_set_precomputed_data` fills in any
-    chunk it finds zeroed and writes it back. Several `fo` processes sharing one
-    copy would interleave those 1800-byte chunk writes, and while every writer
-    computes identical bytes (so a torn write cannot corrupt a *value*), a
-    reader can catch a chunk mid-write: the "already computed?" test reads only
-    the first asteroid's three int16s, so a partially-written chunk reads as
-    done and the remaining asteroids are used at position (0,0,0). That is a
-    silent physics error, so each process gets its own file instead.
-
-    Seeded by copying the shared cache when one exists, purely to skip
-    recomputation — the cache is pure memoization, and a private copy was
-    verified to reproduce shared-cache predictions byte for byte. When no shared
-    cache exists the file is deliberately NOT created: find_orb then makes one
-    here, correctly sized for whichever BC-405 variant is installed. Creating a
-    wrong-sized placeholder would be worse than creating none.
-
-    Everything else find_orb needs (`bc405.dat`, `mu1.txt`, `ObsCodes.htm`, the
-    other 50 config files) is absent here and falls back to ~/.find_orb, which
-    is read-only in this flow.
-    """
-    cfg = base / "cfg"
-    cfg.mkdir(parents=True, exist_ok=True)
-    master = FO_CONFIG_DIR / BC405_PRE
-    private = cfg / BC405_PRE
-    if master.exists() and not private.exists():
-        shutil.copy2(master, private)
-    return cfg
-
-
-def _jpl_ephemeris(explicit: str | None, repo: Path) -> Path | None:
-    """Locate Bill Gray's binary JPL DE file (``linux_p1550p2650.440``)."""
-    candidates: list[Path] = []
-    if explicit:
-        candidates.append(Path(explicit).expanduser())
-    candidates += [
-        Path.home() / ".empyrean" / "data" / "linux_p1550p2650.440",
-        Path.home() / ".find_orb" / "linux_p1550p2650.440",
-        repo.parent / "data" / "linux_p1550p2650.440",
-    ]
-    for c in candidates:
-        if c.is_file():
-            return c
-    return None
 
 
 # ── ADES fixture handling ───────────────────────────────────
@@ -463,6 +422,8 @@ class Fixture:
         except ValueError as e:
             raise ValueError(f"{path}: header lacks stn/obsTime: {cols}") from e
         self.pos_cols = [cols.index(k) for k in ("pos1", "pos2", "pos3") if k in cols]
+        # find_orb's debiasing looks each correction up by this column's catalog.
+        self.ast_cat_col: int | None = cols.index("astCat") if "astCat" in cols else None
         for line in raw[i + 1 :]:
             if not line.strip():
                 continue
@@ -503,6 +464,8 @@ def _write_window_ades(fx: Fixture, keep: set[tuple[str, str]], out: Path) -> in
     """
     kept = [line for line, key in zip(fx.lines, fx.keys) if key in keep]
     body = [_sanitize_ades(line, fx.pos_cols) for line in kept]
+    if fx.ast_cat_col is not None:
+        body = [FC.findorb_catalog_spelling(line, fx.ast_cat_col) for line in body]
     with open(out, "w") as f:
         f.writelines(line + "\n" for line in (*fx.pre_header, fx.header, *body))
     return len(kept)
@@ -512,7 +475,8 @@ def _write_window_ades(fx: Fixture, keep: set[tuple[str, str]], out: Path) -> in
 
 
 def _write_environ(
-    work: Path, n_times: int, times_name: str, perturbers: str, pert_list: str
+    work: Path, n_times: int, times_name: str, perturbers: str, pert_list: str,
+    *, debiasing: bool,
 ) -> None:
     """Write find_orb's per-run configuration file.
 
@@ -522,48 +486,20 @@ def _write_environ(
     absolute path under a long scratch directory overflows them — harmlessly on
     macOS, fatally on a ``_FORTIFY_SOURCE`` Linux build.
     """
-    lines = [
-        # Symlinked into the working directory by the caller.
-        "LINUX_JPL_FILENAME=jpl_de.440",
-        # Mercury..Pluto + Moon (0x7fe) + asteroids (bit 20 = 0x100000, the
-        # `IDX_ASTEROIDS` runge.cpp tests before calling `detect_perturbers`).
-        f"PERTURBERS={perturbers}",
-        # ── BC-405 asteroid perturbations ────────────────────
-        # All three of these are find_orb's own documented defaults
-        # (`environ.def`), written explicitly so the configuration states what
-        # runs instead of relying on built-in fallbacks.
-        #
-        # BC405_ASTEROIDS: how many of BC-405's 300 asteroids are eligible. 300
-        # is find_orb's default and the full model.
-        "BC405_ASTEROIDS=300",
-        # ASTEROID_THRESH: include an asteroid when it is within this many AU of
-        # the target, scaled by sqrt(mass/Pallas). 10 is find_orb's default.
-        "ASTEROID_THRESH=10",
-        # ASTEROID_PERT_LIST: EMPTY is find_orb's default and means "consider all
-        # 300, culled by the proximity test above". A non-empty list is the
-        # opposite of what it looks like — `detect_perturbers` sets
-        # `possible_perturber = 0` whenever `n_fixed` is set, so naming asteroids
-        # RESTRICTS the model to exactly those and disables the other ~284.
-        # Hence the default stays empty; `--asteroid-pert-list` exists for
-        # deliberately replicating another integrator's fixed set.
-        f"ASTEROID_PERT_LIST={pert_list}",
-        # use_sigmas=1 (honour the ADES rmsRA/rmsDec), ephemeris_mag_limit=22
-        # (fo resets this to 999 before any ephemeris), sigmas_in_columns=0,
-        # forced_central_body=-2 (auto), apply_debiasing=0.
-        #
-        # The last field is the load-bearing one: find_orb's own EFCC/Farnocchia
-        # debiasing stays OFF, because this family applies catalog debiasing
-        # centrally from the manifest. Two debiasing passes would double-correct.
-        "SETTINGS2=1 22.00 0 -2 0",
-        # Encke's method for the integration.
-        "ENCKE=1",
-        # find_orb's stock 3-sigma outlier rejection.
-        "OUTLIER_REJECTION_LIMIT=3",
-        # Ephemeris epochs come from a file (leading 't' selects that mode); the
-        # times in it are TT and we want TT back out.
-        f"EPHEM_STEPS={n_times} t{times_name}",
-        "TT_EPHEMERIS=1",
-    ]
+    # The shared settings (findorb_common.environ_lines), with find_orb's EFCC18
+    # debiasing as the reference walk's fit has it (`debiasing`, from its
+    # `debias` axis; see FIT_DEBIAS), and this walk's one difference: the
+    # ephemeris epochs come from a file (leading 't' selects that mode), the times
+    # in it TT, the dates written back UTC (converted to TT on parse; see
+    # findorb_common on EPHEMERIS_TIMESCALE). The manifest's debias is a scoring correction to
+    # the observed position a prediction is measured against, never a fit input,
+    # so nothing is corrected twice.
+    lines = FC.environ_lines(
+        debiasing=debiasing,
+        perturbers=perturbers,
+        pert_list=pert_list,
+        extra=(f"EPHEM_STEPS={n_times} t{times_name}",),
+    )
     (work / "environ.dat").write_text("\n".join(lines) + "\n")
 
 
@@ -663,6 +599,12 @@ _EPHEM_WIDTHS = {
 def _parse_ephem_file(path: Path) -> list[dict] | str:
     """Parse one station's computer-friendly ephemeris written with ``-E 5,16,17``.
 
+    find_orb dates each row in UTC (its default for observables; the TT keyword
+    corrupts total.json at the pinned commit, see findorb_common). Each date is
+    converted to TT here with the pinned leap-second table (``jd_tt``; the UTC
+    date stays as ``jd_utc``), the conversion that made the TT epochs find_orb
+    was handed, so the epoch check compares like with like.
+
     Returns the parsed rows, or a *reason string* when the file cannot be used —
     the caller turns that into a named per-window failure rather than a silent
     gap. An unexpected row width is one of those reasons: a mis-indexed row
@@ -690,8 +632,10 @@ def _parse_ephem_file(path: Path) -> list[dict] | str:
         # Offsets from the right end: [... motion, motionPA (, sigma, sigmaPA)].
         m0 = -4 if has_sigma else -2
         try:
+            jd_utc = float(parts[0])
             row = {
-                "jd_tt": float(parts[0]),
+                "jd_utc": jd_utc,
+                "jd_tt": mjd_utc_to_jd_tt(jd_utc - MJD_TO_JD),
                 "ra_deg": float(parts[1]),
                 "dec_deg": float(parts[2]),
                 "motion_arcmin_hr": float(parts[m0]),
@@ -737,7 +681,7 @@ def _run_fo(
         obs_name,
         "-c",  # combine every record in the file into one object
         "-q",  # quiet: no progress chatter from parallel workers
-        # Private config directory (see `_make_cfg_dir`). find_orb looks here
+        # Private config directory (see `findorb_common.stage_cfg_dir`). find_orb looks here
         # first and falls back to ~/.find_orb for everything absent, so this
         # costs one file and isolates the one config file fo WRITES.
         # The trailing separator is required: fopen_ext does `strcat` with no
@@ -1387,6 +1331,7 @@ def _walk_object(task: dict) -> tuple[list[dict], list[dict], dict]:
     max_reduced_chi2 = task["max_reduced_chi2"]
     pert_list = task["asteroid_pert_list"]
     n_mc = task["mc_samples"]
+    debiasing = task["debiasing"]
 
     name = obj["object"]
     stats = {
@@ -1418,6 +1363,12 @@ def _walk_object(task: dict) -> tuple[list[dict], list[dict], dict]:
     except Exception as e:  # noqa: BLE001
         stats["error"] = f"fixture parse failed: {e}"
         return [], [], stats
+    if debiasing and fx.ast_cat_col is None:
+        stats["error"] = (
+            "fixture has no astCat column: find_orb looks each debias correction up by "
+            "the observation's catalog and would fit undebiased without a word"
+        )
+        return [], [], stats
 
     observations = obj["observations"]
     win_records: list[dict] = []
@@ -1438,7 +1389,10 @@ def _walk_object(task: dict) -> tuple[list[dict], list[dict], dict]:
         # the asteroid-position cache it holds is worth carrying across an
         # object's windows, and it is what keeps parallel workers off each
         # other's writes.
-        cfg_dir = _make_cfg_dir(base)
+        cfg_dir = FC.stage_cfg_dir(
+            base, Path(task["data_dir"]), debiasing=debiasing,
+            asteroids=bool(int(task["perturbers"], 16) & (1 << 20)),
+        )
         for w in windows:
             idx = int(w["index"])
             stats["windows"] += 1
@@ -1499,11 +1453,12 @@ def _walk_object(task: dict) -> tuple[list[dict], list[dict], dict]:
 
             with open(work / "times.txt", "w") as f:
                 # OPTION T: the times below are TD/TT. find_orb converts them to
-                # UTC on read and back to TT for the ephemeris (TT_EPHEMERIS=1),
-                # so what comes back out is what went in.
+                # UTC on read, evaluates each at its TT instant and dates the row
+                # in UTC, which _parse_ephem_file converts back to TT, so what
+                # comes back out is what went in (the epoch check below).
                 f.write("OPTION T\n")
                 f.writelines(f"JD {t:.9f}\n" for t in times)
-            _write_environ(work, len(times), "times.txt", perturbers, pert_list)
+            _write_environ(work, len(times), "times.txt", perturbers, pert_list, debiasing=debiasing)
             for code in codes:
                 stale = work / f"eph_{code}.txt"
                 if stale.exists():
@@ -1731,6 +1686,26 @@ def _write_jsonl(path: Path, records: list[dict]) -> None:
     path.write_text("".join(line + "\n" for line in lines))
 
 
+def walk_settings(fo_bin: Path, data_dir: Path, debiasing: bool, args) -> dict:
+    """The find_orb version and every setting the walk's fits ran at, keyed as the
+    OD runner keys its rows (``fo_version``, ``fo_settings``)."""
+    settings = FC.settings_record(data_dir, debiasing=debiasing, pert_list=args.asteroid_pert_list)
+    settings["perturbers_mask"] = args.perturbers
+    settings["fit_debias_axis"] = (
+        f"{FIT_DEBIAS}: the reference walk's fit-side debias axis on its default arm "
+        "(the manifest's debias is applied only in scoring)"
+    )
+    if debiasing:
+        settings["catalog_names"] = (
+            "MPC astCat names find_orb's reader misses given find_orb's spelling: "
+            + ", ".join(f"{k} -> {v}" for k, v in FC.ADES_CATALOG_SPELLING.items())
+        )
+    settings["warm_start"] = str(bool(args.warm_start))
+    settings["max_reduced_chi2"] = f"{args.max_reduced_chi2:g}"
+    settings["mc_samples"] = str(max(0, int(args.mc_samples)))
+    return {"tool": TOOL, "fo_version": f"find_orb {_findorb_version(fo_bin)}", "fo_settings": settings}
+
+
 def main() -> int:
     here = Path(__file__).resolve().parent
     repo = here.parent.parent  # runners/findorb/ → repo root
@@ -1779,11 +1754,12 @@ def main() -> int:
         "runners/findorb/install/bin/fo, then ../tools/find_orb/fo, then $PATH.",
     )
     p.add_argument(
-        "--jpl-ephemeris",
+        "--data-dir",
         type=str,
         default=None,
-        help="Bill Gray's binary JPL DE file (linux_p1550p2650.440). Default: "
-        "~/.empyrean/data, then ~/.find_orb, then ../data.",
+        help="The registered find_orb data folder (third-party set, findorb/): "
+        "bc405.dat and linux_p1550p2650.440. Required; the run refuses to start "
+        "without them.",
     )
     p.add_argument(
         "--perturbers",
@@ -1857,31 +1833,17 @@ def main() -> int:
         )
         return 1
 
-    jpl = _jpl_ephemeris(args.jpl_ephemeris, repo)
-
     # Asteroid perturbations are requested by the PERTURBERS mask but ENABLED by
     # the presence of the data. Without bc405.dat find_orb prints one line about
-    # it and integrates on happily with planets only — a silent downgrade of the
-    # force model that would show up nowhere in the output. Refuse instead.
+    # it and integrates on happily with planets only, a silent downgrade of the
+    # force model. stage_cfg_dir refuses, naming the file.
     asteroids_on = bool(int(args.perturbers, 16) & (1 << 20))
-    bc405_path, bc405_status = _bc405_status()
-    if asteroids_on and bc405_path is None:
-        print(
-            f"ERROR: asteroid perturbations are requested (PERTURBERS={args.perturbers}, "
-            f"bit 20 set) but {BC405_DAT} is {bc405_status}.\n"
-            "       find_orb would print 'asteroid perturbations cannot be included' and "
-            "run with planets only —\n"
-            "       a quietly different force model that no output field records.\n"
-            "       Install it: download BC-405 (~131 MB ASCII, 6,577,200 lines) from the "
-            "link on\n"
-            "       https://www.projectpluto.com/ast_pert.htm, put it in "
-            f"{FO_CONFIG_DIR}/asteroid_ephemeris.txt,\n"
-            f"       and run one fo fit to convert it — {BC405_DAT} must end up exactly "
-            f"{BC405_DAT_BYTES} bytes.\n"
-            "       To run deliberately without asteroids, pass --perturbers 7fe.",
-            file=sys.stderr,
-        )
-        return 1
+    debiasing = DEBIAS_AXIS[FIT_DEBIAS]
+    data_dir = Path(args.data_dir).expanduser().resolve() if args.data_dir else None
+    with tempfile.TemporaryDirectory(prefix="fo_walk_check_") as chk:
+        FC.stage_cfg_dir(Path(chk), data_dir, debiasing=debiasing, asteroids=asteroids_on)
+    jpl = data_dir / FC.JPL_DE_FILE
+    bc405_status = f"{data_dir / FC.BC405_DAT} ({FC.BC405_DAT_BYTES} bytes, intact)"
 
     manifest_path = args.manifest.expanduser().resolve()
     if not manifest_path.exists():
@@ -1925,7 +1887,7 @@ def main() -> int:
     )
     print(
         f"  fo: {fo_bin} (find_orb {_findorb_version(fo_bin)})\n"
-        f"  JPL DE: {jpl if jpl else 'NOT FOUND — find_orb will fall back to its own search'}\n"
+        f"  JPL DE: {jpl}\n"
         f"  perturbers: {args.perturbers} "
         + (
             f"(Merc-Pluto + Moon + BC-405 asteroids: {bc405_status}, "
@@ -1938,6 +1900,8 @@ def main() -> int:
             else "(Merc-Pluto + Moon; asteroid perturbations OFF)"
         )
         + "\n"
+        f"  debias: {FIT_DEBIAS} (the reference walk's fit-side axis) -> find_orb EFCC18 "
+        f"{'on' if debiasing else 'off'}\n"
         f"  warm_start: {args.warm_start}  workers: {args.workers}  "
         f"max_reduced_chi2: {args.max_reduced_chi2:g}",
         file=sys.stderr,
@@ -1949,13 +1913,15 @@ def main() -> int:
             "fixtures_dir": str(fixtures_dir),
             "profile": args.profile,
             "fo_bin": str(fo_bin),
-            "jpl": str(jpl) if jpl else None,
+            "jpl": str(jpl),
+            "data_dir": str(data_dir),
             "timeout": args.timeout,
             "perturbers": args.perturbers,
             "warm_start": args.warm_start,
             "max_reduced_chi2": args.max_reduced_chi2,
             "asteroid_pert_list": args.asteroid_pert_list,
             "mc_samples": max(0, int(args.mc_samples)),
+            "debiasing": debiasing,
         }
         for obj in selected
     ]
@@ -2019,11 +1985,18 @@ def main() -> int:
     stem = out.with_suffix("")
     windows_path = stem.with_name(stem.name + "_windows.jsonl")
     preds_path = stem.with_name(stem.name + "_predictions.jsonl")
+    settings_path = stem.with_name(stem.name + "_settings.json")
 
     # Sidecars first: the thin-row file is what a downstream `make` target keys
     # on, so it must not appear before the payload it stands for exists.
     _write_jsonl(windows_path, all_windows)
     _write_jsonl(preds_path, all_predictions)
+    # The walk's records have no settings field (predict_schema is
+    # deny_unknown_fields), so the settings every window ran at go beside them,
+    # keyed as the OD runner keys them on its rows.
+    settings_path.write_text(
+        json.dumps(walk_settings(fo_bin, data_dir, debiasing, args), indent=2) + "\n"
+    )
     # External tools emit no thin ValidationResult rows; the empty array keeps
     # the pipeline's file shape uniform.
     out.write_text("[]\n")
@@ -2065,7 +2038,8 @@ def main() -> int:
         + mc_block
         + f"  Thin rows:        {out} (empty by design)\n"
         f"  Windows sidecar:  {windows_path}\n"
-        f"  Predictions:      {preds_path}\n" + "─" * 56,
+        f"  Predictions:      {preds_path}\n"
+        f"  Settings:         {settings_path}\n" + "─" * 56,
         file=sys.stderr,
     )
 

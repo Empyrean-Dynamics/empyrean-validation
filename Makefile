@@ -123,37 +123,18 @@ FO_BIN := $(EMP_VAL_RUNNERS)/findorb/install/bin/fo
 CORE_BIN := $(EMPYREAN_CORE_ROOT)/target/release/validate-core
 WITH_CORE := $(if $(or $(wildcard $(EMPYREAN_CORE_ROOT)/Cargo.toml),$(and $(PREBUILT_BIN),$(wildcard $(CORE_BIN)))),1,)
 
-# OpenOrb: DEFAULT-OFF, and that is a decision, not an oversight.
-#
-# run_oorb.py needs ref_sun_pos_au / ref_sun_vel_au_d on each row to convert
-# OpenOrb's heliocentric convention into the plan's SSB frame. Only
-# `empyrean-validation plan` populates those; the plan CI and this Makefile
-# actually use is stripped from the rust runner's output, which never does.
-# Measured: 0 of 652 rust rows and 0 of 448 plan rows carry the key, so 100%
-# of oorb's rows skip. The runner now exits nonzero on that instead of writing
-# a pass-through of untouched plan rows and calling it a green channel — which
-# means running it today is a guaranteed, permanent failure, not a flaky one.
-#
-# It cannot simply be plumbed: ref_sun_* are not among the 70 keys of the
-# v0.7.0 schema empyrean-core pins, so adding them to PLAN_CARRIED_KEYS
-# reintroduces the deny_unknown_fields break the whitelist strip exists to
-# kill. Sequencing (empyrean-jg3o): tag the validation schema -> re-pin
-# empyrean-core -> populate ref_sun_* -> set WITH_OORB=1 here and restore the
-# `oorb` matrix leg in .github/workflows/validation.yml.
-#
-# Turning it off rather than leaving it red is the point: a leg that is always
-# red teaches people to ignore red, and a leg that skips in silence is the
-# defect this whole branch exists to eliminate. Set WITH_OORB=1 to run it
-# anyway — the runner's honest nonzero exit is deliberately intact, so a
-# premature re-enable fails immediately and says why.
+# OpenOrb runs by default. Its runner converts the plan's SSB states to
+# OpenOrb's heliocentric convention with the Sun's state from the registered
+# DE440 (runners/sunstate, the oorb/ folder of the third-party tool set), so it
+# no longer needs a Sun state on the plan rows. WITH_OORB= skips it.
 #
 # Defined here, above every target that references it: GNU make expands a
 # prerequisite list when the rule is READ, so a flag defined below `setup`
 # reads as empty there no matter what it is later assigned.
-WITH_OORB ?=
+WITH_OORB ?= 1
 # Why the OpenOrb channel is absent, in one line, for the reduce log. Empty
 # when WITH_OORB is set, so a re-enabled leg stops claiming to be disabled.
-OORB_DISABLED_REASON := $(if $(WITH_OORB),,the plan carries no ref_sun_pos_au/ref_sun_vel_au_d and cannot until the validation schema is tagged and empyrean-core re-pinned (empyrean-jg3o); leg turned off in .github/workflows/validation.yml and behind WITH_OORB here)
+OORB_DISABLED_REASON := $(if $(WITH_OORB),,skipped by WITH_OORB=)
 
 # DYLD path for runtime linking against libempyrean.dylib (built by
 # empyrean-c into the empyrean repo's target/release).
@@ -224,6 +205,12 @@ JORBIT_OUT := $(RESULTS_DIR)/validation_jorbit.json
 # layup external OD reference (opt-in, WITH_LAYUP=1); its rows attach to the
 # `orbit_determination` OD rows in the merge, alongside find_orb + OrbFit.
 LAYUP_OUT := $(RESULTS_DIR)/validation_layup.json
+# adam-core external reference (propagation + ephemeris + OD): the released
+# adam-core 0.8.0 / adam-assist 0.7.0. Its rows attach to the prop / eph / OD rows.
+ADAM_CORE_OUT := $(RESULTS_DIR)/validation_adam-core.json
+# The same adam-core release through its public Rust API (adam_core 0.8.0 +
+# adam_assist 0.7.0); its rows attach to the same rows under tool id adam-core-rust.
+ADAM_CORE_RUST_OUT := $(RESULTS_DIR)/validation_adam-core-rust.json
 # Merged-with-external version of the rust unified file. ASSIST and find_orb
 # references attach onto the rust prop+eph and OD rows in a single pass.
 RUST_MERGED := $(RESULTS_DIR)/validation_rust_merged.json
@@ -252,11 +239,11 @@ REPORT_INPUTS := $(if $(WITH_CORE),$(RUST)$(comma)$(PYTHON)$(comma)$(C_OUT)$(com
 
 # ── Targets ────────────────────────────────────────────────
 .PHONY: all setup build run report clean clean-results clean-all archive help fixtures check-fixtures \
-        setup-assist setup-findorb setup-oorb setup-orbfit setup-kete setup-jorbit setup-layup \
+        setup-assist setup-findorb setup-oorb setup-orbfit setup-kete setup-jorbit setup-layup setup-adam-core setup-adam-core-rust \
         setup-grss run-grss \
         build-empyrean-c build-rust build-c build-cli build-wheel build-core build-empyrean-validation \
         run-rust run-python run-c run-cli run-assist run-findorb run-oorb run-orbfit \
-        run-core run-kete run-jorbit run-layup \
+        run-core run-kete run-jorbit run-layup run-adam-core run-adam-core-rust \
         merge-external plan check-plan reduce
 
 help:
@@ -310,7 +297,7 @@ check-fixtures: fixtures
 # when it will actually run — otherwise `make setup` pulls a Docker image
 # for a comparator that never executes (and fails the setup if Docker is
 # unavailable).
-setup: setup-assist setup-findorb setup-kete setup-jorbit setup-grss $(if $(WITH_OORB),setup-oorb,) $(if $(WITH_ORBFIT),setup-orbfit,) $(if $(WITH_LAYUP),setup-layup,)
+setup: setup-assist setup-findorb setup-kete setup-jorbit setup-grss $(if $(WITH_OORB),setup-oorb,) $(if $(WITH_ORBFIT),setup-orbfit,) $(if $(WITH_LAYUP),setup-layup,) $(if $(WITH_ADAM_CORE),setup-adam-core,) $(if $(WITH_ADAM_CORE_RUST),setup-adam-core-rust,)
 	@echo
 	@echo "External dependencies installed."
 
@@ -534,12 +521,20 @@ WITH_ORBFIT ?= 1
 # Default-on; set WITH_LAYUP= (empty) to skip on hosts where its heavy
 # C-extension venv is unavailable.
 WITH_LAYUP ?= 1
-# OpenOrb is gated on WITH_OORB, defined above with the reason it is off.
+# adam-core: the released adam-core / adam-assist (PyPI wheels, no private data).
+# Default-on; set WITH_ADAM_CORE= (empty) to skip.
+WITH_ADAM_CORE ?= 1
+# adam-core-rust: the same release through its public Rust crates (one cargo
+# build, no private data). Default-on; set WITH_ADAM_CORE_RUST= (empty) to skip.
+WITH_ADAM_CORE_RUST ?= 1
+# OpenOrb is gated on WITH_OORB, defined above (on by default).
 run: run-rust run-python run-c run-cli run-assist run-findorb \
      run-kete run-jorbit run-grss \
      $(if $(WITH_OORB),run-oorb,) \
      $(if $(WITH_ORBFIT),run-orbfit,) \
      $(if $(WITH_LAYUP),run-layup,) \
+     $(if $(WITH_ADAM_CORE),run-adam-core,) \
+     $(if $(WITH_ADAM_CORE_RUST),run-adam-core-rust,) \
      $(if $(WITH_CORE),run-core,)
 
 # Rust channel: two binary subcommands (`validate run` for prop+eph,
@@ -1080,7 +1075,7 @@ schedule: $(PLAN) check-plan
 	    --out $(SCHEDULE) --matrix $(LEG_MATRIX)
 
 # The external legs (S7): one leg per tool, or, for a tool the external cost
-# table prices per object (jorbit, OrbFit), object legs packed longest object
+# table prices per object (jorbit, OrbFit, kete, adam-core, adam-core-rust), object legs packed longest object
 # first so no leg replays the whole catalog, each with a timeout sized to its
 # predicted wall (scripts/schedule.py pack-external). EXTERNAL_TOOLS names the
 # tools that run; EXTERNAL_LEG_TARGET_MIN overrides the table's target leg wall
@@ -1088,7 +1083,7 @@ schedule: $(PLAN) check-plan
 EXTERNAL_COSTS := $(ROOT)/fixtures/external-costs.json
 EXTERNAL_SCHEDULE ?= $(RESULTS_DIR)/external-schedule.json
 EXTERNAL_LEG_MATRIX := $(RESULTS_DIR)/external-leg-matrix.json
-EXTERNAL_TOOLS ?= assist,findorb,kete,jorbit,layup,orbfit,grss
+EXTERNAL_TOOLS ?= assist,findorb,kete,jorbit,layup,orbfit,grss,adam-core,adam-core-rust
 EXTERNAL_LEG_TARGET_MIN ?=
 # One external leg's id in $(EXTERNAL_SCHEDULE); empty runs the tool over the
 # whole plan, as before the chunking.
@@ -1150,8 +1145,10 @@ run-assist: $(PLAN) check-plan $(ASSIST_PY)
 # reduce then omits find_orb honestly.
 # fo asserts without ~/.find_orb (miscell.cpp); a cached build restores the
 # binary but not $HOME, so the config dir is installed here when missing.
-# find_orb's binary DE440 comes from its folder of the third-party tool set.
+# find_orb reads bc405.dat, bias.dat and its binary DE440 from the findorb
+# folder of the third-party tool set; it refuses to start without any of them.
 FINDORB_DATA_DIR ?= $(DATA_DIR)/third-party/findorb
+
 run-findorb: $(ASSIST_PY) check-plan fixtures
 	@test -f "$(HOME)/.find_orb/cospar.txt" || { \
 	    echo "──── Installing find_orb config directory (cached build) ───"; \
@@ -1180,9 +1177,11 @@ run-findorb: $(ASSIST_PY) check-plan fixtures
 # ── OpenOrb (oorb) external comparison — propagation + ephemeris ─
 # Independent Fortran implementation (Granvik et al., University of
 # Helsinki). Covers the same propagation + ephemeris axes ASSIST does,
-# from a different code base. Setup builds oorb from source via the
-# bundled setup.sh; subsequent runs reuse the installed binary.
+# from a different code base. Setup builds oorb from source at the commit
+# setup.sh pins; every file oorb reads, the BC430 asteroid files included,
+# comes from the oorb/ folder of the third-party tool set at run time.
 OORB_BIN := $(EMP_VAL_RUNNERS)/oorb/install/bin/oorb
+OORB_DATA_DIR ?= $(DATA_DIR)/third-party/oorb
 
 setup-oorb: $(OORB_BIN)
 $(OORB_BIN):
@@ -1193,7 +1192,7 @@ run-oorb: $(OORB_OUT)
 # find_orb's RUN-time rule (OpenOrb's BUILD stays optional): a missing binary
 # at RUN time is a failure. The `echo '[]'` fallback made a leg that compared nothing
 # indistinguishable from a leg that compared everything and agreed.
-$(OORB_OUT): $(PLAN) $(ASSIST_PY) | check-plan
+$(OORB_OUT): $(PLAN) $(ASSIST_PY) | check-plan fixtures
 	@test -x "$(OORB_BIN)" || { \
 	    echo "ERROR: OpenOrb binary not built: $(OORB_BIN)"; \
 	    echo "       Build it with: make setup-oorb"; \
@@ -1201,12 +1200,15 @@ $(OORB_OUT): $(PLAN) $(ASSIST_PY) | check-plan
 	@echo "──── OpenOrb: external prop + ephemeris reference ──────"
 	@$(ASSIST_PY) $(EMP_VAL_RUNNERS)/oorb/run_oorb.py \
 	    --input $(PLAN) --output $(OORB_OUT) \
-	    --prefix $(EMP_VAL_RUNNERS)/oorb/install
+	    --prefix $(EMP_VAL_RUNNERS)/oorb/install --data-dir $(OORB_DATA_DIR) \
+	    --fixtures-dir $(FIXTURES_PSV)
 
 # ── OrbFit external comparison — orbit determination ─────────────
 # OrbFit Consortium (University of Pisa) / IAU Minor Planet Center.
 # Canonical implementation of CMC2003 χ²-with-hysteresis rejection.
-# Setup pulls the MPC's Docker container; runner shells out via docker.
+# Setup pulls the MPC's Docker container by digest; the runner shells out via
+# docker with no network, and seeds from the Sun's DE440 state (orbfit/ folder).
+ORBFIT_DATA_DIR ?= $(DATA_DIR)/third-party/orbfit
 setup-orbfit:
 	@echo "──── Pulling OrbFit container ──────────────────────────"
 	@cd $(EMP_VAL_RUNNERS)/orbfit && ./setup.sh
@@ -1225,7 +1227,8 @@ $(ORBFIT_OUT): $(PLAN) | check-plan fixtures
 	    if [ -n "$$only" ]; then echo "  leg $(EXT_LEG): $$only"; set -- --defer-all-failed --only "$$only"; fi; \
 	fi; \
 	$(EMP_VAL_RUNNERS)/orbfit/run_orbfit.py \
-	    --plan $(PLAN) --output $(ORBFIT_OUT) --psv-dir $(FIXTURES_PSV) "$$@"
+	    --plan $(PLAN) --output $(ORBFIT_OUT) --psv-dir $(FIXTURES_PSV) \
+	    --de440 $(ORBFIT_DATA_DIR)/de440.bsp "$$@"
 
 # Optional: empyrean-core direct (no FFI). Replays the plan in-process so
 # the report's Section 09 can show binding-translation drift (rust wrapper
@@ -1267,6 +1270,10 @@ $(CORE_OUT): $(call channel_plan,core) $(CORE_BIN) | check-plan fixtures
 # ephemeris, and OD. Used as a sanity check parallel to ASSIST /
 # find_orb but covering all three test types.
 KETE_VENV := $(EMP_VAL_RUNNERS)/kete/.venv
+# Everything kete loads, and the EFCC18 bias.dat its OD debiases with, comes
+# from the kete folder of the third-party tool set (synced under
+# $(DATA_DIR)/third-party), linked into the runner's private KETE_CACHE_DIR.
+KETE_DATA_DIR ?= $(DATA_DIR)/third-party/kete
 KETE_PY := $(KETE_VENV)/bin/python
 
 setup-kete: $(KETE_PY)
@@ -1275,11 +1282,20 @@ $(KETE_PY):
 	@cd $(EMP_VAL_RUNNERS)/kete && ./setup.sh
 
 run-kete: $(KETE_OUT)
+# EXT_LEG runs one object leg of the external schedule (`--only` its objects).
+# No kete row reads another object's rows, so the merged legs are the rows one
+# unchunked run writes.
 $(KETE_OUT): $(PLAN) $(KETE_PY) | check-plan fixtures
 	@echo "──── Kete: external all-test-types reference ──────────"
-	@$(KETE_PY) $(EMP_VAL_RUNNERS)/kete/run_kete.py \
+	@set --; \
+	if [ -n "$(EXT_LEG)" ]; then \
+	    only="$$(python3 $(ROOT)/scripts/channel-chunks.py external-objects --plan $(PLAN) \
+	        --schedule $(EXTERNAL_SCHEDULE) --tool kete --leg "$(EXT_LEG)")" || exit 1; \
+	    if [ -n "$$only" ]; then echo "  leg $(EXT_LEG): $$only"; set -- --only "$$only"; fi; \
+	fi; \
+	$(KETE_PY) $(EMP_VAL_RUNNERS)/kete/run_kete.py \
 	    --input $(PLAN) --output $(KETE_OUT) \
-	    --fixtures-dir $(FIXTURES_PSV) --data-dir $(DATA_DIR)
+	    --fixtures-dir $(FIXTURES_PSV) --data-dir $(KETE_DATA_DIR) "$$@"
 
 # ── GRSS external comparison — propagation + ephemeris + OD ──
 # The Gauss-Radau Small-body Simulator (Makadia et al.;
@@ -1297,8 +1313,9 @@ $(KETE_OUT): $(PLAN) $(KETE_PY) | check-plan fixtures
 GRSS_VENV := $(EMP_VAL_RUNNERS)/grss/.venv
 GRSS_PY := $(GRSS_VENV)/bin/python
 
-# GRSS's seven SPICE kernels come from its folder of the third-party tool set,
-# synced under $(DATA_DIR)/third-party; none is downloaded.
+# GRSS's six SPICE kernels, its debiasing table and its two observatory tables
+# come from its folder of the third-party tool set, synced under
+# $(DATA_DIR)/third-party; none is downloaded.
 GRSS_DATA_DIR ?= $(DATA_DIR)/third-party/grss
 setup-grss: $(GRSS_PY)
 $(GRSS_PY):
@@ -1333,12 +1350,15 @@ $(GRSS_OUT): $(PLAN) | check-plan fixtures
 JORBIT_VENV := $(EMP_VAL_RUNNERS)/jorbit/.venv
 JORBIT_PY := $(JORBIT_VENV)/bin/python
 
-# Offline: jorbit's DE440 and SB441-N16 are staged from the registered kernel
-# set in DATA_DIR (runners/jorbit/jorbit_offline.py), never downloaded.
+# Offline: jorbit's DE440 and SB441-N16 come from the jorbit folder of the
+# third-party tool set (synced under $(DATA_DIR)/third-party; the engine set's
+# own bytes), staged by runners/jorbit/jorbit_offline.py, never downloaded. Each
+# object replays in a worker process of its own, which bounds the leg's memory.
+JORBIT_DATA_DIR ?= $(DATA_DIR)/third-party/jorbit
 setup-jorbit: $(JORBIT_PY)
 $(JORBIT_PY):
 	@echo "──── Setting up jorbit venv ────────────────────────────"
-	@cd $(EMP_VAL_RUNNERS)/jorbit && DATA_DIR="$(DATA_DIR)" ./setup.sh
+	@cd $(EMP_VAL_RUNNERS)/jorbit && DATA_DIR="$(JORBIT_DATA_DIR)" ./setup.sh
 
 run-jorbit: $(JORBIT_OUT)
 # EXT_LEG runs one object leg of the external schedule (`--only` its objects);
@@ -1353,19 +1373,20 @@ $(JORBIT_OUT): $(PLAN) $(JORBIT_PY) | check-plan
 	    if [ -n "$$only" ]; then echo "  leg $(EXT_LEG): $$only"; set -- --only "$$only"; fi; \
 	fi; \
 	$(JORBIT_PY) $(EMP_VAL_RUNNERS)/jorbit/run_jorbit.py \
-	    --input $(PLAN) --output $(JORBIT_OUT) --data-dir $(DATA_DIR) "$$@"
+	    --input $(PLAN) --output $(JORBIT_OUT) --data-dir $(JORBIT_DATA_DIR) "$$@"
 
-# ── layup (opt-in external OD reference) ─────────────────────
+# ── layup (external OD reference) ───────────────────────────
 # MIT-licensed, ASSIST-backed orbit fitter (Smithsonian / CfA; Matthew
 # Holman et al.). Fits the optical OD fixtures directly from ADES PSV and
 # folds χ² / reduced-χ² / n_obs / convergence onto the OD rows alongside
-# find_orb + OrbFit. Opt-in via WITH_LAYUP=1 (heavy C-extension build).
+# find_orb + OrbFit. On by default (WITH_LAYUP=1; WITH_LAYUP= skips it). Each
+# fit runs layup's Python API at its documented settings (runners/layup/README.md).
 LAYUP_VENV := $(EMP_VAL_RUNNERS)/layup/.venv
 LAYUP_PY := $(LAYUP_VENV)/bin/python
 # layup's data directory (its --ar): every kernel, the observatory codes and
 # the debiasing table under layup's own names, staged by stage_data.py from
 # the layup folder of the third-party tool set (dataset
-# third-party-tools-2026-11-08, synced under $(DATA_DIR)/third-party): the
+# third-party-tools-2026-11-11, synced under $(DATA_DIR)/third-party): the
 # folder lists every file layup reads, shared kernels included, so layup needs
 # nothing from the engine kernel set. layup never downloads at run time.
 LAYUP_DATA_DIR ?= $(DATA_DIR)/third-party/layup
@@ -1397,6 +1418,92 @@ $(LAYUP_OUT): | fixtures
 	    --ar-data-path "$(LAYUP_DATA)" --output $(LAYUP_OUT) \
 	    $(if $(OBJECTS),--only "$(OBJECTS)",)
 
+# ── adam-core (external propagation + ephemeris + OD reference) ─
+# The released adam-core 0.8.0 with adam-assist 0.7.0 (PyPI wheels, own venv).
+# OD runs the public CORE_OD_V1 profile; its missing per-observation sigma comes
+# from the suite's shared public Veres 2017 model (runners/sigmafill). It reads
+# DE440 and SB441-N16 from the adam-core folder of the third-party tool set
+# (dataset third-party-tools-2026-11-11, synced under $(DATA_DIR)/third-party)
+# and passes them to adam-assist explicitly; it never falls back to the
+# install-time PyPI kernels and fetches nothing at run time. EXT_LEG runs one
+# object leg of the external schedule: OD dominates the cost and is priced per
+# object (fixtures/external-costs.json). Each fit runs in its own child process
+# under a wall cap; a capped object is a named row.
+ADAM_CORE_VENV := $(EMP_VAL_RUNNERS)/adam-core/.venv
+ADAM_CORE_PY := $(ADAM_CORE_VENV)/bin/python
+ADAM_CORE_DATA_DIR ?= $(DATA_DIR)/third-party/adam-core
+# The per-object OD wall cap of both adam-core channels (adam-core and
+# adam-core-rust): one value, recorded by each as od_timeout_min.
+ADAM_CORE_TIMEOUT_MIN ?= 30
+
+setup-adam-core: $(ADAM_CORE_PY)
+$(ADAM_CORE_PY):
+	@echo "──── Setting up adam-core venv (adam-core 0.8.0 + adam-assist 0.7.0) ─"
+	@cd $(EMP_VAL_RUNNERS)/adam-core && ./setup.sh
+
+run-adam-core: $(ADAM_CORE_OUT)
+$(ADAM_CORE_OUT): $(PLAN) | check-plan fixtures
+	@test -x "$(ADAM_CORE_PY)" || { \
+	    echo "ERROR: adam-core venv not built: $(ADAM_CORE_PY)"; \
+	    echo "       Build it with: make setup-adam-core, or opt out with WITH_ADAM_CORE="; \
+	    exit 1; }
+	@echo "──── adam-core: external prop + eph + OD reference ─────"
+	@mkdir -p $(RESULTS_DIR)
+	@set --; \
+	if [ -n "$(EXT_LEG)" ]; then \
+	    only="$$(python3 $(ROOT)/scripts/channel-chunks.py external-objects --plan $(PLAN) \
+	        --schedule $(EXTERNAL_SCHEDULE) --tool adam-core --leg "$(EXT_LEG)")" || exit 1; \
+	    if [ -n "$$only" ]; then echo "  leg $(EXT_LEG): $$only"; set -- --objects "$$only"; fi; \
+	elif [ -n "$(OBJECTS)" ]; then set -- --objects "$(OBJECTS)"; fi; \
+	$(ADAM_CORE_PY) $(EMP_VAL_RUNNERS)/adam-core/run_adam_core.py \
+	    --input $(PLAN) --output $(ADAM_CORE_OUT) \
+	    --fixtures-dir $(FIXTURES_PSV) --data-dir "$(ADAM_CORE_DATA_DIR)" \
+	    --registered-obscodes "$(DATA_DIR)/obscodes_extended.json" \
+	    --timeout-min $(ADAM_CORE_TIMEOUT_MIN) "$$@"
+
+# ── adam-core-rust (external prop + eph + OD reference, Rust API) ─
+# The same adam-core release through its public Rust crates: adam_core 0.8.0
+# for OD, observers, SPICE and time, adam_assist 0.7.0 (GPL-3.0, linked into
+# this runner's binary only, never into empyrean) for ASSIST propagation. One
+# cargo build from crates.io at setup, with its own Cargo.lock. It reads every
+# file (DE440, SB441-N16, the default Earth-orientation kernels, the observatory
+# table, the EFCC18 table) from the adam-core-rust folder of the third-party
+# tool set by explicit path; adam-core's resolver is never called, and
+# ADAM_CORE_KERNEL_OFFLINE=1 makes a stray call fail instead of fetching.
+# Missing sigma comes from the shared runners/sigmafill through its JSON front
+# end. EXT_LEG runs one object leg of the external schedule: OD dominates the
+# cost and is priced per object (fixtures/external-costs.json). Each fit runs
+# in its own child process under a wall cap; a capped object is a named row.
+ADAM_CORE_RUST_DIR := $(EMP_VAL_RUNNERS)/adam-core-rust
+ADAM_CORE_RUST_BUILD ?= $(ADAM_CORE_RUST_DIR)/build
+ADAM_CORE_RUST_BIN := $(ADAM_CORE_RUST_BUILD)/release/run-adam-core-rust
+ADAM_CORE_RUST_DATA_DIR ?= $(DATA_DIR)/third-party/adam-core-rust
+
+setup-adam-core-rust: $(ADAM_CORE_RUST_BIN)
+$(ADAM_CORE_RUST_BIN): $(ADAM_CORE_RUST_DIR)/Cargo.toml $(ADAM_CORE_RUST_DIR)/Cargo.lock $(wildcard $(ADAM_CORE_RUST_DIR)/src/*.rs)
+	@echo "──── Building adam-core-rust (adam_core 0.8.0 + adam_assist 0.7.0) ─"
+	@cd $(ADAM_CORE_RUST_DIR) && CARGO_TARGET_DIR="$(ADAM_CORE_RUST_BUILD)" ./setup.sh
+
+run-adam-core-rust: $(ADAM_CORE_RUST_OUT)
+$(ADAM_CORE_RUST_OUT): $(PLAN) | check-plan fixtures
+	@test -x "$(ADAM_CORE_RUST_BIN)" || { \
+	    echo "ERROR: adam-core-rust not built: $(ADAM_CORE_RUST_BIN)"; \
+	    echo "       Build it with: make setup-adam-core-rust, or opt out with WITH_ADAM_CORE_RUST="; \
+	    exit 1; }
+	@echo "──── adam-core-rust: external prop + eph + OD reference (Rust API) ─"
+	@mkdir -p $(RESULTS_DIR)
+	@set --; \
+	if [ -n "$(EXT_LEG)" ]; then \
+	    only="$$(python3 $(ROOT)/scripts/channel-chunks.py external-objects --plan $(PLAN) \
+	        --schedule $(EXTERNAL_SCHEDULE) --tool adam-core-rust --leg "$(EXT_LEG)")" || exit 1; \
+	    if [ -n "$$only" ]; then echo "  leg $(EXT_LEG): $$only"; set -- --objects "$$only"; fi; \
+	elif [ -n "$(OBJECTS)" ]; then set -- --objects "$(OBJECTS)"; fi; \
+	ADAM_CORE_KERNEL_OFFLINE=1 ADAM_CORE_KERNEL_PYTHON= $(ADAM_CORE_RUST_BIN) \
+	    --plan $(PLAN) --output $(ADAM_CORE_RUST_OUT) \
+	    --data-dir "$(ADAM_CORE_RUST_DATA_DIR)" --fixtures-dir $(FIXTURES_PSV) \
+	    --sigmafill $(EMP_VAL_RUNNERS)/sigmafill/fill_json.py --python python3 \
+	    --timeout-min $(ADAM_CORE_TIMEOUT_MIN) "$$@"
+
 # ── Merge external + report ────────────────────────────────
 # Channel-agnostic meta operations live in this repo's CLI binary. It
 # owns the schema, so its merge / report / ci-check stays in lockstep
@@ -1417,8 +1524,8 @@ INCLUDE_OPTIONAL ?=
 merge-external: $(if $(WITH_CORE),$(CORE_MERGED),$(RUST_MERGED))
 $(CORE_MERGED): $(CORE_OUT) $(ASSIST_OUT) $(FINDORB_OUT) $(FINDORB_RADAR_OUT) $(if $(WITH_OORB),$(OORB_OUT),) \
                 $(KETE_OUT) $(JORBIT_OUT) $(GRSS_OUT) \
-                $(if $(WITH_ORBFIT),$(ORBFIT_OUT),) $(if $(WITH_LAYUP),$(LAYUP_OUT),) $(EMP_VAL_BIN)
-	@echo "──── Merge ASSIST + find_orb$(if $(WITH_OORB), + OpenOrb,) + kete + jorbit + GRSS$(if $(WITH_ORBFIT), + OrbFit,)$(if $(WITH_LAYUP), + layup,) into core ──"
+                $(if $(WITH_ORBFIT),$(ORBFIT_OUT),) $(if $(WITH_LAYUP),$(LAYUP_OUT),) $(if $(WITH_ADAM_CORE),$(ADAM_CORE_OUT),) $(if $(WITH_ADAM_CORE_RUST),$(ADAM_CORE_RUST_OUT),) $(EMP_VAL_BIN)
+	@echo "──── Merge ASSIST + find_orb$(if $(WITH_OORB), + OpenOrb,) + kete + jorbit + GRSS$(if $(WITH_ORBFIT), + OrbFit,)$(if $(WITH_LAYUP), + layup,)$(if $(WITH_ADAM_CORE), + adam-core,)$(if $(WITH_ADAM_CORE_RUST), + adam-core-rust,) into core ──"
 	@$(EMP_VAL_BIN) merge-external -i $(CORE_OUT) -o $(CORE_MERGED) \
 	    --assist $(ASSIST_OUT) --findorb $(FINDORB_OUT) \
 	    --findorb-radar $(FINDORB_RADAR_OUT) \
@@ -1427,11 +1534,13 @@ $(CORE_MERGED): $(CORE_OUT) $(ASSIST_OUT) $(FINDORB_OUT) $(FINDORB_RADAR_OUT) $(
 	    --grss $(GRSS_OUT) --grss-radar $(GRSS_RADAR_OUT) \
 	    --jpl-sbdb-cache $(CACHE_DIR)/sbdb \
 	    $(if $(WITH_ORBFIT),--orbfit $(ORBFIT_OUT),) \
-	    $(if $(WITH_LAYUP),--layup $(LAYUP_OUT),)
+	    $(if $(WITH_LAYUP),--layup $(LAYUP_OUT),) \
+	    $(if $(WITH_ADAM_CORE),--adam-core $(ADAM_CORE_OUT),) \
+	    $(if $(WITH_ADAM_CORE_RUST),--adam-core-rust $(ADAM_CORE_RUST_OUT),)
 $(RUST_MERGED): $(RUST) $(ASSIST_OUT) $(FINDORB_OUT) $(FINDORB_RADAR_OUT) $(if $(WITH_OORB),$(OORB_OUT),) \
                 $(KETE_OUT) $(JORBIT_OUT) $(GRSS_OUT) \
-                $(if $(WITH_ORBFIT),$(ORBFIT_OUT),) $(if $(WITH_LAYUP),$(LAYUP_OUT),) $(EMP_VAL_BIN)
-	@echo "──── Merge ASSIST + find_orb$(if $(WITH_OORB), + OpenOrb,) + kete + jorbit + GRSS$(if $(WITH_ORBFIT), + OrbFit,)$(if $(WITH_LAYUP), + layup,) into rust (fallback) ──"
+                $(if $(WITH_ORBFIT),$(ORBFIT_OUT),) $(if $(WITH_LAYUP),$(LAYUP_OUT),) $(if $(WITH_ADAM_CORE),$(ADAM_CORE_OUT),) $(if $(WITH_ADAM_CORE_RUST),$(ADAM_CORE_RUST_OUT),) $(EMP_VAL_BIN)
+	@echo "──── Merge ASSIST + find_orb$(if $(WITH_OORB), + OpenOrb,) + kete + jorbit + GRSS$(if $(WITH_ORBFIT), + OrbFit,)$(if $(WITH_LAYUP), + layup,)$(if $(WITH_ADAM_CORE), + adam-core,)$(if $(WITH_ADAM_CORE_RUST), + adam-core-rust,) into rust (fallback) ──"
 	@$(EMP_VAL_BIN) merge-external -i $(RUST) -o $(RUST_MERGED) \
 	    --assist $(ASSIST_OUT) --findorb $(FINDORB_OUT) \
 	    --findorb-radar $(FINDORB_RADAR_OUT) \
@@ -1440,7 +1549,9 @@ $(RUST_MERGED): $(RUST) $(ASSIST_OUT) $(FINDORB_OUT) $(FINDORB_RADAR_OUT) $(if $
 	    --grss $(GRSS_OUT) --grss-radar $(GRSS_RADAR_OUT) \
 	    --jpl-sbdb-cache $(CACHE_DIR)/sbdb \
 	    $(if $(WITH_ORBFIT),--orbfit $(ORBFIT_OUT),) \
-	    $(if $(WITH_LAYUP),--layup $(LAYUP_OUT),)
+	    $(if $(WITH_LAYUP),--layup $(LAYUP_OUT),) \
+	    $(if $(WITH_ADAM_CORE),--adam-core $(ADAM_CORE_OUT),) \
+	    $(if $(WITH_ADAM_CORE_RUST),--adam-core-rust $(ADAM_CORE_RUST_OUT),)
 
 report: $(RUST) $(PYTHON) $(C_OUT) $(CLI_OUT) $(if $(WITH_CORE),$(CORE_MERGED),$(RUST_MERGED)) $(EMP_VAL_BIN)
 	@echo "──── Generating combined HTML report ───────────────────"
@@ -1507,6 +1618,8 @@ reduce: build-empyrean-validation
 	add --grss-radar    "$(GRSS_RADAR_OUT)"       ""; \
 	add --orbfit        "$(ORBFIT_OUT)"          ""; \
 	add --layup         "$(LAYUP_OUT)"           ""; \
+	add --adam-core      "$(ADAM_CORE_OUT)"        ""; \
+	add --adam-core-rust "$(ADAM_CORE_RUST_OUT)"   ""; \
 	if [ -d "$(CACHE_DIR)/sbdb" ]; then flags="$$flags --jpl-sbdb-cache $(CACHE_DIR)/sbdb"; fi; \
 	if [ -s "$(RESULTS_DIR)/comparators-absent.txt" ]; then flags="$$flags --comparator-absent-file $(RESULTS_DIR)/comparators-absent.txt"; fi; \
 	$(EMP_VAL_BIN) merge-external -i "$$ref" -o "$$merged" $$flags

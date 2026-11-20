@@ -1,0 +1,7 @@
+# Per-runner build + cache artifacts (never tracked).
+.venv/
+.cache/
+results/
+__pycache__/
+*.log
+*.pyc

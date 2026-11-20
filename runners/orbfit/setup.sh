@@ -11,15 +11,18 @@
 # OrbFit is GPL-licensed and never linked into empyrean. This script
 # pulls the MPC's pre-built container for comparison purposes only.
 #
-# Container: minorplanetcenter/orbfit:latest
+# Container: minorplanetcenter/orbfit, pinned by digest
 #   - Maintained by the MPC (Federica Spoto et al.)
 #   - ~3.1 GB compressed, ~6 GB on disk
-#   - Includes OrbFit 5.0.x compiled with gfortran + the planetary
-#     ephemeris kernels needed for OD against MPC observations
+#   - Includes OrbFit 5.0.x compiled with gfortran and OrbFit's own data
+#     (AST17.bai / AST17.bep, the neofit options), so the digest pins those.
+#   - The digest is what minorplanetcenter/orbfit:latest resolved to on
+#     2026-11-09 (docker buildx imagetools inspect); run_orbfit.py's
+#     DEFAULT_IMAGE names the same one. Bump both together, deliberately.
 #
 # Usage:
-#   ./setup.sh                # pull the latest tag
-#   ./setup.sh <tag>          # pin to a specific tag
+#   ./setup.sh                # pull the pinned digest
+#   ./setup.sh <image ref>    # another image (testing only)
 #
 # Prerequisites: a running Docker daemon. On macOS install Docker
 # Desktop or colima; on Linux ensure the docker daemon is up.
@@ -27,8 +30,7 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-TAG="${1:-latest}"
-IMAGE="minorplanetcenter/orbfit:${TAG}"
+IMAGE="${1:-minorplanetcenter/orbfit@sha256:0a72ed7c2c528e0e3fe24a0f280a251f6ab610eb3d5e1d63dbf0f2bd20104f64}"
 
 # ── Sanity: Docker available + daemon reachable ─────────────────
 if ! command -v docker >/dev/null 2>&1; then
@@ -47,7 +49,7 @@ fi
 
 # ── Pull the image ──────────────────────────────────────────────
 echo "──── Pulling ${IMAGE} ────"
-docker pull "${IMAGE}"
+docker pull --platform linux/amd64 "${IMAGE}"
 
 # ── Smoke test ──────────────────────────────────────────────────
 echo
@@ -59,7 +61,7 @@ docker inspect "${IMAGE}" --format '  WORKDIR:    {{.Config.WorkingDir}}'
 
 echo
 echo "OrbFit binaries available inside the container:"
-docker run --rm "${IMAGE}" sh -c 'ls -1 /usr/local/bin 2>/dev/null | grep -iE "orbfit|fitobs|catpro" || ls -1 $(find / -name "fitobs*" -type f 2>/dev/null | head -1 | xargs dirname 2>/dev/null) 2>/dev/null | head -20' || \
+docker run --rm --network none --platform linux/amd64 "${IMAGE}" sh -c 'ls -1 /usr/local/bin 2>/dev/null | grep -iE "orbfit|fitobs|catpro" || ls -1 $(find / -name "fitobs*" -type f 2>/dev/null | head -1 | xargs dirname 2>/dev/null) 2>/dev/null | head -20' || \
     echo "  (could not auto-detect binaries — inspect the container manually)"
 
 echo
@@ -69,4 +71,5 @@ echo
 echo "Run OD comparison with:"
 echo "  python3 $SCRIPT_DIR/run_orbfit.py \\"
 echo "      --plan ../../results/validation_plan.json \\"
+echo "      --de440 <third-party>/orbfit/de440.bsp \\"
 echo "      --output ../../results/validation_orbfit.json"

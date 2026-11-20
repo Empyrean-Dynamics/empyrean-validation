@@ -40,10 +40,10 @@ use empyrean_validation::{
     catalog::{
         RADAR_FIXTURE_OBJECTS, ValidationObject, all_objects, filter_by_name, filter_by_population,
     },
-    comparators::{self, ComparatorOutcome, read_tool_records},
+    comparators::{self, ComparatorOutcome, Folded, read_tool_records},
     inputs::{InputProduct, cache_file_name, missing_input},
     plan::{PlanConfig, build_plan},
-    report::{SUMMARY_TEST_TYPES, generate_report},
+    report::{FLOOR_EXCEPTIONS, SUMMARY_TEST_TYPES, generate_report, normalize_engine},
     schema::{OrbitComparison, ValidationResult, channels, test_types},
 };
 
@@ -262,6 +262,18 @@ struct MergeExternalArgs {
     /// convergence) onto matching rows.
     #[arg(long)]
     layup: Option<PathBuf>,
+    /// adam-core per-channel JSON (from `runners/adam-core/run_adam_core.py`).
+    /// Folds propagation + ephemeris + OD fields (the released adam-core
+    /// 0.8.0 / adam-assist 0.7.0, CORE_OD_V1) onto matching rows, with its
+    /// version and settings.
+    #[arg(long)]
+    adam_core: Option<PathBuf>,
+    /// adam-core Rust-API per-channel JSON (from `runners/adam-core-rust`).
+    /// The same adam-core release through its public Rust crates (adam_core
+    /// 0.8.0 + adam_assist 0.7.0); folds the same fields as `--adam-core`
+    /// under its own tool id, `adam-core-rust`.
+    #[arg(long)]
+    adam_core_rust: Option<PathBuf>,
     /// kete per-channel JSON (from `runners/kete/run_kete.py`). Currently
     /// folds per-row wall-clock timing only (`kete_time_ms`) — kete is not
     /// yet a selectable comparison tool in the report registry.
@@ -395,6 +407,18 @@ struct CiCheckArgs {
     /// unreferenced, and the strict-channel check passed on the rest.
     #[arg(long)]
     plan: Option<PathBuf>,
+    /// The external comparators this run requested (the workflow's
+    /// `EXTERNAL_TOOLS`, comma-separated, plus `jpl-sbdb`, the pinned SBDB OD
+    /// reference every reduce merges). Every one must have merged, and every
+    /// one of its merge paths must have landed more than 0 rows
+    /// ([`COMPARATOR_MERGE_PATHS`]); a failure names the comparator, the path
+    /// and the reason (absent, failed with its error, or 0 rows). Only valid
+    /// for a FULL-catalog run: a subset can legitimately produce 0 on a path
+    /// (act's find_orb leg writes no propagation rows), so a subset run omits
+    /// the flag and keeps the NOTE on a failed comparator. A summary that
+    /// carries no per-path counts fails the requirement rather than passing it.
+    #[arg(long, value_delimiter = ',')]
+    require_comparators: Vec<String>,
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -778,11 +802,11 @@ fn isolated_merge(
     tool: &str,
     rows: &mut Vec<ValidationResult>,
     outcomes: &mut Vec<ComparatorOutcome>,
-    fold: impl FnOnce(&mut Vec<ValidationResult>) -> Result<usize, Box<dyn std::error::Error>>,
+    fold: impl FnOnce(&mut Vec<ValidationResult>) -> Result<Folded, Box<dyn std::error::Error>>,
 ) {
     let snapshot = rows.clone();
     match fold(rows) {
-        Ok(n) => outcomes.push(ComparatorOutcome::merged(tool, n)),
+        Ok(folded) => outcomes.push(ComparatorOutcome::folded(tool, folded)),
         Err(e) => {
             *rows = snapshot;
             let outcome = ComparatorOutcome::failed(tool, e.to_string());
@@ -825,21 +849,24 @@ fn merge_external(args: MergeExternalArgs) -> Result<(), Box<dyn std::error::Err
         isolated_merge("core-stm", &mut rows, &mut outcomes, |rows| {
             let n = merge_core_stm(rows, path)?;
             eprintln!("Merged {n} core first-order STM rows (emp_stm)");
-            Ok(n)
+            Ok(Folded::single("stm", n))
         });
     }
     if let Some(path) = &args.core_fd_stm {
         isolated_merge("core-fd-stm", &mut rows, &mut outcomes, |rows| {
             let n = merge_core_fd_stm(rows, path)?;
             eprintln!("Merged {n} finite-difference STM reference rows (fd_stm)");
-            Ok(n)
+            Ok(Folded::single("fd-stm", n))
         });
     }
     if let Some(path) = &args.assist {
         isolated_merge("assist", &mut rows, &mut outcomes, |rows| {
-            let n = merge_assist(rows, path)?;
+            let (n, n_standalone) = merge_assist(rows, path)?;
             eprintln!("Merged {n} ASSIST rows");
-            Ok(n)
+            Ok(Folded::with_paths(
+                n,
+                &[("folded", n), ("standalone", n_standalone)],
+            ))
         });
     }
     if let Some(path) = &args.findorb {
@@ -850,7 +877,10 @@ fn merge_external(args: MergeExternalArgs) -> Result<(), Box<dyn std::error::Err
             if np + ne > 0 {
                 eprintln!("Merged {np} find_orb propagation + {ne} ephemeris reference rows");
             }
-            Ok(n)
+            Ok(Folded::with_paths(
+                n,
+                &[("od", n), ("propagation", np), ("ephemeris", ne)],
+            ))
         });
     }
     if let Some(path) = &args.findorb_radar {
@@ -873,49 +903,67 @@ fn merge_external(args: MergeExternalArgs) -> Result<(), Box<dyn std::error::Err
                     path.display()
                 );
             }
-            Ok(n)
+            Ok(Folded::single("radar", n))
         });
     }
     if let Some(path) = &args.oorb {
         isolated_merge("oorb", &mut rows, &mut outcomes, |rows| {
             let n = merge_oorb(rows, path)?;
             eprintln!("Merged {n} OpenOrb rows");
-            Ok(n)
+            Ok(Folded::single("rows", n))
         });
     }
     if let Some(path) = &args.orbfit {
         isolated_merge("orbfit", &mut rows, &mut outcomes, |rows| {
             let n = merge_orbfit(rows, path)?;
             eprintln!("Merged {n} OrbFit rows");
-            Ok(n)
+            Ok(Folded::single("rows", n))
         });
     }
     if let Some(path) = &args.layup {
         isolated_merge("layup", &mut rows, &mut outcomes, |rows| {
             let n = merge_layup(rows, path)?;
             eprintln!("Merged {n} layup rows");
-            Ok(n)
+            Ok(Folded::single("rows", n))
+        });
+    }
+    if let Some(path) = &args.adam_core {
+        isolated_merge("adam-core", &mut rows, &mut outcomes, |rows| {
+            let n = merge_adam_core(rows, path)?;
+            eprintln!("Merged {n} adam-core rows");
+            Ok(Folded::single("rows", n))
+        });
+    }
+    if let Some(path) = &args.adam_core_rust {
+        isolated_merge("adam-core-rust", &mut rows, &mut outcomes, |rows| {
+            let n = merge_adam_core_rust(rows, path)?;
+            eprintln!("Merged {n} adam-core-rust rows");
+            Ok(Folded::single("rows", n))
         });
     }
     if let Some(path) = &args.kete {
         isolated_merge("kete", &mut rows, &mut outcomes, |rows| {
-            let n = merge_tool_times(rows, path, "kete_time_ms", |r, v| r.kete_time_ms = v)?;
+            let n = merge_tool_times(rows, path, "kete", "kete_time_ms", |r, v| {
+                r.kete_time_ms = v
+            })?;
             eprintln!("Merged {n} kete timing rows");
-            Ok(n)
+            Ok(Folded::single("timing", n))
         });
     }
     if let Some(path) = &args.jorbit {
         isolated_merge("jorbit", &mut rows, &mut outcomes, |rows| {
-            let n = merge_tool_times(rows, path, "jorbit_time_ms", |r, v| r.jorbit_time_ms = v)?;
+            let n = merge_tool_times(rows, path, "jorbit", "jorbit_time_ms", |r, v| {
+                r.jorbit_time_ms = v
+            })?;
             eprintln!("Merged {n} jorbit timing rows");
-            Ok(n)
+            Ok(Folded::single("timing", n))
         });
     }
     if let Some(path) = &args.grss {
         isolated_merge("grss", &mut rows, &mut outcomes, |rows| {
             let n = merge_grss(rows, path)?;
             eprintln!("Merged {n} GRSS rows");
-            Ok(n)
+            Ok(Folded::single("rows", n))
         });
     }
     if let Some(path) = &args.grss_radar {
@@ -937,14 +985,14 @@ fn merge_external(args: MergeExternalArgs) -> Result<(), Box<dyn std::error::Err
                     path.display()
                 );
             }
-            Ok(n)
+            Ok(Folded::single("radar", n))
         });
     }
     if let Some(dir) = &args.jpl_sbdb_cache {
         isolated_merge("jpl-sbdb", &mut rows, &mut outcomes, |rows| {
             let n = merge_jpl(rows, dir)?;
             eprintln!("Merged {n} JPL SBDB OD-reference rows");
-            Ok(n)
+            Ok(Folded::single("od-reference", n))
         });
     }
 
@@ -1129,12 +1177,18 @@ type CoreF64Snapshot = ([f64; 3], Option<f64>, String);
 ///    per-arm STM agreement. `emp_vs_assist_km` and `speed_ratio` are computed
 ///    here. The resolved integrator settings ride in `notes`.
 ///
+/// A record ASSIST named unsupported (`assist_unsupported`, a self-perturber)
+/// carries no number: step 1 folds its reason into `tool_unsupported` on the
+/// reference rows through [`record_tool_config`], and step 2 appends no arm row
+/// for it, since an arm row without a time reads as a capped FAIL.
+///
 /// Returns the number of rows folded onto the core reference (the backward-compat
-/// count); the standalone-append count is logged separately by the caller path.
+/// count) and the number of standalone per-arm rows appended; the outcome
+/// records both as merge paths.
 fn merge_assist(
     rows: &mut Vec<ValidationResult>,
     path: &std::path::Path,
-) -> Result<usize, Box<dyn std::error::Error>> {
+) -> Result<(usize, usize), Box<dyn std::error::Error>> {
     let assist = read_tool_records(path)?;
     let au_km = empyrean_validation::compare::AU_KM;
 
@@ -1198,6 +1252,7 @@ fn merge_assist(
         };
         let key = (r.object.clone(), r.dt_days as i64, arm);
         let Some(a) = idx.get(&key) else { continue };
+        record_tool_config(r, "assist", a, "assist");
         r.assist_vs_horizons_km = a["assist_vs_horizons_km"].as_f64();
         r.assist_time_ms = a["assist_time_ms"].as_f64();
         r.assist_call_time_ms = a["assist_call_time_ms"].as_f64();
@@ -1226,6 +1281,10 @@ fn merge_assist(
         ) else {
             continue;
         };
+        if a["assist_unsupported"].is_string() {
+            // Not run: its reason is on the reference rows (step 1), not an arm row.
+            continue;
+        }
         let key = (object.to_string(), dt as i64);
         let variational = a["variational"].as_bool().unwrap_or(arm.ends_with("_on"));
         let mut row = ValidationResult::empty();
@@ -1278,7 +1337,7 @@ fn merge_assist(
     rows.append(&mut appended);
     eprintln!("  (appended {n_appended} standalone per-arm ASSIST rows across six arms)");
 
-    Ok(n_folded)
+    Ok((n_folded, n_appended))
 }
 
 fn merge_findorb(
@@ -1315,6 +1374,7 @@ fn merge_findorb(
         r.findorb_n_obs_used = f["fo_n_obs_used"].as_u64().map(|v| v as u32);
         r.findorb_time_ms = f["fo_time_ms"].as_f64();
         r.findorb_n_obs_rejected = f["fo_n_obs_rejected"].as_u64().map(|v| v as u32);
+        record_tool_config(r, "findorb", f, "fo");
         n += 1;
     }
     Ok(n)
@@ -1375,6 +1435,7 @@ fn merge_oorb(
                         (dx * dx + dy * dy + dz * dz).sqrt() * empyrean_validation::compare::AU_KM,
                     );
                 }
+                record_tool_config(r, "oorb", o, "oorb");
                 n += 1;
             }
             "ephemeris" => {
@@ -1388,6 +1449,7 @@ fn merge_oorb(
                 r.oorb_d_dec_arcsec = o["oorb_d_dec_arcsec"].as_f64();
                 r.oorb_d_rho_km = o["oorb_d_rho_km"].as_f64();
                 r.oorb_time_ms = o["oorb_time_ms"].as_f64();
+                record_tool_config(r, "oorb", o, "oorb");
                 n += 1;
             }
             _ => {}
@@ -1426,6 +1488,7 @@ fn merge_orbfit(
         r.orbfit_n_obs_rejected = f["orbfit_n_obs_rejected"].as_u64().map(|v| v as u32);
         r.orbfit_time_ms = f["orbfit_time_ms"].as_f64();
         r.orbfit_error = f["orbfit_error"].as_str().map(String::from);
+        record_tool_config(r, "orbfit", f, "orbfit");
         n += 1;
     }
     Ok(n)
@@ -1461,7 +1524,162 @@ fn merge_layup(
         r.layup_reduced_chi2 = f["layup_reduced_chi2"].as_f64();
         r.layup_n_obs_used = f["layup_n_obs_used"].as_u64().map(|v| v as u32);
         r.layup_converged = f["layup_converged"].as_bool();
+        r.layup_flag = f["layup_flag"].as_i64().map(|v| v as i32);
+        r.layup_flag_name = f["layup_flag_name"].as_str().map(str::to_string);
+        r.layup_flag_meaning = f["layup_flag_meaning"].as_str().map(str::to_string);
         r.layup_time_ms = f["layup_time_ms"].as_f64();
+        record_tool_config(r, "layup", f, "layup");
+        n += 1;
+    }
+    Ok(n)
+}
+
+/// Record a tool's version, settings and unsupported reason on a row, from the tool
+/// runner's own record.
+///
+/// Every runner names its fields with one prefix (`fo`, `oorb`, `adam_core`, ...):
+/// `<prefix>_version` is a string, `<prefix>_settings` an object of settings, and
+/// `<prefix>_unsupported` the named reason the tool produced no result for the row.
+/// Values are stored exactly as the runner recorded them (non-string JSON setting
+/// values are rendered as JSON text) under the tool id, so one code path carries
+/// every tool's record; an absent field leaves the row untouched, so the report can
+/// say "not recorded" instead of inventing a value.
+fn record_tool_config(r: &mut ValidationResult, tool: &str, o: &serde_json::Value, prefix: &str) {
+    let (version_key, settings_key) = (format!("{prefix}_version"), format!("{prefix}_settings"));
+    if let Some(why) = o[format!("{prefix}_unsupported").as_str()].as_str() {
+        r.tool_unsupported
+            .get_or_insert_with(Default::default)
+            .insert(tool.to_string(), why.to_string());
+    }
+    if let Some(v) = o[version_key.as_str()].as_str() {
+        r.tool_versions
+            .get_or_insert_with(Default::default)
+            .insert(tool.to_string(), v.to_string());
+    }
+    if let Some(map) = o[settings_key.as_str()].as_object() {
+        let entry = r
+            .tool_settings
+            .get_or_insert_with(Default::default)
+            .entry(tool.to_string())
+            .or_default();
+        for (k, v) in map {
+            let text = match v.as_str() {
+                Some(t) => t.to_string(),
+                None => v.to_string(),
+            };
+            entry.insert(k.clone(), text);
+        }
+    }
+}
+
+/// Fold adam-core per-channel JSON (the Python package) onto the reference rows.
+fn merge_adam_core(
+    rows: &mut [ValidationResult],
+    path: &std::path::Path,
+) -> Result<usize, Box<dyn std::error::Error>> {
+    merge_adam_core_channel(rows, path, "adam-core")
+}
+
+/// Fold adam-core Rust-API per-channel JSON onto the reference rows.
+fn merge_adam_core_rust(
+    rows: &mut [ValidationResult],
+    path: &std::path::Path,
+) -> Result<usize, Box<dyn std::error::Error>> {
+    merge_adam_core_channel(rows, path, "adam-core-rust")
+}
+
+/// Fold one adam-core channel's JSON onto the reference rows.
+///
+/// adam-core (the released 0.8.0 with ASSIST through adam-assist 0.7.0) covers all
+/// three axes, and its two channels (the Python package, `adam-core`, and the Rust
+/// API, `adam-core-rust`) write the same fields under their own prefixes, so one
+/// merge serves both. It routes by test type like [`merge_oorb`] and
+/// [`merge_grss`]: propagation by (object, dt), ephemeris by (object, dt,
+/// observer), OD by object. A row the runner could not compute (a self-perturber,
+/// a refused or failed fit) carries `<prefix>_unsupported` with the tool's own
+/// reason; it is folded into `tool_unsupported`, never dropped. The runner's
+/// version and settings ride along on every folded row.
+fn merge_adam_core_channel(
+    rows: &mut [ValidationResult],
+    path: &std::path::Path,
+    tool: &str,
+) -> Result<usize, Box<dyn std::error::Error>> {
+    let prefix = empyrean_validation::schema::ADAM_CORE_TOOLS
+        .iter()
+        .find(|(t, _)| *t == tool)
+        .map(|(_, p)| *p)
+        .ok_or_else(|| format!("{tool} is not an adam-core channel"))?;
+    let key = |name: &str| format!("{prefix}_{name}");
+    let txt = std::fs::read_to_string(path).map_err(|e| format!("read {}: {e}", path.display()))?;
+    let ac: Vec<serde_json::Value> = serde_json::from_str(&txt)?;
+    let mut prop_idx: std::collections::HashMap<(String, i64), &serde_json::Value> =
+        Default::default();
+    let mut eph_idx: std::collections::HashMap<(String, i64, String), &serde_json::Value> =
+        Default::default();
+    let mut od_idx: std::collections::HashMap<String, &serde_json::Value> = Default::default();
+    for o in &ac {
+        let Some(name) = o["object"].as_str() else {
+            continue;
+        };
+        match o["test_type"].as_str() {
+            Some("propagation") => {
+                if let Some(dt) = o["dt_days"].as_f64() {
+                    prop_idx.insert((name.to_string(), dt as i64), o);
+                }
+            }
+            Some("ephemeris") => {
+                if let (Some(dt), Some(obs)) = (o["dt_days"].as_f64(), o["observer"].as_str()) {
+                    eph_idx.insert((name.to_string(), dt as i64, obs.to_string()), o);
+                }
+            }
+            Some("orbit_determination") => {
+                od_idx.insert(name.to_string(), o);
+            }
+            _ => {}
+        }
+    }
+    let mut n = 0;
+    for r in rows.iter_mut() {
+        let o = match r.test_type.as_str() {
+            "propagation" => prop_idx.get(&(r.object.clone(), r.dt_days as i64)).copied(),
+            "ephemeris" => r.observer.as_deref().and_then(|obs| {
+                eph_idx
+                    .get(&(r.object.clone(), r.dt_days as i64, obs.to_string()))
+                    .copied()
+            }),
+            "orbit_determination" => od_idx.get(&r.object).copied(),
+            _ => None,
+        };
+        let Some(o) = o else { continue };
+        let test_type = r.test_type.clone();
+        let f = r
+            .adam_core_fields_mut(tool)
+            .expect("an adam-core channel id has fields");
+        *f.time_ms = o[key("time_ms").as_str()].as_f64();
+        match test_type.as_str() {
+            "propagation" => {
+                *f.vs_horizons_km = o[key("vs_horizons_km").as_str()].as_f64();
+            }
+            "ephemeris" => {
+                *f.separation_arcsec = o[key("separation_arcsec").as_str()].as_f64();
+                *f.d_ra_arcsec = o[key("d_ra_arcsec").as_str()].as_f64();
+                *f.d_dec_arcsec = o[key("d_dec_arcsec").as_str()].as_f64();
+                *f.d_rho_km = o[key("d_rho_km").as_str()].as_f64();
+            }
+            _ => {
+                *f.chi2 = o[key("chi2").as_str()].as_f64();
+                *f.reduced_chi2 = o[key("reduced_chi2").as_str()].as_f64();
+                *f.n_obs_used = o[key("n_obs_used").as_str()].as_u64().map(|v| v as u32);
+                *f.n_obs_rejected = o[key("n_obs_rejected").as_str()].as_u64().map(|v| v as u32);
+                *f.converged = o[key("converged").as_str()].as_bool();
+                *f.sigma_source = o[key("sigma_source").as_str()].as_object().map(|m| {
+                    m.iter()
+                        .map(|(k, v)| (k.clone(), v.clone()))
+                        .collect::<std::collections::BTreeMap<_, _>>()
+                });
+            }
+        }
+        record_tool_config(r, tool, o, prefix);
         n += 1;
     }
     Ok(n)
@@ -1549,6 +1767,7 @@ fn merge_grss(
         // A named force-model difference travels on every axis, because it
         // applies to the number on the row rather than to one kind of number.
         r.grss_model_note = g["grss_model_note"].as_str().map(String::from);
+        record_tool_config(r, "grss", g, "grss");
         match r.test_type.as_str() {
             "propagation" => {
                 r.grss_vs_horizons_km = g["grss_vs_horizons_km"].as_f64();
@@ -1592,26 +1811,40 @@ fn merge_grss(
     Ok(n)
 }
 
+/// A timing-only tool's records by (object, test_type, dt, observer): the timing,
+/// when the tool ran the row, and the record itself.
+type ToolTimeIndex<'a> =
+    std::collections::HashMap<(String, String, i64, String), (Option<f64>, &'a serde_json::Value)>;
+
 /// Fold one external tool's per-row wall-clock timings onto matching rows,
-/// keyed by (object, test_type, dt, observer?). Used for the kete / jorbit
-/// runners, whose comparison axes are not yet wired into the report
-/// registry — only their timing feeds the performance strip.
+/// keyed by (object, test_type, dt, observer?), with the tool's recorded version,
+/// settings and unsupported reason (see [`record_tool_config`]). A record the tool
+/// did not run carries no timing but its `<prefix>_unsupported` reason, and is
+/// folded all the same. Used for the kete / jorbit runners, whose comparison axes
+/// are not yet wired into the report registry — only their timing feeds the
+/// performance strip.
 fn merge_tool_times(
     rows: &mut [ValidationResult],
     path: &std::path::Path,
+    tool: &str,
     field: &str,
     set: impl Fn(&mut ValidationResult, Option<f64>),
 ) -> Result<usize, Box<dyn std::error::Error>> {
     let ext = read_tool_records(path)?;
-    let mut idx: std::collections::HashMap<(String, String, i64, String), f64> = Default::default();
+    let prefix = tool.replace('-', "_");
+    let unsupported_key = format!("{prefix}_unsupported");
+    let mut idx: ToolTimeIndex = Default::default();
     for o in &ext {
         let (Some(name), Some(tt)) = (o["object"].as_str(), o["test_type"].as_str()) else {
             continue;
         };
-        let Some(t) = o[field].as_f64() else { continue };
+        let t = o[field].as_f64();
+        if t.is_none() && o[unsupported_key.as_str()].as_str().is_none() {
+            continue;
+        }
         let dt = o["dt_days"].as_f64().unwrap_or(0.0) as i64;
         let obs = o["observer"].as_str().unwrap_or("").to_string();
-        idx.insert((name.to_string(), tt.to_string(), dt, obs), t);
+        idx.insert((name.to_string(), tt.to_string(), dt, obs), (t, o));
     }
     let mut n = 0;
     for r in rows.iter_mut() {
@@ -1621,8 +1854,11 @@ fn merge_tool_times(
             r.dt_days as i64,
             r.observer.clone().unwrap_or_default(),
         );
-        if let Some(&t) = idx.get(&key) {
-            set(r, Some(t));
+        if let Some(&(t, o)) = idx.get(&key) {
+            if t.is_some() {
+                set(r, t);
+            }
+            record_tool_config(r, tool, o, &prefix);
             n += 1;
         }
     }
@@ -2242,10 +2478,13 @@ fn parse_min_rows(specs: &[String]) -> Result<Vec<RowFloor>, String> {
 /// - `orbit_determination_radar` — one row per object with a manifest-pinned radar
 ///   fixture, scoped to `rust`. The radar rows ride the plan and the python
 ///   and cli drivers replay them, but the reference channel has no
-///   optical+radar arm and emits no row for the arc, so no channel's radar
-///   row is ever compared (`n_compared` is structurally 0 there) and the
-///   floor can only live where the rows are produced for certain
-///   (`empyrean-s1ab`).
+///   optical+radar arm: at the bound tag it writes the row back empty, and
+///   the summary drops that declined row from the pairing (as empyrean-core
+///   #26 does at the source, in no tag yet), so no channel's radar row is
+///   ever compared (`n_compared` is structurally 0 there) and the floor can
+///   only live where the rows are produced for certain (`empyrean-s1ab`).
+///   One fit is excused from its converged count by name, keyed to the rc1
+///   engine ([`FLOOR_EXCEPTIONS`], `empyrean-a7f5f`).
 fn catalog_row_floors() -> Vec<RowFloor> {
     vec![
         RowFloor {
@@ -2261,12 +2500,140 @@ fn catalog_row_floors() -> Vec<RowFloor> {
     ]
 }
 
+/// The merge paths each requested comparator must fill on a full-catalog run:
+/// `(tool id as EXTERNAL_TOOLS spells it, the comparator outcome it lands on,
+/// the merge path)`. One tool id can land on more than one outcome (find_orb's
+/// and GRSS's radar passes are their own comparators) and one outcome can have
+/// more than one path (find_orb's OD, propagation and ephemeris references;
+/// ASSIST's folded reference rows and its standalone per-arm rows). The names
+/// are the ones `merge-external` records in [`ComparatorOutcome::paths`].
+/// `jpl-sbdb` is not a tool of `EXTERNAL_TOOLS`: the workflow adds it, because
+/// every reduce merges the pinned SBDB OD reference.
+const COMPARATOR_MERGE_PATHS: [(&str, &str, &str); 16] = [
+    ("assist", "assist", "folded"),
+    ("assist", "assist", "standalone"),
+    ("findorb", "findorb", "od"),
+    ("findorb", "findorb", "propagation"),
+    ("findorb", "findorb", "ephemeris"),
+    ("findorb", "findorb-radar", "radar"),
+    ("grss", "grss", "rows"),
+    ("grss", "grss-radar", "radar"),
+    ("oorb", "oorb", "rows"),
+    ("orbfit", "orbfit", "rows"),
+    ("layup", "layup", "rows"),
+    ("adam-core", "adam-core", "rows"),
+    ("adam-core-rust", "adam-core-rust", "rows"),
+    ("kete", "kete", "timing"),
+    ("jorbit", "jorbit", "timing"),
+    ("jpl-sbdb", "jpl-sbdb", "od-reference"),
+];
+
+/// Merge paths that legitimately land 0 rows on a full catalog, each with its
+/// reason: `(comparator outcome, path, reason)`. A path in this table is
+/// excused by name and printed as a NOTE; it is never skipped silently. It is
+/// empty: on the full-catalog hosted run 44355534056 every path of every
+/// comparator landed rows (find_orb's propagation and ephemeris references and
+/// both radar passes included). The act legs' empty find_orb propagation path
+/// is a subset-run property, and a subset run does not apply the requirement.
+const LEGITIMATELY_EMPTY_PATHS: [(&str, &str, &str); 0] = [];
+
+/// Why the full-catalog comparator requirement fails for this summary, one line
+/// per comparator and path, plus the NOTEs for excused paths.
+///
+/// `requested` are tool ids; one the table does not know is an error (a typo
+/// must not read as "required nothing"). A summary with no `comparators` array
+/// fails every requested path, and a merged comparator whose outcome carries no
+/// per-path counts fails with the count missing, never passes.
+fn comparator_requirement_outcome(
+    summary: &serde_json::Value,
+    requested: &[String],
+    empty_ok: &[(&str, &str, &str)],
+) -> Result<GateOutcome, String> {
+    let mut out = GateOutcome::default();
+    let mut seen: Vec<&str> = Vec::new();
+    for id in requested.iter().map(|s| s.trim()).filter(|s| !s.is_empty()) {
+        if !COMPARATOR_MERGE_PATHS
+            .iter()
+            .any(|(tool, _, _)| *tool == id)
+        {
+            let known: Vec<&str> = COMPARATOR_MERGE_PATHS
+                .iter()
+                .map(|(tool, _, _)| *tool)
+                .fold(Vec::new(), |mut acc, t| {
+                    if !acc.contains(&t) {
+                        acc.push(t);
+                    }
+                    acc
+                });
+            return Err(format!(
+                "--require-comparators names `{id}`, which is not a comparator this suite merges (known: {})",
+                known.join(", ")
+            ));
+        }
+        if !seen.contains(&id) {
+            seen.push(id);
+        }
+    }
+    let comparators = summary["comparators"].as_array();
+    for id in seen {
+        for (_, outcome_tool, path) in COMPARATOR_MERGE_PATHS.iter().filter(|(t, _, _)| *t == id) {
+            let who = format!("comparator {id} ({outcome_tool}), merge path {path}");
+            let Some(comparators) = comparators else {
+                out.failures.push(format!(
+                    "{who}: the summary has no `comparators` array, so the merge outcome cannot be read"
+                ));
+                continue;
+            };
+            let Some(c) = comparators
+                .iter()
+                .find(|c| c["tool"].as_str() == Some(*outcome_tool))
+            else {
+                out.failures.push(format!(
+                    "{who}: ABSENT: it was requested but no merge outcome was recorded for `{outcome_tool}` (its leg staged nothing and nothing named why)"
+                ));
+                continue;
+            };
+            if c["status"].as_str() == Some("failed") {
+                out.failures.push(format!(
+                    "{who}: FAILED: {}",
+                    c["reason"].as_str().unwrap_or("no reason recorded")
+                ));
+                continue;
+            }
+            let Some(rows) = c["paths"]
+                .as_array()
+                .and_then(|ps| ps.iter().find(|p| p["path"].as_str() == Some(*path)))
+                .and_then(|p| p["rows"].as_u64())
+            else {
+                out.failures.push(format!(
+                    "{who}: the summary records no row count for this path (a summary written before per-path counts, or a merge that did not record it), so the requirement cannot be verified"
+                ));
+                continue;
+            };
+            if rows == 0 {
+                match empty_ok
+                    .iter()
+                    .find(|(t, p, _)| t == outcome_tool && p == path)
+                {
+                    Some((_, _, why)) => out.notes.push(format!(
+                        "ci-check: NOTE {who}: merged 0 rows, excused by name: {why}"
+                    )),
+                    None => out.failures.push(format!(
+                        "{who}: merged 0 rows (a full-catalog run must land rows on every path)"
+                    )),
+                }
+            }
+        }
+    }
+    Ok(out)
+}
+
 /// Channel names a `--min-rows` floor (or `--strict-channels`) may name.
 ///
 /// The `channels` module constants plus the externally-merged comparators that
 /// only ever appear as their own result JSON. Validated against so a typo is
 /// "you typed it wrong", not "that channel produced nothing".
-const KNOWN_CHANNELS: [&str; 13] = [
+const KNOWN_CHANNELS: [&str; 15] = [
     channels::RUST,
     channels::PYTHON,
     channels::C,
@@ -2278,6 +2645,8 @@ const KNOWN_CHANNELS: [&str; 13] = [
     "oorb",
     "jorbit",
     "layup",
+    "adam-core",
+    "adam-core-rust",
     "orbfit",
     "grss",
 ];
@@ -2287,13 +2656,35 @@ const KNOWN_CHANNELS: [&str; 13] = [
 /// Split out from [`ci_check`] so the gate's logic is testable without a
 /// process exit — a gate nobody can write a test against is a gate nobody
 /// notices has stopped checking anything.
+#[cfg(test)]
 fn ci_check_failures(
     channels: &[serde_json::Value],
     strict_channels: &[String],
     min_rows: &[RowFloor],
     summary_path: &std::path::Path,
 ) -> Vec<String> {
+    ci_check_outcome(channels, strict_channels, min_rows, summary_path).failures
+}
+
+/// What the channel and floor checks found: the failures, and the NOTEs for
+/// every row a floor excused or an exception left unused. Notes never change
+/// the verdict; they exist so an excused row is printed rather than hidden.
+#[derive(Debug, Default)]
+struct GateOutcome {
+    failures: Vec<String>,
+    notes: Vec<String>,
+}
+
+/// [`ci_check_failures`] with the notes the floors produce (see
+/// [`floor_outcome`]).
+fn ci_check_outcome(
+    channels: &[serde_json::Value],
+    strict_channels: &[String],
+    min_rows: &[RowFloor],
+    summary_path: &std::path::Path,
+) -> GateOutcome {
     let mut failures = Vec::new();
+    let mut notes = Vec::new();
     for want in strict_channels {
         // Absence check FIRST. The previous gate iterated the summary and
         // `continue`d past any channel not in --strict-channels, which meant
@@ -2416,7 +2807,9 @@ fn ci_check_failures(
         // Unscoped per-axis floors apply to every strict channel. Scoped
         // floors are handled below, against the one channel they name.
         for f in min_rows.iter().filter(|f| f.channel.is_none()) {
-            failures.extend(floor_failures(ch, want, f, true));
+            let o = floor_outcome(ch, want, f, true);
+            failures.extend(o.failures);
+            notes.extend(o.notes);
         }
     }
 
@@ -2444,9 +2837,11 @@ fn ci_check_failures(
             continue;
         };
         let strict = strict_channels.iter().any(|s| s == want);
-        failures.extend(floor_failures(ch, want, f, strict));
+        let o = floor_outcome(ch, want, f, strict);
+        failures.extend(o.failures);
+        notes.extend(o.notes);
     }
-    failures
+    GateOutcome { failures, notes }
 }
 
 /// The distinct objects a plan names, in plan order.
@@ -2466,6 +2861,53 @@ fn planned_objects(path: &std::path::Path) -> Result<Vec<String>, String> {
         .into_iter()
         .filter_map(|r| seen.insert(r.object.clone()).then_some(r.object))
         .collect())
+}
+
+/// The reference's declined radar rows the summary dropped from the pairing
+/// (`n_reference_declined`, `reference_declined_rows`), as a NOTE, or a failure
+/// when the summary carries no count.
+///
+/// A summary without the count predates the rule: its radar rows were paired
+/// against the reference's empty ones and read as unjudged, so it must not
+/// pass silently as though nothing had been dropped.
+fn reference_declined_outcome(summary: &serde_json::Value) -> GateOutcome {
+    let Some(n) = summary["n_reference_declined"].as_u64() else {
+        return GateOutcome {
+            failures: vec![
+                "the summary carries no n_reference_declined; it predates the declined \
+                 reference radar row rule, so regenerate it with this build of `report`"
+                    .to_string(),
+            ],
+            notes: Vec::new(),
+        };
+    };
+    if n == 0 {
+        return GateOutcome::default();
+    }
+    let named: Vec<String> = summary["reference_declined_rows"]
+        .as_array()
+        .map(|rows| {
+            rows.iter()
+                .map(|r| {
+                    format!(
+                        "{} / {}",
+                        r["object"].as_str().unwrap_or("?"),
+                        r["test_type"].as_str().unwrap_or("?")
+                    )
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    GateOutcome {
+        failures: Vec::new(),
+        notes: vec![format!(
+            "ci-check: NOTE {n} reference (core) radar row(s) were declined by the reference \
+             (neither a comparable metric nor a delivery signal) and dropped from the pairing, \
+             as empyrean-core #26 does at the source; every channel's radar row reads as \
+             unreferenced [{}]",
+            named.join(", ")
+        )],
+    }
 }
 
 /// Why the summary fails the `--plan` check: planned objects with no
@@ -2520,29 +2962,33 @@ fn reference_coverage_failures(summary: &serde_json::Value, planned: &[String]) 
 /// - `n_compared` — this many of them paired with a reference row and were
 ///   actually diffed. Checked only for `--strict-channels`, whose whole job is
 ///   to match the reference. It is meaningless for an axis the reference does
-///   not run: the reference channel has no optical+radar arm and emits no
-///   `orbit_determination_radar` row (empyrean-s1ab), so every channel's
-///   `n_compared` on that axis is structurally 0 and a floor on it would fail
-///   forever no matter how much radar work ran.
+///   not run: the reference channel has no optical+radar arm and its empty
+///   `orbit_determination_radar` row is dropped from the pairing
+///   (empyrean-s1ab), so every channel's `n_compared` on that axis is
+///   structurally 0 and a floor on it would fail forever no matter how much
+///   radar work ran.
 ///
 /// `by_test_type` is keyed by test type; a missing key and a zero count are the
 /// same failure — the axis was not exercised — and are reported as such rather
 /// than skipped.
-fn floor_failures(
-    ch: &serde_json::Value,
-    channel: &str,
-    f: &RowFloor,
-    strict: bool,
-) -> Vec<String> {
+///
+/// A fit named in [`FLOOR_EXCEPTIONS`] for this channel and axis is excused
+/// from the CONVERGED check, by object, only while the engine that ran it is
+/// the one the exception is keyed to; see [`apply_floor_exceptions`].
+fn floor_outcome(ch: &serde_json::Value, channel: &str, f: &RowFloor, strict: bool) -> GateOutcome {
     let (tt, floor) = (&f.test_type, f.floor);
     let entry = &ch["by_test_type"][tt];
     if entry.is_null() {
-        return vec![format!(
-            "{channel}: {tt} is absent from the summary (floor is {floor}) — \
-             that axis was never exercised"
-        )];
+        return GateOutcome {
+            failures: vec![format!(
+                "{channel}: {tt} is absent from the summary (floor is {floor}) — \
+                 that axis was never exercised"
+            )],
+            notes: Vec::new(),
+        };
     }
     let mut out = Vec::new();
+    let excused = apply_floor_exceptions(entry, channel, tt, &mut out);
     // `n_rows` predates nothing — it was added with the scoped floors. Treat a
     // summary that lacks it as a hard error rather than skipping the check: a
     // stale summary silently passing a floor is the defect, not the fix.
@@ -2574,11 +3020,12 @@ fn floor_failures(
     // twice — worse, it would claim the pass ran when it may not have.
     if rows_ok {
         match entry["n_converged"].as_u64() {
-            Some(n) if n >= floor => {}
+            Some(n) if n + excused.count >= floor => {}
             Some(n) => out.push(format!(
-                "{channel}: {tt} produced {} rows but only {n} CONVERGED, floor is {floor} — \
-                 the pass ran and emitted failure rows rather than being skipped",
-                entry["n_rows"].as_u64().unwrap_or(0)
+                "{channel}: {tt} produced {} rows but only {n} CONVERGED ({} excused by name), \
+                 floor is {floor} — the pass ran and emitted failure rows rather than being skipped",
+                entry["n_rows"].as_u64().unwrap_or(0),
+                excused.count
             )),
             None => out.push(format!(
                 "{channel}: {tt} carries no n_converged count (floor is {floor}) — the summary \
@@ -2597,6 +3044,92 @@ fn floor_failures(
             )),
         }
     }
+    GateOutcome {
+        failures: out,
+        notes: excused.notes,
+    }
+}
+
+/// What [`apply_floor_exceptions`] found on one axis.
+#[derive(Default)]
+struct Excused {
+    /// Unconverged fits excused from the CONVERGED check.
+    count: u64,
+    /// One NOTE per exception that applied or went unused.
+    notes: Vec<String>,
+}
+
+/// Apply [`FLOOR_EXCEPTIONS`] to one channel and axis of the summary.
+///
+/// For each exception on this channel and test type, read the summary's
+/// `fit_rows` for the excepted object:
+///
+/// - the row ran on any engine but the one the exception is keyed to: the
+///   exception itself FAILS, converged or not, saying it must be re-examined;
+/// - the engine matches and the fit did not converge: excused, NOTE names the
+///   fit and the engine, one more row counts toward the CONVERGED floor;
+/// - the engine matches and the fit converged (it is platform-marginal): the
+///   NOTE says the exception went unused.
+///
+/// No row for the object (a subset run) leaves the exception silent: nothing
+/// ran that it could excuse. A summary with no `fit_rows` for an axis that has
+/// an exception predates the field, which is a failure, never a pass.
+fn apply_floor_exceptions(
+    entry: &serde_json::Value,
+    channel: &str,
+    tt: &str,
+    failures: &mut Vec<String>,
+) -> Excused {
+    let mut out = Excused::default();
+    for e in FLOOR_EXCEPTIONS
+        .iter()
+        .filter(|e| e.channel == channel && e.test_type == tt)
+    {
+        let Some(rows) = entry["fit_rows"].as_array() else {
+            failures.push(format!(
+                "{channel}: {tt} carries no fit_rows, which the floor exception for {} needs; \
+                 the summary predates it, so regenerate it with this build of `report`",
+                e.object
+            ));
+            continue;
+        };
+        for row in rows
+            .iter()
+            .filter(|r| r["object"].as_str() == Some(e.object))
+        {
+            let ran_on = row["source_version"]
+                .as_str()
+                .map(normalize_engine)
+                .unwrap_or_default();
+            if ran_on != e.engine {
+                failures.push(format!(
+                    "{channel}: floor exception FAILED: {} / {tt} is excused only on the rc1 \
+                     engine [{}], but this row ran on [{}]; the exception is keyed to the rc1 \
+                     engine and must be re-examined",
+                    e.object,
+                    e.engine,
+                    if ran_on.is_empty() {
+                        "no source_version"
+                    } else {
+                        &ran_on
+                    }
+                ));
+            } else if row["converged"].as_bool() == Some(false) {
+                out.count += 1;
+                out.notes.push(format!(
+                    "ci-check: {channel}: NOTE the {} / {tt} fit did not converge and is excused \
+                     from the converged floor by name on the rc1 engine [{}]: {}",
+                    e.object, e.engine, e.reason
+                ));
+            } else {
+                out.notes.push(format!(
+                    "ci-check: {channel}: NOTE the floor exception for {} / {tt} went unused: \
+                     the fit converged on the rc1 engine [{}]",
+                    e.object, e.engine
+                ));
+            }
+        }
+    }
     out
 }
 
@@ -2611,7 +3144,18 @@ fn ci_check(args: CiCheckArgs) -> Result<(), Box<dyn std::error::Error>> {
     if args.catalog_floors {
         min_rows.extend(catalog_row_floors());
     }
-    let mut failures = ci_check_failures(channels, &args.strict_channels, &min_rows, &args.summary);
+    let GateOutcome {
+        mut failures,
+        mut notes,
+    } = ci_check_outcome(channels, &args.strict_channels, &min_rows, &args.summary);
+    let declined = reference_declined_outcome(&summary);
+    failures.extend(declined.failures);
+    notes.extend(declined.notes);
+    // Printed before the verdict, pass or fail: an excused or dropped row is
+    // never hidden behind a green.
+    for note in &notes {
+        eprintln!("{note}");
+    }
     let planned = match &args.plan {
         Some(plan) => Some(planned_objects(plan)?),
         None => None,
@@ -2620,10 +3164,27 @@ fn ci_check(args: CiCheckArgs) -> Result<(), Box<dyn std::error::Error>> {
         failures.extend(reference_coverage_failures(&summary, planned));
     }
 
-    // A comparator `merge-external` skipped is never a gate failure (an external
-    // reference that did not deliver does not make the engine wrong), but it is
-    // named here beside the verdict so the gate's green is not read as "every
-    // comparator ran".
+    // On a full-catalog run the workflow names the comparators it requested; every
+    // one of them and every one of its merge paths must have landed rows. This is
+    // the one place an external reference's absence fails the gate: a full
+    // run that quietly lost a comparator (as run 44355534056 lost find_orb) has
+    // not been the validation of record, whatever else it passed.
+    if !args.require_comparators.is_empty() {
+        let required = comparator_requirement_outcome(
+            &summary,
+            &args.require_comparators,
+            &LEGITIMATELY_EMPTY_PATHS,
+        )?;
+        for note in &required.notes {
+            eprintln!("{note}");
+        }
+        failures.extend(required.failures);
+    }
+
+    // A comparator `merge-external` skipped is never a gate failure unless the
+    // run required it (above): an external reference that did not deliver does
+    // not make the engine wrong. It is named here beside the verdict so the
+    // gate's green is not read as "every comparator ran".
     if let Some(comparators) = summary["comparators"].as_array() {
         for c in comparators
             .iter()
@@ -2707,6 +3268,12 @@ fn ci_check(args: CiCheckArgs) -> Result<(), Box<dyn std::error::Error>> {
                 "ci-check: every object in {} ({}) has reference rows",
                 plan.display(),
                 planned.len()
+            );
+        }
+        if !args.require_comparators.is_empty() {
+            eprintln!(
+                "ci-check: every requested comparator [{}] merged, and every one of its merge paths landed rows",
+                args.require_comparators.join(", ")
             );
         }
         if min_rows.is_empty() {
@@ -2801,6 +3368,7 @@ mod tests {
                         "n_rows": rows,
                         "n_converged": converged,
                         "n_compared": compared,
+                        "fit_rows": [],
                     }),
                 )
             })
@@ -2851,11 +3419,11 @@ mod tests {
     /// signal — so a one-row shortfall is actionable from the log alone.
     #[test]
     fn ci_check_names_every_unjudged_row() {
-        let mut ch = summary_channel("core", &[("orbit_determination_radar", 1)]);
+        let mut ch = summary_channel("core", &[("orbit_determination", 1)]);
         ch["n_passing"] = serde_json::json!(0);
         ch["unjudged_rows"] = serde_json::json!([{
             "object": "Apophis",
-            "test_type": "orbit_determination_radar",
+            "test_type": "orbit_determination",
             "dt_days": 0.0,
             "observer": null,
             "method": "—",
@@ -2869,7 +3437,7 @@ mod tests {
         );
         assert!(
             failures[1].contains(
-                "unjudged — Apophis / orbit_determination_radar / dt +0 d / —: \
+                "unjudged — Apophis / orbit_determination / dt +0 d / —: \
                  the reference row carries neither a comparable metric nor a delivery signal"
             ),
             "{failures:?}"
@@ -3198,7 +3766,7 @@ mod tests {
         //
         // Note the (rows, compared) split on the rust radar axis: 5 rows
         // produced, 0 compared. That is not a degenerate case, it is THE
-        // case — the reference channel carries no radar rows to pair with,
+        // case — the reference channel's radar rows are declined and dropped,
         // so a compared-count floor could never pass. Non-strict channels are
         // floored on rows produced for exactly this reason.
         let channels = vec![
@@ -3311,6 +3879,212 @@ mod tests {
             failures[0].contains("rust:orbit_determination_radar>=5"),
             "names the floor that could not be evaluated: {failures:?}"
         );
+    }
+
+    // ── ci-check: the declined radar rows and the floor exception ────
+
+    /// The rc1 engine stamp as the rust runner writes it: one multi-line
+    /// string, columns padded with spaces.
+    const RC1_STAMP: &str = "empyrean-core 0.11.1\nvilleneuve    1.26.5+72dc426\n\
+                             scott         1.19.5+f6d217a\nnolan         1.15.0";
+
+    /// A rust channel with the radar axis carrying `rows` fits: (object,
+    /// converged, engine stamp). The axis counts follow the rows.
+    fn rust_radar(rows: &[(&str, bool, &str)]) -> serde_json::Value {
+        let n = rows.len() as u64;
+        let converged = rows.iter().filter(|r| r.1).count() as u64;
+        let mut ch =
+            summary_channel_split_conv("rust", &[("orbit_determination_radar", n, converged, 0)]);
+        ch["by_test_type"]["orbit_determination_radar"]["fit_rows"] = rows
+            .iter()
+            .map(|(o, c, v)| serde_json::json!({"object": o, "converged": c, "source_version": v}))
+            .collect::<Vec<_>>()
+            .into();
+        ch
+    }
+
+    fn radar_outcome(ch: serde_json::Value, floor: u64) -> GateOutcome {
+        let spec = format!("rust:orbit_determination_radar={floor}");
+        let min_rows = parse_min_rows(&strict(&[spec.as_str()])).expect("floor parses");
+        ci_check_outcome(
+            &[ch],
+            &[],
+            &min_rows,
+            std::path::Path::new("results/validation_summary.json"),
+        )
+    }
+
+    const FIVE: [(&str, bool, &str); 4] = [
+        ("Eros", true, RC1_STAMP),
+        ("Bennu", true, RC1_STAMP),
+        ("Didymos", true, RC1_STAMP),
+        ("Toutatis", true, RC1_STAMP),
+    ];
+
+    fn five_with(apophis: (bool, &str)) -> serde_json::Value {
+        let mut rows: Vec<(&str, bool, &str)> = FIVE.to_vec();
+        rows.push(("Apophis", apophis.0, apophis.1));
+        rust_radar(&rows)
+    }
+
+    /// The Apophis fit unconverged on the rc1 engine is excused by name: the
+    /// 4/5 floor passes, the NOTE names the fit and the engine.
+    #[test]
+    fn floor_exception_excuses_the_apophis_fit_on_the_rc1_engine() {
+        let o = radar_outcome(five_with((false, RC1_STAMP)), 5);
+        assert!(o.failures.is_empty(), "{:?}", o.failures);
+        assert_eq!(o.notes.len(), 1, "{:?}", o.notes);
+        assert_eq!(
+            o.notes[0],
+            "ci-check: rust: NOTE the Apophis / orbit_determination_radar fit did not converge \
+             and is excused from the converged floor by name on the rc1 engine \
+             [empyrean-core 0.11.1 villeneuve 1.26.5+72dc426 scott 1.19.5+f6d217a nolan 1.15.0]: \
+             the optical+radar fit exhausts damping on the rc.1 engine on every platform \
+             (beads a7f5f, slpum, wka0f)"
+        );
+    }
+
+    /// Any other engine fails the exception itself, converged or not.
+    #[test]
+    fn floor_exception_fails_on_any_other_engine_converged_or_not() {
+        for converged in [false, true] {
+            let o = radar_outcome(
+                five_with((converged, "empyrean-core 0.12.0\nscott 1.20.0")),
+                5,
+            );
+            assert!(
+                o.failures.iter().any(|f| f.starts_with(
+                    "rust: floor exception FAILED: Apophis / orbit_determination_radar is excused only on the rc1 engine"
+                ) && f.contains("must be re-examined")
+                    && f.contains("[empyrean-core 0.12.0 scott 1.20.0]")),
+                "converged={converged}: {:?}",
+                o.failures
+            );
+            assert!(o.notes.is_empty(), "{:?}", o.notes);
+        }
+        // A row with no engine stamp at all is not the rc1 engine either.
+        let mut rows: Vec<(&str, bool, &str)> = FIVE.to_vec();
+        rows.push(("Apophis", false, ""));
+        let o = radar_outcome(rust_radar(&rows), 5);
+        assert!(
+            o.failures.iter().any(|f| f.contains("[no source_version]")),
+            "{:?}",
+            o.failures
+        );
+    }
+
+    /// The fit converged on the rc1 engine (it is platform-marginal): the gate
+    /// passes and says the exception went unused.
+    #[test]
+    fn floor_exception_notes_when_unused_on_the_rc1_engine() {
+        let o = radar_outcome(five_with((true, RC1_STAMP)), 5);
+        assert!(o.failures.is_empty(), "{:?}", o.failures);
+        assert_eq!(o.notes.len(), 1, "{:?}", o.notes);
+        assert_eq!(
+            o.notes[0],
+            "ci-check: rust: NOTE the floor exception for Apophis / orbit_determination_radar \
+             went unused: the fit converged on the rc1 engine \
+             [empyrean-core 0.11.1 villeneuve 1.26.5+72dc426 scott 1.19.5+f6d217a nolan 1.15.0]"
+        );
+    }
+
+    /// The exception excuses Apophis and nothing else: a second unconverged
+    /// radar object still fails the converged floor.
+    #[test]
+    fn floor_exception_does_not_excuse_a_second_unconverged_object() {
+        let rows = [
+            ("Eros", true, RC1_STAMP),
+            ("Bennu", true, RC1_STAMP),
+            ("Didymos", true, RC1_STAMP),
+            ("Toutatis", false, RC1_STAMP),
+            ("Apophis", false, RC1_STAMP),
+        ];
+        let o = radar_outcome(rust_radar(&rows), 5);
+        assert_eq!(o.failures.len(), 1, "{:?}", o.failures);
+        assert!(
+            o.failures[0].contains("only 3 CONVERGED (1 excused by name), floor is 5"),
+            "{:?}",
+            o.failures
+        );
+        // Without Apophis in the summary the exception is silent and a
+        // Toutatis failure fails alone.
+        let o = radar_outcome(
+            rust_radar(&[("Eros", true, RC1_STAMP), ("Toutatis", false, RC1_STAMP)]),
+            2,
+        );
+        assert_eq!(o.failures.len(), 1, "{:?}", o.failures);
+        assert!(o.notes.is_empty(), "{:?}", o.notes);
+    }
+
+    /// The exception only applies to the axis and channel it names: Apophis
+    /// unconverged on another test type is not excused.
+    #[test]
+    fn floor_exception_is_scoped_to_its_channel_and_axis() {
+        let mut ch = summary_channel_split_conv("rust", &[("orbit_determination", 5, 4, 0)]);
+        ch["by_test_type"]["orbit_determination"]["fit_rows"] = serde_json::json!([
+            {"object": "Apophis", "converged": false, "source_version": RC1_STAMP}
+        ]);
+        let min_rows = parse_min_rows(&strict(&["rust:orbit_determination=5"])).unwrap();
+        let o = ci_check_outcome(
+            &[ch],
+            &[],
+            &min_rows,
+            std::path::Path::new("results/validation_summary.json"),
+        );
+        assert_eq!(o.failures.len(), 1, "{:?}", o.failures);
+        assert!(
+            o.failures[0].contains("only 4 CONVERGED"),
+            "{:?}",
+            o.failures
+        );
+    }
+
+    /// A summary with no `fit_rows` on the excepted axis predates the field:
+    /// it fails rather than passing as though no fit had failed.
+    #[test]
+    fn floor_exception_refuses_a_summary_without_fit_rows() {
+        let mut ch = five_with((false, RC1_STAMP));
+        ch["by_test_type"]["orbit_determination_radar"]
+            .as_object_mut()
+            .unwrap()
+            .remove("fit_rows");
+        let o = radar_outcome(ch, 5);
+        assert!(
+            o.failures.iter().any(|f| f.contains("carries no fit_rows")),
+            "{:?}",
+            o.failures
+        );
+    }
+
+    /// The NOTE for the reference's declined radar rows, and the refusal of a
+    /// summary that carries no count.
+    #[test]
+    fn declined_reference_rows_are_a_note_and_a_missing_count_fails() {
+        let summary = serde_json::json!({
+            "n_reference_declined": 1,
+            "reference_declined_rows": [
+                {"object": "Apophis", "test_type": "orbit_determination_radar"}
+            ],
+        });
+        let o = reference_declined_outcome(&summary);
+        assert!(o.failures.is_empty(), "{:?}", o.failures);
+        assert_eq!(
+            o.notes,
+            vec![
+                "ci-check: NOTE 1 reference (core) radar row(s) were declined by the reference \
+                 (neither a comparable metric nor a delivery signal) and dropped from the pairing, \
+                 as empyrean-core #26 does at the source; every channel's radar row reads as \
+                 unreferenced [Apophis / orbit_determination_radar]"
+                    .to_string()
+            ]
+        );
+        // Nothing declined: silent.
+        let none = reference_declined_outcome(&serde_json::json!({"n_reference_declined": 0}));
+        assert!(none.failures.is_empty() && none.notes.is_empty());
+        // An older summary has no count: it must not pass.
+        let old = reference_declined_outcome(&serde_json::json!({}));
+        assert_eq!(old.failures.len(), 1, "{:?}", old.failures);
+        assert!(old.failures[0].contains("no n_reference_declined"));
     }
 
     // ── ci-check --plan: reference rows per planned object ───────────
@@ -3535,7 +4309,9 @@ mod tests {
             f,
             r#"[{{"object":"Eros","test_type":"orbit_determination",
                  "layup_chi2":10.5,"layup_reduced_chi2":1.05,
-                 "layup_n_obs_used":512,"layup_converged":true,
+                 "layup_n_obs_used":512,"layup_converged":false,
+                 "layup_flag":3,"layup_flag_name":"FLAG_NO_ROOT_CONVERGED",
+                 "layup_flag_meaning":"none converged",
                  "layup_time_ms":42.0}}]"#
         )
         .unwrap();
@@ -3547,7 +4323,13 @@ mod tests {
         assert_eq!(od.layup_chi2, Some(10.5));
         assert_eq!(od.layup_reduced_chi2, Some(1.05));
         assert_eq!(od.layup_n_obs_used, Some(512));
-        assert_eq!(od.layup_converged, Some(true));
+        assert_eq!(od.layup_converged, Some(false));
+        assert_eq!(od.layup_flag, Some(3));
+        assert_eq!(
+            od.layup_flag_name.as_deref(),
+            Some("FLAG_NO_ROOT_CONVERGED")
+        );
+        assert_eq!(od.layup_flag_meaning.as_deref(), Some("none converged"));
         assert_eq!(od.layup_time_ms, Some(42.0));
 
         // Propagation row for the same object stays clear.
@@ -3564,6 +4346,474 @@ mod tests {
         let n = merge_layup(&mut rows, f.path()).unwrap();
         assert_eq!(n, 0);
         assert_eq!(rows[0].layup_chi2, None);
+    }
+
+    /// Every external merge folds the runner's `<prefix>_version` and
+    /// `<prefix>_settings` onto the row it touches, through the same maps adam-core
+    /// uses, so the Configurations appendix can state each tool's record.
+    #[test]
+    fn every_external_merge_records_the_tools_version_and_settings() {
+        type Merge = fn(
+            &mut [ValidationResult],
+            &std::path::Path,
+        ) -> Result<usize, Box<dyn std::error::Error>>;
+        fn rows() -> Vec<ValidationResult> {
+            let mut prop = ValidationResult::empty();
+            prop.object = "Eros".into();
+            prop.test_type = "propagation".into();
+            prop.dt_days = 30.0;
+            vec![prop, od_row("Eros")]
+        }
+        fn check(tool: &str, r: &ValidationResult) {
+            assert_eq!(
+                r.tool_versions.as_ref().expect(tool)[tool],
+                format!("{tool} 1.2.3"),
+                "{tool} version"
+            );
+            let s = &r.tool_settings.as_ref().expect(tool)[tool];
+            assert_eq!(s["knob"], "on", "{tool} string setting");
+            assert_eq!(s["n"], "3", "{tool} non-string setting as JSON text");
+        }
+        let cases: [(&str, &str, &str, Merge, usize); 5] = [
+            (
+                "findorb",
+                "fo",
+                r#""test_type":"orbit_determination","fo_rms_residual":0.4"#,
+                merge_findorb,
+                1,
+            ),
+            (
+                "oorb",
+                "oorb",
+                r#""test_type":"propagation","dt_days":30.0,"oorb_vs_horizons_km":1.0"#,
+                merge_oorb,
+                0,
+            ),
+            (
+                "orbfit",
+                "orbfit",
+                r#""test_type":"orbit_determination","orbfit_rms_arcsec":0.5"#,
+                merge_orbfit,
+                1,
+            ),
+            (
+                "layup",
+                "layup",
+                r#""test_type":"orbit_determination","layup_chi2":1.0"#,
+                merge_layup,
+                1,
+            ),
+            (
+                "grss",
+                "grss",
+                r#""test_type":"propagation","dt_days":30.0,"grss_time_ms":2.0"#,
+                merge_grss,
+                0,
+            ),
+        ];
+        for (tool, prefix, body, merge, at) in cases {
+            let mut rows = rows();
+            let mut f = tempfile::NamedTempFile::new().unwrap();
+            write!(
+                f,
+                r#"[{{"object":"Eros",{body},"{prefix}_version":"{tool} 1.2.3","{prefix}_settings":{{"knob":"on","n":3}}}}]"#
+            )
+            .unwrap();
+            assert_eq!(
+                merge(&mut rows, f.path()).unwrap(),
+                1,
+                "{tool} folds one row"
+            );
+            check(tool, &rows[at]);
+            assert!(
+                rows[1 - at].tool_versions.is_none(),
+                "{tool}: an untouched row stays clear"
+            );
+        }
+        for tool in ["kete", "jorbit"] {
+            let mut rows = rows();
+            let mut f = tempfile::NamedTempFile::new().unwrap();
+            write!(
+                f,
+                r#"[{{"object":"Eros","test_type":"propagation","dt_days":30.0,"{tool}_time_ms":4.0,"{tool}_version":"{tool} 1.2.3","{tool}_settings":{{"knob":"on","n":3}}}}]"#
+            )
+            .unwrap();
+            let n = merge_tool_times(
+                &mut rows,
+                f.path(),
+                tool,
+                &format!("{tool}_time_ms"),
+                |r, v| r.kete_time_ms = v,
+            )
+            .unwrap();
+            assert_eq!(n, 1, "{tool} folds one row");
+            check(tool, &rows[0]);
+        }
+    }
+
+    /// Every external merge folds the runner's `<prefix>_unsupported` reason into
+    /// `tool_unsupported` under the tool id, through the one path that carries
+    /// versions and settings, so no tool's named unsupported row collapses into a
+    /// blank. Each record here carries ONLY the reason (no number, no timing): the
+    /// row a tool did not run is still folded.
+    #[test]
+    fn every_external_merge_folds_the_tools_unsupported_reason() {
+        type Merge = fn(
+            &mut [ValidationResult],
+            &std::path::Path,
+        ) -> Result<usize, Box<dyn std::error::Error>>;
+        fn rows() -> Vec<ValidationResult> {
+            let mut prop = ValidationResult::empty();
+            prop.object = "Vesta".into();
+            prop.test_type = "propagation".into();
+            prop.dt_days = 30.0;
+            let mut eph = ValidationResult::empty();
+            eph.object = "Vesta".into();
+            eph.test_type = "ephemeris".into();
+            eph.dt_days = 30.0;
+            eph.observer = Some("W84".into());
+            vec![prop, eph, od_row("Vesta")]
+        }
+        fn kete_time(r: &mut ValidationResult, v: Option<f64>) {
+            r.kete_time_ms = v;
+        }
+        fn jorbit_time(r: &mut ValidationResult, v: Option<f64>) {
+            r.jorbit_time_ms = v;
+        }
+        fn kete(
+            rows: &mut [ValidationResult],
+            p: &std::path::Path,
+        ) -> Result<usize, Box<dyn std::error::Error>> {
+            merge_tool_times(rows, p, "kete", "kete_time_ms", kete_time)
+        }
+        fn jorbit(
+            rows: &mut [ValidationResult],
+            p: &std::path::Path,
+        ) -> Result<usize, Box<dyn std::error::Error>> {
+            merge_tool_times(rows, p, "jorbit", "jorbit_time_ms", jorbit_time)
+        }
+        // (tool id, field prefix, the record's keys, merge, rows it lands on)
+        let prop = r#""test_type":"propagation","dt_days":30.0"#;
+        let eph = r#""test_type":"ephemeris","dt_days":30.0,"observer":"W84""#;
+        let od = r#""test_type":"orbit_determination""#;
+        type Case = (
+            &'static str,
+            &'static str,
+            Vec<&'static str>,
+            Merge,
+            Vec<usize>,
+        );
+        let cases: Vec<Case> = vec![
+            ("findorb", "fo", vec![od], merge_findorb, vec![2]),
+            ("oorb", "oorb", vec![prop, eph], merge_oorb, vec![0, 1]),
+            ("orbfit", "orbfit", vec![od], merge_orbfit, vec![2]),
+            ("layup", "layup", vec![od], merge_layup, vec![2]),
+            (
+                "grss",
+                "grss",
+                vec![prop, eph, od],
+                merge_grss,
+                vec![0, 1, 2],
+            ),
+            (
+                "adam-core",
+                "adam_core",
+                vec![prop, eph, od],
+                merge_adam_core,
+                vec![0, 1, 2],
+            ),
+            (
+                "adam-core-rust",
+                "adam_core_rust",
+                vec![prop, eph, od],
+                merge_adam_core_rust,
+                vec![0, 1, 2],
+            ),
+            ("kete", "kete", vec![prop, eph, od], kete, vec![0, 1, 2]),
+            ("jorbit", "jorbit", vec![prop, eph], jorbit, vec![0, 1]),
+        ];
+        for (tool, prefix, keys, merge, on) in cases {
+            let mut rows = rows();
+            let why =
+                format!("self-perturber: {tool} cannot leave the object out of its own forces");
+            let records: Vec<String> = keys
+                .iter()
+                .map(|k| format!(r#"{{"object":"Vesta",{k},"{prefix}_unsupported":"{why}"}}"#))
+                .collect();
+            let mut f = tempfile::NamedTempFile::new().unwrap();
+            write!(f, "[{}]", records.join(",")).unwrap();
+            assert_eq!(
+                merge(&mut rows, f.path()).unwrap(),
+                on.len(),
+                "{tool} folds every reason-only record"
+            );
+            for (i, r) in rows.iter().enumerate() {
+                if on.contains(&i) {
+                    assert_eq!(r.unsupported_by(tool), Some(why.as_str()), "{tool} row {i}");
+                    assert_eq!(
+                        r.tool_unsupported.as_ref().unwrap().len(),
+                        1,
+                        "{tool}: only its own id"
+                    );
+                } else {
+                    assert!(r.tool_unsupported.is_none(), "{tool}: row {i} untouched");
+                }
+            }
+        }
+    }
+
+    /// ASSIST's named unsupported rows (a self-perturber: one record per arm with
+    /// `assist_unsupported` and no number, as run_assist.py writes them) fold the
+    /// reason onto every reference row of the object, append no standalone arm
+    /// row (one without a time would count as a capped FAIL), and reach the
+    /// report's Configurations appendix with the object. The object ASSIST ran
+    /// keeps its numbers and its six arm rows.
+    #[test]
+    fn merge_assist_folds_a_self_perturbers_reason_and_appends_no_arm_row() {
+        const ARMS: [&str; 6] = [
+            "assist_default_variational_off",
+            "assist_default_variational_on",
+            "assist_layup_variational_off",
+            "assist_layup_variational_on",
+            "assist_asteroid_institute_variational_off",
+            "assist_asteroid_institute_variational_on",
+        ];
+        let why = "self-perturber: ASSIST integrates the sixteen SB441-N16 perturbers of \
+                   sb441-n16.bsp and has no per-body exclusion, so the object would sit on \
+                   its own 1/r² singularity";
+        let mut rows = Vec::new();
+        for (object, population) in [("Vesta", "Self-Perturber"), ("Eros", "NEO")] {
+            for channel in ["rust", "core"] {
+                for arm in ["none_detection_on", "first_order_detection_on"] {
+                    let mut r = ValidationResult::empty();
+                    r.object = object.into();
+                    r.population = population.into();
+                    r.channel = channel.into();
+                    r.test_type = "propagation".into();
+                    r.dt_days = 30.0;
+                    r.propagation_uncertainty = Some(arm.into());
+                    r.emp_pos_au = Some([1.0, 0.0, 0.0]);
+                    rows.push(r);
+                }
+            }
+        }
+        let mut records = Vec::new();
+        for arm in ARMS {
+            let variational = arm.ends_with("_on");
+            records.push(serde_json::json!({
+                "object": "Vesta", "population": "Self-Perturber", "dt_days": 30.0,
+                "test_type": "assist", "propagation_uncertainty": arm,
+                "variational": variational, "assist_unsupported": why,
+                "assist_version": "1.2.3",
+            }));
+            records.push(serde_json::json!({
+                "object": "Eros", "population": "NEO", "dt_days": 30.0,
+                "test_type": "assist", "propagation_uncertainty": arm,
+                "variational": variational, "assist_vs_horizons_km": 0.001,
+                "assist_time_ms": 2.0, "assist_pos_au": [1.0, 0.0, 0.0],
+                "assist_version": "1.2.3",
+            }));
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("validation_assist.json");
+        std::fs::write(&path, serde_json::to_string(&records).unwrap()).unwrap();
+
+        assert_eq!(
+            merge_assist(&mut rows, &path).unwrap().0,
+            8,
+            "four reference rows per object"
+        );
+        for r in rows.iter().filter(|r| r.channel != "assist") {
+            if r.object == "Vesta" {
+                assert_eq!(r.unsupported_by("assist"), Some(why), "{}", r.channel);
+                assert!(r.assist_time_ms.is_none() && r.emp_vs_assist_km.is_none());
+            } else {
+                assert!(r.tool_unsupported.is_none());
+                assert_eq!(r.assist_time_ms, Some(2.0));
+            }
+        }
+        let arm_rows: Vec<&ValidationResult> =
+            rows.iter().filter(|r| r.channel == "assist").collect();
+        assert_eq!(arm_rows.len(), 6, "the six arms of Eros only");
+        assert!(arm_rows.iter().all(|r| r.object == "Eros"));
+
+        let results = write_results(dir.path(), "validation_core_merged.json", &rows);
+        let out = dir.path().join("report.html");
+        report(ReportArgs {
+            results: vec![results],
+            output: out.clone(),
+            summary: None,
+            predict_agg: vec![],
+            predict_run: vec![],
+        })
+        .unwrap();
+        let html = std::fs::read_to_string(&out).unwrap();
+        let cfg = &html[html.find("id=\"s05c\"").expect("Configurations section")..];
+        let block = cfg
+            .split("<div class=\"cfg-unsupported\" data-tool=\"assist\">")
+            .nth(1)
+            .expect("ASSIST's unsupported rows in Configurations");
+        let block = block.split("</table>").next().unwrap();
+        assert!(
+            block.contains(why) && block.contains("Vesta") && !block.contains("Eros"),
+            "the reason with its object"
+        );
+    }
+
+    /// The Rust-API channel folds into its own fields and its own tool id, and
+    /// leaves the Python package's untouched (and the reverse): the two channels
+    /// of one release sit side by side on the same reference row.
+    #[test]
+    fn merge_adam_core_rust_folds_into_its_own_fields_beside_the_python_channel() {
+        let mut prop = ValidationResult::empty();
+        prop.object = "Eros".into();
+        prop.test_type = "propagation".into();
+        prop.dt_days = 30.0;
+        let mut eph = ValidationResult::empty();
+        eph.object = "Eros".into();
+        eph.test_type = "ephemeris".into();
+        eph.dt_days = 30.0;
+        eph.observer = Some("W84".into());
+        let mut rows = vec![prop, eph, od_row("Eros")];
+        let mut py = tempfile::NamedTempFile::new().unwrap();
+        write!(
+            py,
+            r#"[{{"object":"Eros","test_type":"propagation","dt_days":30.0,
+                "adam_core_vs_horizons_km":0.25,"adam_core_version":"0.8.0",
+                "adam_core_settings":{{"obscodes_source":"mpc-obscodes 2026.11.7"}}}}]"#
+        )
+        .unwrap();
+        let mut rs = tempfile::NamedTempFile::new().unwrap();
+        write!(
+            rs,
+            r#"[{{"object":"Eros","test_type":"propagation","dt_days":30.0,
+                "adam_core_rust_vs_horizons_km":0.26,"adam_core_rust_time_ms":2.0,
+                "adam_core_rust_version":"0.8.0",
+                "adam_core_rust_settings":{{"obscodes":"mpc-obscodes 2026.4.23"}}}},
+              {{"object":"Eros","test_type":"ephemeris","dt_days":30.0,"observer":"W84",
+                "adam_core_rust_d_rho_km":-0.07}},
+              {{"object":"Eros","test_type":"orbit_determination",
+                "adam_core_rust_converged":true,"adam_core_rust_reduced_chi2":0.4,
+                "adam_core_rust_n_obs_used":100,"adam_core_rust_n_obs_rejected":2,
+                "adam_core_rust_sigma_source":{{"reported":3,"filled":97}},
+                "adam_core_converged":false}}]"#
+        )
+        .unwrap();
+        assert_eq!(merge_adam_core(&mut rows, py.path()).unwrap(), 1);
+        assert_eq!(merge_adam_core_rust(&mut rows, rs.path()).unwrap(), 3);
+        assert_eq!(rows[0].adam_core_vs_horizons_km, Some(0.25));
+        assert_eq!(rows[0].adam_core_rust_vs_horizons_km, Some(0.26));
+        assert_eq!(rows[1].adam_core_rust_d_rho_km, Some(-0.07));
+        assert_eq!(rows[1].adam_core_d_rho_km, None);
+        assert_eq!(rows[2].adam_core_rust_converged, Some(true));
+        assert_eq!(rows[2].adam_core_rust_n_obs_rejected, Some(2));
+        assert_eq!(
+            rows[2].adam_core_converged, None,
+            "a Python-prefixed field in the Rust file is not read"
+        );
+        assert_eq!(
+            rows[2].adam_core_rust_sigma_source.as_ref().unwrap()["filled"],
+            97
+        );
+        let settings = rows[0].tool_settings.as_ref().unwrap();
+        assert_eq!(
+            settings["adam-core"]["obscodes_source"],
+            "mpc-obscodes 2026.11.7"
+        );
+        assert_eq!(
+            settings["adam-core-rust"]["obscodes"],
+            "mpc-obscodes 2026.4.23"
+        );
+        assert_eq!(
+            rows[0].tool_versions.as_ref().unwrap()["adam-core-rust"],
+            "0.8.0"
+        );
+    }
+
+    #[test]
+    fn merge_adam_core_routes_by_test_type_and_carries_reasons_and_settings() {
+        let mut prop = ValidationResult::empty();
+        prop.object = "Eros".into();
+        prop.test_type = "propagation".into();
+        prop.dt_days = 30.0;
+        let mut eph = ValidationResult::empty();
+        eph.object = "Eros".into();
+        eph.test_type = "ephemeris".into();
+        eph.dt_days = 30.0;
+        eph.observer = Some("W84".into());
+        let mut rows = vec![prop, eph, od_row("Eros"), od_row("Vesta"), od_row("Bennu")];
+        let mut f = tempfile::NamedTempFile::new().unwrap();
+        write!(
+            f,
+            r#"[
+              {{"object":"Eros","test_type":"propagation","dt_days":30.0,
+                "adam_core_vs_horizons_km":0.27,"adam_core_time_ms":3.0,
+                "adam_core_version":"0.8.0",
+                "adam_core_settings":{{"epsilon":"1e-06","planets_kernel":"de440.bsp (sha256 a4ce)"}}}},
+              {{"object":"Eros","test_type":"ephemeris","dt_days":30.0,"observer":"W84",
+                "adam_core_separation_arcsec":0.0002,"adam_core_d_rho_km":-0.1}},
+              {{"object":"Eros","test_type":"orbit_determination",
+                "adam_core_chi2":10.5,"adam_core_reduced_chi2":0.9,"adam_core_n_obs_used":512,
+                "adam_core_n_obs_rejected":3,"adam_core_converged":true,
+                "adam_core_sigma_source":{{"reported":10,"filled":2,
+                  "filled_by_level":{{"station":1,"catalog":1}}}},
+                "adam_core_version":"0.8.0","adam_core_settings":{{"profile":"CORE_OD_V1"}}}},
+              {{"object":"Vesta","test_type":"orbit_determination","adam_core_converged":false,
+                "adam_core_unsupported":"self-perturber: adam-assist 0.7.0 offers no planets-only force model"}}
+            ]"#
+        )
+        .unwrap();
+        let n = merge_adam_core(&mut rows, f.path()).unwrap();
+        assert_eq!(n, 4, "prop + eph + two OD rows fold; Bennu has no record");
+        assert_eq!(rows[0].adam_core_vs_horizons_km, Some(0.27));
+        assert_eq!(
+            rows[0].adam_core_separation_arcsec, None,
+            "prop row takes no eph field"
+        );
+        assert_eq!(rows[1].adam_core_separation_arcsec, Some(0.0002));
+        assert_eq!(rows[1].adam_core_d_rho_km, Some(-0.1));
+        assert_eq!(rows[2].adam_core_reduced_chi2, Some(0.9));
+        assert_eq!(rows[2].adam_core_n_obs_rejected, Some(3));
+        assert_eq!(rows[2].adam_core_converged, Some(true));
+        let ss = rows[2].adam_core_sigma_source.as_ref().unwrap();
+        assert_eq!(ss["reported"], serde_json::json!(10));
+        // The unsupported reason survives with the tool's own words.
+        assert_eq!(rows[3].adam_core_converged, Some(false));
+        assert!(
+            rows[3]
+                .unsupported_by("adam-core")
+                .unwrap()
+                .contains("planets-only")
+        );
+        // Versions and settings ride along, exactly as recorded.
+        assert_eq!(
+            rows[0].tool_versions.as_ref().unwrap()["adam-core"],
+            "0.8.0"
+        );
+        assert_eq!(
+            rows[0].tool_settings.as_ref().unwrap()["adam-core"]["epsilon"],
+            "1e-06"
+        );
+        // An object with no adam-core record stays untouched.
+        assert_eq!(rows[4].adam_core_reduced_chi2, None);
+        assert!(rows[4].tool_versions.is_none() && rows[4].tool_settings.is_none());
+    }
+
+    #[test]
+    fn merge_adam_core_rows_round_trip_through_the_schema() {
+        let mut r = od_row("Eros");
+        r.adam_core_reduced_chi2 = Some(0.9);
+        r.tool_versions = Some([("adam-core".to_string(), "0.8.0".to_string())].into());
+        let s = serde_json::to_string(&r).unwrap();
+        assert!(s.contains("adam_core_reduced_chi2") && s.contains("tool_versions"));
+        let back: ValidationResult = serde_json::from_str(&s).unwrap();
+        assert_eq!(back, r);
+        // None fields stay out of the JSON (the schema omits them).
+        assert!(
+            !serde_json::to_string(&od_row("Bennu"))
+                .unwrap()
+                .contains("adam-core")
+        );
     }
 
     #[test]
@@ -4181,7 +5431,13 @@ mod tests {
         let layup = good_layup(dir.path());
         merge_external(merge_args(dir.path(), &[("layup", layup.as_path())])).unwrap();
         let outcomes = comparators::read_sidecar(&merged).unwrap().unwrap();
-        assert_eq!(outcomes, vec![ComparatorOutcome::merged("layup", 1)]);
+        assert_eq!(
+            outcomes,
+            vec![ComparatorOutcome::folded(
+                "layup",
+                Folded::single("rows", 1)
+            )]
+        );
     }
 
     #[test]
@@ -4260,5 +5516,384 @@ mod tests {
         let sum: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(&summary).unwrap()).unwrap();
         assert_eq!(sum["comparators"].as_array().unwrap().len(), 0);
+    }
+
+    // ── the full-catalog comparator requirement (ci-check) ─────────────────
+
+    /// The run's `EXTERNAL_TOOLS` on the full-catalog hosted run 44355534056,
+    /// plus `jpl-sbdb`, which the workflow adds.
+    const FULL_RUN_TOOLS: [&str; 11] = [
+        "assist",
+        "findorb",
+        "oorb",
+        "kete",
+        "jorbit",
+        "layup",
+        "adam-core",
+        "adam-core-rust",
+        "orbfit",
+        "grss",
+        "jpl-sbdb",
+    ];
+
+    fn tools(ids: &[&str]) -> Vec<String> {
+        ids.iter().map(|s| s.to_string()).collect()
+    }
+
+    /// A summary whose comparators carry every path of `COMPARATOR_MERGE_PATHS`
+    /// with `rows` rows, the way a clean full-catalog merge writes it.
+    fn full_summary(rows: usize) -> serde_json::Value {
+        let mut by_outcome: std::collections::BTreeMap<&str, Vec<(&str, usize)>> =
+            Default::default();
+        for (_, outcome_tool, path) in COMPARATOR_MERGE_PATHS {
+            by_outcome
+                .entry(outcome_tool)
+                .or_default()
+                .push((path, rows));
+        }
+        let outcomes: Vec<ComparatorOutcome> = by_outcome
+            .into_iter()
+            .map(|(tool, paths)| {
+                ComparatorOutcome::folded(tool, Folded::with_paths(paths[0].1, &paths))
+            })
+            .collect();
+        serde_json::json!({ "comparators": outcomes })
+    }
+
+    fn requirement(summary: &serde_json::Value, requested: &[&str]) -> GateOutcome {
+        comparator_requirement_outcome(summary, &tools(requested), &[]).unwrap()
+    }
+
+    fn set_path_rows(summary: &mut serde_json::Value, outcome: &str, path: &str, rows: usize) {
+        let c = summary["comparators"]
+            .as_array_mut()
+            .unwrap()
+            .iter_mut()
+            .find(|c| c["tool"] == outcome)
+            .unwrap();
+        let p = c["paths"]
+            .as_array_mut()
+            .unwrap()
+            .iter_mut()
+            .find(|p| p["path"] == path)
+            .unwrap();
+        p["rows"] = serde_json::json!(rows);
+    }
+
+    #[test]
+    fn a_full_run_with_every_comparator_and_every_path_nonzero_passes() {
+        let out = requirement(&full_summary(7), &FULL_RUN_TOOLS);
+        assert!(out.failures.is_empty(), "{:?}", out.failures);
+        assert!(out.notes.is_empty());
+    }
+
+    #[test]
+    fn a_requested_comparator_absent_from_the_summary_fails_naming_it_and_its_paths() {
+        let mut s = full_summary(7);
+        s["comparators"]
+            .as_array_mut()
+            .unwrap()
+            .retain(|c| c["tool"] != "findorb");
+        let out = requirement(&s, &FULL_RUN_TOOLS);
+        // find_orb's three paths, each named; findorb-radar (the other
+        // comparator of the same tool id) is still there.
+        assert_eq!(out.failures.len(), 3, "{:?}", out.failures);
+        for path in ["od", "propagation", "ephemeris"] {
+            assert!(
+                out.failures
+                    .iter()
+                    .any(|f| f.contains("comparator findorb (findorb)")
+                        && f.contains(&format!("merge path {path}"))
+                        && f.contains("ABSENT")),
+                "{path}: {:?}",
+                out.failures
+            );
+        }
+    }
+
+    #[test]
+    fn a_requested_comparator_that_failed_fails_with_its_error() {
+        let mut s = full_summary(7);
+        let arr = s["comparators"].as_array_mut().unwrap();
+        arr.retain(|c| c["tool"] != "findorb");
+        arr.push(serde_json::to_value(ComparatorOutcome::failed(
+            "findorb",
+            "merge --findorb: engine context for Earth SSB state: Missing data files: de440.bsp",
+        ))
+        .unwrap());
+        let out = requirement(&s, &FULL_RUN_TOOLS);
+        assert_eq!(out.failures.len(), 3, "{:?}", out.failures);
+        assert!(
+            out.failures
+                .iter()
+                .all(|f| f.contains("FAILED: merge --findorb: engine context")
+                    && f.contains("Missing data files: de440.bsp"))
+        );
+    }
+
+    #[test]
+    fn a_path_at_zero_fails_naming_the_comparator_and_the_path() {
+        for (_, outcome_tool, path) in COMPARATOR_MERGE_PATHS {
+            let mut s = full_summary(7);
+            set_path_rows(&mut s, outcome_tool, path, 0);
+            let out = requirement(&s, &FULL_RUN_TOOLS);
+            assert_eq!(
+                out.failures.len(),
+                1,
+                "{outcome_tool}/{path}: {:?}",
+                out.failures
+            );
+            assert!(
+                out.failures[0].contains(&format!(
+                    "({outcome_tool}), merge path {path}: merged 0 rows"
+                )),
+                "{:?}",
+                out.failures
+            );
+        }
+    }
+
+    #[test]
+    fn a_path_excused_by_name_is_noted_not_failed_and_only_that_path() {
+        let mut s = full_summary(7);
+        set_path_rows(&mut s, "findorb", "propagation", 0);
+        set_path_rows(&mut s, "kete", "timing", 0);
+        let excused = [(
+            "findorb",
+            "propagation",
+            "the leg writes no propagation rows",
+        )];
+        let out = comparator_requirement_outcome(&s, &tools(&FULL_RUN_TOOLS), &excused).unwrap();
+        assert_eq!(out.failures.len(), 1, "{:?}", out.failures);
+        assert!(out.failures[0].contains("kete"));
+        assert_eq!(out.notes.len(), 1);
+        assert!(
+            out.notes[0].contains("findorb")
+                && out.notes[0].contains("excused by name: the leg writes no propagation rows")
+        );
+        // The shipped table excuses nothing: every path is required.
+        assert!(LEGITIMATELY_EMPTY_PATHS.is_empty());
+    }
+
+    #[test]
+    fn a_summary_without_the_counts_is_refused_not_passed() {
+        // A merged comparator with no per-path counts (a harness that predates them).
+        let mut s = serde_json::json!({ "comparators": [ComparatorOutcome::merged("layup", 354)] });
+        let out = requirement(&s, &["layup"]);
+        assert_eq!(out.failures.len(), 1, "{:?}", out.failures);
+        assert!(
+            out.failures[0].contains("no row count for this path"),
+            "{:?}",
+            out.failures
+        );
+        // A comparator whose paths lack the one the table requires.
+        s["comparators"][0]["paths"] = serde_json::json!([{ "path": "other", "rows": 3 }]);
+        assert_eq!(requirement(&s, &["layup"]).failures.len(), 1);
+        // A summary with no comparators array at all.
+        let none = serde_json::json!({ "channels": [] });
+        let out = requirement(&none, &["layup", "grss"]);
+        assert_eq!(
+            out.failures.len(),
+            3,
+            "layup + grss + grss-radar: {:?}",
+            out.failures
+        );
+        assert!(
+            out.failures
+                .iter()
+                .all(|f| f.contains("no `comparators` array"))
+        );
+    }
+
+    #[test]
+    fn the_tool_id_mapping_covers_every_comparator_and_radar_path() {
+        let paths_of = |id: &str| -> Vec<(&str, &str)> {
+            COMPARATOR_MERGE_PATHS
+                .iter()
+                .filter(|(t, _, _)| *t == id)
+                .map(|(_, o, p)| (*o, *p))
+                .collect()
+        };
+        assert_eq!(
+            paths_of("findorb"),
+            [
+                ("findorb", "od"),
+                ("findorb", "propagation"),
+                ("findorb", "ephemeris"),
+                ("findorb-radar", "radar"),
+            ]
+        );
+        assert_eq!(
+            paths_of("grss"),
+            [("grss", "rows"), ("grss-radar", "radar")]
+        );
+        assert_eq!(
+            paths_of("assist"),
+            [("assist", "folded"), ("assist", "standalone")]
+        );
+        for id in ["oorb", "orbfit", "layup", "adam-core", "adam-core-rust"] {
+            assert_eq!(paths_of(id), [(id, "rows")], "{id}");
+        }
+        assert_eq!(paths_of("kete"), [("kete", "timing")]);
+        assert_eq!(paths_of("jorbit"), [("jorbit", "timing")]);
+        assert_eq!(paths_of("jpl-sbdb"), [("jpl-sbdb", "od-reference")]);
+        // Every tool the run requests is mapped, and the radar passes ride their tool id.
+        for id in FULL_RUN_TOOLS {
+            assert!(!paths_of(id).is_empty(), "{id} is unmapped");
+        }
+        // The radar rows of find_orb and GRSS are required when their tool is requested.
+        let mut s = full_summary(7);
+        set_path_rows(&mut s, "findorb-radar", "radar", 0);
+        assert_eq!(requirement(&s, &["findorb"]).failures.len(), 1);
+        let mut s = full_summary(7);
+        set_path_rows(&mut s, "grss-radar", "radar", 0);
+        assert_eq!(requirement(&s, &["grss"]).failures.len(), 1);
+        // A tool that was not requested is not required.
+        let mut s = full_summary(7);
+        s["comparators"]
+            .as_array_mut()
+            .unwrap()
+            .retain(|c| c["tool"] != "kete");
+        assert!(requirement(&s, &["assist", "findorb"]).failures.is_empty());
+    }
+
+    #[test]
+    fn an_unknown_or_empty_request_is_a_usage_error_or_nothing() {
+        let err =
+            comparator_requirement_outcome(&full_summary(1), &tools(&["findorb", "findorbb"]), &[])
+                .unwrap_err();
+        assert!(
+            err.contains("`findorbb`") && err.contains("known:"),
+            "{err}"
+        );
+        // Blank entries (a trailing comma in EXTERNAL_TOOLS) require nothing.
+        assert!(
+            requirement(&full_summary(1), &["", " "])
+                .failures
+                .is_empty()
+        );
+        // A subset run passes no flag and so requires nothing, whatever the summary holds.
+        assert!(requirement(&serde_json::json!({}), &[]).failures.is_empty());
+    }
+
+    /// The table and the merge agree: feed every comparator flag an empty
+    /// per-row file and the sidecar must carry every (outcome, path) the table
+    /// requires, so a path renamed in `merge-external` cannot leave the gate
+    /// requiring a name nothing records; every path the merge records is either
+    /// in the table or one of the two STM paths that are not comparators.
+    #[test]
+    fn the_required_paths_are_exactly_the_paths_merge_external_records() {
+        let dir = tempfile::tempdir().unwrap();
+        let empty = dir.path().join("empty.json");
+        std::fs::write(&empty, "[]").unwrap();
+        let sbdb = dir.path().join("sbdb");
+        std::fs::create_dir(&sbdb).unwrap();
+        let mut args = merge_args(
+            dir.path(),
+            &[
+                ("core-stm", empty.as_path()),
+                ("core-fd-stm", empty.as_path()),
+                ("assist", empty.as_path()),
+                ("findorb", empty.as_path()),
+                ("findorb-radar", empty.as_path()),
+                ("oorb", empty.as_path()),
+                ("orbfit", empty.as_path()),
+                ("layup", empty.as_path()),
+                ("adam-core", empty.as_path()),
+                ("adam-core-rust", empty.as_path()),
+                ("kete", empty.as_path()),
+                ("jorbit", empty.as_path()),
+                ("grss", empty.as_path()),
+                ("grss-radar", empty.as_path()),
+            ],
+        );
+        args.jpl_sbdb_cache = Some(sbdb);
+        // No OD row, so the SBDB merge reads no cache file and lands 0 rows.
+        let mut prop = ValidationResult::empty();
+        prop.object = "Eros".into();
+        prop.channel = "rust".into();
+        prop.test_type = "propagation".into();
+        args.input = write_results(dir.path(), "base-prop.json", &[prop]);
+        merge_external(args).unwrap();
+        let outcomes = comparators::read_sidecar(&dir.path().join("merged.json"))
+            .unwrap()
+            .unwrap();
+        let mut recorded: Vec<(String, String)> = Vec::new();
+        for o in &outcomes {
+            assert!(!o.is_failed(), "{o:?}");
+            assert!(!o.paths.is_empty(), "{} records no merge path", o.tool);
+            for p in &o.paths {
+                recorded.push((o.tool.clone(), p.path.clone()));
+            }
+        }
+        for (_, outcome_tool, path) in COMPARATOR_MERGE_PATHS {
+            assert!(
+                recorded.contains(&(outcome_tool.to_string(), path.to_string())),
+                "the table requires {outcome_tool}/{path}, which merge-external never records: {recorded:?}"
+            );
+        }
+        for (tool, path) in &recorded {
+            let required = COMPARATOR_MERGE_PATHS
+                .iter()
+                .any(|(_, o, p)| o == tool && p == path);
+            let stm = matches!(
+                (tool.as_str(), path.as_str()),
+                ("core-stm", "stm") | ("core-fd-stm", "fd-stm")
+            );
+            assert!(
+                required || stm,
+                "{tool}/{path} is recorded but neither required nor an STM path"
+            );
+        }
+    }
+
+    #[test]
+    fn the_summary_carries_every_merge_path_count_next_to_the_outcome() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut prop = ValidationResult::empty();
+        prop.object = "Eros".into();
+        prop.channel = "rust".into();
+        prop.test_type = "propagation".into();
+        let results = write_results(dir.path(), "validation_core_merged.json", &[prop]);
+        comparators::write_sidecar(
+            &results,
+            &[ComparatorOutcome::folded(
+                "findorb",
+                Folded::with_paths(
+                    354,
+                    &[("od", 354), ("propagation", 800), ("ephemeris", 4005)],
+                ),
+            )],
+        )
+        .unwrap();
+        let summary = dir.path().join("summary.json");
+        report(ReportArgs {
+            results: vec![results],
+            output: dir.path().join("r.html"),
+            summary: Some(summary.clone()),
+            predict_agg: vec![],
+            predict_run: vec![],
+        })
+        .unwrap();
+        let sum: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&summary).unwrap()).unwrap();
+        let fo = &sum["comparators"][0];
+        assert_eq!(fo["tool"], "findorb");
+        assert_eq!(fo["rows"], 354);
+        assert_eq!(
+            fo["paths"],
+            serde_json::json!([
+                { "path": "od", "rows": 354 },
+                { "path": "propagation", "rows": 800 },
+                { "path": "ephemeris", "rows": 4005 },
+            ])
+        );
+        // The gate reads exactly that summary.
+        assert!(
+            requirement(&sum, &["findorb"])
+                .failures
+                .iter()
+                .all(|f| f.contains("findorb-radar") || !f.contains("findorb (findorb)"))
+        );
     }
 }
