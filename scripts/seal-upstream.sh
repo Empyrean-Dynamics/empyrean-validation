@@ -1,18 +1,30 @@
 #!/usr/bin/env bash
-# Seal the running job from JPL and the MPC.
+# Seal the running job from JPL, NAIF and the MPC.
 #
-# The validation suite reads every JPL and MPC product from the pinned inputs
-# snapshot on disk and from nothing else. Any client that would reach these
-# hosts is reading past the snapshot, so it must fail at the socket rather than
-# silently fetch a different input than the one the git SHA pins. This points
-# the five upstream hosts at the loopback address in /etc/hosts and then PROVES
-# the override took, failing the job if any host still resolves off-box.
+# No validation job reaches JPL, NAIF or the MPC: the inputs snapshot, the
+# registered kernel set and the third-party tool set (all in our own buckets,
+# minted by the manual mint-inputs run) carry every product they publish. Any
+# client that would reach these hosts is reading past those sets, so it must
+# fail at the socket rather than silently fetch a different input than the one
+# the git SHA pins. This points the six upstream hosts at the loopback address
+# in /etc/hosts and then PROVES the override took, failing the job if any host
+# still resolves off-box.
 #
-# Position: run AFTER tool setup and BEFORE the suite's run step. find_orb's
-# binary DE440 (engine-setup, writer) and GRSS's two kernels (its setup.sh)
-# still download from ssd.jpl.nasa.gov during setup; once the kernel set
-# carries them the seal can move before setup. Publishing to
-# storage.googleapis.com is deliberately NOT sealed.
+#   seal-upstream.sh               all six hosts. Every engine job (prep,
+#                                  reference, reference-heavy, assemble,
+#                                  assemble-final, empyrean, empyrean-heavy,
+#                                  reduce) runs this before any setup, and so
+#                                  does every external leg whose tool is not on
+#                                  the upstream-fetch allowlist.
+#   seal-upstream.sh --allow-naif  the five JPL SSD and MPC hosts, NAIF left
+#                                  open: kete's import still fetches its kernels
+#                                  from naif.jpl.nasa.gov at run time.
+#
+# The tools whose setup or import still reaches one of these hosts are named in
+# the workflow's UPSTREAM_FETCH_ALLOWLIST and in
+# scripts/tests/test_no_upstream_fetch.py, which fails if the two disagree or
+# the list grows. Their legs seal after setup instead of before it.
+# Publishing to storage.googleapis.com is deliberately NOT sealed.
 set -euo pipefail
 
 HOSTS=(
@@ -22,8 +34,13 @@ HOSTS=(
   minorplanetcenter.net
   www.minorplanetcenter.net
 )
+case "${1:-}" in
+  "") HOSTS+=(naif.jpl.nasa.gov) ;;
+  --allow-naif) ;;
+  *) echo "usage: seal-upstream.sh [--allow-naif]" >&2; exit 2 ;;
+esac
 
-echo "Sealing the job from JPL and the MPC (pinned-snapshot inputs only):"
+echo "Sealing the job from ${#HOSTS[@]} JPL, NAIF and MPC hosts (pinned inputs only):"
 # A container-generated hosts file need not end with a newline. Appending to
 # such a file glues the first entry onto its last line, so the host lands on
 # that line's address instead of 127.0.0.1 (seen under act, where the first
@@ -50,7 +67,7 @@ for h in "${HOSTS[@]}"; do
 done
 
 if [ "${fail}" -ne 0 ]; then
-  echo "ERROR: upstream seal verification failed; refusing to run suite code that could reach JPL or the MPC." >&2
+  echo "ERROR: upstream seal verification failed; refusing to run suite code that could reach JPL, NAIF or the MPC." >&2
   exit 1
 fi
 

@@ -231,3 +231,19 @@ def test_a_missing_data_directory_is_named(sd, layout, tmp_path):
     with pytest.raises(sd.StagingError) as e:
         sd.stage(tmp_path / "nowhere", tmp_path / "ar", layout)
     assert "does not exist" in e.value.problems[0]
+
+
+def test_layup_env_points_layups_cache_at_the_staged_directory(monkeypatch):
+    """layup reads naif0012.tls from its cache directory whatever --ar says."""
+    import importlib.util
+    from pathlib import Path
+
+    path = Path(__file__).resolve().parents[1] / "run_layup.py"
+    spec = importlib.util.spec_from_file_location("run_layup_under_test", path)
+    rl = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(rl)
+
+    monkeypatch.setenv("LAYUP_CACHE_DIR", "/somewhere/else")
+    assert rl.layup_env("/staged/data")["LAYUP_CACHE_DIR"] == "/staged/data"
+    # No staged directory: the caller's environment is passed through untouched.
+    assert rl.layup_env(None)["LAYUP_CACHE_DIR"] == "/somewhere/else"

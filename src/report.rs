@@ -6,14 +6,14 @@
 //! All non-rust channel data are embedded so the report can render any
 //! channel-comparison view client-side without a separate run.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::Path;
 
 use crate::catalog::population_color;
 use crate::predict_schema::{
     COVERAGE_ARC_SPLIT_DAYS, CalibrationCell, ObjectWalkSummary, PredictAggregates, SurfaceCell,
 };
-use crate::schema::{ValidationResult, test_types};
+use crate::schema::{ValidationResult, channel_produces, test_types};
 
 /// Numerical-fidelity threshold: any metric whose absolute difference
 /// against the Rust reference exceeds this is flagged as a failure.
@@ -545,6 +545,16 @@ struct ChannelRollup {
     /// here and per test type so an axis the reference does not run stays
     /// visible instead of vanishing from the gate.
     n_unreferenced: usize,
+    /// Reference rows, of a test type this channel produces, for which the
+    /// channel emitted no row of the same key: the converse of
+    /// `n_unreferenced`. Pairing walks the channel's rows, so such a row is
+    /// never compared and was counted nowhere; named here so the gate can
+    /// fail a strict channel that skipped it.
+    missing_rows: Vec<MissingRow>,
+    /// Reference rows of a test type this channel does not produce at this
+    /// pin ([`crate::schema::NOT_PRODUCED_AT_THIS_PIN`]), per test type:
+    /// excused from `missing_rows`, counted so the excuse stays visible.
+    not_produced_by_test_type: BTreeMap<String, usize>,
     p50_time_ms: f64,
     p50_rust_time_ms: f64,
     p50_speed_ratio: f64,
@@ -557,6 +567,10 @@ struct ChannelRollup {
 struct RefusalMismatch {
     object: String,
     test_type: String,
+    /// The row's offset and observer, so a mismatch on a propagation or
+    /// ephemeris row (many per object and method) names the row.
+    dt_days: f64,
+    observer: Option<String>,
     /// The uncertainty method the row was run under (prefix, e.g.
     /// `second_order`), or the raw tag when it is outside the vocabulary.
     method: String,
@@ -580,6 +594,19 @@ struct UnjudgedRow {
     method: String,
     /// Which side lacked the signal, in words.
     reason: &'static str,
+}
+
+/// A reference row the channel has no row for: same identity fields as an
+/// [`UnjudgedRow`], so the gate names it the same way.
+#[derive(Debug, Clone)]
+struct MissingRow {
+    object: String,
+    test_type: String,
+    dt_days: f64,
+    observer: Option<String>,
+    /// The uncertainty method the reference row ran under, named as the
+    /// report names it (see [`refused_method_name`]).
+    method: String,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -715,6 +742,28 @@ fn od_delivery(r: &ValidationResult) -> Delivery {
     }
 }
 
+/// Does the row carry any of the fidelity metrics the rollup compares
+/// (position, separation, RA, Dec, range, light time)?
+fn carries_metric(r: &ValidationResult) -> bool {
+    r.emp_pos_au.is_some()
+        || r.separation_arcsec.is_some()
+        || r.d_ra_arcsec.is_some()
+        || r.d_dec_arcsec.is_some()
+        || r.d_rho_km.is_some()
+        || r.d_light_time_s.is_some()
+}
+
+/// [`od_delivery`] for a pair with no comparable metric: a row that carries no
+/// delivery fields but does carry its own metric delivered a product (the core
+/// channel's propagation and ephemeris rows), so it reads as delivered rather
+/// than not applicable.
+fn judged_delivery(r: &ValidationResult) -> Delivery {
+    match od_delivery(r) {
+        Delivery::NotApplicable if carries_metric(r) => Delivery::Delivered,
+        d => d,
+    }
+}
+
 /// The uncertainty method a row ran under, named the way the report names it
 /// (reusing [`method_label`]): the human label for the row's
 /// `propagation_uncertainty` tag, or `—` when the row carries no method.
@@ -745,19 +794,31 @@ fn rollup_channels(results: &[ValidationResult]) -> Vec<ChannelRollup> {
     // that's small but well above the 1e-10 fidelity threshold.
     // (object, dt_days, force_model, test_type, observer, uncertainty-mode).
     type RowKey = (String, i64, String, String, Option<String>, Option<String>);
+    fn row_key(r: &ValidationResult) -> RowKey {
+        (
+            r.object.clone(),
+            r.dt_days as i64,
+            r.force_model.clone(),
+            r.test_type.clone(),
+            r.observer.clone(),
+            r.propagation_uncertainty.clone(),
+        )
+    }
     let mut core_by_key: HashMap<RowKey, &ValidationResult> = HashMap::new();
     for r in core_rows {
-        core_by_key.insert(
-            (
-                r.object.clone(),
-                r.dt_days as i64,
-                r.force_model.clone(),
-                r.test_type.clone(),
-                r.observer.clone(),
-                r.propagation_uncertainty.clone(),
-            ),
-            r,
-        );
+        core_by_key.insert(row_key(r), r);
+    }
+    // The reference's keys in row order, each once, for the converse walk
+    // below (reference rows with no channel row).
+    let mut core_keys: Vec<(RowKey, &ValidationResult)> = Vec::new();
+    {
+        let mut seen: HashSet<RowKey> = HashSet::new();
+        for r in core_rows {
+            let k = row_key(r);
+            if seen.insert(k.clone()) {
+                core_keys.push((k, r));
+            }
+        }
     }
 
     let mut out = Vec::new();
@@ -816,19 +877,14 @@ fn rollup_channels(results: &[ValidationResult]) -> Vec<ChannelRollup> {
         // floor on them behaves exactly as before.
         let mut by_tt_converged: BTreeMap<String, usize> = BTreeMap::new();
 
+        let mut channel_keys: HashSet<RowKey> = HashSet::new();
         for r in rows {
             *by_tt_rows.entry(r.test_type.clone()).or_default() += 1;
             if r.od_converged.unwrap_or(true) {
                 *by_tt_converged.entry(r.test_type.clone()).or_default() += 1;
             }
-            let key = (
-                r.object.clone(),
-                r.dt_days as i64,
-                r.force_model.clone(),
-                r.test_type.clone(),
-                r.observer.clone(),
-                r.propagation_uncertainty.clone(),
-            );
+            let key = row_key(r);
+            channel_keys.insert(key.clone());
             let Some(&core_r) = core_by_key.get(&key) else {
                 // No reference row of this key: the row cannot be compared.
                 // Counted, not dropped — an axis the reference never runs
@@ -930,7 +986,12 @@ fn rollup_channels(results: &[ValidationResult]) -> Vec<ChannelRollup> {
                         reason,
                     });
                 };
-                match (od_delivery(core_r), od_delivery(r)) {
+                // A side that carries its own fidelity metric delivered a
+                // product even with no delivery fields (the core channel
+                // writes none on propagation / ephemeris rows), so a refused
+                // channel row against it is a named refusal mismatch, not an
+                // unjudged pair.
+                match (judged_delivery(core_r), judged_delivery(r)) {
                     (Delivery::NotDelivered, Delivery::NotDelivered) => {
                         n_passing += 1;
                         n_refused_identically += 1;
@@ -946,6 +1007,8 @@ fn rollup_channels(results: &[ValidationResult]) -> Vec<ChannelRollup> {
                         refusal_mismatches.push(RefusalMismatch {
                             object: r.object.clone(),
                             test_type: r.test_type.clone(),
+                            dt_days: r.dt_days,
+                            observer: r.observer.clone(),
                             method: refused_method_name(r),
                             delivered_side: "reference",
                         });
@@ -958,6 +1021,8 @@ fn rollup_channels(results: &[ValidationResult]) -> Vec<ChannelRollup> {
                         refusal_mismatches.push(RefusalMismatch {
                             object: r.object.clone(),
                             test_type: r.test_type.clone(),
+                            dt_days: r.dt_days,
+                            observer: r.observer.clone(),
                             method: refused_method_name(r),
                             delivered_side: "channel",
                         });
@@ -997,6 +1062,33 @@ fn rollup_channels(results: &[ValidationResult]) -> Vec<ChannelRollup> {
         // from `by_tt_row_max_diff` (the per-row worst-metric diff in
         // whatever native unit dominated the row), so ephemeris rows —
         // which don't carry `emp_pos_au` — still report real agreement.
+        // The converse of the pairing above, which walks this channel's rows:
+        // a reference row the channel emitted nothing for was never visited,
+        // so a channel could skip any row and still read 100%. Every
+        // reference row of a test type the channel produces must have the
+        // channel's row; a test type the channel does not produce at this pin
+        // is counted per type, not required.
+        let mut missing_rows: Vec<MissingRow> = Vec::new();
+        let mut not_produced_by_test_type: BTreeMap<String, usize> = BTreeMap::new();
+        for (key, core_r) in &core_keys {
+            if channel_keys.contains(key) {
+                continue;
+            }
+            if !channel_produces(channel, &core_r.test_type) {
+                *not_produced_by_test_type
+                    .entry(core_r.test_type.clone())
+                    .or_default() += 1;
+                continue;
+            }
+            missing_rows.push(MissingRow {
+                object: core_r.object.clone(),
+                test_type: core_r.test_type.clone(),
+                dt_days: core_r.dt_days,
+                observer: core_r.observer.clone(),
+                method: refused_method_name(core_r),
+            });
+        }
+
         let mut by_test_type: BTreeMap<String, TestTypeRollup> = BTreeMap::new();
         for tt in SUMMARY_TEST_TYPES {
             let n_compared_tt = by_tt_compared.get(tt).copied().unwrap_or(0);
@@ -1055,6 +1147,8 @@ fn rollup_channels(results: &[ValidationResult]) -> Vec<ChannelRollup> {
             n_unjudged,
             unjudged_rows,
             n_unreferenced,
+            missing_rows,
+            not_produced_by_test_type,
             p50_time_ms: {
                 if channel == "core" {
                     let mut all_rust: Vec<f64> = rows
@@ -1172,9 +1266,31 @@ fn method_summary_json(results: &[ValidationResult]) -> serde_json::Value {
     serde_json::Value::Array(arr)
 }
 
+/// Rows the parity reference channel (`core`) emitted, per object, counted
+/// over the rows [`rollup_channels`] pairs against (timing-only arms are
+/// excluded there and here).
+///
+/// Written into the summary so `ci-check --plan` can tell an object the
+/// reference never replayed from one it replayed. Without it the gap is
+/// invisible: every other channel's rows for such an object land in
+/// `n_unreferenced`, which the gate notes per axis but does not fail, so a
+/// reference leg that delivered nothing for an object read as green.
+fn reference_rows_by_object(results: &[ValidationResult]) -> BTreeMap<String, usize> {
+    let mut out: BTreeMap<String, usize> = BTreeMap::new();
+    for r in results {
+        if r.channel == crate::schema::channels::CORE
+            && !is_timing_only_uncertainty(r.propagation_uncertainty.as_deref())
+        {
+            *out.entry(r.object.clone()).or_default() += 1;
+        }
+    }
+    out
+}
+
 fn write_summary(
     rollups: &[ChannelRollup],
     results: &[ValidationResult],
+    comparators: &[crate::comparators::ComparatorOutcome],
     path: &Path,
 ) -> Result<(), String> {
     let arr: Vec<serde_json::Value> = rollups
@@ -1224,6 +1340,8 @@ fn write_summary(
                     .map(|m| serde_json::json!({
                         "object": m.object,
                         "test_type": m.test_type,
+                        "dt_days": m.dt_days,
+                        "observer": m.observer,
                         "method": m.method,
                         "delivered_side": m.delivered_side,
                     }))
@@ -1242,6 +1360,19 @@ fn write_summary(
                     }))
                     .collect::<Vec<_>>(),
                 "n_unreferenced": r.n_unreferenced,
+                "n_missing": r.missing_rows.len(),
+                "missing_rows": r
+                    .missing_rows
+                    .iter()
+                    .map(|m| serde_json::json!({
+                        "object": m.object,
+                        "test_type": m.test_type,
+                        "dt_days": m.dt_days,
+                        "observer": m.observer,
+                        "method": m.method,
+                    }))
+                    .collect::<Vec<_>>(),
+                "not_produced_by_test_type": r.not_produced_by_test_type,
                 "max_dr_km": r.max_dr_km,
                 "max_sep_diff_arcsec": r.max_sep_diff_arcsec,
                 "max_d_ra_diff_arcsec": r.max_d_ra_diff_arcsec,
@@ -1259,6 +1390,9 @@ fn write_summary(
         "fidelity_threshold": FIDELITY_THRESHOLD,
         "channels": arr,
         "by_method": method_summary_json(results),
+        "reference_channel": crate::schema::channels::CORE,
+        "reference_rows_by_object": reference_rows_by_object(results),
+        "comparators": comparators,
     });
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).map_err(|e| format!("create {}: {e}", parent.display()))?;
@@ -9299,20 +9433,44 @@ fn config_tool_subsection(results: &[ValidationResult], key: &str) -> String {
 
 /// The whole "Configurations" appendix (A.3, `s05c`): one subsection per present
 /// external tool, in the Part 2 tool order.
-fn render_configurations_section(results: &[ValidationResult]) -> String {
+fn render_configurations_section(
+    results: &[ValidationResult],
+    comparators: &[crate::comparators::ComparatorOutcome],
+) -> String {
     let mut subs = String::new();
     for (key, _display) in CONFIG_TOOL_ORDER {
         if config_tool_present(results, key) {
             subs.push_str(&config_tool_subsection(results, key));
         }
     }
-    let body = if subs.is_empty() {
+    let failed = render_failed_comparators(comparators);
+    let body = if subs.is_empty() && failed.is_empty() {
         "  <div class=\"cfg-empty\" style=\"color:var(--ed-text-muted);font-size:12px;margin-top:8px;\">No external tool ran in this run.</div>\n".to_string()
     } else {
-        subs
+        format!("{subs}{failed}")
     };
     format!(
         "<div class=\"section\" id=\"s05c\" data-page=\"empyrean\">\n  <div class=\"section-num\">A.3</div>\n  <div class=\"section-title\" title=\"Configuration of each external reference tool in this run\">Configurations</div>\n{body}</div>"
+    )
+}
+
+/// The comparators `merge-external` skipped, one line each as `<tool>: failed:
+/// <reason>`. Empty when every comparator merged. A failed comparator is a
+/// finding of the run, so it is on the page, not only in the job log.
+fn render_failed_comparators(comparators: &[crate::comparators::ComparatorOutcome]) -> String {
+    let mut lines = String::new();
+    for c in comparators.iter().filter(|c| c.is_failed()) {
+        lines.push_str(&format!(
+            "    <li class=\"cfg-failed\"><code>{}</code>: {}</li>\n",
+            attr_escape(&c.tool),
+            attr_escape(&c.failure_line().unwrap_or_else(|| "failed".to_string()))
+        ));
+    }
+    if lines.is_empty() {
+        return String::new();
+    }
+    format!(
+        "  <div class=\"cfg-failed-comparators\" style=\"margin-top:8px;font-size:12px;\">\n    <div class=\"cfg-failed-head\">Comparators that did not merge into this report</div>\n    <ul>\n{lines}    </ul>\n  </div>\n"
     )
 }
 
@@ -9323,6 +9481,7 @@ pub fn generate_report(
     summary: Option<&Path>,
     predict_agg: Option<&crate::predict_schema::PredictAggregates>,
     predict_runs: &[crate::predict_schema::PredictAggregates],
+    comparators: &[crate::comparators::ComparatorOutcome],
 ) -> Result<(), String> {
     let core_results: Vec<&ValidationResult> =
         results.iter().filter(|r| r.channel == "core").collect();
@@ -9472,7 +9631,7 @@ pub fn generate_report(
 
     // S5a: the "Configurations" appendix (A.3). One subsection per external
     // tool with rows, server-rendered from the rows (empyrean is not one).
-    let configurations_section = render_configurations_section(results);
+    let configurations_section = render_configurations_section(results, comparators);
 
     // The dataset ships beside the page as "<output stem>.data.json" and the page
     // fetches it — the name derives from the output path so two reports written to
@@ -9588,7 +9747,7 @@ pub fn generate_report(
         })
         .count();
     if let Some(path) = summary {
-        write_summary(&rollups, results, path)?;
+        write_summary(&rollups, results, comparators, path)?;
     }
     // Redesign (empyrean-k2rkx): server-side Part-1 agreement grids + H3.
     let h1_prop_grid_html = build_prop_agreement_grid(results);
@@ -12504,7 +12663,7 @@ mod tests {
         let rows = vec![synthetic_rust_prop_row("Apophis", 0.0)];
         let dir = tempfile::tempdir().unwrap();
         let out = dir.path().join("report.html");
-        generate_report(&rows, &[], &out, None, None, &[]).unwrap();
+        generate_report(&rows, &[], &out, None, None, &[], &[]).unwrap();
         let html = std::fs::read_to_string(&out).unwrap();
 
         // The light page ground the finding measured against.
@@ -12600,7 +12759,7 @@ mod tests {
         let (rows, cmps) = radar_scenario();
         let dir = tempfile::tempdir().unwrap();
         let out = dir.path().join("report.html");
-        generate_report(&rows, &cmps, &out, None, None, &[]).unwrap();
+        generate_report(&rows, &cmps, &out, None, None, &[], &[]).unwrap();
         let raw = std::fs::read_to_string(&out).unwrap();
         // Excise <script>/<style> so `<th>` literals in the client JS source
         // (headers the browser builds at runtime) are not scanned as markup.
@@ -12659,7 +12818,7 @@ mod tests {
         ];
         let dir = tempfile::tempdir().unwrap();
         let out = dir.path().join("report.html");
-        let result = generate_report(&rows, &[], &out, None, None, &[]);
+        let result = generate_report(&rows, &[], &out, None, None, &[], &[]);
         assert!(result.is_ok(), "generate_report failed: {result:?}");
         let html = std::fs::read_to_string(&out).unwrap();
         assert!(html.contains("EMPYREAN"), "missing brand title");
@@ -12675,7 +12834,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let html = dir.path().join("report.html");
         let summary = dir.path().join("summary.json");
-        let result = generate_report(&rows, &[], &html, Some(&summary), None, &[]);
+        let result = generate_report(&rows, &[], &html, Some(&summary), None, &[], &[]);
         assert!(result.is_ok());
         let summary_json = std::fs::read_to_string(&summary).unwrap();
         let v: serde_json::Value = serde_json::from_str(&summary_json).unwrap();
@@ -12713,7 +12872,7 @@ mod tests {
         }];
         let dir = tempfile::tempdir().unwrap();
         let out = dir.path().join("report.html");
-        generate_report(&rows, &comps, &out, None, None, &[]).unwrap();
+        generate_report(&rows, &comps, &out, None, None, &[], &[]).unwrap();
         let html = std::fs::read_to_string(&out).unwrap();
         assert!(
             html.contains("Covariance realism"),
@@ -12817,7 +12976,7 @@ mod tests {
         ];
         let dir = tempfile::tempdir().unwrap();
         let out = dir.path().join("report.html");
-        generate_report(&rows, &[], &out, None, None, &[]).unwrap();
+        generate_report(&rows, &[], &out, None, None, &[], &[]).unwrap();
         std::fs::read_to_string(&out).unwrap()
     }
 
@@ -12949,7 +13108,7 @@ mod tests {
         let agg = synthetic_predict_aggregates("snap");
         let dir = tempfile::tempdir().unwrap();
         let out = dir.path().join("report.html");
-        generate_report(&rows, &[], &out, None, Some(&agg), &[]).unwrap();
+        generate_report(&rows, &[], &out, None, Some(&agg), &[], &[]).unwrap();
         let raw = std::fs::read_to_string(&out).unwrap();
         let html = strip_tag(&strip_tag(&raw, "script"), "style");
         if let Some((tok, sid, ctx)) = scan(&html) {
@@ -13249,6 +13408,73 @@ mod tests {
         );
     }
 
+    // (f2) The converse of (g): a reference row the channel emitted nothing
+    // for. Pairing walks the channel's rows, so this row was never visited and
+    // the channel read 100% without it. It is named, with the fields the gate
+    // prints; the reference itself is never missing its own rows.
+    #[test]
+    fn reference_row_with_no_channel_row_is_named_missing() {
+        let core_od = parity_od_row("core", "first_order_detection_on");
+        let mut core_eph = parity_od_row("core", "second_order_detection_on");
+        core_eph.test_type = "ephemeris".to_string();
+        core_eph.dt_days = -5475.0;
+        core_eph.observer = Some("W84".to_string());
+        let py_od = parity_od_row("python", "first_order_detection_on");
+
+        let rollups = rollup_channels(&[core_od.clone(), core_eph.clone(), py_od.clone()]);
+        let py_r = rollup_for(&rollups, "python");
+        assert_eq!(py_r.n_total_compared, 1, "the missing row is not compared");
+        assert_eq!(py_r.missing_rows.len(), 1);
+        let m = &py_r.missing_rows[0];
+        assert_eq!(m.object, "Chiron");
+        assert_eq!(m.test_type, "ephemeris");
+        assert_eq!(m.dt_days, -5475.0);
+        assert_eq!(m.observer.as_deref(), Some("W84"));
+        assert_eq!(m.method, "second order");
+        assert!(py_r.not_produced_by_test_type.is_empty());
+        assert!(rollup_for(&rollups, "core").missing_rows.is_empty());
+
+        // With the channel's row present there is nothing missing.
+        let mut py_eph = core_eph.clone();
+        py_eph.channel = "python".to_string();
+        let rollups = rollup_channels(&[core_od, core_eph, py_od, py_eph]);
+        assert!(rollup_for(&rollups, "python").missing_rows.is_empty());
+    }
+
+    // (f3) A reference row of a test type the channel does not produce at
+    // this pin (the per-method OD transport on python / c / cli) is excused
+    // and counted per type, not named missing. The excuse is the declared
+    // pair only: a channel outside the declaration missing the same row is
+    // named.
+    #[test]
+    fn transport_rows_a_channel_does_not_produce_are_counted_not_missing() {
+        let core_od = parity_od_row("core", "first_order_detection_on");
+        let mut core_tr = parity_od_row("core", "second_order_detection_on");
+        core_tr.test_type = test_types::ORBIT_DETERMINATION_TRANSPORT.to_string();
+        let py_od = parity_od_row("python", "first_order_detection_on");
+        let c_od = parity_od_row("c", "first_order_detection_on");
+        let rust_od = parity_od_row("rust", "first_order_detection_on");
+
+        let rollups = rollup_channels(&[core_od, core_tr, py_od, c_od, rust_od]);
+        for ch in ["python", "c"] {
+            let r = rollup_for(&rollups, ch);
+            assert!(r.missing_rows.is_empty(), "{ch}: {:?}", r.missing_rows);
+            assert_eq!(
+                r.not_produced_by_test_type
+                    .get(test_types::ORBIT_DETERMINATION_TRANSPORT),
+                Some(&1),
+                "{ch}"
+            );
+        }
+        let rust = rollup_for(&rollups, "rust");
+        assert_eq!(rust.missing_rows.len(), 1, "{:?}", rust.missing_rows);
+        assert_eq!(
+            rust.missing_rows[0].test_type,
+            test_types::ORBIT_DETERMINATION_TRANSPORT
+        );
+        assert!(rust.not_produced_by_test_type.is_empty());
+    }
+
     // (g) A channel row with no reference row of its key is not compared at
     // all; it is counted as unreferenced, per channel and per test type, so an
     // axis the reference never runs stays visible in the gate's accounting.
@@ -13278,6 +13504,32 @@ mod tests {
         assert_eq!(py_r.by_test_type["orbit_determination_radar"].n_compared, 0);
         assert_eq!(py_r.by_test_type["orbit_determination_radar"].n_rows, 1);
         assert_eq!(py_r.by_test_type["orbit_determination"].n_unreferenced, 0);
+    }
+
+    // The summary's per-object reference counts are what `ci-check --plan`
+    // reads: core rows only, the timing-only arms left out exactly as the
+    // rollup leaves them out, and an object with no core rows absent rather
+    // than present at zero.
+    #[test]
+    fn reference_rows_by_object_counts_core_rows_the_rollup_pairs_against() {
+        let core_a = parity_od_row("core", "first_order_detection_on");
+        let mut core_b = parity_od_row("core", "none_detection_on");
+        core_b.test_type = "propagation".to_string();
+        let mut core_timing = parity_od_row("core", "none_detection_off");
+        core_timing.test_type = "propagation".to_string();
+        let mut core_eris = parity_od_row("core", "none_detection_on");
+        core_eris.object = "Eris".to_string();
+        let mut py_hektor = parity_od_row("python", "none_detection_on");
+        py_hektor.object = "Hektor".to_string();
+
+        let counts = reference_rows_by_object(&[core_a, core_b, core_timing, core_eris, py_hektor]);
+        assert_eq!(counts.get("Chiron"), Some(&2), "{counts:?}");
+        assert_eq!(counts.get("Eris"), Some(&1), "{counts:?}");
+        assert_eq!(
+            counts.get("Hektor"),
+            None,
+            "a replay channel's rows are not reference rows"
+        );
     }
 
     // (a) Both sides refuse → the pair is parity: it counts as passing and
@@ -13353,6 +13605,46 @@ mod tests {
         assert_eq!(py_r.refusal_mismatches[0].delivered_side, "reference");
     }
 
+    // (c2) An ephemeris row the channel's engine call declined (no position,
+    // `failed:<variant>`) against a core row that delivered (its own metrics,
+    // no delivery fields — core writes none on ephemeris rows) is a named
+    // refusal mismatch with the reference as the delivering side, naming the
+    // row's offset and observer. It used to read as unjudged ("the reference
+    // row carries neither a comparable metric nor a delivery signal"), which
+    // was false: the reference carried both a position and its residuals.
+    #[test]
+    fn declined_channel_row_against_a_delivered_reference_row_is_a_named_mismatch() {
+        let mut core = parity_od_row("core", "sigma_point_detection_on");
+        core.object = "Vesta".to_string();
+        core.test_type = "ephemeris".to_string();
+        core.dt_days = 365.0;
+        core.observer = Some("F51".to_string());
+        core.d_ra_arcsec = Some(1.133733e-05);
+        core.d_dec_arcsec = Some(1.170568e-06);
+        core.d_rho_km = Some(-0.0445076);
+        let mut py = core.clone();
+        py.channel = "python".to_string();
+        py.d_ra_arcsec = None;
+        py.d_dec_arcsec = None;
+        py.d_rho_km = None;
+        py.orbit_delivered = Some(false);
+        py.orbit_status = Some("failed:other".to_string());
+
+        let rollups = rollup_channels(&[core, py]);
+        let py_r = rollup_for(&rollups, "python");
+        assert_eq!(py_r.n_total_compared, 1);
+        assert_eq!(py_r.n_passing, 0);
+        assert_eq!(py_r.n_unjudged, 0, "{:?}", py_r.unjudged_rows);
+        assert_eq!(py_r.n_refusal_mismatch, 1);
+        let m = &py_r.refusal_mismatches[0];
+        assert_eq!(m.delivered_side, "reference");
+        assert_eq!(m.object, "Vesta");
+        assert_eq!(m.test_type, "ephemeris");
+        assert_eq!(m.dt_days, 365.0);
+        assert_eq!(m.observer.as_deref(), Some("F51"));
+        assert_eq!(m.method, "sigma-point");
+    }
+
     // (d) A core-style refusal (od_converged false, no delivery fields) is
     // classified as not-delivered, so the core self-comparison is an identical
     // refusal rather than an uncounted row.
@@ -13406,7 +13698,7 @@ mod tests {
         ];
         let dir = tempfile::tempdir().unwrap();
         let out = dir.path().join("report.html");
-        generate_report(&rows, &[], &out, None, None, &[]).unwrap();
+        generate_report(&rows, &[], &out, None, None, &[], &[]).unwrap();
         let html = std::fs::read_to_string(&out).unwrap();
 
         // (1) the sibling dataset holds the verbatim serialization.
@@ -13538,8 +13830,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let a = dir.path().join("report_a.html");
         let b = dir.path().join("report_b.html");
-        generate_report(&rows, &[], &a, None, None, &[]).unwrap();
-        generate_report(&rows, &[], &b, None, None, &[]).unwrap();
+        generate_report(&rows, &[], &a, None, None, &[], &[]).unwrap();
+        generate_report(&rows, &[], &b, None, None, &[], &[]).unwrap();
         assert!(dir.path().join("report_a.data.json").exists());
         assert!(dir.path().join("report_b.data.json").exists());
         assert!(
@@ -13571,8 +13863,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let out1 = dir.path().join("r1.html");
         let out2 = dir.path().join("r2.html");
-        generate_report(&rows, &[], &out1, None, None, &[]).unwrap();
-        generate_report(&rows, &[], &out2, None, None, &[]).unwrap();
+        generate_report(&rows, &[], &out1, None, None, &[], &[]).unwrap();
+        generate_report(&rows, &[], &out2, None, None, &[], &[]).unwrap();
         // The ONLY intended difference is the dataset file name each page cites.
         let s1 = std::fs::read_to_string(&out1)
             .unwrap()
@@ -13627,7 +13919,7 @@ mod tests {
         }
         let dir = tempfile::tempdir().unwrap();
         let out = dir.path().join("report.html");
-        generate_report(&rows, &[], &out, None, None, &[]).unwrap();
+        generate_report(&rows, &[], &out, None, None, &[], &[]).unwrap();
         let html = std::fs::read_to_string(&out).unwrap();
 
         // Exactly one hatch definition, everywhere on the page.
@@ -14424,7 +14716,7 @@ mod tests {
         let rows = timing_fixture();
         let dir = tempfile::tempdir().unwrap();
         let out = dir.path().join("report.html");
-        generate_report(&rows, &[], &out, None, None, &[]).unwrap();
+        generate_report(&rows, &[], &out, None, None, &[], &[]).unwrap();
         let html = std::fs::read_to_string(&out).unwrap();
 
         let all = ["empyrean", "assist", "findorb", "jpl", "kete", "jorbit"];
@@ -14677,7 +14969,7 @@ mod tests {
     fn run_summary_is_ordered_into_the_appendix_and_the_page_opens_on_part_one() {
         let dir = tempfile::tempdir().unwrap();
         let out = dir.path().join("report.html");
-        generate_report(&timing_fixture(), &[], &out, None, None, &[]).unwrap();
+        generate_report(&timing_fixture(), &[], &out, None, None, &[], &[]).unwrap();
         let html = std::fs::read_to_string(&out).unwrap();
         // S7 item 3: DOM order == visual order — no flex `order` reorders the
         // column, so byte position IS the on-page order. The page opens on Part 1
@@ -14708,7 +15000,7 @@ mod tests {
     fn part_two_hatched_cells_carry_their_reason_on_hover_only() {
         let dir = tempfile::tempdir().unwrap();
         let out = dir.path().join("report.html");
-        generate_report(&timing_fixture(), &[], &out, None, None, &[]).unwrap();
+        generate_report(&timing_fixture(), &[], &out, None, None, &[], &[]).unwrap();
         let html = std::fs::read_to_string(&out).unwrap();
         // S7: Part 2 is the three sections between the part2 and part3 heads.
         let start = html.find("id=\"part2\"").expect("Part 2 head");
@@ -14785,7 +15077,7 @@ mod tests {
 
         let dir = tempfile::tempdir().unwrap();
         let out = dir.path().join("report.html");
-        generate_report(&timing_fixture(), &[], &out, None, None, &[]).unwrap();
+        generate_report(&timing_fixture(), &[], &out, None, None, &[], &[]).unwrap();
         let html = std::fs::read_to_string(&out).unwrap();
         // S7: the rail names 2.1 by its axis (Propagation), never a "side by
         // side" ranking label.
@@ -14898,7 +15190,7 @@ mod tests {
         // console stays clean on the owner's local server.
         let dir = tempfile::tempdir().unwrap();
         let out = dir.path().join("report.html");
-        generate_report(&timing_fixture(), &[], &out, None, None, &[]).unwrap();
+        generate_report(&timing_fixture(), &[], &out, None, None, &[], &[]).unwrap();
         let html = std::fs::read_to_string(&out).unwrap();
         let head = &html[..html.find("</head>").expect("head present")];
         assert!(
@@ -14912,7 +15204,7 @@ mod tests {
         let rows = timing_fixture();
         let dir = tempfile::tempdir().unwrap();
         let out = dir.path().join("report.html");
-        generate_report(&rows, &[], &out, None, None, &[]).unwrap();
+        generate_report(&rows, &[], &out, None, None, &[], &[]).unwrap();
         let html = std::fs::read_to_string(&out).unwrap();
 
         let p2 = html.find("id=\"part2\"").expect("part2 anchor");
@@ -14966,7 +15258,7 @@ mod tests {
         assert_eq!(emp_eph_channel(&rows), ("core", true));
         let dir = tempfile::tempdir().unwrap();
         let out = dir.path().join("report.html");
-        generate_report(&rows, &[], &out, None, None, &[]).unwrap();
+        generate_report(&rows, &[], &out, None, None, &[], &[]).unwrap();
         let html = std::fs::read_to_string(&out).unwrap();
         assert!(
             html.contains("core channel</span>"),
@@ -14995,7 +15287,7 @@ mod tests {
         assert_eq!(picked, vec![5.0], "the rust ephemeris value must be used");
         let dir2 = tempfile::tempdir().unwrap();
         let out2 = dir2.path().join("report.html");
-        generate_report(&rows2, &[], &out2, None, None, &[]).unwrap();
+        generate_report(&rows2, &[], &out2, None, None, &[], &[]).unwrap();
         let html2 = std::fs::read_to_string(&out2).unwrap();
         assert!(
             !html2.contains("core channel</span>"),
@@ -15087,6 +15379,7 @@ mod tests {
             &out,
             None,
             None,
+            &[],
             &[],
         )
         .unwrap();
@@ -15298,7 +15591,7 @@ mod tests {
     fn render_rows(rows: &[ValidationResult]) -> String {
         let dir = tempfile::tempdir().unwrap();
         let out = dir.path().join("report.html");
-        generate_report(rows, &[], &out, None, None, &[]).unwrap();
+        generate_report(rows, &[], &out, None, None, &[], &[]).unwrap();
         std::fs::read_to_string(&out).unwrap()
     }
 
@@ -15640,7 +15933,7 @@ mod tests {
         let agg = synthetic_predict_aggregates("snap");
         let dir = tempfile::tempdir().unwrap();
         let out = dir.path().join("report.html");
-        generate_report(&rows, &[], &out, None, Some(&agg), &[]).unwrap();
+        generate_report(&rows, &[], &out, None, Some(&agg), &[], &[]).unwrap();
         let html = std::fs::read_to_string(&out).unwrap();
         let f = html
             .find("function drawWalkTimeline(")
@@ -15676,7 +15969,7 @@ mod tests {
         let agg = synthetic_predict_aggregates("snap");
         let dir = tempfile::tempdir().unwrap();
         let out = dir.path().join("report.html");
-        generate_report(&rows, &[], &out, None, Some(&agg), &[]).unwrap();
+        generate_report(&rows, &[], &out, None, Some(&agg), &[], &[]).unwrap();
         let html = std::fs::read_to_string(&out).unwrap();
         let mut n_tables = 0usize;
         let mut idx = 0usize;
@@ -15895,7 +16188,7 @@ mod tests {
         // inside the merged 1.2 section (s06), between the B and C slot anchors.
         let dir = tempfile::tempdir().unwrap();
         let out = dir.path().join("report.html");
-        generate_report(&timing_fixture(), &[], &out, None, None, &[]).unwrap();
+        generate_report(&timing_fixture(), &[], &out, None, None, &[], &[]).unwrap();
         let html = std::fs::read_to_string(&out).unwrap();
 
         // The old split sections no longer exist as section anchors.
@@ -15948,7 +16241,7 @@ mod tests {
         // section.
         let dir = tempfile::tempdir().unwrap();
         let out = dir.path().join("report.html");
-        generate_report(&timing_fixture(), &[], &out, None, None, &[]).unwrap();
+        generate_report(&timing_fixture(), &[], &out, None, None, &[], &[]).unwrap();
         let html = std::fs::read_to_string(&out).unwrap();
         let num = |sid: &str| -> String {
             let at = html
@@ -16001,7 +16294,7 @@ mod tests {
         // read from the rows, in the eyebrow role under the title.
         let dir = tempfile::tempdir().unwrap();
         let out = dir.path().join("report.html");
-        generate_report(&timing_fixture(), &[], &out, None, None, &[]).unwrap();
+        generate_report(&timing_fixture(), &[], &out, None, None, &[], &[]).unwrap();
         let html = std::fs::read_to_string(&out).unwrap();
         let bar = html.find("id=\"part1-bar\"").expect("part1-bar");
         let p2 = html[bar..].find("id=\"part2\"").map(|e| bar + e).unwrap();
@@ -16036,7 +16329,7 @@ mod tests {
         // · error growth / · cost / · outliers entries are gone.
         let dir = tempfile::tempdir().unwrap();
         let out = dir.path().join("report.html");
-        generate_report(&timing_fixture(), &[], &out, None, None, &[]).unwrap();
+        generate_report(&timing_fixture(), &[], &out, None, None, &[], &[]).unwrap();
         let html = std::fs::read_to_string(&out).unwrap();
         let rail_at = html.find("<nav class=\"rail\"").expect("rail");
         let rail_end = html[rail_at..].find("</nav>").map(|e| rail_at + e).unwrap();
@@ -16078,7 +16371,7 @@ mod tests {
         // also keeps the ▸outliers itemised runaway list.
         let dir = tempfile::tempdir().unwrap();
         let out = dir.path().join("report.html");
-        generate_report(&timing_fixture(), &[], &out, None, None, &[]).unwrap();
+        generate_report(&timing_fixture(), &[], &out, None, None, &[], &[]).unwrap();
         let html = std::fs::read_to_string(&out).unwrap();
         let count_methods = |a: &str, b: &str| -> usize {
             let lo = html.find(a).unwrap();
@@ -16119,7 +16412,7 @@ mod tests {
         let (rows, cmp) = radar_scenario();
         let dir = tempfile::tempdir().unwrap();
         let out = dir.path().join("report.html");
-        generate_report(&rows, &cmp, &out, None, None, &[]).unwrap();
+        generate_report(&rows, &cmp, &out, None, None, &[], &[]).unwrap();
         let html = std::fs::read_to_string(&out).unwrap();
         assert!(
             !html.contains("Δr @epoch") && !html.contains("not in the sidecar schema yet"),
@@ -16152,7 +16445,7 @@ mod tests {
         // per-chart drawers and the divergent gMed estimator are gone.
         let dir = tempfile::tempdir().unwrap();
         let out = dir.path().join("report.html");
-        generate_report(&timing_fixture(), &[], &out, None, None, &[]).unwrap();
+        generate_report(&timing_fixture(), &[], &out, None, None, &[], &[]).unwrap();
         let html = std::fs::read_to_string(&out).unwrap();
         assert_eq!(
             html.matches("function drawGrowthChart(").count(),
@@ -16199,7 +16492,7 @@ mod tests {
         // ephemeris canonical, 520px). The card class is defined exactly once.
         let dir = tempfile::tempdir().unwrap();
         let out = dir.path().join("report.html");
-        generate_report(&timing_fixture(), &[], &out, None, None, &[]).unwrap();
+        generate_report(&timing_fixture(), &[], &out, None, None, &[], &[]).unwrap();
         let html = std::fs::read_to_string(&out).unwrap();
         assert_eq!(
             html.matches(".chart-container {").count(),
@@ -16230,7 +16523,7 @@ mod tests {
         // token, re-theme on a flip, and keep the legend clear of the title band.
         let dir = tempfile::tempdir().unwrap();
         let out = dir.path().join("report.html");
-        generate_report(&timing_fixture(), &[], &out, None, None, &[]).unwrap();
+        generate_report(&timing_fixture(), &[], &out, None, None, &[], &[]).unwrap();
         let html = std::fs::read_to_string(&out).unwrap();
 
         // The invisible ghost-grey literal is gone everywhere.
@@ -16551,7 +16844,7 @@ mod tests {
         let agg = synthetic_predict_aggregates("snap");
         let dir = tempfile::tempdir().unwrap();
         let out = dir.path().join("report.html");
-        generate_report(&rows, &[], &out, None, Some(&agg), &[]).unwrap();
+        generate_report(&rows, &[], &out, None, Some(&agg), &[], &[]).unwrap();
         let html = std::fs::read_to_string(&out).unwrap();
         // The 4.2 panel titles carry no hover caption (fails on the old structure).
         assert!(
@@ -17791,6 +18084,7 @@ mod tests {
             None,
             Some(&agg),
             std::slice::from_ref(&run),
+            &[],
         )
         .unwrap();
         let html = std::fs::read_to_string(&out).unwrap();
@@ -17885,6 +18179,7 @@ mod tests {
             None,
             Some(&agg),
             std::slice::from_ref(&run),
+            &[],
         )
         .unwrap();
         let html = std::fs::read_to_string(&out).unwrap();
@@ -17932,7 +18227,7 @@ mod tests {
         let agg = synthetic_predict_aggregates("2026-07-29-snap");
         let dir = tempfile::tempdir().unwrap();
         let out = dir.path().join("report.html");
-        generate_report(&rows, &[], &out, None, Some(&agg), &[]).unwrap();
+        generate_report(&rows, &[], &out, None, Some(&agg), &[], &[]).unwrap();
         let html = std::fs::read_to_string(&out).unwrap();
         assert!(html.contains("id=\"s15\""), "missing 4.2 anchor");
         assert!(html.contains("class=\"agrid pw-grid\""), "no 4.2 grids");
@@ -17969,7 +18264,7 @@ mod tests {
         let agg = synthetic_predict_aggregates("snap");
         let dir = tempfile::tempdir().unwrap();
         let out = dir.path().join("report.html");
-        generate_report(&rows, &[], &out, None, Some(&agg), &[]).unwrap();
+        generate_report(&rows, &[], &out, None, Some(&agg), &[], &[]).unwrap();
         let html = std::fs::read_to_string(&out).unwrap();
 
         // Count the numeric value spans (`<span class="cn">…`) inside one panel's
@@ -18034,7 +18329,7 @@ mod tests {
         let agg = synthetic_predict_aggregates("snap");
         let dir = tempfile::tempdir().unwrap();
         let out = dir.path().join("report.html");
-        generate_report(&rows, &[], &out, None, Some(&agg), &[]).unwrap();
+        generate_report(&rows, &[], &out, None, Some(&agg), &[], &[]).unwrap();
         let html = std::fs::read_to_string(&out).unwrap();
 
         let cs = html.find(">Coverage</div>").expect("4.2A Coverage panel");
@@ -18114,7 +18409,7 @@ mod tests {
         let agg = synthetic_predict_aggregates("snap");
         let dir = tempfile::tempdir().unwrap();
         let out = dir.path().join("report.html");
-        generate_report(&rows, &[], &out, None, Some(&agg), &[]).unwrap();
+        generate_report(&rows, &[], &out, None, Some(&agg), &[], &[]).unwrap();
         let html = std::fs::read_to_string(&out).unwrap();
         let cs = html.find(">Coverage</div>").expect("4.2A Coverage panel");
         let ce = html[cs..].find("Surfaces</div>").map(|i| cs + i).unwrap();
@@ -18180,7 +18475,7 @@ mod tests {
         ));
         let dir = tempfile::tempdir().unwrap();
         let out = dir.path().join("report.html");
-        generate_report(&rows, &[], &out, None, Some(&agg), &[]).unwrap();
+        generate_report(&rows, &[], &out, None, Some(&agg), &[], &[]).unwrap();
         let html = std::fs::read_to_string(&out).unwrap();
         let cs = html.find(">Coverage</div>").expect("4.2A Coverage panel");
         let ce = html[cs..].find("Surfaces</div>").map(|i| cs + i).unwrap();
@@ -18245,7 +18540,7 @@ mod tests {
         let agg = synthetic_predict_aggregates("snap");
         let dir = tempfile::tempdir().unwrap();
         let out = dir.path().join("report.html");
-        generate_report(&rows, &[], &out, None, Some(&agg), &[]).unwrap();
+        generate_report(&rows, &[], &out, None, Some(&agg), &[], &[]).unwrap();
         let html = std::fs::read_to_string(&out).unwrap();
         assert!(
             html.contains("σ_pred-dominated 75% of rows"),
@@ -18386,7 +18681,7 @@ mod tests {
         let rows = vec![synthetic_rust_prop_row("Apophis", 0.0)];
         let dir = tempfile::tempdir().unwrap();
         let out = dir.path().join("report.html");
-        generate_report(&rows, &[], &out, None, None, &[]).unwrap();
+        generate_report(&rows, &[], &out, None, None, &[], &[]).unwrap();
         let html = std::fs::read_to_string(&out).unwrap();
         assert!(html.contains("id=\"s15\""), "the 4.2 shell always renders");
         assert!(
@@ -18413,7 +18708,7 @@ mod tests {
         let agg = synthetic_predict_aggregates("snap");
         let dir = tempfile::tempdir().unwrap();
         let out = dir.path().join("report.html");
-        generate_report(&rows, &[], &out, None, Some(&agg), &[]).unwrap();
+        generate_report(&rows, &[], &out, None, Some(&agg), &[], &[]).unwrap();
         let html = std::fs::read_to_string(&out).unwrap();
         // The n=2 thin cell renders hatched with its count + reason, never as a
         // coloured value (its 0.3 realism / 0.5 sep must not appear as a cell).
@@ -18429,7 +18724,7 @@ mod tests {
         let agg = synthetic_predict_aggregates("snap"); // calibration is empty
         let dir = tempfile::tempdir().unwrap();
         let out = dir.path().join("report.html");
-        generate_report(&rows, &[], &out, None, Some(&agg), &[]).unwrap();
+        generate_report(&rows, &[], &out, None, Some(&agg), &[], &[]).unwrap();
         let html = std::fs::read_to_string(&out).unwrap();
         assert!(
             html.contains("awaiting Student-t chain"),
@@ -18443,7 +18738,7 @@ mod tests {
         let agg = synthetic_predict_aggregates("snap");
         let dir = tempfile::tempdir().unwrap();
         let out = dir.path().join("report.html");
-        generate_report(&rows, &[], &out, None, Some(&agg), &[]).unwrap();
+        generate_report(&rows, &[], &out, None, Some(&agg), &[], &[]).unwrap();
         let html = std::fs::read_to_string(&out).unwrap();
         // The large per-object family must not ride inline on the page.
         assert!(
@@ -18476,8 +18771,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let a = dir.path().join("a.html");
         let b = dir.path().join("b.html");
-        generate_report(&rows, &[], &a, None, Some(&agg), &[]).unwrap();
-        generate_report(&rows, &[], &b, None, Some(&agg), &[]).unwrap();
+        generate_report(&rows, &[], &a, None, Some(&agg), &[], &[]).unwrap();
+        generate_report(&rows, &[], &b, None, Some(&agg), &[], &[]).unwrap();
         let sa = std::fs::read(predict_path_for(&a)).unwrap();
         let sb = std::fs::read(predict_path_for(&b)).unwrap();
         assert_eq!(sa, sb, "the predict sidecar must be byte-reproducible");
@@ -18802,7 +19097,7 @@ mod tests {
         let agg = synthetic_predict_aggregates("snap");
         let dir = tempfile::tempdir().unwrap();
         let out = dir.path().join("report.html");
-        generate_report(&rows, &[], &out, None, Some(&agg), &[]).unwrap();
+        generate_report(&rows, &[], &out, None, Some(&agg), &[], &[]).unwrap();
         let html = std::fs::read_to_string(&out).unwrap();
         // One merged section: no separate Calibration panel-title.
         assert!(
@@ -18913,7 +19208,7 @@ mod tests {
         let (rows, cmp) = radar_scenario();
         let dir = tempfile::tempdir().unwrap();
         let out = dir.path().join("report.html");
-        generate_report(&rows, &cmp, &out, None, None, &[]).unwrap();
+        generate_report(&rows, &cmp, &out, None, None, &[], &[]).unwrap();
         let html = std::fs::read_to_string(&out).unwrap();
 
         // 2.1 "By object and fitter": the empyrean σ_eq column is dropped (1.3A
@@ -18956,7 +19251,7 @@ mod tests {
         let agg = synthetic_predict_aggregates("snap");
         let dir = tempfile::tempdir().unwrap();
         let out = dir.path().join("report.html");
-        generate_report(&rows, &[], &out, None, Some(&agg), &[]).unwrap();
+        generate_report(&rows, &[], &out, None, Some(&agg), &[], &[]).unwrap();
         let html = std::fs::read_to_string(&out).unwrap();
         assert!(
             html.contains(">empyrean <span class=\"pwarm\" title=\"arm efcc.adap.nonight\">EFCC · adaptive · per-obs · linear</span>"),
@@ -19124,7 +19419,7 @@ mod tests {
     fn s5_item6_timing_key_line_and_a2_absent_line_is_data_driven() {
         let dir = tempfile::tempdir().unwrap();
         let out = dir.path().join("report.html");
-        generate_report(&timing_fixture(), &[], &out, None, None, &[]).unwrap();
+        generate_report(&timing_fixture(), &[], &out, None, None, &[], &[]).unwrap();
         let html = std::fs::read_to_string(&out).unwrap();
         // The 2.2 timing tables carry ONE visible key line; the header-row hover
         // sentence is gone from the speed matrix. Delta 9: the key line is a terse
@@ -19206,7 +19501,7 @@ mod tests {
 
         let dir = tempfile::tempdir().unwrap();
         let out = dir.path().join("report.html");
-        generate_report(&timing_fixture(), &[], &out, None, None, &[]).unwrap();
+        generate_report(&timing_fixture(), &[], &out, None, None, &[], &[]).unwrap();
         let html = std::fs::read_to_string(&out).unwrap();
         // The key lines this delta governs are the Part 1 and Part 2 unit keys
         // (the C·cost timing keys and the Part-2 readout keys km/mas/σ_eq); scan
@@ -19234,7 +19529,7 @@ mod tests {
     fn delta9_masthead_has_no_rust_channel_under_test() {
         let dir = tempfile::tempdir().unwrap();
         let out = dir.path().join("report.html");
-        generate_report(&timing_fixture(), &[], &out, None, None, &[]).unwrap();
+        generate_report(&timing_fixture(), &[], &out, None, None, &[], &[]).unwrap();
         let html = std::fs::read_to_string(&out).unwrap();
         let mstart = html.find("<div class=\"masthead\">").expect("masthead");
         let mend = mstart
@@ -19607,7 +19902,7 @@ mod tests {
         ];
         let dir = tempfile::tempdir().unwrap();
         let out = dir.path().join("report.html");
-        generate_report(&rows, &[], &out, None, None, &[]).unwrap();
+        generate_report(&rows, &[], &out, None, None, &[], &[]).unwrap();
         let html = std::fs::read_to_string(&out).unwrap();
         let data_bytes = std::fs::read(dir.path().join("report.data.json")).unwrap();
         // The new fields reached the sidecar.

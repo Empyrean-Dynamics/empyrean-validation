@@ -127,6 +127,8 @@ use empyrean_validation::schema::{
     CapturedOrbit, OrbitComparison, ValidationResult, orbit_sources,
 };
 
+use crate::rows::{DroppedRow, RepsOverride, RowId, RowSelection};
+
 /// Runner config.
 pub struct ValidateConfig {
     pub tiers: Vec<String>,
@@ -137,6 +139,20 @@ pub struct ValidateConfig {
     /// exercise the f64-only path (useful for head-to-head timing vs
     /// external propagators that don't propagate uncertainty).
     pub attach_covariance: bool,
+    /// Compute only these rows (a CI reference leg). `None` computes every
+    /// candidate row of the selected objects.
+    pub select: Option<RowSelection>,
+    /// Per-row timing repetitions that replace the default (the heavy row's
+    /// three timing repetitions run on three legs, one each).
+    pub reps_override: RepsOverride,
+}
+
+impl ValidateConfig {
+    /// The timing repetitions a row runs: its override when the leg has one,
+    /// else `default` (the method's own count, or `n_timing_runs`).
+    pub fn timing_runs(&self, id: &RowId, default: usize) -> usize {
+        self.reps_override.get(id).unwrap_or(default)
+    }
 }
 
 impl Default for ValidateConfig {
@@ -145,6 +161,8 @@ impl Default for ValidateConfig {
             tiers: FORCE_MODEL_TIERS.iter().map(|s| s.to_string()).collect(),
             n_timing_runs: 3,
             attach_covariance: true,
+            select: None,
+            reps_override: RepsOverride::default(),
         }
     }
 }
@@ -386,8 +404,8 @@ fn populate_mixture_tallies(
 /// its `kind` is the delivered kind, so the one joint carries both — reading the
 /// chain accessor would add nothing it lacks. A covariance is `withheld` only
 /// when the per-state joint is absent though one was expected (`attach_cov`),
-/// and then it is carried by name with the engine's own reason (the point
-/// accessor's error) rather than as a blank cell.
+/// and then it is carried by name, as the vocabulary's
+/// `cov_withheld:covariance_absent`, rather than as a blank cell.
 struct PropProducts {
     /// The delivered covariance kind (the joint's `kind`); `None` when no
     /// covariance was delivered.
@@ -428,11 +446,13 @@ fn read_prop_products(
             cov_joint = Some(joint);
         }
         None => {
+            // The vocabulary's one withheld reason
+            // (`empyrean_validation::schema::orbit_status`), so this condition
+            // reads the same on every channel; the engine's wording for why
+            // stays out of the status.
             if attach_cov {
-                withheld = Some(match result.covariance_at_cartesian(0, 0) {
-                    Err(e) => e.to_string(),
-                    Ok(_) => "covariance absent from the propagated state".to_string(),
-                });
+                withheld =
+                    Some(empyrean_validation::schema::orbit_status::COVARIANCE_ABSENT.to_string());
             }
         }
     }
@@ -694,6 +714,45 @@ fn build_uncertainty_axes(
     axes
 }
 
+/// Every propagation and ephemeris row the sweep can emit for these objects,
+/// in the order [`run_propagation_validation`] emits them: per object, each
+/// method of [`build_uncertainty_axes`], and under each method the propagation
+/// rows (tier, then dt) followed by the ephemeris rows (site, then dt).
+///
+/// A candidate is a row the sweep REQUESTS. The engine may still refuse it
+/// (the run records the refusal in its dropped-row file), so the emitted rows
+/// are a subsequence of this list, and the run refuses to write when they are
+/// not. It needs no engine call, so CI prep can list the rows and schedule the
+/// reference legs before any leg runs.
+pub fn candidate_rows(objs: &[&ValidationObject], config: &ValidateConfig) -> Vec<RowId> {
+    use empyrean_validation::schema::uncertainty_modes as um;
+    let mut out = Vec::new();
+    for obj in objs {
+        let dt_list = obj.dt_days.unwrap_or(DEFAULT_DT_DAYS);
+        for axis in build_uncertainty_axes(config.attach_covariance, is_close_approach(obj.name)) {
+            let tag = um::compose(axis.tag, um::DETECTION_ON).to_string();
+            for tier in &config.tiers {
+                for &dt in dt_list {
+                    out.push(RowId::propagation(obj.name, &tag, tier, dt));
+                }
+            }
+            for &obs in empyrean_validation::catalog::OBSERVER_CODES {
+                for &dt in dt_list {
+                    out.push(RowId::ephemeris(obj.name, &tag, obs, dt));
+                }
+            }
+        }
+    }
+    out
+}
+
+/// What [`run_propagation_validation`] produced: the result rows, and every
+/// selected row that produced none, with the engine's reason.
+pub struct PropagationRun {
+    pub rows: Vec<ValidationResult>,
+    pub dropped: Vec<DroppedRow>,
+}
+
 /// Build the ephemeris observers for one site at `target`, byte-for-byte as
 /// the python and core channels build them.
 ///
@@ -753,6 +812,419 @@ fn sky_residuals_arcsec(
     (d_ra_arcsec, d_dec_arcsec)
 }
 
+/// One object's inputs to the propagation / ephemeris sweep, read from the
+/// pinned snapshot: everything a row needs but the engine's result.
+struct ObjData {
+    name: String,
+    population: String,
+    notes: String,
+    /// NAIF ids this object must not be perturbed by — its own, for the
+    /// SB441-N16 self-perturbers. Derived from the catalog entry via
+    /// `plan::self_perturber_naif_ids` so the prop/eph rows and the plan
+    /// cannot disagree about the force model.
+    excluded_naif: Vec<i32>,
+    epoch: f64,
+    ic_pos: [f64; 3],
+    ic_vel: [f64; 3],
+    a1: f64,
+    a2: f64,
+    a3: f64,
+    ng_alpha: f64,
+    ng_r0: f64,
+    ng_m: f64,
+    ng_n: f64,
+    ng_k: f64,
+    ng_dt: Option<f64>,
+    dt_list: &'static [f64],
+    horizons_vectors: HashMap<i64, ([f64; 3], [f64; 3])>,
+    horizons_ephemeris: HashMap<(&'static str, i64), EphemerisEntry>,
+}
+
+/// Read one object's sweep inputs from the pinned snapshot: its SBDB orbit, the
+/// Horizons initial state at the SBDB epoch, the Horizons vectors at every dt
+/// and the Horizons ephemeris at every site and dt. A query that misses the
+/// snapshot is an [`Err`] naming the object, the product and the lookup key.
+/// Shared by the real run and the emit run, so both read the same inputs.
+fn load_object_data(
+    obj: &ValidationObject,
+    horizons_cache_dir: &std::path::Path,
+    sbdb_cache_dir: &std::path::Path,
+) -> Result<ObjData, String> {
+    use empyrean_validation::inputs::{InputProduct, ephemeris_key, missing_input, vectors_key};
+
+    let obs_codes = empyrean_validation::catalog::OBSERVER_CODES;
+    let sbdb = match empyrean::query_sbdb(&[obj.sbdb_query], Some(sbdb_cache_dir)) {
+        Ok(b) if !b.orbits.is_empty() => b,
+        Ok(_) => {
+            return Err(missing_input(
+                obj.name,
+                InputProduct::Sbdb,
+                obj.sbdb_query,
+                sbdb_cache_dir,
+                "SBDB query returned no orbits",
+            ));
+        }
+        Err(e) => {
+            return Err(missing_input(
+                obj.name,
+                InputProduct::Sbdb,
+                obj.sbdb_query,
+                sbdb_cache_dir,
+                &e.to_string(),
+            ));
+        }
+    };
+    let epoch = match sbdb.orbits[0].state.epoch.mjd_tdb() {
+        Ok(t) => t,
+        Err(e) => {
+            return Err(format!(
+                "{}: SBDB record in the pinned snapshot has an unreadable epoch: {e}",
+                obj.name
+            ));
+        }
+    };
+
+    let (hor_pos, hor_vel) = match empyrean::query_horizons_vectors(
+        obj.horizons_command,
+        Epoch::from_mjd_tdb(epoch),
+        Some(horizons_cache_dir),
+    ) {
+        Ok(h) => h,
+        Err(e) => {
+            return Err(missing_input(
+                obj.name,
+                InputProduct::HorizonsVectors,
+                &vectors_key(obj.horizons_command, epoch),
+                horizons_cache_dir,
+                &e.to_string(),
+            ));
+        }
+    };
+
+    // Extract Marsden non-grav from SBDB and pass through with the
+    // explicit g(r) parameters so the C ABI builds the correct
+    // model. SBDB defaults to inverse_square for asteroids and
+    // water-ice for comets. `dt` is the SBDB time-delay (days)
+    // applied to g(r) — non-zero for Jupiter-family comets and
+    // some interstellar objects (67P=+45.7d, 2I/Borisov=−65.1d).
+    let (a1, a2, a3, ng_alpha, ng_r0, ng_m, ng_n, ng_k, ng_dt) = {
+        let o = &sbdb.orbits[0];
+        // The wrapper carries the Marsden g(r) parameters as flat
+        // fields with an all-zero sentinel for the inverse-square
+        // default; record the canonical inverse-square constants
+        // (α=1, r0=1, m=2, n=0, k=0) in that case.
+        let has_g =
+            o.ng_alpha != 0.0 || o.ng_r0 != 0.0 || o.ng_m != 0.0 || o.ng_n != 0.0 || o.ng_k != 0.0;
+        let (ga, gr0, gm, gn, gk) = if has_g {
+            (o.ng_alpha, o.ng_r0, o.ng_m, o.ng_n, o.ng_k)
+        } else {
+            (1.0, 1.0, 2.0, 0.0, 0.0)
+        };
+        (o.a1, o.a2, o.a3, ga, gr0, gm, gn, gk, o.non_grav_dt)
+    };
+
+    eprintln!(
+        "  {}: epoch={:.1} MJD TDB (Horizons IC, a1={:.2e}, dt={:?})",
+        obj.name, epoch, a1, ng_dt
+    );
+
+    let dt_list = obj.dt_days.unwrap_or(DEFAULT_DT_DAYS);
+    let mut horizons_vectors: HashMap<i64, ([f64; 3], [f64; 3])> = HashMap::new();
+    for &dt in dt_list {
+        let target = epoch + dt;
+        match empyrean::query_horizons_vectors(
+            obj.horizons_command,
+            Epoch::from_mjd_tdb(target),
+            Some(horizons_cache_dir),
+        ) {
+            Ok(h) => {
+                horizons_vectors.insert(dt as i64, h);
+            }
+            Err(e) => {
+                return Err(missing_input(
+                    obj.name,
+                    InputProduct::HorizonsVectors,
+                    &vectors_key(obj.horizons_command, target),
+                    horizons_cache_dir,
+                    &e.to_string(),
+                ));
+            }
+        }
+    }
+
+    // Ephemeris (RA/Dec) is observer-dependent — fetch from every site so
+    // the report can average the sky-plane separation over the sites.
+    let mut horizons_ephemeris: HashMap<(&'static str, i64), EphemerisEntry> = HashMap::new();
+    for &obs_code in obs_codes {
+        for &dt in dt_list {
+            let target = epoch + dt;
+            match empyrean::query_horizons(
+                &[obj.horizons_command],
+                obs_code,
+                &[Epoch::from_mjd_tdb(target)],
+                Some(horizons_cache_dir),
+            ) {
+                Ok(r) if !r.is_empty() => {
+                    horizons_ephemeris.insert((obs_code, dt as i64), r.into_iter().next().unwrap());
+                }
+                Ok(_) => {
+                    return Err(missing_input(
+                        obj.name,
+                        InputProduct::HorizonsEphemeris,
+                        &ephemeris_key(obj.horizons_command, obs_code, target),
+                        horizons_cache_dir,
+                        "ephemeris query returned no records",
+                    ));
+                }
+                Err(e) => {
+                    return Err(missing_input(
+                        obj.name,
+                        InputProduct::HorizonsEphemeris,
+                        &ephemeris_key(obj.horizons_command, obs_code, target),
+                        horizons_cache_dir,
+                        &e.to_string(),
+                    ));
+                }
+            }
+        }
+    }
+
+    Ok(ObjData {
+        name: obj.name.to_string(),
+        population: obj.population.to_string(),
+        notes: obj.notes.to_string(),
+        excluded_naif: empyrean_validation::plan::self_perturber_naif_ids(obj),
+        epoch,
+        ic_pos: hor_pos,
+        ic_vel: hor_vel,
+        a1,
+        a2,
+        a3,
+        ng_alpha,
+        ng_r0,
+        ng_m,
+        ng_n,
+        ng_k,
+        ng_dt,
+        dt_list,
+        horizons_vectors,
+        horizons_ephemeris,
+    })
+}
+
+/// A propagation row as everything but the engine fills it: identity, the
+/// initial conditions, the Horizons reference and the provenance, with every
+/// result field `None`. The real run fills the engine's result into it; the
+/// emit run (`validate run --emit-plan-rows`) strips it into the plan row of a
+/// decoupled heavy row with no engine call. One constructor for both is what
+/// makes the published plan row equal the strip of the row the heavy legs
+/// compute, which the final assemble asserts.
+fn propagation_base_row(
+    data: &ObjData,
+    tier_str: &str,
+    dt: f64,
+    hor: ([f64; 3], [f64; 3]),
+    uncertainty_tag: &str,
+    engine_version: &Option<String>,
+    timestamp: &str,
+) -> ValidationResult {
+    ValidationResult {
+        object: data.name.clone(),
+        population: data.population.clone(),
+        epoch_mjd_tdb: data.epoch,
+        dt_days: dt,
+        t_mjd_tdb: data.epoch + dt,
+        force_model: tier_str.to_string(),
+        test_type: "propagation".to_string(),
+        channel: "rust".to_string(),
+        observer: None,
+        emp_vs_horizons_km: None,
+        emp_pos_au: None,
+        emp_pos_cov_au2: None,
+        emp_stm: None,
+        emp_time_ms: None,
+        separation_arcsec: None,
+        d_ra_arcsec: None,
+        d_dec_arcsec: None,
+        emp_radec_cov_arcsec2: None,
+        d_rho_km: None,
+        d_light_time_s: None,
+        ic_pos_au: Some(data.ic_pos),
+        ic_vel_au_d: Some(data.ic_vel),
+        ic_a1: Some(data.a1),
+        ic_a2: Some(data.a2),
+        ic_a3: Some(data.a3),
+        ic_g_alpha: Some(data.ng_alpha),
+        ic_g_r0: Some(data.ng_r0),
+        ic_g_m: Some(data.ng_m),
+        ic_g_n: Some(data.ng_n),
+        ic_g_k: Some(data.ng_k),
+        ic_non_grav_dt: data.ng_dt,
+        ref_pos_au: Some(hor.0),
+        ref_vel_au_d: Some(hor.1),
+        ref_ra_rad: None,
+        ref_dec_rad: None,
+        ref_rho_au: None,
+        ref_light_time_d: None,
+        ref_sun_pos_au: None,
+        ref_sun_vel_au_d: None,
+        ref_od_rms_normalized: None,
+        ref_od_reduced_chi2: None,
+        ref_od_n_obs_used: None,
+        ref_od_n_del_obs_used: None,
+        ref_od_n_dop_obs_used: None,
+        ref_od_data_arc_days: None,
+        ref_od_condition_code: None,
+        ref_od_soln_date: None,
+        ref_od_pe_used: None,
+        ref_od_sb_used: None,
+        n_obs_used: None,
+        od_iterations: None,
+        od_converged: None,
+        od_rms_ra_arcsec: None,
+        od_rms_dec_arcsec: None,
+        od_rms_combined_arcsec: None,
+        od_chi2: None,
+        od_reduced_chi2: None,
+        od_a1: None,
+        od_a2: None,
+        od_a3: None,
+        od_a1_sigma: None,
+        od_a2_sigma: None,
+        od_a3_sigma: None,
+        od_dt: None,
+        od_dt_sigma: None,
+        od_h: None,
+        od_h_sigma: None,
+        od_g1: None,
+        od_g1_sigma: None,
+        od_g2: None,
+        od_g2_sigma: None,
+        od_photometry_model: None,
+        od_photometry_reduced_chi2: None,
+        od_thrust_dv_m_per_s: Vec::new(),
+        od_thrust_dv_sigma_m_per_s: Vec::new(),
+        excluded_perturbers_naif: data.excluded_naif.clone(),
+        // Prop / eph rows run no fit, so there is no
+        // disposition to report. `None` reads as "not
+        // applicable", never as "fixed".
+        od_disposition_marsden: None,
+        od_disposition_dt: None,
+        od_disposition_amrat: None,
+        od_solve_for_used: None,
+        od_joint_covariance_width: None,
+        od_disposition_thrust: Vec::new(),
+        od_warnings: Vec::new(),
+        propagation_uncertainty: Some(uncertainty_tag.to_string()),
+        // The engine's result: filled by the real run only.
+        resolved_method: None,
+        cov_kind: None,
+        cov_joint_width: None,
+        cov_tri: None,
+        orbit_delivered: None,
+        orbit_status: None,
+        mix_n_components_total: None,
+        mix_weight_delivered: None,
+        mix_n_failed: None,
+        mix_n_unresolved: None,
+        mix_n_curvature_refused: None,
+        mix_n_sky_linearization_refused: None,
+        assist_vs_horizons_km: None,
+        emp_vs_assist_km: None,
+        assist_time_ms: None,
+        assist_call_time_ms: None,
+        assist_stm: None,
+        fd_stm: None,
+        var_stm_fixed: None,
+        speed_ratio: None,
+        findorb_rms_residual: None,
+        findorb_n_obs_used: None,
+        findorb_n_obs_rejected: None,
+        findorb_vs_horizons_km: None,
+        emp_vs_findorb_km: None,
+        findorb_separation_arcsec: None,
+        findorb_d_ra_arcsec: None,
+        findorb_d_dec_arcsec: None,
+        findorb_d_rho_km: None,
+        findorb_time_ms: None,
+        kete_time_ms: None,
+        jorbit_time_ms: None,
+        // External-reference fields populated by merge-external:
+        // OpenOrb (prop + ephemeris) and OrbFit (OD).
+        oorb_vs_horizons_km: None,
+        emp_vs_oorb_km: None,
+        oorb_time_ms: None,
+        oorb_separation_arcsec: None,
+        oorb_d_ra_arcsec: None,
+        oorb_d_dec_arcsec: None,
+        oorb_d_rho_km: None,
+        orbfit_rms_arcsec: None,
+        orbfit_n_obs_used: None,
+        orbfit_n_obs_rejected: None,
+        orbfit_time_ms: None,
+        orbfit_error: None,
+        layup_chi2: None,
+        layup_reduced_chi2: None,
+        layup_n_obs_used: None,
+        layup_converged: None,
+        layup_time_ms: None,
+        // GRSS is an external comparator; the reference channel never fills these.
+        grss_vs_horizons_km: None,
+        emp_vs_grss_km: None,
+        grss_time_ms: None,
+        grss_separation_arcsec: None,
+        grss_d_ra_arcsec: None,
+        grss_d_dec_arcsec: None,
+        grss_d_rho_km: None,
+        grss_rms_arcsec: None,
+        grss_chi2: None,
+        grss_reduced_chi2: None,
+        grss_converged: None,
+        grss_n_obs_used: None,
+        grss_n_obs_rejected: None,
+        grss_n_obs_unsupported: None,
+        grss_rms_delay_us: None,
+        grss_rms_doppler_hz: None,
+        grss_n_delay_used: None,
+        grss_n_doppler_used: None,
+        grss_sigma_pos_km: None,
+        grss_model_note: None,
+        grss_error: None,
+        source_version: engine_version.clone(),
+        timestamp: timestamp.to_string(),
+        notes: data.notes.clone(),
+    }
+}
+
+/// What a propagation row needs before any engine call.
+struct RowInputs {
+    /// The Horizons reference state (position, velocity) at the target epoch.
+    hor: ([f64; 3], [f64; 3]),
+    /// The perturbers the row leaves out (the object itself, for an SB441-N16
+    /// member).
+    excluded: Vec<Origin>,
+}
+
+/// The inputs a propagation row needs before any engine call: its Horizons
+/// reference vector and the perturbers it excludes. A row missing either is
+/// dropped with this reason, by the real run and the emit run alike.
+fn propagation_row_inputs(data: &ObjData, tier_str: &str, dt: f64) -> Result<RowInputs, String> {
+    let Some(&hor) = data.horizons_vectors.get(&(dt as i64)) else {
+        return Err("no Horizons vector at this epoch in the pinned snapshot".to_string());
+    };
+    // Take the body out of its own perturber set. This also takes the
+    // engine's ephemeris-overlap short-circuit out of play, so the row measures
+    // a real integration rather than a resample of the body's own SPK — see
+    // `naif_to_origins`.
+    match naif_to_origins(&data.excluded_naif) {
+        Ok(excluded) => Ok(RowInputs { hor, excluded }),
+        Err(e) => {
+            eprintln!("  {}: {tier_str} SKIP ({e})", data.name);
+            Err(format!("SKIP ({e})"))
+        }
+    }
+}
+
 /// Run propagation + ephemeris validation against Horizons reference.
 ///
 /// The IC + reference inputs are read from the pinned snapshot on disk
@@ -768,9 +1240,7 @@ pub fn run_propagation_validation(
     horizons_cache_dir: &std::path::Path,
     sbdb_cache_dir: &std::path::Path,
     num_threads: Option<usize>,
-) -> Result<Vec<ValidationResult>, String> {
-    use empyrean_validation::inputs::{InputProduct, ephemeris_key, missing_input, vectors_key};
-
+) -> Result<PropagationRun, String> {
     let timestamp = chrono::Utc::now().to_rfc3339();
     let channel = "rust".to_string();
     // Provenance: the exact empyrean engine (empyrean-core / villeneuve /
@@ -782,197 +1252,11 @@ pub fn run_propagation_validation(
 
     eprintln!("Fetching initial conditions...");
 
-    struct ObjData {
-        name: String,
-        population: String,
-        notes: String,
-        /// NAIF ids this object must not be perturbed by — its own, for the
-        /// SB441-N16 self-perturbers. Derived from the catalog entry via
-        /// `plan::self_perturber_naif_ids` so the prop/eph rows and the plan
-        /// cannot disagree about the force model.
-        excluded_naif: Vec<i32>,
-        epoch: f64,
-        ic_pos: [f64; 3],
-        ic_vel: [f64; 3],
-        a1: f64,
-        a2: f64,
-        a3: f64,
-        ng_alpha: f64,
-        ng_r0: f64,
-        ng_m: f64,
-        ng_n: f64,
-        ng_k: f64,
-        ng_dt: Option<f64>,
-        dt_list: &'static [f64],
-        horizons_vectors: HashMap<i64, ([f64; 3], [f64; 3])>,
-        horizons_ephemeris: HashMap<(&'static str, i64), EphemerisEntry>,
-    }
-
     let obs_codes = empyrean_validation::catalog::OBSERVER_CODES;
     let mut obj_data: Vec<ObjData> = Vec::new();
 
     for obj in objs {
-        let sbdb = match empyrean::query_sbdb(&[obj.sbdb_query], Some(sbdb_cache_dir)) {
-            Ok(b) if !b.orbits.is_empty() => b,
-            Ok(_) => {
-                return Err(missing_input(
-                    obj.name,
-                    InputProduct::Sbdb,
-                    obj.sbdb_query,
-                    sbdb_cache_dir,
-                    "SBDB query returned no orbits",
-                ));
-            }
-            Err(e) => {
-                return Err(missing_input(
-                    obj.name,
-                    InputProduct::Sbdb,
-                    obj.sbdb_query,
-                    sbdb_cache_dir,
-                    &e.to_string(),
-                ));
-            }
-        };
-        let epoch = match sbdb.orbits[0].state.epoch.mjd_tdb() {
-            Ok(t) => t,
-            Err(e) => {
-                return Err(format!(
-                    "{}: SBDB record in the pinned snapshot has an unreadable epoch: {e}",
-                    obj.name
-                ));
-            }
-        };
-
-        let (hor_pos, hor_vel) = match empyrean::query_horizons_vectors(
-            obj.horizons_command,
-            Epoch::from_mjd_tdb(epoch),
-            Some(horizons_cache_dir),
-        ) {
-            Ok(h) => h,
-            Err(e) => {
-                return Err(missing_input(
-                    obj.name,
-                    InputProduct::HorizonsVectors,
-                    &vectors_key(obj.horizons_command, epoch),
-                    horizons_cache_dir,
-                    &e.to_string(),
-                ));
-            }
-        };
-
-        // Extract Marsden non-grav from SBDB and pass through with the
-        // explicit g(r) parameters so the C ABI builds the correct
-        // model. SBDB defaults to inverse_square for asteroids and
-        // water-ice for comets. `dt` is the SBDB time-delay (days)
-        // applied to g(r) — non-zero for Jupiter-family comets and
-        // some interstellar objects (67P=+45.7d, 2I/Borisov=−65.1d).
-        let (a1, a2, a3, ng_alpha, ng_r0, ng_m, ng_n, ng_k, ng_dt) = {
-            let o = &sbdb.orbits[0];
-            // The wrapper carries the Marsden g(r) parameters as flat
-            // fields with an all-zero sentinel for the inverse-square
-            // default; record the canonical inverse-square constants
-            // (α=1, r0=1, m=2, n=0, k=0) in that case.
-            let has_g = o.ng_alpha != 0.0
-                || o.ng_r0 != 0.0
-                || o.ng_m != 0.0
-                || o.ng_n != 0.0
-                || o.ng_k != 0.0;
-            let (ga, gr0, gm, gn, gk) = if has_g {
-                (o.ng_alpha, o.ng_r0, o.ng_m, o.ng_n, o.ng_k)
-            } else {
-                (1.0, 1.0, 2.0, 0.0, 0.0)
-            };
-            (o.a1, o.a2, o.a3, ga, gr0, gm, gn, gk, o.non_grav_dt)
-        };
-
-        eprintln!(
-            "  {}: epoch={:.1} MJD TDB (Horizons IC, a1={:.2e}, dt={:?})",
-            obj.name, epoch, a1, ng_dt
-        );
-
-        let dt_list = obj.dt_days.unwrap_or(DEFAULT_DT_DAYS);
-        let mut horizons_vectors: HashMap<i64, ([f64; 3], [f64; 3])> = HashMap::new();
-        for &dt in dt_list {
-            let target = epoch + dt;
-            match empyrean::query_horizons_vectors(
-                obj.horizons_command,
-                Epoch::from_mjd_tdb(target),
-                Some(horizons_cache_dir),
-            ) {
-                Ok(h) => {
-                    horizons_vectors.insert(dt as i64, h);
-                }
-                Err(e) => {
-                    return Err(missing_input(
-                        obj.name,
-                        InputProduct::HorizonsVectors,
-                        &vectors_key(obj.horizons_command, target),
-                        horizons_cache_dir,
-                        &e.to_string(),
-                    ));
-                }
-            }
-        }
-
-        // Ephemeris (RA/Dec) is observer-dependent — fetch from every site so
-        // the report can average the sky-plane separation over the sites.
-        let mut horizons_ephemeris: HashMap<(&'static str, i64), EphemerisEntry> = HashMap::new();
-        for &obs_code in obs_codes {
-            for &dt in dt_list {
-                let target = epoch + dt;
-                match empyrean::query_horizons(
-                    &[obj.horizons_command],
-                    obs_code,
-                    &[Epoch::from_mjd_tdb(target)],
-                    Some(horizons_cache_dir),
-                ) {
-                    Ok(r) if !r.is_empty() => {
-                        horizons_ephemeris
-                            .insert((obs_code, dt as i64), r.into_iter().next().unwrap());
-                    }
-                    Ok(_) => {
-                        return Err(missing_input(
-                            obj.name,
-                            InputProduct::HorizonsEphemeris,
-                            &ephemeris_key(obj.horizons_command, obs_code, target),
-                            horizons_cache_dir,
-                            "ephemeris query returned no records",
-                        ));
-                    }
-                    Err(e) => {
-                        return Err(missing_input(
-                            obj.name,
-                            InputProduct::HorizonsEphemeris,
-                            &ephemeris_key(obj.horizons_command, obs_code, target),
-                            horizons_cache_dir,
-                            &e.to_string(),
-                        ));
-                    }
-                }
-            }
-        }
-
-        obj_data.push(ObjData {
-            name: obj.name.to_string(),
-            population: obj.population.to_string(),
-            notes: obj.notes.to_string(),
-            excluded_naif: empyrean_validation::plan::self_perturber_naif_ids(obj),
-            epoch,
-            ic_pos: hor_pos,
-            ic_vel: hor_vel,
-            a1,
-            a2,
-            a3,
-            ng_alpha,
-            ng_r0,
-            ng_m,
-            ng_n,
-            ng_k,
-            ng_dt,
-            dt_list,
-            horizons_vectors,
-            horizons_ephemeris,
-        });
+        obj_data.push(load_object_data(obj, horizons_cache_dir, sbdb_cache_dir)?);
     }
 
     eprintln!();
@@ -999,12 +1283,15 @@ pub fn run_propagation_validation(
     //
     // Built per object: a close-approach object additionally carries the
     // Gaussian-mixture arm (see `build_uncertainty_axes`).
-    let all_results: Vec<Vec<ValidationResult>> = pool.install(|| {
+    let all_results: Vec<(Vec<ValidationResult>, Vec<DroppedRow>)> = pool.install(|| {
         obj_data
             .par_iter()
             .map(|data| {
                 use empyrean_validation::schema::uncertainty_modes as um;
                 let mut results: Vec<ValidationResult> = Vec::new();
+                // Selected rows that produced no result, with the reason.
+                let mut dropped: Vec<DroppedRow> = Vec::new();
+                let wanted = |id: &RowId| config.select.as_ref().is_none_or(|s| s.contains(id));
                 let modes = build_uncertainty_axes(
                     config.attach_covariance,
                     is_close_approach(&data.name),
@@ -1071,23 +1358,20 @@ pub fn run_propagation_validation(
                     let tier = tier_from_str(tier_str);
 
                     for &dt in data.dt_list {
-                        let Some(&hor) = data.horizons_vectors.get(&(dt as i64)) else {
+                        let row_id =
+                            RowId::propagation(&data.name, &uncertainty_tag, tier_str, dt);
+                        if !wanted(&row_id) {
                             continue;
-                        };
+                        }
+                        let RowInputs { hor, excluded } =
+                            match propagation_row_inputs(data, tier_str, dt) {
+                                Ok(v) => v,
+                                Err(reason) => {
+                                    dropped.push(DroppedRow { id: row_id, reason });
+                                    continue;
+                                }
+                            };
                         let target = Epoch::from_mjd_tdb(data.epoch + dt);
-
-                        // Take the body out of its own perturber set. This
-                        // also takes the engine's ephemeris-overlap
-                        // short-circuit out of play, so the row measures a
-                        // real integration rather than a resample of the
-                        // body's own SPK — see `naif_to_origins`.
-                        let excluded = match naif_to_origins(&data.excluded_naif) {
-                            Ok(o) => o,
-                            Err(e) => {
-                                eprintln!("  {}: {tier_str} SKIP ({e})", data.name);
-                                continue;
-                            }
-                        };
                         let prop_config = PropagationConfig {
                             force_model: tier,
                             excluded_perturbers: excluded,
@@ -1114,12 +1398,16 @@ pub fn run_propagation_validation(
                             Vec::new();
                         let mut emp_state: Option<[f64; 3]> = None;
                         let mut failed = false;
+                        let mut fail_reason: Option<String> = None;
 
-                        let runs = if axis.timing_runs > 0 {
-                            axis.timing_runs
-                        } else {
-                            config.n_timing_runs
-                        };
+                        let runs = config.timing_runs(
+                            &row_id,
+                            if axis.timing_runs > 0 {
+                                axis.timing_runs
+                            } else {
+                                config.n_timing_runs
+                            },
+                        );
                         for _ in 0..runs {
                             let t0 = Instant::now();
                             match ctx.propagate(&[orbit.clone()], &[target], &prop_config) {
@@ -1157,11 +1445,19 @@ pub fn run_propagation_validation(
                                         data.name, axis.tag,
                                     );
                                     failed = true;
+                                    fail_reason = Some(format!("empyrean FAIL ({e})"));
                                     break;
                                 }
                             }
                         }
                         if failed || emp_state.is_none() {
+                            dropped.push(DroppedRow {
+                                id: row_id,
+                                reason: fail_reason.unwrap_or_else(|| {
+                                    "empyrean Ok but states.len()=0 (likely AGM mixture-only return)"
+                                        .to_string()
+                                }),
+                            });
                             continue;
                         }
                         let emp_pos = emp_state.unwrap();
@@ -1177,184 +1473,41 @@ pub fn run_propagation_validation(
                             emp_ms,
                         );
 
-                        let mut prop_row = ValidationResult {
-                            object: data.name.clone(),
-                            population: data.population.clone(),
-                            epoch_mjd_tdb: data.epoch,
-                            dt_days: dt,
-                            t_mjd_tdb: data.epoch + dt,
-                            force_model: tier_str.clone(),
-                            test_type: "propagation".to_string(),
-                            channel: channel.clone(),
-                            observer: None,
-                            emp_vs_horizons_km: Some(emp_vs_hor),
-                            emp_pos_au: Some(emp_pos),
-                            emp_pos_cov_au2: emp_pos_cov,
-                            emp_stm: None,
-                            emp_time_ms: Some(emp_ms),
-                            separation_arcsec: None,
-                            d_ra_arcsec: None,
-                            d_dec_arcsec: None,
-                            emp_radec_cov_arcsec2: None,
-                            d_rho_km: None,
-                            d_light_time_s: None,
-                            ic_pos_au: Some(data.ic_pos),
-                            ic_vel_au_d: Some(data.ic_vel),
-                            ic_a1: Some(data.a1),
-                            ic_a2: Some(data.a2),
-                            ic_a3: Some(data.a3),
-                            ic_g_alpha: Some(data.ng_alpha),
-                            ic_g_r0: Some(data.ng_r0),
-                            ic_g_m: Some(data.ng_m),
-                            ic_g_n: Some(data.ng_n),
-                            ic_g_k: Some(data.ng_k),
-                            ic_non_grav_dt: data.ng_dt,
-                            ref_pos_au: Some(hor.0),
-                            ref_vel_au_d: Some(hor.1),
-                            ref_ra_rad: None,
-                            ref_dec_rad: None,
-                            ref_rho_au: None,
-                            ref_light_time_d: None,
-                            ref_sun_pos_au: None,
-                            ref_sun_vel_au_d: None,
-                            ref_od_rms_normalized: None,
-                            ref_od_reduced_chi2: None,
-                            ref_od_n_obs_used: None,
-                            ref_od_n_del_obs_used: None,
-                            ref_od_n_dop_obs_used: None,
-                            ref_od_data_arc_days: None,
-                            ref_od_condition_code: None,
-                            ref_od_soln_date: None,
-                            ref_od_pe_used: None,
-                            ref_od_sb_used: None,
-                            n_obs_used: None,
-                            od_iterations: None,
-                            od_converged: None,
-                            od_rms_ra_arcsec: None,
-                            od_rms_dec_arcsec: None,
-                            od_rms_combined_arcsec: None,
-                            od_chi2: None,
-                            od_reduced_chi2: None,
-                            od_a1: None,
-                            od_a2: None,
-                            od_a3: None,
-                            od_a1_sigma: None,
-                            od_a2_sigma: None,
-                            od_a3_sigma: None,
-                            od_dt: None,
-                            od_dt_sigma: None,
-                            od_h: None,
-                            od_h_sigma: None,
-                            od_g1: None,
-                            od_g1_sigma: None,
-                            od_g2: None,
-                            od_g2_sigma: None,
-                            od_photometry_model: None,
-                            od_photometry_reduced_chi2: None,
-                            od_thrust_dv_m_per_s: Vec::new(),
-                            od_thrust_dv_sigma_m_per_s: Vec::new(),
-                            excluded_perturbers_naif: data.excluded_naif.clone(),
-                            // Prop / eph rows run no fit, so there is no
-                            // disposition to report. `None` reads as "not
-                            // applicable", never as "fixed".
-                            od_disposition_marsden: None,
-                            od_disposition_dt: None,
-                            od_disposition_amrat: None,
-                            od_solve_for_used: None,
-                            od_joint_covariance_width: None,
-                            od_disposition_thrust: Vec::new(),
-                            od_warnings: Vec::new(),
-                            propagation_uncertainty: Some(uncertainty_tag.to_string()),
-                            // Per-method uncertainty output, read off the 0.11
-                            // wrapper. `resolved_method` is the tag of the
-                            // covariance kind the engine delivered on every
-                            // covariance-bearing row (the rung an `auto` row
-                            // chose; the honoured request on an explicit row;
-                            // the delivered kind, never the request, on a silent
-                            // substitution the compare catches); `None` on an
-                            // `none` row. `cov_kind` / `cov_joint_width` /
-                            // `cov_tri` are the delivered packed joint; the
-                            // outcome channel is `outcomes[0]`. The mixture
-                            // side-table tallies are populated below when the
-                            // engine delivered a Mixture.
-                            resolved_method: resolved_method_for(axis.tag, resolved_kind)
-                                .map(|m| um::compose(&m, um::DETECTION_ON)),
-                            cov_kind: cov_joint.as_ref().map(|j| cov_kind_wire(j.kind)),
-                            cov_joint_width: cov_joint.as_ref().map(|j| j.width as u32),
-                            cov_tri: cov_joint.as_ref().map(|j| j.tri.clone()),
-                            orbit_delivered: outcome_channel.as_ref().map(|(d, _)| *d),
-                            orbit_status: outcome_channel.as_ref().map(|(_, s)| s.clone()),
-                            mix_n_components_total: None,
-                            mix_weight_delivered: None,
-                            mix_n_failed: None,
-                            mix_n_unresolved: None,
-                            mix_n_curvature_refused: None,
-                            mix_n_sky_linearization_refused: None,
-                            assist_vs_horizons_km: None,
-                            emp_vs_assist_km: None,
-                            assist_time_ms: None,
-                            assist_call_time_ms: None,
-                            assist_stm: None,
-                            fd_stm: None,
-                            var_stm_fixed: None,
-                            speed_ratio: None,
-                            findorb_rms_residual: None,
-                            findorb_n_obs_used: None,
-                            findorb_n_obs_rejected: None,
-                            findorb_vs_horizons_km: None,
-                            emp_vs_findorb_km: None,
-                            findorb_separation_arcsec: None,
-                            findorb_d_ra_arcsec: None,
-                            findorb_d_dec_arcsec: None,
-                            findorb_d_rho_km: None,
-                            findorb_time_ms: None,
-                            kete_time_ms: None,
-                            jorbit_time_ms: None,
-                            // External-reference fields populated by merge-external:
-                            // OpenOrb (prop + ephemeris) and OrbFit (OD).
-                            oorb_vs_horizons_km: None,
-                            emp_vs_oorb_km: None,
-                            oorb_time_ms: None,
-                            oorb_separation_arcsec: None,
-                            oorb_d_ra_arcsec: None,
-                            oorb_d_dec_arcsec: None,
-                            oorb_d_rho_km: None,
-                            orbfit_rms_arcsec: None,
-                            orbfit_n_obs_used: None,
-                            orbfit_n_obs_rejected: None,
-                            orbfit_time_ms: None,
-                            orbfit_error: None,
-                            layup_chi2: None,
-                            layup_reduced_chi2: None,
-                            layup_n_obs_used: None,
-                            layup_converged: None,
-                            layup_time_ms: None,
-                            // GRSS is an external comparator; the reference channel never fills these.
-                            grss_vs_horizons_km: None,
-                            emp_vs_grss_km: None,
-                            grss_time_ms: None,
-                            grss_separation_arcsec: None,
-                            grss_d_ra_arcsec: None,
-                            grss_d_dec_arcsec: None,
-                            grss_d_rho_km: None,
-                            grss_rms_arcsec: None,
-                            grss_chi2: None,
-                            grss_reduced_chi2: None,
-                            grss_converged: None,
-                            grss_n_obs_used: None,
-                            grss_n_obs_rejected: None,
-                            grss_n_obs_unsupported: None,
-                            grss_rms_delay_us: None,
-                            grss_rms_doppler_hz: None,
-                            grss_n_delay_used: None,
-                            grss_n_doppler_used: None,
-                            grss_sigma_pos_km: None,
-                            grss_model_note: None,
-                            grss_error: None,
-                            source_version: engine_version.clone(),
-                            timestamp: timestamp.clone(),
-                            notes: data.notes.clone(),
-                        };
+                        // The row's inputs (identity, initial conditions, the
+                        // Horizons reference) come from the constructor the
+                        // emit run shares; the engine's result fills the rest.
+                        let mut prop_row = propagation_base_row(
+                            data,
+                            tier_str,
+                            dt,
+                            hor,
+                            &uncertainty_tag,
+                            &engine_version,
+                            &timestamp,
+                        );
+                        prop_row.emp_vs_horizons_km = Some(emp_vs_hor);
+                        prop_row.emp_pos_au = Some(emp_pos);
+                        prop_row.emp_pos_cov_au2 = emp_pos_cov;
+                        prop_row.emp_time_ms = Some(emp_ms);
+                        // Per-method uncertainty output, read off the 0.11
+                        // wrapper. `resolved_method` is the tag of the
+                        // covariance kind the engine delivered on every
+                        // covariance-bearing row (the rung an `auto` row
+                        // chose; the honoured request on an explicit row;
+                        // the delivered kind, never the request, on a silent
+                        // substitution the compare catches); `None` on an
+                        // `none` row. `cov_kind` / `cov_joint_width` /
+                        // `cov_tri` are the delivered packed joint; the
+                        // outcome channel is `outcomes[0]`. The mixture
+                        // side-table tallies are populated below when the
+                        // engine delivered a Mixture.
+                        prop_row.resolved_method = resolved_method_for(axis.tag, resolved_kind)
+                            .map(|m| um::compose(&m, um::DETECTION_ON));
+                        prop_row.cov_kind = cov_joint.as_ref().map(|j| cov_kind_wire(j.kind));
+                        prop_row.cov_joint_width = cov_joint.as_ref().map(|j| j.width as u32);
+                        prop_row.cov_tri = cov_joint.as_ref().map(|j| j.tri.clone());
+                        prop_row.orbit_delivered = outcome_channel.as_ref().map(|(d, _)| *d);
+                        prop_row.orbit_status = outcome_channel.as_ref().map(|(_, st)| st.clone());
                         // Gaussian-mixture side table: populate the six tallies
                         // only on a row the engine actually split (delivered a
                         // Mixture); an unsplit row (SecondOrder collapse) keeps
@@ -1373,7 +1526,16 @@ pub fn run_propagation_validation(
                 // per-method sky covariance is read off the delivered entry.
                 for &obs_code in obs_codes {
                 for &dt in data.dt_list {
+                    let row_id = RowId::ephemeris(&data.name, &uncertainty_tag, obs_code, dt);
+                    if !wanted(&row_id) {
+                        continue;
+                    }
                     let Some(hor) = data.horizons_ephemeris.get(&(obs_code, dt as i64)) else {
+                        dropped.push(DroppedRow {
+                            id: row_id,
+                            reason: "no Horizons ephemeris at this site and epoch in the pinned snapshot"
+                                .to_string(),
+                        });
                         continue;
                     };
                     // Reference entries carry degrees over the wrapper
@@ -1395,10 +1557,18 @@ pub fn run_propagation_validation(
                         Ok(o) => o,
                         Err(e) => {
                             eprintln!("  {} dt={dt:+.0}d SKIP (observer: {e})", data.name);
+                            dropped.push(DroppedRow {
+                                id: row_id,
+                                reason: format!("SKIP (observer: {e})"),
+                            });
                             continue;
                         }
                     };
                     if observers.is_empty() {
+                        dropped.push(DroppedRow {
+                            id: row_id,
+                            reason: "the observer lookup returned no observer".to_string(),
+                        });
                         continue;
                     }
 
@@ -1421,6 +1591,10 @@ pub fn run_propagation_validation(
                             Ok(o) => o,
                             Err(e) => {
                                 eprintln!("  {} dt={dt:+.0}d SKIP ({e})", data.name);
+                                dropped.push(DroppedRow {
+                                    id: row_id,
+                                    reason: format!("SKIP ({e})"),
+                                });
                                 continue;
                             }
                         };
@@ -1439,14 +1613,18 @@ pub fn run_propagation_validation(
                     // identical). `generate_ephemeris` is deterministic run to run,
                     // so the delivered sky position is bit-identical to the
                     // pre-timing single call.
-                    let eph_runs = if axis.timing_runs > 0 {
-                        axis.timing_runs
-                    } else {
-                        config.n_timing_runs
-                    };
+                    let eph_runs = config.timing_runs(
+                        &row_id,
+                        if axis.timing_runs > 0 {
+                            axis.timing_runs
+                        } else {
+                            config.n_timing_runs
+                        },
+                    );
                     let mut eph_times = Vec::new();
                     let mut eph_out = None;
                     let mut eph_failed = false;
+                    let mut eph_fail_reason: Option<String> = None;
                     for _ in 0..eph_runs {
                         let t0 = Instant::now();
                         match ctx.generate_ephemeris(
@@ -1461,17 +1639,26 @@ pub fn run_propagation_validation(
                             Err(e) => {
                                 eprintln!("  {} dt={dt:+.0}d FAIL ({e})", data.name);
                                 eph_failed = true;
+                                eph_fail_reason = Some(format!("FAIL ({e})"));
                                 break;
                             }
                         }
                     }
                     if eph_failed {
+                        dropped.push(DroppedRow {
+                            id: row_id,
+                            reason: eph_fail_reason.unwrap_or_default(),
+                        });
                         continue;
                     }
                     let emp_eph_ms = eph_times.iter().copied().fold(f64::INFINITY, f64::min);
                     match eph_out {
                         Some(eph) => {
                             let Some(entry) = eph.entries.first() else {
+                                dropped.push(DroppedRow {
+                                    id: row_id,
+                                    reason: "the ephemeris returned no entry".to_string(),
+                                });
                                 continue;
                             };
                             // Per-orbit delivery outcome for the ephemeris row,
@@ -1730,18 +1917,136 @@ pub fn run_propagation_validation(
                                 notes: eph_notes,
                             });
                         }
-                        None => continue,
+                        None => {
+                            dropped.push(DroppedRow {
+                                id: row_id,
+                                reason: "no ephemeris timing run executed".to_string(),
+                            });
+                            continue;
+                        }
                     }
                 }
                 } // end for &obs_code (observing sites)
                 } // end for &attach
 
-                results
+                (results, dropped)
             })
             .collect()
     });
 
-    Ok(all_results.into_iter().flatten().collect())
+    let mut rows = Vec::new();
+    let mut dropped = Vec::new();
+    for (r, d) in all_results {
+        rows.extend(r);
+        dropped.extend(d);
+    }
+    // The candidate list and the run must agree on what a row is and in what
+    // order the run emits them, or a leg could lose or invent rows unseen.
+    let candidates = candidate_rows(objs, config);
+    let emitted: Vec<String> = rows
+        .iter()
+        .map(|r| {
+            RowId {
+                object: r.object.clone(),
+                test_type: r.test_type.clone(),
+                propagation_uncertainty: r.propagation_uncertainty.clone().unwrap_or_default(),
+                dt_days: r.dt_days,
+                observer: r.observer.clone(),
+                force_model: r.force_model.clone(),
+            }
+            .key()
+        })
+        .collect();
+    crate::rows::check_accounted(&candidates, config.select.as_ref(), &emitted, &dropped)?;
+    Ok(PropagationRun { rows, dropped })
+}
+
+/// The rows of the selected propagation candidates as [`propagation_base_row`]
+/// builds them, with no engine call: what `validate run --emit-plan-rows` strips
+/// into the plan rows of the decoupled heavy rows, so the channels and the
+/// externals can replay them while the heavy legs still compute them.
+///
+/// The selection must name propagation rows only (an ephemeris row's note is
+/// written from the engine's first-order ephemeris, so it is not
+/// input-determined and cannot be emitted). A row whose inputs are missing is
+/// dropped with the same reason the real run gives; the engine's own refusals
+/// are found only by computing, which the final assemble checks.
+pub fn emit_propagation_rows(
+    objs: &[&ValidationObject],
+    config: &ValidateConfig,
+    horizons_cache_dir: &std::path::Path,
+    sbdb_cache_dir: &std::path::Path,
+) -> Result<PropagationRun, String> {
+    use empyrean_validation::schema::uncertainty_modes as um;
+    let Some(select) = config.select.as_ref() else {
+        return Err(
+            "--emit-plan-rows needs --select: it emits the decoupled rows only".to_string(),
+        );
+    };
+    let candidates = candidate_rows(objs, config);
+    if let Some(bad) = candidates
+        .iter()
+        .find(|c| select.contains(c) && c.test_type != "propagation")
+    {
+        return Err(format!(
+            "--emit-plan-rows takes propagation rows only; {} has test_type {}, whose plan \
+             content the engine writes",
+            bad.key(),
+            bad.test_type
+        ));
+    }
+    let timestamp = chrono::Utc::now().to_rfc3339();
+    let engine_version = empyrean::version_string().ok();
+    let mut rows = Vec::new();
+    let mut dropped = Vec::new();
+    for obj in objs {
+        let wanted_here = candidates
+            .iter()
+            .any(|c| c.object == obj.name && select.contains(c));
+        if !wanted_here {
+            continue;
+        }
+        let data = load_object_data(obj, horizons_cache_dir, sbdb_cache_dir)?;
+        for axis in build_uncertainty_axes(config.attach_covariance, is_close_approach(obj.name)) {
+            let uncertainty_tag = um::compose(axis.tag, um::DETECTION_ON);
+            for tier_str in &config.tiers {
+                for &dt in data.dt_list {
+                    let row_id = RowId::propagation(&data.name, &uncertainty_tag, tier_str, dt);
+                    if !select.contains(&row_id) {
+                        continue;
+                    }
+                    match propagation_row_inputs(&data, tier_str, dt) {
+                        Ok(RowInputs { hor, .. }) => rows.push(propagation_base_row(
+                            &data,
+                            tier_str,
+                            dt,
+                            hor,
+                            &uncertainty_tag,
+                            &engine_version,
+                            &timestamp,
+                        )),
+                        Err(reason) => dropped.push(DroppedRow { id: row_id, reason }),
+                    }
+                }
+            }
+        }
+    }
+    let emitted: Vec<String> = rows
+        .iter()
+        .map(|r| {
+            RowId {
+                object: r.object.clone(),
+                test_type: r.test_type.clone(),
+                propagation_uncertainty: r.propagation_uncertainty.clone().unwrap_or_default(),
+                dt_days: r.dt_days,
+                observer: r.observer.clone(),
+                force_model: r.force_model.clone(),
+            }
+            .key()
+        })
+        .collect();
+    crate::rows::check_accounted(&candidates, Some(select), &emitted, &dropped)?;
+    Ok(PropagationRun { rows, dropped })
 }
 
 /// Result of [`run_od_validation`] — the existing per-row metric records
@@ -2801,19 +3106,19 @@ pub fn run_od_validation(
             let orbit = determine_result.state();
             let meta = SolveMetadata::from_fit(&determine_result);
 
-            // Capture the fitted state + cov in three coordinate views
-            // (native Cartesian, Sun-centered ICRF Cartesian, Sun-centered
-            // ecliptic-J2000 Keplerian) for the orbit-comparison panel.
-            // Transformation via `ctx.transform` propagates covariance
-            // through the Jacobian.
-            let fit_native = propagated_state_to_coord(&orbit);
+            // Capture the fitted orbit in three coordinate views (native
+            // Cartesian, Sun-centered ICRF Cartesian, Sun-centered
+            // ecliptic-J2000 Keplerian) for the orbit-comparison panel. The
+            // capture transports the fit's whole packed joint through the
+            // transform (`capture_orbit`).
+            let fit_orbit = &determine_result.orbit;
             let empy_version = engine_version.clone();
             let fit_captured = match capture_orbit(
                 ctx,
                 obj.name,
                 orbit_sources::EMPYREAN_OD,
                 empy_version.clone(),
-                &fit_native,
+                fit_orbit,
             ) {
                 Ok(captured) => Some(captured),
                 Err(e) => {
@@ -2835,15 +3140,17 @@ pub fn run_od_validation(
             let (sbdb_native, sbdb_captured, sbdb_nongrav) =
                 match empyrean::query_sbdb(&[obj.sbdb_query], sbdb_cache_dir) {
                     Ok(batch) if !batch.orbits.is_empty() => {
-                        let sbdb_state = batch.orbits[0].state;
+                        // The published orbit with its packed joint, as the
+                        // reader delivered it.
+                        let sbdb_orbit = batch.orbits[0].clone();
                         let sbdb_orbit_id = batch.orbit_ids.first().cloned();
-                        let sbdb_ng = (batch.orbits[0].a1, batch.orbits[0].a2, batch.orbits[0].a3);
+                        let sbdb_ng = (sbdb_orbit.a1, sbdb_orbit.a2, sbdb_orbit.a3);
                         let captured = match capture_orbit(
                             ctx,
                             obj.name,
                             orbit_sources::SBDB,
                             sbdb_orbit_id,
-                            &sbdb_state,
+                            &sbdb_orbit,
                         ) {
                             Ok(c) => {
                                 captured_orbits.push(c.clone());
@@ -2857,7 +3164,7 @@ pub fn run_od_validation(
                                 None
                             }
                         };
-                        (Some(sbdb_state), captured, Some(sbdb_ng))
+                        (Some(sbdb_orbit), captured, Some(sbdb_ng))
                     }
                     Ok(_) => {
                         // A present SBDB record with no published orbit is
@@ -2890,12 +3197,7 @@ pub fn run_od_validation(
             if let (Some(fit_c), Some(sbdb_native), Some(sbdb_c)) =
                 (&fit_captured, &sbdb_native, &sbdb_captured)
             {
-                let prop_cfg = empyrean::PropagationConfig {
-                    force_model: tier,
-                    uncertainty_method: empyrean::UncertaintyMethod::FirstOrder,
-                    frame: empyrean::Frame::ICRF,
-                    ..empyrean::PropagationConfig::default()
-                };
+                let prop_cfg = comparison_prop_config(&od_config);
 
                 // Direction A: bring sbdb to fit's epoch; compare at fit's epoch.
                 match propagate_and_capture(
@@ -2934,7 +3236,7 @@ pub fn run_od_validation(
                     obj.name,
                     "fit_at_sbdb_epoch",
                     empy_version.clone(),
-                    &fit_native,
+                    fit_orbit,
                     sbdb_c.epoch_mjd_tdb,
                     &prop_cfg,
                 ) {
@@ -3437,23 +3739,22 @@ pub fn run_od_validation(
     })
 }
 
-/// Propagate a native CoordinateState (any representation) to
+/// Propagate a source orbit (its state and packed joint) to
 /// `target_epoch_mjd_tdb` via `ctx.propagate` with the supplied config
 /// and capture the result as a [`CapturedOrbit`] tagged with `source`.
-/// Covariance is propagated through the STM by the propagator (when
-/// the input state carries one).
+/// The joint is propagated through the STM, and the propagated state's
+/// joint is what the capture then transports.
 fn propagate_and_capture(
     ctx: &Context,
     object: &str,
     source: &str,
     source_version: Option<String>,
-    native: &CoordinateState,
+    orbit: &empyrean::Orbit,
     target_epoch_mjd_tdb: f64,
     prop_cfg: &empyrean::PropagationConfig,
 ) -> Result<CapturedOrbit, empyrean::Error> {
-    let orbit = empyrean::Orbit::new(*native);
     let target = Epoch::from_mjd_tdb(target_epoch_mjd_tdb);
-    let result = ctx.propagate(&[orbit], &[target], prop_cfg)?;
+    let result = ctx.propagate(std::slice::from_ref(orbit), &[target], prop_cfg)?;
     let propagated = result.states.first().ok_or_else(|| empyrean::Error {
         code: -4,
         message: "propagation returned no states (AGM mixture-only return or empty result)"
@@ -3467,8 +3768,53 @@ fn propagate_and_capture(
         orbit_id: None,
         epoch_mjd_tdb: None,
     })?;
-    let propagated_coord = propagated_state_to_coord(propagated);
-    capture_orbit(ctx, object, source, source_version, &propagated_coord)
+    capture_orbit(
+        ctx,
+        object,
+        source,
+        source_version,
+        &propagated_orbit(propagated),
+    )
+}
+
+/// The propagation config of the bidirectional orbit-vs-orbit comparison:
+/// first order, ICRF, at the fit's tier and with the fit's own perturber
+/// exclusions. On a self-perturber the propagation otherwise serves the body's
+/// SPK, which delivers no covariance, and that side of the comparison came out
+/// with no σ and no Mahalanobis distance.
+fn comparison_prop_config(od_config: &ODConfig) -> empyrean::PropagationConfig {
+    empyrean::PropagationConfig {
+        force_model: od_config.force_model,
+        excluded_perturbers: od_config.excluded_perturbers.clone(),
+        uncertainty_method: empyrean::UncertaintyMethod::FirstOrder,
+        frame: empyrean::Frame::ICRF,
+        ..empyrean::PropagationConfig::default()
+    }
+}
+
+/// An invalid-input error the harness raises itself (the wrapper's own
+/// constructor is crate-private): code `-1`, naming no orbit, batch index or
+/// epoch, like the synthetic error above.
+fn harness_input_error(message: impl Into<String>) -> empyrean::Error {
+    empyrean::Error {
+        code: -1,
+        message: message.into(),
+        missing_data_files: Vec::new(),
+        orbit_index: None,
+        orbit_id: None,
+        epoch_mjd_tdb: None,
+    }
+}
+
+/// A propagated or fitted state as the orbit the capture transforms: its
+/// state, and its packed joint as the one covariance home (the flat 6×6 is
+/// the joint's state block, so it is not carried twice).
+pub(crate) fn propagated_orbit(state: &empyrean::PropagatedState) -> empyrean::Orbit {
+    let mut coord = propagated_state_to_coord(state);
+    coord.covariance = None;
+    let mut orbit = empyrean::Orbit::new(coord);
+    orbit.covariance = state.joint.clone();
+    orbit
 }
 
 /// Promote an `empyrean::PropagatedState` (OD output shape) to a full
@@ -3498,15 +3844,31 @@ pub(crate) fn propagated_state_to_coord(orbit: &empyrean::PropagatedState) -> Co
 /// Transform any source's native orbit + covariance into the three
 /// canonical views used by the orbit-comparison panel: the native view
 /// (as-supplied), Sun-centered ICRF Cartesian, and Sun-centered
-/// ecliptic-J2000 Keplerian. Covariance is propagated through the
-/// Jacobian by `ctx.transform`.
+/// ecliptic-J2000 Keplerian.
+///
+/// The transform is `ctx.transform_orbits`, which carries the orbit's whole
+/// packed joint through the element Jacobian. The state-only
+/// `transform_coordinates_single` refuses a covariance-bearing state by
+/// design, which is what left every capture failing ("coordinate transform
+/// carries the state only") and the orbit comparison empty; dropping the
+/// covariance to get past it would silently narrow a comparison whose kernel
+/// compares covariances. A state that carries a covariance without its joint
+/// is refused here by name for the same reason.
 pub(crate) fn capture_orbit(
     ctx: &Context,
     object: &str,
     source: &str,
     source_version: Option<String>,
-    native: &CoordinateState,
+    orbit: &empyrean::Orbit,
 ) -> Result<CapturedOrbit, empyrean::Error> {
+    let native = &orbit.state;
+    if native.covariance.is_some() && orbit.covariance.is_none() {
+        return Err(harness_input_error(format!(
+            "{object} ({source}): the state carries a covariance but the orbit has no packed \
+             joint; the capture transports the joint, so it refuses rather than drop the \
+             covariance"
+        )));
+    }
     let epoch_mjd_tdb = native.epoch.mjd_tdb().unwrap_or(f64::NAN);
     let native_repr = match native.representation {
         Representation::Cartesian => "cartesian",
@@ -3523,23 +3885,31 @@ pub(crate) fn capture_orbit(
     .to_string();
     let native_origin_naif = native.origin.naif_id();
 
-    // Sun-centered ICRF Cartesian. `transform` split into a batch form and
-    // this single-state one at 0.10; one state at a time is what this
-    // per-object capture has, and the single form is the same computation.
-    let cart_sun = ctx.transform_coordinates_single(
-        native,
-        Representation::Cartesian,
-        Frame::ICRF,
-        Origin::SUN,
-    )?;
-
+    // The joint is the covariance home: the transform input carries it
+    // alone, and each output's flat 6×6 is the transported joint's state
+    // block.
+    let mut input = orbit.clone();
+    input.state.covariance = None;
+    let transport = |rep: Representation,
+                     frame: Frame|
+     -> Result<CoordinateState, empyrean::Error> {
+        let batch = ctx.transform_orbits(std::slice::from_ref(&input), rep, frame, Origin::SUN)?;
+        batch
+            .orbits
+            .into_iter()
+            .next()
+            .map(|o| o.state)
+            .ok_or_else(|| harness_input_error("transform_orbits returned no orbit"))
+    };
+    // Sun-centered ICRF Cartesian.
+    let cart_sun = transport(Representation::Cartesian, Frame::ICRF)?;
     // Sun-centered ecliptic-J2000 Keplerian.
-    let kep_sun = ctx.transform_coordinates_single(
-        native,
-        Representation::Keplerian,
-        Frame::EclipticJ2000,
-        Origin::SUN,
-    )?;
+    let kep_sun = transport(Representation::Keplerian, Frame::EclipticJ2000)?;
+    // The native 6×6: the state's own when it carries one, else the joint's
+    // state block.
+    let native_cov_6x6 = native
+        .covariance
+        .or_else(|| orbit.covariance.as_ref().map(|j| j.state_block()));
 
     Ok(CapturedOrbit {
         object: object.to_string(),
@@ -3550,7 +3920,7 @@ pub(crate) fn capture_orbit(
         native_frame,
         native_origin_naif,
         native_state: native.elements,
-        native_cov_6x6: native.covariance,
+        native_cov_6x6,
         state_cart_icrf_sun: cart_sun.elements,
         cov_cart_icrf_sun_6x6: cart_sun.covariance,
         state_kep_ecliptic_sun: kep_sun.elements,
@@ -4589,6 +4959,108 @@ mod tests {
         }
     }
 
+    /// The orbit capture transports the orbit's packed joint into both
+    /// Sun-centered views (`transform_orbits`), so every captured view
+    /// carries its 6×6. The old capture called the state-only
+    /// `transform_coordinates_single` on the covariance-bearing state, which
+    /// the 0.11 engine refuses ("coordinate transform carries the state
+    /// only"), so every fit and SBDB capture failed and the orbit comparison
+    /// came out empty. Mutation: put the state-only transform back in
+    /// `capture_orbit` → the capture errors → red.
+    #[test]
+    fn capture_transports_the_joint_into_every_view() {
+        let Some(ctx) = test_ctx() else {
+            return;
+        };
+        // A delivered state with its joint: the synthetic NEO prior
+        // propagated under first order.
+        let config = PropagationConfig {
+            force_model: ForceModelTier::Standard,
+            uncertainty_method: empyrean::UncertaintyMethod::FirstOrder,
+            frame: Frame::ICRF,
+            ..PropagationConfig::default()
+        };
+        let result = ctx
+            .propagate(
+                std::slice::from_ref(&synthetic_neo_orbit()),
+                &[Epoch::from_mjd_tdb(59_030.0)],
+                &config,
+            )
+            .expect("first-order propagation");
+        let orbit = propagated_orbit(&result.states[0]);
+        assert!(
+            orbit.covariance.is_some(),
+            "the propagated state carries a joint"
+        );
+        // The engine's own contract, which is why the capture cannot use the
+        // state-only transform on this state.
+        let mut with_cov = orbit.state;
+        with_cov.covariance = orbit.covariance.as_ref().map(|j| j.state_block());
+        assert!(
+            ctx.transform_coordinates_single(
+                &with_cov,
+                Representation::Cartesian,
+                Frame::ICRF,
+                Origin::SUN
+            )
+            .is_err(),
+            "the state-only transform refuses a covariance-bearing state"
+        );
+        let captured = capture_orbit(&ctx, "TestNEO", orbit_sources::EMPYREAN_OD, None, &orbit)
+            .expect("the capture transports the joint");
+        let cart = captured
+            .cov_cart_icrf_sun_6x6
+            .expect("Sun ICRF Cartesian covariance");
+        let kep = captured
+            .cov_kep_ecliptic_sun_6x6
+            .expect("Sun ecliptic Keplerian covariance");
+        assert!(captured.native_cov_6x6.is_some(), "native covariance");
+        for i in 0..6 {
+            assert!(cart[i][i] > 0.0 && cart[i][i].is_finite(), "cart σ²[{i}]");
+            assert!(kep[i][i] >= 0.0 && kep[i][i].is_finite(), "kep σ²[{i}]");
+        }
+        // A pure origin shift leaves the Cartesian position block's trace
+        // unchanged to rounding: the joint was transported, not rebuilt.
+        let native = captured.native_cov_6x6.unwrap();
+        let tr = |m: &[[f64; 6]; 6]| m[0][0] + m[1][1] + m[2][2];
+        assert!(
+            (tr(&cart) - tr(&native)).abs() <= 1e-9 * tr(&native),
+            "position-block trace survives the SSB→Sun shift"
+        );
+    }
+
+    /// The comparison propagation carries the fit's tier and perturber
+    /// exclusions. Mutation: drop `excluded_perturbers` from
+    /// `comparison_prop_config` → red (and, end to end, the Vesta comparison
+    /// loses one side's σ).
+    #[test]
+    fn comparison_propagation_carries_the_fits_exclusions() {
+        let excluded = naif_to_origins(&[2000004]).expect("Vesta");
+        let od_config = ODConfig {
+            force_model: ForceModelTier::Standard,
+            excluded_perturbers: excluded.clone(),
+            ..ODConfig::default()
+        };
+        let cfg = comparison_prop_config(&od_config);
+        assert_eq!(cfg.excluded_perturbers, excluded);
+        assert_eq!(cfg.force_model, ForceModelTier::Standard);
+    }
+
+    /// A state that carries a covariance without its packed joint is refused
+    /// by name: the capture transports the joint, so transporting the state
+    /// alone would silently narrow the comparison.
+    #[test]
+    fn capture_refuses_a_covariance_without_its_joint() {
+        let Some(ctx) = test_ctx() else {
+            return;
+        };
+        let bare = synthetic_neo_orbit();
+        assert!(bare.state.covariance.is_some() && bare.covariance.is_none());
+        let err = capture_orbit(&ctx, "TestNEO", orbit_sources::EMPYREAN_OD, None, &bare)
+            .expect_err("a covariance without its joint is refused");
+        assert!(err.message.contains("no packed joint"), "{}", err.message);
+    }
+
     /// The post-fit OD transport leg delivers the SAMPLING kinds too: the
     /// SigmaPoint transport row carries its per-state joint (kind 5, width 6, a
     /// 21-cell triangle) with `orbit_status == "delivered"`, not `cov_withheld`
@@ -4771,5 +5243,334 @@ mod tests {
         let delta = (old_d_ra_arcsec - d_ra_arcsec).abs();
         assert!(delta > 0.0, "the RA wrap perturbs d_ra on a negative Δα");
         assert!(delta < 1e-9, "but only at the ULP of 2π");
+    }
+
+    // ── Row selection (reference legs) ──────────────────────────────────────
+
+    /// The pinned inputs snapshot the integration tests read, or `None` to
+    /// skip (the same gate as the data tier).
+    fn snapshot_dirs() -> Option<(std::path::PathBuf, std::path::PathBuf)> {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../fixtures");
+        let (h, s) = (root.join("horizons"), root.join("sbdb"));
+        (h.is_dir() && s.is_dir()).then_some((h, s))
+    }
+
+    fn object(name: &str) -> &'static empyrean_validation::catalog::ValidationObject {
+        empyrean_validation::catalog::all_objects()
+            .into_iter()
+            .find(|o| o.name == name)
+            .unwrap_or_else(|| panic!("{name} is not in the catalog"))
+    }
+
+    fn run_rows(ctx: &Context, name: &str, select: Option<Vec<RowId>>) -> PropagationRun {
+        let (h, s) = snapshot_dirs().expect("snapshot");
+        let config = ValidateConfig {
+            n_timing_runs: 1,
+            select: select.as_deref().map(RowSelection::from_rows),
+            ..ValidateConfig::default()
+        };
+        run_propagation_validation(ctx, &[object(name)], &config, &h, &s, Some(1))
+            .unwrap_or_else(|e| panic!("run failed: {e}"))
+    }
+
+    fn key_of(r: &ValidationResult) -> String {
+        RowId {
+            object: r.object.clone(),
+            test_type: r.test_type.clone(),
+            propagation_uncertainty: r.propagation_uncertainty.clone().unwrap_or_default(),
+            dt_days: r.dt_days,
+            observer: r.observer.clone(),
+            force_model: r.force_model.clone(),
+        }
+        .key()
+    }
+
+    /// A row with the wall-clock fields blanked, as JSON, for bit comparison.
+    fn without_volatile(r: &ValidationResult) -> serde_json::Value {
+        let mut v = serde_json::to_value(r).unwrap();
+        for k in ["timestamp", "emp_time_ms"] {
+            v[k] = serde_json::Value::Null;
+        }
+        v
+    }
+
+    #[test]
+    fn candidate_rows_list_what_the_run_emits_in_the_order_it_emits_it() {
+        let Some(ctx) = test_ctx() else { return };
+        if snapshot_dirs().is_none() {
+            eprintln!("SKIP: pinned inputs snapshot unavailable");
+            return;
+        }
+        let name = "2008 TC3";
+        let candidates = candidate_rows(&[object(name)], &ValidateConfig::default());
+        let run = run_rows(&ctx, name, None);
+        let emitted: Vec<String> = run.rows.iter().map(key_of).collect();
+        // Every candidate is a result or a named drop, and the results keep the
+        // candidate order: the candidate list IS the emission order.
+        let dropped: std::collections::HashSet<String> =
+            run.dropped.iter().map(|d| d.id.key()).collect();
+        let expected: Vec<String> = candidates
+            .iter()
+            .map(RowId::key)
+            .filter(|k| !dropped.contains(k))
+            .collect();
+        assert_eq!(emitted, expected);
+        assert!(emitted.len() > 100, "a real object emits rows");
+    }
+
+    #[test]
+    fn a_selected_subset_is_bit_identical_to_the_same_rows_of_a_full_run() {
+        let Some(ctx) = test_ctx() else { return };
+        if snapshot_dirs().is_none() {
+            eprintln!("SKIP: pinned inputs snapshot unavailable");
+            return;
+        }
+        let name = "2008 TC3";
+        let candidates = candidate_rows(&[object(name)], &ValidateConfig::default());
+        let full = run_rows(&ctx, name, None);
+        // Every seventh candidate: cuts every method and both row types.
+        let pick: Vec<RowId> = candidates.iter().cloned().step_by(7).collect();
+        let sub = run_rows(&ctx, name, Some(pick.clone()));
+        let want: std::collections::HashSet<String> = pick.iter().map(RowId::key).collect();
+        let from_full: Vec<_> = full
+            .rows
+            .iter()
+            .filter(|r| want.contains(&key_of(r)))
+            .map(without_volatile)
+            .collect();
+        let from_sub: Vec<_> = sub.rows.iter().map(without_volatile).collect();
+        assert!(from_sub.len() > 20);
+        assert_eq!(
+            from_sub, from_full,
+            "a subset computes the rows a full run does, bit for bit"
+        );
+        assert!(sub.dropped.is_empty());
+    }
+
+    /// The plan row of a decoupled heavy row is built in prep with no engine call;
+    /// the heavy legs compute the real row later, and the final assemble asserts
+    /// the published plan equals the strip of the reference. This is that
+    /// equality at the source: the emitted rows strip to exactly what the real
+    /// rows strip to (all but the timestamp), for a self-perturber (non-empty
+    /// excluded_perturbers_naif) and a comet with non-gravitational parameters.
+    /// Mutation: clear `excluded_perturbers_naif` on the emitted rows only (in
+    /// `emit_propagation_rows`) and the Pallas comparison goes red.
+    #[test]
+    fn emitted_plan_rows_equal_the_strip_of_the_real_rows() {
+        let Some(ctx) = test_ctx() else { return };
+        let Some((h, s)) = snapshot_dirs() else {
+            eprintln!("SKIP: pinned inputs snapshot unavailable");
+            return;
+        };
+        let strip = |rows: &[ValidationResult]| -> Vec<serde_json::Value> {
+            let v: Vec<serde_json::Value> = rows
+                .iter()
+                .map(|r| serde_json::to_value(r).unwrap())
+                .collect();
+            let (plan, drops) = empyrean_validation::plan::strip_to_plan(&v).unwrap();
+            assert_eq!(drops.total(), 0);
+            plan.into_iter()
+                .map(|mut r| {
+                    r["timestamp"] = serde_json::Value::Null;
+                    r
+                })
+                .collect()
+        };
+        for name in ["Pallas", "2P/Encke"] {
+            let pick: Vec<RowId> = candidate_rows(&[object(name)], &ValidateConfig::default())
+                .into_iter()
+                .filter(|c| c.test_type == "propagation" && c.dt_days.abs() <= 30.0)
+                .filter(|c| {
+                    c.propagation_uncertainty == "none_detection_on"
+                        || c.propagation_uncertainty == "first_order_detection_on"
+                })
+                .collect();
+            assert!(pick.len() >= 4, "{name}: cheap propagation rows to compare");
+            let config = ValidateConfig {
+                n_timing_runs: 1,
+                select: Some(RowSelection::from_rows(&pick)),
+                ..ValidateConfig::default()
+            };
+            let real = run_propagation_validation(&ctx, &[object(name)], &config, &h, &s, Some(1))
+                .unwrap_or_else(|e| panic!("{name}: real run failed: {e}"));
+            let emitted = emit_propagation_rows(&[object(name)], &config, &h, &s)
+                .unwrap_or_else(|e| panic!("{name}: emit failed: {e}"));
+            assert_eq!(real.rows.len(), pick.len(), "{name}: every row computed");
+            assert!(emitted.dropped.is_empty());
+            assert!(
+                emitted
+                    .rows
+                    .iter()
+                    .all(|r| r.emp_pos_au.is_none() && r.emp_time_ms.is_none()),
+                "the emit run fills no engine result"
+            );
+            assert_eq!(
+                strip(&emitted.rows),
+                strip(&real.rows),
+                "{name}: the emitted plan rows are the strip of the real rows"
+            );
+            if name == "Pallas" {
+                assert!(!emitted.rows[0].excluded_perturbers_naif.is_empty());
+            } else {
+                assert!(
+                    emitted.rows[0].ic_a1.is_some_and(|a| a != 0.0)
+                        || emitted.rows[0].ic_a2.is_some_and(|a| a != 0.0)
+                );
+            }
+        }
+    }
+
+    /// The emit run builds propagation rows only, and only a selection.
+    /// Mutation: drop the test_type check in `emit_propagation_rows`.
+    #[test]
+    fn the_emit_run_refuses_an_ephemeris_row_and_an_empty_selection() {
+        let dir = std::path::Path::new("/nonexistent");
+        let eph = RowId::ephemeris("2008 TC3", "first_order_detection_on", "500", 0.0);
+        assert!(
+            candidate_rows(&[object("2008 TC3")], &ValidateConfig::default()).contains(&eph),
+            "the test row is a candidate"
+        );
+        let config = ValidateConfig {
+            select: Some(RowSelection::from_rows(std::slice::from_ref(&eph))),
+            ..ValidateConfig::default()
+        };
+        let err = emit_propagation_rows(&[object("2008 TC3")], &config, dir, dir)
+            .err()
+            .expect("an ephemeris row is refused");
+        assert!(err.contains("propagation rows only"), "{err}");
+        let err =
+            emit_propagation_rows(&[object("2008 TC3")], &ValidateConfig::default(), dir, dir)
+                .err()
+                .expect("no selection is refused");
+        assert!(err.contains("needs --select"), "{err}");
+    }
+
+    #[test]
+    fn a_refused_row_lands_in_the_dropped_file_with_the_engines_reason() {
+        let Some(ctx) = test_ctx() else { return };
+        if snapshot_dirs().is_none() {
+            eprintln!("SKIP: pinned inputs snapshot unavailable");
+            return;
+        }
+        // 2020 CD3's sigma_point ephemeris at dt = -3650 d is refused: the
+        // sampled sky ensemble disperses 2.1 rad (run 42506609035).
+        let row = RowId::ephemeris("2020 CD3", "sigma_point_detection_on", "W84", -3650.0);
+        let run = run_rows(&ctx, "2020 CD3", Some(vec![row.clone()]));
+        assert!(run.rows.is_empty());
+        assert_eq!(run.dropped.len(), 1);
+        assert_eq!(run.dropped[0].id, row);
+        assert!(
+            run.dropped[0].reason.contains("dispersed"),
+            "{}",
+            run.dropped[0].reason
+        );
+    }
+
+    #[test]
+    fn a_repetition_override_changes_how_often_a_row_runs_and_not_what_it_computes() {
+        let Some(ctx) = test_ctx() else { return };
+        if snapshot_dirs().is_none() {
+            eprintln!("SKIP: pinned inputs snapshot unavailable");
+            return;
+        }
+        let (h, s) = snapshot_dirs().unwrap();
+        let name = "2008 TC3";
+        let id = RowId::propagation(name, "second_order_detection_on", "full", -365.0);
+        let candidates = candidate_rows(&[object(name)], &ValidateConfig::default());
+        assert!(candidates.contains(&id), "the test row is a candidate");
+        let mk = |reps: Option<usize>| {
+            let dir = std::env::temp_dir().join(format!("reps-{}-{:?}", std::process::id(), reps));
+            std::fs::create_dir_all(&dir).unwrap();
+            let f = dir.join("reps.json");
+            let mut e = serde_json::to_value(&id).unwrap();
+            e["reps"] = serde_json::json!(reps.unwrap_or(1));
+            std::fs::write(&f, serde_json::to_string(&vec![e]).unwrap()).unwrap();
+            let config = ValidateConfig {
+                n_timing_runs: 3,
+                select: Some(RowSelection::from_rows(std::slice::from_ref(&id))),
+                reps_override: if reps.is_some() {
+                    crate::rows::load_reps_override(&f).unwrap()
+                } else {
+                    RepsOverride::default()
+                },
+                ..ValidateConfig::default()
+            };
+            run_propagation_validation(&ctx, &[object(name)], &config, &h, &s, Some(1))
+                .unwrap()
+                .rows
+        };
+        let three = mk(None);
+        let one = mk(Some(1));
+        assert_eq!((three.len(), one.len()), (1, 1));
+        assert_eq!(without_volatile(&three[0]), without_volatile(&one[0]));
+    }
+
+    #[test]
+    fn a_rows_timing_runs_are_its_override_else_the_default() {
+        let dir = std::env::temp_dir().join(format!("reps-unit-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let f = dir.join("reps.json");
+        let heavy = RowId::propagation("2020 CD3", "auto_detection_on", "standard", -5475.0);
+        let other = RowId::propagation("2020 CD3", "auto_detection_on", "standard", -3650.0);
+        let mut e = serde_json::to_value(&heavy).unwrap();
+        e["reps"] = serde_json::json!(1);
+        std::fs::write(&f, serde_json::to_string(&vec![e]).unwrap()).unwrap();
+        let config = ValidateConfig {
+            n_timing_runs: 3,
+            reps_override: crate::rows::load_reps_override(&f).unwrap(),
+            ..ValidateConfig::default()
+        };
+        assert_eq!(
+            config.timing_runs(&heavy, 3),
+            1,
+            "the overridden row runs once"
+        );
+        assert_eq!(
+            config.timing_runs(&other, 3),
+            3,
+            "every other row keeps its default"
+        );
+        assert_eq!(
+            config.timing_runs(&other, 1),
+            1,
+            "including a sampling row's own count"
+        );
+    }
+
+    #[test]
+    fn candidate_rows_cover_every_method_tier_site_and_epoch_of_an_object() {
+        // A close-approach object carries the mixture arm; the others do not.
+        let cfg = ValidateConfig::default();
+        let plain = candidate_rows(&[object("Eros")], &cfg);
+        let ca = candidate_rows(&[object("Bennu")], &cfg);
+        let tags = |rows: &[RowId]| {
+            rows.iter()
+                .map(|r| r.propagation_uncertainty.clone())
+                .collect::<std::collections::BTreeSet<_>>()
+        };
+        assert!(!tags(&plain).contains("gaussian_mixture_detection_on"));
+        assert!(tags(&ca).contains("gaussian_mixture_detection_on"));
+        // Keys are unique, and propagation rows precede ephemeris rows within a method.
+        let keys: std::collections::HashSet<String> = ca.iter().map(RowId::key).collect();
+        assert_eq!(keys.len(), ca.len());
+        let first_method = &ca[0].propagation_uncertainty;
+        let block: Vec<&RowId> = ca
+            .iter()
+            .take_while(|r| &r.propagation_uncertainty == first_method)
+            .collect();
+        let first_eph = block
+            .iter()
+            .position(|r| r.test_type == "ephemeris")
+            .unwrap();
+        assert!(
+            block[..first_eph]
+                .iter()
+                .all(|r| r.test_type == "propagation")
+        );
+        assert!(
+            block[first_eph..]
+                .iter()
+                .all(|r| r.test_type == "ephemeris")
+        );
     }
 }

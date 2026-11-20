@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Stage layup's data directory from the registered kernel set.
+"""Stage layup's data directory from the third-party tool set's layup folder.
 
 layup reads its SPICE kernels, its ASSIST ephemerides, the observatory codes
 and the debiasing table from one directory (its ``--ar`` "ASSIST+Rebound" data
@@ -12,9 +12,9 @@ the spot from the address layup was released with. When NAIF renamed its
 dated Earth-orientation kernels those downloads began to 404, and every layup
 fit failed.
 
-This script builds that directory from the engine data directory (the
-registered kernel set the suite syncs, ``EMPYREAN_DATA_DIR``) and from nothing
-else: no download, and never layup's per-user cache. The names come from the
+This script builds that directory from one data folder (``--data-dir``: the
+``layup/`` folder of the ``third-party-tools-2026-11-08`` dataset, which lists
+every file layup reads, shared kernels included) and from nothing else: no download, and never layup's per-user cache. The names come from the
 installed layup's own defaults, so a layup bump that renames a file is staged
 under the new name, and a file the bump adds that no role below fills is a
 hard stop. Each name becomes a symbolic link to the one data-directory file
@@ -32,7 +32,7 @@ names everything a set update has to add.
 Usage (with the layup venv's python, which supplies layup's names and the
 spiceypy load check)::
 
-    .venv/bin/python stage_data.py --data-dir "$DATA_DIR" --dest data
+    .venv/bin/python stage_data.py --data-dir "$DATA_DIR/third-party/layup" --dest data
 """
 
 from __future__ import annotations

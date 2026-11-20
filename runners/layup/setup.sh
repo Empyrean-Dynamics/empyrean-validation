@@ -13,7 +13,9 @@
 # Usage:
 #   ./layup/setup.sh                           # pinned release, staged data
 #   LAYUP_VERSION=<x.y.z> ./layup/setup.sh     # another PyPI release
-#   DATA_DIR=<dir> ./layup/setup.sh            # another synced kernel set
+#   DATA_DIR=<dir> ./layup/setup.sh            # another data folder (default
+#                                              # ~/.empyrean/data; `make` passes
+#                                              # third-party/layup of the tool set)
 #
 # Prerequisites: python >=3.11, a C compiler, and cmake. layup publishes an
 # sdist only, so the install compiles its C extension against assist/rebound.
@@ -72,7 +74,7 @@ fi
 "$PY" -c 'import layup' || { echo "ERROR: layup $installed does not import." >&2; exit 1; }
 echo "layup $installed installed; layup-orbitfit present."
 
-# ── Stage layup's data directory from the registered kernel set ──
+# ── Stage layup's data directory from the third-party tool set's layup folder ──
 # No `layup bootstrap`: it downloads every kernel from the dated address the
 # release names, and the fit path re-downloads whatever is missing, so a
 # renamed upstream file fails every fit (NAIF's Earth-orientation rename did

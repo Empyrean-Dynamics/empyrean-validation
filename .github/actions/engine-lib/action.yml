@@ -1,0 +1,114 @@
+name: Engine library
+description: >
+  Puts the prebuilt engine library (libempyrean) where every job that builds or
+  runs against `empyrean` expects it, WITHOUT reaching the public release URL.
+  empyrean-sys's build script downloads that URL once per job with no retry; on
+  2026-11-09 it answered HTTP 504 for every asset while the authenticated API
+  worked. The writer (prep, the mint's first job) fetches the pinned version's
+  `libempyrean-<platform>.tar.gz` ONCE through `gh release download`, retrying
+  with backoff, verifies it against the empyrean-sys crate's checksums.txt and
+  refuses by name on a mismatch, and caches it keyed by version. Every reader
+  restores that cache and re-verifies it offline. Both log one `engine-lib:`
+  line naming the version, platform, sha256 and source.
+
+  The workflow sets EMPYREAN_LIB_DIR for the whole run (the directory below), so
+  a job that forgot this action fails the build with "libempyrean not found"
+  instead of downloading. This action sets EMPYREAN_LIB, the run-time path of the
+  library file, for the steps after it.
+
+inputs:
+  role:
+    description: "`writer` fetches (and caches) the library; `reader` only restores and verifies it."
+    required: false
+    default: reader
+  token:
+    description: Token for the authenticated release API (writer only). The empyrean repo's read PAT, or the workflow token.
+    required: false
+    default: ""
+
+runs:
+  using: composite
+  steps:
+    # The pin is read where every other job reads it: the rust runner's manifest.
+    - name: Resolve the pinned distribution version
+      id: pin
+      shell: bash
+      run: |
+        version="$(sed -n 's/^empyrean = "=\(.*\)"/\1/p' empyrean-validation/runners/rust/Cargo.toml)"
+        if [ -z "$version" ]; then
+          echo "ERROR: engine-lib: could not read the pinned empyrean version from empyrean-validation/runners/rust/Cargo.toml." >&2
+          exit 1
+        fi
+        if [ -z "${EMPYREAN_LIB_DIR:-}" ]; then
+          echo "ERROR: engine-lib: EMPYREAN_LIB_DIR is not set. The workflow sets it for the whole run so that" >&2
+          echo "       empyrean-sys can never fall through to the public release URL; refusing to continue without it." >&2
+          exit 1
+        fi
+        echo "version=$version" >> "$GITHUB_OUTPUT"
+
+    - name: Restore the engine library (keyed by version)
+      id: cache
+      uses: actions/cache/restore@v4
+      with:
+        path: engine-lib
+        key: engine-lib-${{ steps.pin.outputs.version }}-${{ runner.os }}-${{ runner.arch }}
+
+    - name: Require a warm engine-library cache (reader role)
+      if: inputs.role != 'writer' && steps.cache.outputs.cache-hit != 'true'
+      shell: bash
+      run: |
+        echo "ERROR: engine-lib: cache miss on engine-lib-${{ steps.pin.outputs.version }}-${{ runner.os }}-${{ runner.arch }}," >&2
+        echo "       and this job's role is 'reader' so it will not download the library." >&2
+        echo "       prep is the sole writer of this cache. A miss means prep did not run, its fetch failed," >&2
+        echo "       or the pinned version changed between jobs of the same run." >&2
+        echo "       Refusing to build or run against an engine prep did not verify." >&2
+        exit 1
+
+    # The empyrean-sys crate's checksums.txt, from the cargo registry: the pin the
+    # crate's own build script would have verified against.
+    - name: Locate the empyrean-sys checksums (writer)
+      id: crate
+      if: inputs.role == 'writer'
+      shell: bash
+      run: |
+        cargo fetch --manifest-path empyrean-validation/runners/rust/Cargo.toml
+        found="$(ls "$HOME"/.cargo/registry/src/*/empyrean-sys-${{ steps.pin.outputs.version }}/checksums.txt 2>/dev/null | head -n 1 || true)"
+        if [ -z "$found" ]; then
+          echo "ERROR: engine-lib: empyrean-sys-${{ steps.pin.outputs.version }}/checksums.txt is not in the cargo registry after cargo fetch." >&2
+          exit 1
+        fi
+        echo "checksums=$found" >> "$GITHUB_OUTPUT"
+
+    - name: Fetch the engine library once (writer, authenticated API)
+      if: inputs.role == 'writer'
+      shell: bash
+      env:
+        GH_TOKEN: ${{ inputs.token }}
+      run: |
+        python3 empyrean-validation/scripts/engine_lib.py fetch \
+          --version "${{ steps.pin.outputs.version }}" \
+          --dest "$EMPYREAN_LIB_DIR" \
+          --checksums "${{ steps.crate.outputs.checksums }}"
+
+    - name: Save the engine library (writer)
+      if: inputs.role == 'writer' && steps.cache.outputs.cache-hit != 'true'
+      uses: actions/cache/save@v4
+      with:
+        path: engine-lib
+        key: engine-lib-${{ steps.pin.outputs.version }}-${{ runner.os }}-${{ runner.arch }}
+
+    - name: Verify the cached engine library offline (reader)
+      if: inputs.role != 'writer'
+      shell: bash
+      run: |
+        python3 empyrean-validation/scripts/engine_lib.py restore \
+          --version "${{ steps.pin.outputs.version }}" \
+          --dest "$EMPYREAN_LIB_DIR"
+
+    - name: Point the run-time loader at the library
+      shell: bash
+      run: |
+        lib="$(python3 -c "import json,os,sys; r=json.load(open(os.path.join(os.environ['EMPYREAN_LIB_DIR'],'engine-lib.json'))); print(os.path.join(os.environ['EMPYREAN_LIB_DIR'], r['lib']))")"
+        test -f "$lib" || { echo "ERROR: engine-lib: $lib does not exist." >&2; exit 1; }
+        echo "EMPYREAN_LIB=$lib" >> "$GITHUB_ENV"
+        echo "engine-lib: EMPYREAN_LIB_DIR=$EMPYREAN_LIB_DIR EMPYREAN_LIB=$lib"

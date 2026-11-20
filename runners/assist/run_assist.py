@@ -632,10 +632,14 @@ def main():
         print("Run: ./setup.sh")
         sys.exit(1)
 
-    ephem_kw = {"planets_path": str(planets_path)}
-    if asteroids_path.exists():
-        ephem_kw["asteroids_path"] = str(asteroids_path)
-    ephem = assist.Ephem(**ephem_kw)
+    if not asteroids_path.exists():
+        # Never a silent planets-only run: without the asteroid file every
+        # object would lose its 16 SB441-N16 perturbers and still look compared.
+        print(f"ERROR: ASSIST asteroid file not found: {asteroids_path}")
+        print("Run: ./setup.sh")
+        sys.exit(1)
+
+    ephem = assist.Ephem(planets_path=str(planets_path), asteroids_path=str(asteroids_path))
     # Self-perturber objects (SB441-N16 members: Iris/Vesta/Pallas/Hygiea)
     # CANNOT be propagated with the asteroid-perturber set loaded: ASSIST has
     # no per-body exclusion, so the test particle starts on top of its own

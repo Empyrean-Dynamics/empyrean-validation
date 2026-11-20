@@ -28,19 +28,19 @@
 #        de440.bsp  sb441-n16s.bsp  earth_{latest,historic,predict}.bpc
 #        moon_pa_de440.bpc  pck00011.tpc
 #
-#    The planetary ephemeris and the Earth/Moon orientation kernels come from
-#    the registered kernel set every empyrean repo pins (synced into DATA_DIR
-#    by the suite; CI restores it before this script runs) — the same files
-#    the engine reads, never a second download of a moving name. Only the two
-#    files the set does not carry, the short-span SB441-N16 and pck00011.tpc,
-#    are fetched, from stable undated addresses.
+#    Every kernel comes from GRSS's folder of the third-party tool set
+#    (dataset third-party-tools-*, folder `grss/`, synced by the suite under
+#    DATA_DIR/third-party; CI restores it before this script runs). The folder
+#    lists every file GRSS reads, shared kernels included, so GRSS reads the
+#    same bytes the engine does and nothing is ever downloaded: a file the
+#    folder does not carry is a hard stop that names the set.
 #
 #    run_grss.py passes `--de-kernel 440` to match and STAMPS the kernel
 #    version into every row's `source_version`, so the report always records
 #    which planetary ephemeris produced the comparison. Set
 #    GRSS_DE_KERNEL=441 here (and `--de-kernel 441` on the runner) for an
-#    exact-DE441 run against empyrean's DE441 + SB441-N16 reference; that
-#    costs the full 4.4 GB download.
+#    exact-DE441 run against empyrean's DE441 + SB441-N16 reference; that needs
+#    a tool-set folder carrying de441.bsp and sb441-n16.bsp.
 #
 #    A missing kernel is never papered over: run_grss.py asserts every file
 #    the requested version needs is present and non-empty before it fits or
@@ -117,7 +117,12 @@ VENV_PY="$(pwd)/.venv/bin/python"
 # between runs without a reviewed diff.
 "$VENV_PY" -m pip install "grss==${GRSS_VERSION}"
 
-GRSS_PKG="$("$VENV_PY" -c 'import os,grss.utils as u; print(u.grss_path)' 2>/dev/null | tail -1)"
+# Located without importing it: `import grss` (or `import grss.utils`) runs
+# grss.utils.initialize(), which shells out to get_kernels.py and pulls the full
+# kernel set from NAIF and the SSD (DE441 included) and replaces a day-old
+# earth_latest.bpc with NAIF's current one. find_spec reads the package's
+# location and runs none of it.
+GRSS_PKG="$("$VENV_PY" -c 'import importlib.util, os; print(os.path.dirname(importlib.util.find_spec("grss").origin))' 2>/dev/null | tail -1)"
 if [ -z "$GRSS_PKG" ] || [ ! -d "$GRSS_PKG" ]; then
     echo "ERROR: grss installed but its package directory could not be resolved." >&2
     exit 1
@@ -127,31 +132,29 @@ echo "grss package: $GRSS_PKG"
 # ── 2. SPICE kernels ───────────────────────────────────────
 # Staged here, deliberately, instead of letting `import grss` shell out to
 # get_kernels.py — see the header.
-NAIF="https://naif.jpl.nasa.gov/pub/naif/generic_kernels"
-SSD="https://ssd.jpl.nasa.gov/ftp"
-
 KDIR="$GRSS_PKG/kernels"
 mkdir -p "$KDIR"
 
-# ── 2a. From the registered kernel set ─────────────────────
-# DATA_DIR is the synced set (the Makefile passes its DATA_DIR; the suite's
-# default is ~/.empyrean/data). Each file is matched by the pattern its NAIF
-# name follows across set versions and must match exactly once; a missing or
-# ambiguous file is a hard stop with the set named, never a download.
-DATA_DIR="${DATA_DIR:-$HOME/.empyrean/data}"
-if [ ! -d "$DATA_DIR" ]; then
-    echo "ERROR: DATA_DIR=$DATA_DIR does not exist." >&2
-    echo "       GRSS stages its planetary and orientation kernels from the registered" >&2
-    echo "       kernel set the suite syncs there; sync it first (the CI prep job does)." >&2
+# GRSS_DATA_DIR is GRSS's folder of the third-party tool set (the Makefile
+# passes it; the suite's default is ~/.empyrean/data/third-party/grss). Each
+# file is matched by the pattern its NAIF name follows across set versions and
+# must match exactly once; a missing or ambiguous file is a hard stop with the
+# set named, never a download.
+GRSS_DATA_DIR="${GRSS_DATA_DIR:-$HOME/.empyrean/data/third-party/grss}"
+if [ ! -d "$GRSS_DATA_DIR" ]; then
+    echo "ERROR: GRSS_DATA_DIR=$GRSS_DATA_DIR does not exist." >&2
+    echo "       GRSS stages every SPICE kernel from the grss/ folder of the third-party" >&2
+    echo "       tool set the suite syncs under DATA_DIR/third-party; sync it first (the CI" >&2
+    echo "       prep job does)." >&2
     exit 1
 fi
 stage_from_set() {  # stage_from_set <pattern> <grss name>
     local pattern="$1" name="$2"
     local matches=()
-    while IFS= read -r f; do matches+=("$f"); done < <(find "$DATA_DIR" -maxdepth 1 -name "$pattern" -type f | sort)
+    while IFS= read -r f; do matches+=("$f"); done < <(find "$GRSS_DATA_DIR" -maxdepth 1 -name "$pattern" \( -type f -o -type l \) | sort)
     if [ "${#matches[@]}" -ne 1 ] || [ ! -s "${matches[0]}" ]; then
-        echo "ERROR: expected exactly one non-empty '$pattern' in the registered kernel set at" >&2
-        echo "       $DATA_DIR; found ${#matches[@]}. GRSS never downloads what the set carries." >&2
+        echo "ERROR: expected exactly one non-empty '$pattern' in the third-party tool set's" >&2
+        echo "       grss/ folder at $GRSS_DATA_DIR; found ${#matches[@]}. GRSS never downloads a kernel." >&2
         exit 1
     fi
     local src="${matches[0]}" dest="$KDIR/$name"
@@ -168,59 +171,14 @@ stage_from_set "earth_latest_high_prec.bpc"   "earth_latest.bpc"
 stage_from_set "earth_620120_*.bpc"           "earth_historic.bpc"
 stage_from_set "earth_*_predict.bpc"          "earth_predict.bpc"
 stage_from_set "moon_pa_de440_*.bpc"          "moon_pa_de440.bpc"
+stage_from_set "pck00011.tpc"                 "pck00011.tpc"
 if [ "$GRSS_DE_KERNEL" = "441" ]; then
     stage_from_set "sb441-n16.bsp" "sb441-n16.bsp"
+    stage_from_set "de441.bsp"     "de441.bsp"
 else
-    stage_from_set "de440.bsp" "de440.bsp"
+    stage_from_set "de440.bsp"      "de440.bsp"
+    stage_from_set "sb441-n16s.bsp" "sb441-n16s.bsp"
 fi
-
-# ── 2b. The two files the set does not carry ──────────────
-# Stable, undated addresses. Downloads are atomic (temp file, then rename)
-# and size-verified against the server's Content-Length on every invocation,
-# cache hit or miss, so a truncated kernel can never be silently reused.
-KERNELS=(
-    "$NAIF/pck/pck00011.tpc|pck00011.tpc"
-)
-if [ "$GRSS_DE_KERNEL" = "441" ]; then
-    KERNELS+=( "$SSD/eph/planets/bsp/de441.bsp|de441.bsp" )
-else
-    KERNELS+=( "$SSD/xfr/sb441-n16s.bsp|sb441-n16s.bsp" )
-fi
-
-for entry in "${KERNELS[@]}"; do
-    url="${entry%%|*}"
-    name="${entry##*|}"
-    dest="$KDIR/$name"
-
-    remote_size="$(curl -sSIL --retry 3 --retry-delay 2 "$url" \
-        | tr -d '\r' | awk 'tolower($1) == "content-length:" { n = $2 } END { print n }')"
-    if [ -z "$remote_size" ] || [ "$remote_size" -le 0 ] 2>/dev/null; then
-        echo "ERROR: could not read Content-Length for $name from $url" >&2
-        echo "       Refusing to guess whether a local copy is complete." >&2
-        exit 1
-    fi
-
-    if [ -f "$dest" ]; then
-        local_size="$(wc -c < "$dest" | tr -d ' ')"
-        if [ "$local_size" = "$remote_size" ]; then
-            printf '  ok       %-22s %s bytes\n' "$name" "$remote_size"
-            continue
-        fi
-        printf '  stale    %-22s local %s != remote %s bytes; refetching\n' \
-            "$name" "$local_size" "$remote_size"
-    fi
-
-    printf '  fetching %-22s %s bytes\n' "$name" "$remote_size"
-    curl -fsSL --retry 3 --retry-delay 2 -o "$dest.part" "$url"
-    got="$(wc -c < "$dest.part" | tr -d ' ')"
-    if [ "$got" != "$remote_size" ]; then
-        rm -f "$dest.part"
-        echo "ERROR: $name downloaded $got bytes, expected $remote_size." >&2
-        echo "       A partial kernel would silently corrupt every GRSS state." >&2
-        exit 1
-    fi
-    mv "$dest.part" "$dest"
-done
 
 # ── 3. Astrometry auxiliary data ───────────────────────────
 # Eggl et al. (2020) star-catalog debiasing tables + the MPC observatory-code
@@ -228,6 +186,12 @@ done
 # .initialize() re-downloads codes.json when it is over a day old, but skips
 # the whole step when offline, so the run-time path only works if setup left
 # a usable copy behind.
+#
+# STILL UPSTREAM: the grss package fetches the debiasing tables from
+# ssd.jpl.nasa.gov and the codes from data.minorplanetcenter.net. No folder of
+# the third-party tool set carries them yet, so grss is on the workflow's
+# UPSTREAM_FETCH_ALLOWLIST (scripts/tests/test_no_upstream_fetch.py) and its
+# leg seals after this setup instead of before it.
 echo
 echo "──── Debiasing tables (Eggl et al. 2020) ────────────────"
 "$VENV_PY" "$GRSS_PKG/debias/get_debiasing_data.py"
@@ -261,6 +225,6 @@ test -s "$GRSS_PKG/fit/codes.json" || {
 
 echo
 echo "grss venv ready: $(pwd)/.venv"
-echo "  grss           $("$VENV_PY" -c 'import grss; print(grss.__version__)' 2>/dev/null | tail -1)"
+echo "  grss           $(cat "$GRSS_PKG/version.txt")"
 echo "  DE kernel case $GRSS_DE_KERNEL"
 echo "  kernels        $KDIR"

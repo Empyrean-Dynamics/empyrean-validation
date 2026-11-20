@@ -55,6 +55,16 @@ inputs:
     description: Install uv (only the wheel-building jobs need it).
     required: false
     default: "false"
+  skip-build:
+    description: >
+      `"true"` for a job that RUNS prebuilt binaries (the prebuilt-bin artifact prep
+      uploads, unpacked by `make ... PREBUILT_BIN=1`) and compiles nothing: the
+      sibling engine checkouts, the Rust toolchain, the private-dependency git
+      rewrite and the cargo cache are all skipped, because nothing here builds.
+      The kernels, the inputs snapshot and the engine library are still set up
+      the same way.
+    required: false
+    default: "false"
 
 runs:
   using: composite
@@ -68,6 +78,7 @@ runs:
     # empyrean checkout to its tag.
     - name: Resolve the pinned distribution version
       id: pinned-engine
+      if: inputs.skip-build != 'true'
       shell: bash
       run: |
         version="$(sed -n 's/^empyrean = "=\(.*\)"/\1/p' empyrean-validation/runners/rust/Cargo.toml)"
@@ -87,6 +98,7 @@ runs:
     # already on disk. Every caller therefore checks out empyrean-validation
     # into ./empyrean-validation first, and this action adds the siblings.
     - name: Checkout empyrean (sibling)
+      if: inputs.skip-build != 'true'
       uses: actions/checkout@v4
       with:
         repository: Empyrean-Dynamics/empyrean
@@ -101,6 +113,7 @@ runs:
     # it. A manifest without that pin is a stop, not a fall-through to main.
     - name: Resolve the engine the distribution binds
       id: pinned-core
+      if: inputs.skip-build != 'true'
       shell: bash
       run: |
         tag="$(sed -n 's/^empyrean-core = {.*tag = "\([^"]*\)".*/\1/p' empyrean/empyrean-c/Cargo.toml)"
@@ -112,6 +125,7 @@ runs:
         echo "tag=$tag" >> "$GITHUB_OUTPUT"
         echo "Reference engine: empyrean-core $tag"
     - name: Checkout empyrean-core (sibling)
+      if: inputs.skip-build != 'true'
       uses: actions/checkout@v4
       with:
         repository: Empyrean-Dynamics/empyrean-core
@@ -119,28 +133,33 @@ runs:
         token: ${{ inputs.gh-pat }}
         ref: ${{ steps.pinned-core.outputs.tag }}
     - name: Checkout core dep (transitive)
+      if: inputs.skip-build != 'true'
       uses: actions/checkout@v4
       with:
         repository: Empyrean-Dynamics/scott
         path: scott
         token: ${{ inputs.gh-pat }}
     - name: Checkout core dep 2 (transitive)
+      if: inputs.skip-build != 'true'
       uses: actions/checkout@v4
       with:
         repository: Empyrean-Dynamics/villeneuve
         path: villeneuve
         token: ${{ inputs.gh-pat }}
     - name: Checkout nolan (transitive)
+      if: inputs.skip-build != 'true'
       uses: actions/checkout@v4
       with:
         repository: Empyrean-Dynamics/nolan
         path: nolan
         token: ${{ inputs.gh-pat }}
     - name: Configure git for any non-patched private deps
+      if: inputs.skip-build != 'true'
       shell: bash
       run: git config --global url."https://x-access-token:${{ inputs.gh-pat }}@github.com/".insteadOf "ssh://git@github.com/"
 
     - uses: actions-rust-lang/setup-rust-toolchain@v1
+      if: inputs.skip-build != 'true'
       with:
         rustflags: ""
         cache-workspaces: |
@@ -150,6 +169,17 @@ runs:
     - uses: actions/setup-python@v5
       with:
         python-version: ${{ inputs.python-version }}
+
+    # The engine library, fetched once through the authenticated API by the
+    # writer and restored by every reader; EMPYREAN_LIB_DIR (set for the whole
+    # run by the workflow) then points every build and run at it, and no job
+    # reaches the public release URL. After the toolchain step: the writer runs
+    # `cargo fetch` to locate the empyrean-sys crate's checksums.
+    - name: Engine library (once, authenticated; no public release URL)
+      uses: ./empyrean-validation/.github/actions/engine-lib
+      with:
+        role: ${{ inputs.role }}
+        token: ${{ inputs.gh-pat }}
     - name: Install uv (used by empyrean-py wheel build)
       if: inputs.install-python-tooling == 'true'
       shell: bash
@@ -163,22 +193,23 @@ runs:
     # slug bump fetches only the delta; the writer ALWAYS syncs, which re-hashes
     # every file, so the cache is verified, not trusted. Readers restore the
     # exact slug key and refuse on a miss: prep is the sole writer. The key also
-    # names what the suite writes into the directory beside the set (`set-codes`:
-    # the registered observatory codes, nothing written over them); a change of
-    # that policy must miss the old cache, or readers would restore the previous
-    # policy's directory while the writer re-synced its own.
+    # names what the suite writes into the directory beside the set (`set-only`:
+    # nothing; the observatory codes are the set's own and find_orb's DE440 comes
+    # from the third-party tool set); a change of that policy must miss the old
+    # cache, or readers would restore the previous policy's directory while the
+    # writer re-synced its own.
     - name: Restore empyrean data kernels
       id: cache-data
       uses: actions/cache/restore@v4
       with:
         path: data
-        key: empyrean-data-${{ inputs.dataset }}-set-codes
+        key: empyrean-data-${{ inputs.dataset }}-set-only
         restore-keys: ${{ inputs.role == 'writer' && 'empyrean-data-' || '' }}
     - name: Require a warm kernel cache (reader role)
       if: inputs.role != 'writer' && steps.cache-data.outputs.cache-hit != 'true' && env.ACT != 'true'
       shell: bash
       run: |
-        echo "ERROR: data-kernel cache miss on key empyrean-data-${{ inputs.dataset }}-set-codes," >&2
+        echo "ERROR: data-kernel cache miss on key empyrean-data-${{ inputs.dataset }}-set-only," >&2
         echo "       and this job's role is 'reader' so it will not sync them." >&2
         echo "       prep is the sole writer of this cache. A miss here means prep" >&2
         echo "       did not run, its sync failed, or the slug changed between" >&2
@@ -227,52 +258,26 @@ runs:
         fi
         rm -rf "$GITHUB_WORKSPACE/data" && mkdir -p "$GITHUB_WORKSPACE/data" && cp -a "$src"/. "$GITHUB_WORKSPACE/data"/
         echo "act: copied $(ls "$GITHUB_WORKSPACE/data" | wc -l) files of ${{ inputs.dataset }} from $src"
-    # One suite-specific file written AFTER the sync so `--prune` cannot remove
-    # it: find_orb's binary DE440 (linux_p1550p2650.440) is not an engine kernel
-    # and not in the registered set; it comes from a stable SSD URL and is cached
-    # under its own key — the one direct NASA URL this repo keeps, listed as the
-    # documented exception in lang's drift checker. The observatory codes are the
-    # registered set's own obscodes_extended.json, synced above — the file every
-    # other empyrean repo's CI reads. The copy once vendored in-repo (July 2026,
-    # kept for parity with the validation of record) differed from it at two
-    # stations the fixtures use (Z84 by about 38 m, B42 by about 300 m), enough
-    # to flip the marginal Apophis optical+radar fit on one platform (2026-10-26).
-    # Nothing is written over the set's file any more; the cache key suffix
-    # records that.
-    - name: Restore find_orb DE440 binary
-      if: inputs.role == 'writer'
-      id: cache-de440-bin
-      uses: actions/cache/restore@v4
-      with:
-        path: de440-bin
-        key: findorb-de440-linux_p1550p2650
-    - name: Download find_orb DE440 binary
-      if: inputs.role == 'writer' && steps.cache-de440-bin.outputs.cache-hit != 'true'
-      shell: bash
-      run: |
-        mkdir -p de440-bin
-        curl -sSfL --retry 5 --retry-delay 10 --retry-all-errors --connect-timeout 60 \
-          -o de440-bin/linux_p1550p2650.440 \
-          https://ssd.jpl.nasa.gov/ftp/eph/planets/Linux/de440/linux_p1550p2650.440
-    - name: Save find_orb DE440 binary
-      if: inputs.role == 'writer' && steps.cache-de440-bin.outputs.cache-hit != 'true'
-      uses: actions/cache/save@v4
-      with:
-        path: de440-bin
-        key: findorb-de440-linux_p1550p2650
-    - name: Add find_orb's DE440 to the data directory (writer)
-      if: inputs.role == 'writer'
-      shell: bash
-      run: |
-        cp de440-bin/linux_p1550p2650.440 data/linux_p1550p2650.440
+    # Nothing is written beside the set: the directory is the registered set and
+    # nothing else (the cache key's `set-only` suffix records that). find_orb's
+    # and ASSIST's binary DE440 (linux_p1550p2650.440) is not an engine kernel;
+    # those tools read it from their own folders of the third-party tool set,
+    # which prep syncs from our bucket, and no job downloads it from JPL. The
+    # observatory codes are the registered set's own obscodes_extended.json,
+    # synced above — the file every other empyrean repo's CI reads. The copy
+    # once vendored in-repo (July 2026, kept for parity with the validation of
+    # record) differed from it at two stations the fixtures use (Z84 by about
+    # 38 m, B42 by about 300 m), enough to flip the marginal Apophis
+    # optical+radar fit on one platform (2026-10-26).
     - name: Save empyrean data kernels
       if: inputs.role == 'writer' && steps.cache-data.outputs.cache-hit != 'true'
       uses: actions/cache/save@v4
       with:
         path: data
-        key: empyrean-data-${{ inputs.dataset }}-set-codes
+        key: empyrean-data-${{ inputs.dataset }}-set-only
 
     - name: Cache cargo state
+      if: inputs.skip-build != 'true'
       uses: actions/cache@v4
       with:
         path: |
@@ -286,7 +291,8 @@ runs:
 
     # ── Inputs snapshot (public validation bucket, pinned by the manifest) ──
     # The four product directories (psv, psv-radar, horizons, sbdb) + the
-    # per-file MANIFEST.json are one immutable snapshot in the suite's
+    # per-file MANIFEST.json (kept beside the data as
+    # fixtures/snapshot-manifest.json) are one immutable snapshot in the suite's
     # public-read bucket. prep is the sole fetcher, but the fetch is a plain
     # HTTPS read (python3 + network only, no credential, independent of the
     # kernel-set auth above): `make fixtures` then saves the cache. Every
@@ -306,7 +312,7 @@ runs:
           empyrean-validation/fixtures/psv-radar
           empyrean-validation/fixtures/horizons
           empyrean-validation/fixtures/sbdb
-          empyrean-validation/fixtures/MANIFEST.json
+          empyrean-validation/fixtures/snapshot-manifest.json
         key: inputs-${{ inputs.inputs-snapshot-id }}
     - name: Fetch + verify the pinned inputs snapshot (writer)
       if: inputs.role == 'writer' && inputs.inputs-snapshot-id != ''
@@ -322,7 +328,7 @@ runs:
           empyrean-validation/fixtures/psv-radar
           empyrean-validation/fixtures/horizons
           empyrean-validation/fixtures/sbdb
-          empyrean-validation/fixtures/MANIFEST.json
+          empyrean-validation/fixtures/snapshot-manifest.json
         key: inputs-${{ inputs.inputs-snapshot-id }}
     - name: Restore inputs snapshot (reader)
       if: inputs.role != 'writer' && inputs.inputs-snapshot-id != ''
@@ -334,7 +340,7 @@ runs:
           empyrean-validation/fixtures/psv-radar
           empyrean-validation/fixtures/horizons
           empyrean-validation/fixtures/sbdb
-          empyrean-validation/fixtures/MANIFEST.json
+          empyrean-validation/fixtures/snapshot-manifest.json
         key: inputs-${{ inputs.inputs-snapshot-id }}
     - name: Require a warm inputs cache (reader role)
       if: inputs.role != 'writer' && inputs.inputs-snapshot-id != '' && steps.cache-inputs-reader.outputs.cache-hit != 'true'

@@ -1,0 +1,138 @@
+"""The non-grav second pass runs exactly for the legacy fits the plan holds a
+``non_grav_recovery`` row for, read off the FULL plan (``--context``).
+
+The plan carries the rust runner's gate (SBDB A2 != 0). Re-deriving it from the
+propagation rows' A1/A2/A3 ran the pass for 2020 CD3 (A1 only), which has no
+plan row: a surplus row that failed the cli channel's account on hosted run
+42940569667. Reading the full plan rather than the leg keeps the account
+strict: a leg holding an object's legacy fit without its plan non-grav row (a
+split scheduling unit) writes a surplus row instead of quietly losing one.
+
+The runner is a stand-in daemon that answers the OD commands with canned
+lines: the lookup and the row plumbing are what is under test, not the fit.
+"""
+
+from __future__ import annotations
+
+import json
+import stat
+import sys
+
+import drive
+import pytest
+
+OBJ = "NGOBJ"
+
+FAKE_RUNNER = """#!/usr/bin/env python3
+import sys
+print("ready", file=sys.stderr, flush=True)
+for line in sys.stdin:
+    cmd = line.split()[0]
+    if cmd == "od":
+        print("ok 1.0 0.0 0.0 0.0 0.017 0.0 3 12.5 0.25", flush=True)
+    elif cmd == "odng":
+        print("ok 1e-13 0 0 1e-14 1e-14 1e-14 3 99.0 0.2 1.0 0.0 0.0", flush=True)
+    else:
+        print("fail unexpected " + cmd, flush=True)
+"""
+
+
+def _row(test_type: str, **kw) -> dict:
+    r = {
+        "object": OBJ,
+        "test_type": test_type,
+        "population": "NEO",
+        "force_model": "standard",
+        "propagation_uncertainty": None,
+        "dt_days": 0.0,
+        "observer": None,
+        "ic_a1": None,
+        "ic_a2": None,
+        "ic_a3": None,
+        "ic_pos_au": [1.0, 0.0, 0.0],
+        "ic_vel_au_d": [0.0, 0.017, 0.0],
+        "epoch_mjd_tdb": 60000.0,
+        "t_mjd_tdb": 60000.0,
+    }
+    r.update(kw)
+    return r
+
+
+@pytest.fixture
+def leg(tmp_path, monkeypatch):
+    """A leg holding only the object's legacy OD row and its NG row (one
+    scheduling unit), the full plan beside it."""
+    od = _row("orbit_determination")
+    prop = _row("propagation", ic_a1=1e-13, dt_days=10.0, propagation_uncertainty="first_order_detection_on")
+    # The plan's NG row, written by the legacy fit's second pass, carries the
+    # SBDB reference the rust runner compared against.
+    ng = _row("non_grav_recovery", ic_a1=1e-13, ic_a2=2e-14, ic_a3=0.0, ic_pos_au=None, ic_vel_au_d=None)
+    (tmp_path / "leg.json").write_text(json.dumps([od, ng]))
+    (tmp_path / "plan.json").write_text(json.dumps([prop, od, ng]))
+    fixtures = tmp_path / "psv"
+    fixtures.mkdir()
+    (fixtures / f"{OBJ}.psv").write_text("# fixture\n")
+    runner = tmp_path / "fake-runner"
+    runner.write_text(FAKE_RUNNER)
+    runner.chmod(runner.stat().st_mode | stat.S_IXUSR)
+
+    def go(*extra, rc=0):
+        out = tmp_path / "out.json"
+        argv = ["drive.py", "--input", str(tmp_path / "leg.json"), "--output", str(out), "--runner", str(runner), "--fixtures-dir", str(fixtures), *extra]
+        monkeypatch.setattr(sys, "argv", argv)
+        assert drive.main() == rc
+        return json.loads(out.read_text())
+
+    return go, tmp_path
+
+
+def test_a_leg_with_only_the_legacy_od_row_asks_for_the_ng_second_pass_given_context(leg):
+    go, tmp = leg
+    rows = go("--context", str(tmp / "plan.json"))
+    assert sorted(r["test_type"] for r in rows) == ["non_grav_recovery", "orbit_determination"]
+
+
+def test_without_context_the_legs_own_plan_ng_row_asks_for_the_pass(leg):
+    go, _ = leg
+    rows = go()
+    assert sorted(r["test_type"] for r in rows) == ["non_grav_recovery", "orbit_determination"]
+
+
+def test_a_reference_without_a_plan_ng_row_gets_no_second_pass(leg):
+    """2020 CD3: SBDB A1 on its propagation rows, A2 = 0, so the plan holds no
+    non_grav_recovery row and the legacy fit writes its OD row alone."""
+    go, tmp = leg
+    od = _row("orbit_determination")
+    prop = _row("propagation", ic_a1=1.36e-10, ic_a2=0.0, ic_a3=0.0, dt_days=10.0, propagation_uncertainty="first_order_detection_on")
+    (tmp / "leg.json").write_text(json.dumps([od]))
+    (tmp / "plan.json").write_text(json.dumps([prop, od]))
+    rows = go("--context", str(tmp / "plan.json"))
+    assert [r["test_type"] for r in rows] == ["orbit_determination"]
+
+
+def test_a_split_unit_writes_a_surplus_row_and_fails_the_account(leg):
+    """The leg holds the legacy fit but its plan NG row went to another leg: the
+    full plan still asks for the pass, so the row is a surplus the account
+    refuses, never a row lost without a word."""
+    go, tmp = leg
+    (tmp / "leg.json").write_text(json.dumps([_row("orbit_determination")]))
+    rows = go("--context", str(tmp / "plan.json"), rc=1)
+    assert sorted(r["test_type"] for r in rows) == ["non_grav_recovery", "orbit_determination"]
+
+
+def test_a_context_that_lacks_an_input_object_is_refused_by_name(leg):
+    go, tmp = leg
+    (tmp / "other.json").write_text(json.dumps([dict(_row("propagation"), object="Elsewhere")]))
+    with pytest.raises(SystemExit) as e:
+        go("--context", str(tmp / "other.json"))
+    assert OBJ in str(e.value)
+
+
+def test_the_gate_is_the_plans_non_grav_rows():
+    ng = _row("non_grav_recovery", object="B", ic_a1=0.0, ic_a2=2e-14, ic_a3=0.0)
+    rows = [_row("propagation", ic_a1=1.36e-10, ic_a2=0.0, ic_a3=0.0), ng, _row("orbit_determination", object="C")]
+    assert drive._plan_non_grav_refs(rows) == {("B", "standard"): (0.0, 2e-14, 0.0)}
+    with pytest.raises(SystemExit, match="carries no SBDB reference"):
+        drive._plan_non_grav_refs([dict(ng, ic_a3=None)])
+    with pytest.raises(SystemExit, match="two non_grav_recovery rows for B"):
+        drive._plan_non_grav_refs([ng, dict(ng)])

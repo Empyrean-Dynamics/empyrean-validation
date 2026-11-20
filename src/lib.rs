@@ -30,6 +30,7 @@
 //!   coordinates the cross-repo run.
 
 pub mod catalog;
+pub mod comparators;
 pub mod compare;
 pub mod debias;
 pub mod inputs;

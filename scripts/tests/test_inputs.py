@@ -10,6 +10,8 @@ import importlib.util
 import json
 import pathlib
 import shutil
+import threading
+import time
 import urllib.parse
 
 import pytest
@@ -133,9 +135,15 @@ PROV = {"catalog_commit": "abc", "distribution_version": "0.11.0-rc.0", "psv_sou
 
 
 def mint(ip, tree, partial=False):
-    """manifest -> pin, returning (manifest dict, pin dict, pin_path)."""
+    """manifest -> pin, returning (manifest dict, pin dict, pin_path).
+
+    The minted tree doubles as an already-fetched dest for the offline fetch
+    tests, so the manifest is also written where `fetch` keeps it
+    (ip.LOCAL_MANIFEST), beside the snapshot's own MANIFEST.json.
+    """
     manifest = ip.build_manifest(pathlib.Path(tree), PROV, partial)
     ip.atomic_write_json(pathlib.Path(tree) / "MANIFEST.json", manifest)
+    ip.atomic_write_json(pathlib.Path(tree) / ip.LOCAL_MANIFEST, manifest)
     pin = ip.build_pin(manifest, "http://run/1", ip.DEFAULT_BUCKET, partial)
     pin_path = pathlib.Path(tree).parent / "pin.json"
     ip.atomic_write_json(pin_path, pin)
@@ -387,6 +395,95 @@ def _publish(ip, tmp_path):
     return manifest, pin, pin_path, fake, FakeHttp(ip, tmp_path / "root")
 
 
+# ── parallel fetch ────────────────────────────────────────────────────────────
+
+
+def _publish_many(ip, tmp_path, n):
+    """A snapshot of the small tree plus n extra psv files, published to a fake
+    bucket. Returns (pin_path, http, expected {relpath: text})."""
+    src = make_tree(tmp_path / "src")
+    for i in range(n):
+        (src / "psv" / f"Obj{i:03d}.psv").write_text(OPTICAL_PSV + f"# obj {i}\n")
+    mint(ip, src)
+    pin_path = src.parent / "pin.json"
+    fake = FakeGcloud(tmp_path / "root")
+    assert ip.upload(src, ip.DEFAULT_BUCKET, yes=True, gcloud=fake) == 0
+    expected = {
+        p.relative_to(src).as_posix(): p.read_text()
+        for d in ("psv", "psv-radar", "horizons", "sbdb")
+        for p in (src / d).iterdir()
+    }
+    return pin_path, FakeHttp(ip, tmp_path / "root"), expected
+
+
+class _CountingHttp:
+    """Wraps a reader to record the peak number of simultaneous calls; `hold`
+    keeps each call in flight long enough for a concurrent pool to overlap."""
+
+    def __init__(self, inner, hold=0.0):
+        self.inner, self.hold = inner, hold
+        self.lock = threading.Lock()
+        self.active = self.peak = 0
+        self.urls = []
+
+    def get(self, url):
+        with self.lock:
+            self.active += 1
+            self.peak = max(self.peak, self.active)
+            self.urls.append(url)
+        try:
+            if self.hold:
+                time.sleep(self.hold)
+            return self.inner.get(url)
+        finally:
+            with self.lock:
+                self.active -= 1
+
+
+def test_parallel_fetch_fetches_each_file_once_and_verifies_every_hash(ip, tmp_path):
+    pin_path, http, expected = _publish_many(ip, tmp_path, 40)
+    counting = _CountingHttp(http)
+    dest = tmp_path / "dest"
+    assert ip.fetch(pin_path, dest, prune=False, offline=False, http_get=counting.get, workers=8) == 0
+    file_urls = [u for u in counting.urls if not u.endswith("/MANIFEST.json")]
+    assert len(file_urls) == len(set(file_urls)) == len(expected), "each file exactly once"
+    for rel, text in expected.items():
+        assert (dest / rel).read_text() == text
+    assert list(dest.rglob("*.part*")) == []
+
+
+def test_parallel_fetch_refuses_a_corrupted_file_among_many(ip, tmp_path):
+    pin_path, http, _ = _publish_many(ip, tmp_path, 40)
+    pin = json.loads(pin_path.read_text())
+    bad = tmp_path / "root" / "empyrean-validation" / "inputs" / pin["snapshot_id"] / "psv" / "Obj017.psv"
+    bad.write_text("corrupted in the bucket\n")
+    dest = tmp_path / "dest"
+    with pytest.raises(ip.ContentError) as exc:
+        ip.fetch(pin_path, dest, prune=False, offline=False, http_get=http.get, workers=8)
+    msgs = exc.value.messages
+    assert len(msgs) == 1 and "psv/Obj017.psv" in msgs[0] and "sha256 expected" in msgs[0]
+    assert not (dest / "psv" / "Obj017.psv").exists()
+    assert (dest / "psv" / "Obj016.psv").exists(), "the good files still landed"
+
+
+def test_parallel_fetch_concurrency_stays_within_the_bound_and_is_real(ip, tmp_path):
+    pin_path, http, _ = _publish_many(ip, tmp_path, 40)
+    counting = _CountingHttp(http, hold=0.02)
+    ip.fetch(pin_path, tmp_path / "dest", prune=False, offline=False, http_get=counting.get, workers=4)
+    assert counting.peak <= 4, f"bound exceeded: {counting.peak} concurrent"
+    assert counting.peak >= 2, "the fetch did not run concurrently at all"
+    one = _CountingHttp(http, hold=0.0)
+    ip.fetch(pin_path, tmp_path / "dest1", prune=False, offline=False, http_get=one.get, workers=1)
+    assert one.peak == 1
+
+
+def test_parallel_fetch_default_is_sixteen_workers_and_zero_is_refused(ip, tmp_path):
+    assert ip.FETCH_WORKERS == 16
+    pin_path, http, _ = _publish_many(ip, tmp_path, 2)
+    with pytest.raises(ip.ContentError, match="--jobs must be at least 1"):
+        ip.fetch(pin_path, tmp_path / "d", prune=False, offline=False, http_get=http.get, workers=0)
+
+
 def test_fetch_offline_roundtrip_all_kept(ip, tmp_path):
     tree = make_tree(tmp_path / "t")
     _, _, pin_path = mint(ip, tree)
@@ -398,8 +495,48 @@ def test_fetch_online_roundtrip(ip, tmp_path):
     dest = tmp_path / "dest"
     assert ip.fetch(pin_path, dest, prune=False, offline=False, http_get=http.get) == 0
     assert (dest / "psv" / "Apophis.psv").read_text() == OPTICAL_PSV
-    assert (dest / "MANIFEST.json").exists()
+    assert (dest / ip.LOCAL_MANIFEST).exists()
+    assert not (dest / "MANIFEST.json").exists()
     assert http.calls  # the reader was actually used
+
+
+def test_fetch_beside_the_pin_never_reads_or_replaces_it(ip, tmp_path):
+    # `make fixtures` fetches into fixtures/, which holds the tracked pin
+    # fixtures/manifest.json. On a case-insensitive filesystem (macOS) a
+    # materialized fixtures/MANIFEST.json is that same file: the manifest read
+    # returned the pin (KeyError 'files') and the manifest write replaced the
+    # pin. No name fetch writes may equal the pin's name up to case.
+    _, _, src_pin, _, http = _publish(ip, tmp_path)
+    dest = tmp_path / "fixtures"
+    dest.mkdir()
+    pin_path = dest / "manifest.json"
+    shutil.copyfile(src_pin, pin_path)
+    pin_bytes = pin_path.read_bytes()
+
+    assert ip.fetch(pin_path, dest, prune=True, offline=False, http_get=http.get) == 0
+    assert pin_path.read_bytes() == pin_bytes
+    names = [p.name.casefold() for p in dest.iterdir() if p.is_file()]
+    assert len(names) == len(set(names)), sorted(names)
+    with open(dest / ip.LOCAL_MANIFEST) as fh:
+        assert isinstance(json.load(fh)["files"], list)
+
+    # The offline verify pass (make fixtures INPUTS_OFFLINE=1) then finds the
+    # manifest, keeps every file, and still leaves the pin alone.
+    assert ip.fetch(pin_path, dest, prune=True, offline=True) == 0
+    assert pin_path.read_bytes() == pin_bytes
+
+
+def test_fetch_refuses_a_pin_in_the_manifest_slot_by_name(ip, tmp_path):
+    # A pin carries the snapshot_id and tree_hash a manifest is matched on, but
+    # no files[]; read as the manifest it must fail naming the file, never as a
+    # KeyError.
+    tree = make_tree(tmp_path / "t")
+    _, pin, pin_path = mint(ip, tree)
+    ip.atomic_write_json(tree / ip.LOCAL_MANIFEST, pin)
+    with pytest.raises(ip.ContentError) as exc:
+        ip.fetch(pin_path, tree, prune=False, offline=True)
+    msg = "\n".join(exc.value.messages)
+    assert ip.LOCAL_MANIFEST in msg and "no files[]" in msg
 
 
 def test_fetch_offline_never_calls_the_reader(ip, tmp_path):

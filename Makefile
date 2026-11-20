@@ -51,6 +51,17 @@ EMPYREAN_ROOT := $(abspath $(ROOT)/../empyrean)
 EMPYREAN_CORE_ROOT := $(abspath $(ROOT)/../empyrean-core)
 EMPYREAN_VALIDATION_ROOT := $(ROOT)
 
+# PREBUILT_BIN=1: the compiled binaries (the rust / CLI / C runners, the harness,
+# validate-core, the engine's C library and the wheel) were built ONCE, in prep,
+# and staged into $(PREBUILT_DIR) by the prebuilt-bin artifact (scripts/prebuilt.py
+# unpack puts each where the build would have). In this mode every `build-*`
+# target below ASSERTS its artifact exists and still hashes to the manifest, and
+# NEVER compiles: a missing or altered binary fails the leg by name instead of
+# being silently rebuilt into something other than what prep measured.
+PREBUILT_BIN ?=
+PREBUILT_DIR := $(ROOT)/prebuilt
+PREBUILT_VERIFY := python3 $(ROOT)/scripts/prebuilt.py verify --manifest $(PREBUILT_DIR)/PREBUILT.json
+
 OBJECTS ?=
 TIERS ?= standard
 # Matrix-CI plumbing. When PLAN_PREBUILT=1 the plan is assumed to have been
@@ -58,6 +69,9 @@ TIERS ?= standard
 # artifact, so the plan target only asserts its presence instead of rebuilding
 # it from the rust channel. This lets the replay + external channels run in
 # isolated matrix legs that never build or run the rust reference themselves.
+# With LEG set as well (a channel leg of results/schedule.json), the four
+# distribution replay channels read only that leg's rows of the plan; see
+# channel_plan below.
 PLAN_PREBUILT ?=
 DATA_DIR ?= $(HOME)/.empyrean/data
 # The JPL cache (SBDB + Horizons) is the pinned inputs snapshot on disk, not a
@@ -107,7 +121,7 @@ FO_BIN := $(EMP_VAL_RUNNERS)/findorb/install/bin/fo
 # `empyrean-core/src/bin/validate-core.rs` behind the `validate`
 # feature flag.
 CORE_BIN := $(EMPYREAN_CORE_ROOT)/target/release/validate-core
-WITH_CORE := $(if $(wildcard $(EMPYREAN_CORE_ROOT)/Cargo.toml),1,)
+WITH_CORE := $(if $(or $(wildcard $(EMPYREAN_CORE_ROOT)/Cargo.toml),$(and $(PREBUILT_BIN),$(wildcard $(CORE_BIN)))),1,)
 
 # OpenOrb: DEFAULT-OFF, and that is a decision, not an oversight.
 #
@@ -157,6 +171,34 @@ ONLY_FLAG := $(if $(OBJECTS),--only "$(OBJECTS)",)
 # stripping channel-specific fields, so the IC/ref data is shared via the
 # Horizons disk cache rather than re-fetched per channel.
 PLAN := $(RESULTS_DIR)/validation_plan.json
+# The plan one distribution replay channel (python / c / cli / core) reads.
+# A CI channel leg runs with PLAN_PREBUILT=1 and LEG=<id>: scripts/schedule.py
+# packed the plan's rows into cost-balanced legs (the schedule job, from the
+# committed cost table), and the leg replays only its rows, the prebuilt plan
+# narrowed by scripts/channel-chunks.py select into
+# $(RESULTS_DIR)/validation_plan.leg-<channel>.json. Legs used to take whole
+# objects, and the one object holding the 42-minute row outran the job limit
+# (run 42506609035). With LEG empty there is no leg and the channel reads
+# $(PLAN) whole, as a local run does. The external comparators read $(PLAN) in
+# every mode.
+LEG ?=
+SCHEDULE ?= $(RESULTS_DIR)/schedule.json
+LEG_MATRIX := $(RESULTS_DIR)/leg-matrix.json
+COSTS := $(ROOT)/fixtures/costs.json
+# Total channel legs over python / c / cli / core: what is left of the
+# account's 60 concurrent jobs after the external legs and a reserve.
+CHANNEL_LEG_BUDGET ?= 50
+SCHEDULED_CHANNELS := python,c,cli,core
+# A row whose single timing run costs this many seconds or more fans its timing
+# repetitions out to distinct legs (the cost table marks the rows, today the
+# one 42-minute 2020 CD3 propagation; this lowers the bar so a cheap row fans
+# out in a rehearsal). Empty = the cost table's own marks only.
+HEAVY_MIN_S ?=
+HEAVY_FLAG := $(if $(HEAVY_MIN_S),--heavy-min-s $(HEAVY_MIN_S),)
+channel_plan = $(if $(LEG),$(RESULTS_DIR)/validation_plan.leg-$(1).json,$(PLAN))
+# The side file of a leg's per-row timing repetition overrides: a replica leg of
+# the heavy row runs it once. Never a plan key, which would flow into outputs.
+channel_reps = $(if $(LEG),--reps-override $(RESULTS_DIR)/validation_plan.leg-$(1).reps.json,)
 RUST_PROPEPH := $(RESULTS_DIR)/validation_rust_propeph.json
 RUST_OD := $(RESULTS_DIR)/validation_rust_od.json
 RUST := $(RESULTS_DIR)/validation_rust.json
@@ -272,10 +314,14 @@ setup: setup-assist setup-findorb setup-kete setup-jorbit setup-grss $(if $(WITH
 	@echo
 	@echo "External dependencies installed."
 
+# ASSIST's two ephemerides (the binary DE440 linux_p1550p2650.440 and
+# sb441-n16.bsp) come from its folder of the third-party tool set, synced under
+# $(DATA_DIR)/third-party; never downloaded.
+ASSIST_DATA_DIR ?= $(DATA_DIR)/third-party/assist
 setup-assist: $(ASSIST_VENV)/bin/python
 $(ASSIST_VENV)/bin/python:
-	@echo "──── Setting up ASSIST venv + DE440 ────────────────────"
-	@cd $(EMP_VAL_RUNNERS)/assist && ./setup.sh
+	@echo "──── Setting up ASSIST venv (ephemerides from the third-party set) ─"
+	@cd $(EMP_VAL_RUNNERS)/assist && ./setup.sh "$(ASSIST_DATA_DIR)"
 
 setup-findorb: $(FO_BIN)
 $(FO_BIN):
@@ -331,6 +377,13 @@ SIBLING_EMPYREAN := $(shell sed -n '1,10s/^version = "\(.*\)"/\1/p' $(EMPYREAN_R
 # fix is one `git checkout` away.
 .PHONY: check-engine-version
 check-engine-version:
+ifeq ($(PREBUILT_BIN),1)
+	@test -n "$(PINNED_EMPYREAN)" || { \
+	    echo "ERROR: could not read the pinned empyrean version from $(EMPYREAN_RUNNERS)/rust/Cargo.toml."; \
+	    exit 1; }
+	@$(PREBUILT_VERIFY) --component engine-c --engine-version "$(PINNED_EMPYREAN)"
+	@echo "engine version OK: $(PINNED_EMPYREAN) (pinned == the prebuilt binaries' engine)"
+else
 	@test -n "$(PINNED_EMPYREAN)" || { \
 	    echo "ERROR: could not read the pinned empyrean version from $(EMPYREAN_RUNNERS)/rust/Cargo.toml."; \
 	    exit 1; }
@@ -350,13 +403,18 @@ check-engine-version:
 	    echo "       EMPYREAN_ROOT at a checkout of it."; \
 	    exit 1; }
 	@echo "engine version OK: $(PINNED_EMPYREAN) (pinned == $(EMPYREAN_ROOT))"
+endif
 
 # PHONY: cargo's incremental build is cheap when nothing changed and
 # this is the only way to guarantee `libempyrean.dylib` matches the
 # header that bindgen was compiled against.
 build-empyrean-c: check-engine-version
+ifeq ($(PREBUILT_BIN),1)
+	@$(PREBUILT_VERIFY) --component engine-c
+else
 	@echo "──── Building empyrean-c (libempyrean.dylib) ───────────"
 	@cd $(EMPYREAN_ROOT) && cargo build --release -p empyrean-c
+endif
 
 # All cargo-based build steps below are PHONY so cargo's incremental
 # fingerprinting decides whether to rebuild. A bare file target with no
@@ -364,20 +422,32 @@ build-empyrean-c: check-engine-version
 # to sibling crates wouldn't rebuild the linked binary because make sees
 # the file already exists.
 build-rust:
+ifeq ($(PREBUILT_BIN),1)
+	@$(PREBUILT_VERIFY) --component rust-runner
+else
 	@echo "──── Building rust runner ──────────────────────────────"
 	@cd $(EMPYREAN_RUNNERS)/rust && cargo build --release
+endif
 
 # Gated on the version check: this compiles against $(EMPYREAN_ROOT)'s
 # empyrean.h and links its dylib, so a mismatched checkout produces a wall
 # of struct / signature errors whose cause is one line of `make` output
 # away. Fail with the cause instead.
 build-c: check-engine-version
+ifeq ($(PREBUILT_BIN),1)
+	@$(PREBUILT_VERIFY) --component c-runner
+else
 	@echo "──── Building C runner ─────────────────────────────────"
 	@cd $(EMPYREAN_RUNNERS)/c && $(MAKE) EMPYREAN_ROOT="$(EMPYREAN_ROOT)"
+endif
 
 build-cli:
+ifeq ($(PREBUILT_BIN),1)
+	@$(PREBUILT_VERIFY) --component cli-runner
+else
 	@echo "──── Building CLI runner ───────────────────────────────"
 	@cd $(EMPYREAN_RUNNERS)/cli && cargo build --release
+endif
 
 # The python / c / cli channels all run through this venv's interpreter,
 # and the python channel imports the empyrean extension that maturin
@@ -391,7 +461,15 @@ $(WHEEL_VENV)/bin/maturin:
 # Same gate as build-c: the wheel is compiled from $(EMPYREAN_ROOT)'s
 # empyrean-py, so a mismatched checkout ships the python channel a
 # different engine than the rust and cli channels resolve.
-build-wheel: check-engine-version $(WHEEL_VENV)/bin/maturin
+build-wheel: check-engine-version $(if $(PREBUILT_BIN),,$(WHEEL_VENV)/bin/maturin)
+ifeq ($(PREBUILT_BIN),1)
+	@# The wheel was built once in prep; this leg only installs those bytes
+	@# (after verifying them) into its own venv.
+	@$(PREBUILT_VERIFY) --component wheel
+	@echo "──── Installing the prebuilt empyrean-py wheel ─────────"
+	@test -x $(WHEEL_PY) || python3 -m venv $(WHEEL_VENV)
+	@$(WHEEL_PY) -m pip install --quiet --force-reinstall $(WHEEL_VENV)/wheelhouse/*.whl
+else
 	@echo "──── Building empyrean-py wheel ────────────────────────"
 	@# Build the wheel and pip-install it, rather than `maturin develop`.
 	@# develop resolves the project's dev dependency-groups (which include
@@ -402,6 +480,7 @@ build-wheel: check-engine-version $(WHEEL_VENV)/bin/maturin
 	@cd $(EMPYREAN_ROOT)/empyrean-py && \
 	    $(WHEEL_VENV)/bin/maturin build --release --out $(WHEEL_VENV)/wheelhouse
 	@$(WHEEL_PY) -m pip install --quiet --force-reinstall $(WHEEL_VENV)/wheelhouse/*.whl
+endif
 
 # Optional: empyrean-core "core" channel runner. Only invoked when the
 # sibling empyrean-core tree exists (WITH_CORE auto-detected above).
@@ -409,15 +488,23 @@ build-wheel: check-engine-version $(WHEEL_VENV)/bin/maturin
 # the `validate` feature so the lib's dep tree stays clean for
 # distribution.
 build-core:
+ifeq ($(PREBUILT_BIN),1)
+	@$(PREBUILT_VERIFY) --component core-runner
+else
 	@echo "──── Building empyrean-core direct runner ──────────────"
 	@cd $(EMPYREAN_CORE_ROOT) && cargo build --release --bin validate-core --features validate
+endif
 
 # `empyrean-validation` CLI: meta operations (plan / merge-external /
 # report / ci-check) shared across every empyrean repo. Built from this
 # repo's own crate.
 build-empyrean-validation:
+ifeq ($(PREBUILT_BIN),1)
+	@$(PREBUILT_VERIFY) --component harness
+else
 	@echo "──── Building empyrean-validation CLI ──────────────────"
 	@cd $(EMPYREAN_VALIDATION_ROOT) && cargo build --release --bin empyrean-validation
+endif
 
 # File target so rules that need the binary (plan strip, merge, report) can
 # depend on it directly instead of failing with "No rule to make target"
@@ -624,19 +711,16 @@ json.dump(a+b, open('$(RUST)','w'), indent=2, default=str); \
 print(f'Wrote {len(a)+len(b)} unified rust rows ({len(a)} prop+eph, {len(b)} OD) to $(RUST)')"
 endif
 
-# ── Per-object reference shards (CI matrix fan-out) ─────────
+# ── Reference legs (CI matrix fan-out) ──────────────────────
 # The rust reference is the expensive half of this suite: running all three
 # axes over the full catalog in one process took 176 min and blew the CI job's
 # 180-minute ceiling, taking ~3 hours of completed fits with it (empyrean-qhhw).
-# The work is embarrassingly parallel per object, so CI fans it out one leg per
-# object and reassembles here.
-#
-# Why per-object rather than N balanced shards: cost is NOT predictable from
-# any cheap proxy — Didymos fits 6,034 observations in 25.4 min while Eros
-# fits 13,150 in 47 s — so a static shard table would need measured weights
-# and would silently unbalance whenever the engine or catalog moved. One leg
-# per object is generated from the catalog, self-balancing forever, and isolates
-# a crash or timeout to the single object that caused it.
+# CI therefore fans it out in legs and reassembles here. The legs used to be one
+# per object (an object is a self-balancing unit: fit cost is NOT predictable
+# from any cheap proxy, Didymos fits 6,034 observations in 25.4 min while Eros
+# fits 13,150 in 47 s), but one object holds the single row that costs 42
+# minutes per run, timed best of three, so a leg now takes ROWS, packed by the
+# committed cost table (see schedule-reference below).
 SHARD_DIR := $(RESULTS_DIR)/shards
 
 # Same filters as ONLY_FLAG, for the catalog enumeration that drives the matrix.
@@ -663,44 +747,149 @@ $(OBJECTS_JSON): $(EMP_VAL_BIN)
 sys.exit('ERROR: $(OBJECTS_JSON) is empty — no objects to validate.') if not d else None; \
 print(f'Wrote {len(d)} objects to $(OBJECTS_JSON)')"
 
-# One object's slice of the reference. OBJECT is the catalog name
-# ("46P/Wirtanen"), SLUG its safe token ("46P_Wirtanen") — both come from
-# `list-objects` so they always correspond.
+# The reference is computed in cost-balanced LEGS, not one job per object: the
+# one object holding the 42-minute 2020 CD3 propagation row (timed best of three
+# in every channel) outran every job budget, and an object-level split cannot
+# cut it. A candidate row is a propagation or ephemeris row the rust runner
+# requests; `validate run --list-rows` prints them in emission order and needs
+# no engine call, so prep lists them, packs them (with one OD unit per object)
+# into legs by cost (scripts/schedule.py pack-reference), and each leg runs
+# `validate run --select` over its rows and `validate od --only` over the
+# objects whose OD run it owns.
+REFERENCE_CANDIDATES := $(RESULTS_DIR)/reference-candidates.json
+REFERENCE_SCHEDULE := $(RESULTS_DIR)/reference-schedule.json
+REFERENCE_LEG_MATRIX := $(RESULTS_DIR)/reference-leg-matrix.json
+REFERENCE_LEG_BUDGET ?= 16
+# The heavy propagation rows (the cost table marks them; HEAVY_MIN_S adds any
+# row whose single timing run costs that much in any channel) are DECOUPLED:
+# they run on legs of their own from prep, in parallel with the light reference
+# (scripts/schedule.py, "heavy decoupling"). prep writes the heavy file, builds
+# their plan rows with no engine call (`validate run --emit-plan-rows`), and
+# schedules their rust replicas (the heavy reference schedule) and their channel
+# replicas (the heavy channel schedule, over the heavy plan).
+HEAVY := $(RESULTS_DIR)/heavy.json
+HEAVY_SELECT := $(RESULTS_DIR)/heavy-select.json
+HEAVY_PLAN := $(RESULTS_DIR)/heavy-plan.json
+REFERENCE_HEAVY_SCHEDULE := $(RESULTS_DIR)/reference-heavy-schedule.json
+REFERENCE_HEAVY_LEG_MATRIX := $(RESULTS_DIR)/reference-heavy-leg-matrix.json
+HEAVY_SCHEDULE := $(RESULTS_DIR)/schedule-heavy.json
+HEAVY_LEG_MATRIX := $(RESULTS_DIR)/heavy-leg-matrix.json
+# The schedule a reference leg reads its rows from: the light one, or the heavy
+# one for a reference-heavy leg (LEG=h01 ...).
+REFERENCE_LEG_SCHEDULE ?= $(REFERENCE_SCHEDULE)
+# The decoupled rows the final assemble found the engine refused after the plan
+# was published; reduce discards them from every channel and external.
+HEAVY_DROPPED := $(RESULTS_DIR)/validation_rust_heavy_dropped.json
+PLAN_FINAL := $(RESULTS_DIR)/validation_plan.final.json
+
+.PHONY: list-reference-rows schedule-reference
+list-reference-rows: $(RUST_BIN)
+	@mkdir -p $(RESULTS_DIR)
+	@$(DYLD) $(RUST_BIN) run --list-rows $(ONLY_FLAG) --tiers $(TIERS) \
+	    --data-dir $(DATA_DIR) --cache-dir $(CACHE_DIR) > $(REFERENCE_CANDIDATES)
+	@python3 -c "import json,sys; d=json.load(open('$(REFERENCE_CANDIDATES)')); \
+sys.exit('ERROR: $(REFERENCE_CANDIDATES) is empty: no candidate rows.') if not d else None; \
+print(f'Wrote {len(d)} candidate reference rows to $(REFERENCE_CANDIDATES)')"
+
+# The reference schedule: a pure function of the candidate rows, the object
+# list, the committed cost table and the leg budget. Writes the schedule and the
+# leg matrix, prints each leg's predicted wall, names every row the cost table
+# does not know.
+schedule-reference: $(OBJECTS_JSON) list-reference-rows
+	@echo "──── Heavy rows: decouple them and emit their plan rows ─"
+	@python3 $(ROOT)/scripts/schedule.py heavy --candidates $(REFERENCE_CANDIDATES) --costs $(COSTS) \
+	    --channels $(SCHEDULED_CHANNELS) $(HEAVY_FLAG) --out $(HEAVY) --select-out $(HEAVY_SELECT)
+	@if [ "$$(python3 -c "import json;print(len(json.load(open('$(HEAVY_SELECT)'))))")" != "0" ]; then \
+	    $(DYLD) $(RUST_BIN) run --select $(HEAVY_SELECT) --emit-plan-rows $(ONLY_FLAG) --tiers $(TIERS) \
+	        --data-dir $(DATA_DIR) --cache-dir $(CACHE_DIR) --output $(HEAVY_PLAN) || exit 1; \
+	else \
+	    echo "[]" > $(HEAVY_PLAN); echo "[]" > $(HEAVY_PLAN).dropped.json; \
+	fi
+	@echo "──── Schedule: pack the reference into cost-balanced legs ───"
+	@python3 $(ROOT)/scripts/schedule.py pack-reference --candidates $(REFERENCE_CANDIDATES) \
+	    --objects $(OBJECTS_JSON) --costs $(COSTS) --legs $(REFERENCE_LEG_BUDGET) $(HEAVY_FLAG) \
+	    --heavy $(HEAVY) --heavy-out $(REFERENCE_HEAVY_SCHEDULE) --heavy-matrix $(REFERENCE_HEAVY_LEG_MATRIX) \
+	    --out $(REFERENCE_SCHEDULE) --matrix $(REFERENCE_LEG_MATRIX)
+	@echo "──── Schedule: the heavy rows' channel replicas ────────"
+	@python3 $(ROOT)/scripts/schedule.py pack-heavy --heavy-plan $(HEAVY_PLAN) --heavy $(HEAVY) \
+	    --costs $(COSTS) --channels $(SCHEDULED_CHANNELS) --out $(HEAVY_SCHEDULE) --matrix $(HEAVY_LEG_MATRIX)
+
+# One reference leg. LEG is the leg id from $(REFERENCE_SCHEDULE).
 #
 # `od` derives its two JSONL sidecars from the --output stem, so pointing
-# --output into the shard directory lands them there too, with no second path
-# to keep in sync.
+# --output into the leg directory lands them there too, with no second path to
+# keep in sync. A leg always writes validation_rust_propeph.json (with its
+# .dropped.json) and validation_rust_od.json, empty lists when it has nothing of
+# that kind, so the assemble step finds the same files in every leg.
 shard-reference: $(RUST_BIN) $(EMP_VAL_BIN) | fixtures
-	@test -n "$(OBJECT)" || { echo "ERROR: shard-reference needs OBJECT=<catalog name>."; exit 1; }
-	@test -n "$(SLUG)"   || { echo "ERROR: shard-reference needs SLUG=<safe token>."; exit 1; }
-	@mkdir -p $(SHARD_DIR)/$(SLUG)
-	@echo "──── Reference shard: $(OBJECT) [prop + ephemeris] ─────"
-	@$(DYLD) $(RUST_BIN) run --only "$(OBJECT)" --tiers $(TIERS) \
-	    --data-dir $(DATA_DIR) --cache-dir $(CACHE_DIR) \
-	    --output $(SHARD_DIR)/$(SLUG)/validation_rust_propeph.json
-	@echo "──── Reference shard: $(OBJECT) [orbit determination] ──"
-	@$(DYLD) $(RUST_BIN) od --only "$(OBJECT)" --tier $(TIERS) \
-	    --data-dir $(DATA_DIR) --cache-dir $(CACHE_DIR) \
-	    --fixtures-dir $(FIXTURES_PSV) \
-	    --output $(SHARD_DIR)/$(SLUG)/validation_rust_od.json
-	@python3 -c "$$ASSERT_SHARD_COMPLETE" $(SHARD_DIR)/$(SLUG) "$(OBJECT)"
+	@test -n "$(LEG)" || { echo "ERROR: shard-reference needs LEG=<leg id> (see $(REFERENCE_SCHEDULE))."; exit 1; }
+	@mkdir -p $(SHARD_DIR)/$(LEG)
+	@python3 $(ROOT)/scripts/reference-legs.py select --candidates $(REFERENCE_CANDIDATES) \
+	    --schedule $(REFERENCE_LEG_SCHEDULE) --leg "$(LEG)" \
+	    --rows-out $(SHARD_DIR)/$(LEG)/leg.rows.json --reps-out $(SHARD_DIR)/$(LEG)/leg.reps.json \
+	    --objects-out $(SHARD_DIR)/$(LEG)/leg.objects
+	@if [ -s $(SHARD_DIR)/$(LEG)/leg.rows.json ]; then \
+	    echo "──── Reference leg $(LEG) [prop + ephemeris rows] ────────"; \
+	    $(DYLD) $(RUST_BIN) run --select $(SHARD_DIR)/$(LEG)/leg.rows.json \
+	        --reps-override $(SHARD_DIR)/$(LEG)/leg.reps.json $(ONLY_FLAG) --tiers $(TIERS) \
+	        --data-dir $(DATA_DIR) --cache-dir $(CACHE_DIR) \
+	        --output $(SHARD_DIR)/$(LEG)/validation_rust_propeph.json || exit 1; \
+	else \
+	    echo "Reference leg $(LEG): no propagation or ephemeris rows."; \
+	    echo "[]" > $(SHARD_DIR)/$(LEG)/validation_rust_propeph.json; \
+	    echo "[]" > $(SHARD_DIR)/$(LEG)/validation_rust_propeph.json.dropped.json; \
+	fi
+	@if [ -s $(SHARD_DIR)/$(LEG)/leg.objects ]; then \
+	    echo "──── Reference leg $(LEG) [orbit determination: $$(cat $(SHARD_DIR)/$(LEG)/leg.objects)] ──"; \
+	    $(DYLD) $(RUST_BIN) od --only "$$(cat $(SHARD_DIR)/$(LEG)/leg.objects)" --tier $(TIERS) \
+	        --data-dir $(DATA_DIR) --cache-dir $(CACHE_DIR) \
+	        --fixtures-dir $(FIXTURES_PSV) \
+	        --output $(SHARD_DIR)/$(LEG)/validation_rust_od.json || exit 1; \
+	else \
+	    echo "Reference leg $(LEG): no orbit-determination objects."; \
+	    echo "[]" > $(SHARD_DIR)/$(LEG)/validation_rust_od.json; \
+	fi
+	@# The rows file is tested by the shell, not $(wildcard): make caches directory
+	@# listings, and a file written earlier in this same recipe reads as absent, which
+	@# would run the check against an empty selection and refuse every result row.
+	@selection=""; if [ -s $(SHARD_DIR)/$(LEG)/leg.rows.json ]; then selection="--rows $(SHARD_DIR)/$(LEG)/leg.rows.json"; fi; \
+	python3 $(ROOT)/scripts/reference-legs.py check --dir $(SHARD_DIR)/$(LEG) $$selection \
+	    --objects "$$(cat $(SHARD_DIR)/$(LEG)/leg.objects 2>/dev/null)"
 
-# Reassemble every per-object shard into the canonical reference, then let the
-# existing $(RUST) merge + strip-plan rules take over unchanged.
+# Reassemble every leg into the canonical reference, then let the existing
+# $(RUST) merge + strip-plan rules take over unchanged (scripts/assemble-reference.py
+# says what it checks: every candidate row a result or named as dropped by the leg
+# that ran it, replicas folded, every object's OD run delivered once).
 #
-# This is the fan-in, and fan-ins are where a parallel pipeline goes quietly
-# wrong: a leg that died leaves its object simply absent, and a report rendered
-# from 49 of 50 objects looks exactly like a healthy one. So the shard set is
-# checked against the catalog enumeration and any missing object is named and
-# fatal — never warned about, never skipped.
-assemble-reference: $(EMP_VAL_BIN)
-	@echo "──── Reference: reassemble per-object shards ───────────"
+# Two steps since the heavy rows decoupled. `assemble-reference` (the assemble
+# job) takes the decoupled rows from the plan rows prep emitted for them: the
+# reference it writes is provisional and exists to be stripped into the plan the
+# channels and externals replay while the heavy legs still run. `assemble-final`
+# (the assemble-final job) takes them from the heavy reference legs, writes the
+# canonical reference, strips it and checks the strip equals the published plan
+# apart from the timestamp, failing closed by row and field; a decoupled row the
+# engine refused goes to $(HEAVY_DROPPED).
+ASSEMBLE_LEGS = --schedule $(REFERENCE_SCHEDULE) --candidates $(REFERENCE_CANDIDATES) --legs-dir $(SHARD_DIR) \
+    --out-propeph $(RUST_PROPEPH) --out-od $(RUST_OD) --out-orbits $(RUST_OD_ORBITS) \
+    --out-compare $(RUST_OD_COMPARE) --out-unified $(RUST) \
+    --out-dropped $(RESULTS_DIR)/validation_rust_dropped.json
+assemble-reference:
+	@echo "──── Reference: reassemble the light legs (decoupled rows from their emitted plan rows) ─"
 	@mkdir -p $(SHARD_DIR)
-	@$(EMP_VAL_BIN) list-objects $(LIST_ONLY_FLAG) --format lines > $(SHARD_DIR)/.expected
-	@python3 -c "$$ASSEMBLE_SHARDS" $(SHARD_DIR) $(SHARD_DIR)/.expected \
-	    $(RUST_PROPEPH) $(RUST_OD) $(RUST_OD_ORBITS) $(RUST_OD_COMPARE) $(RUST)
+	@python3 $(ROOT)/scripts/assemble-reference.py $(ASSEMBLE_LEGS) \
+	    $(if $(wildcard $(HEAVY)),--decoupled-plan $(HEAVY_PLAN) --heavy $(HEAVY),)
 
-.PHONY: list-objects shard-reference assemble-reference lint-workflows
+assemble-final:
+	@echo "──── Reference: reassemble every leg, heavy legs included ─"
+	@mkdir -p $(SHARD_DIR)
+	@python3 $(ROOT)/scripts/assemble-reference.py $(ASSEMBLE_LEGS) \
+	    --heavy-schedule $(REFERENCE_HEAVY_SCHEDULE)
+	@$(EMP_VAL_BIN) strip-plan --input $(RUST) --output $(PLAN_FINAL)
+	@python3 $(ROOT)/scripts/assemble-reference.py check-final --published $(PLAN) --final $(PLAN_FINAL) \
+	    --heavy $(HEAVY) --dropped $(RESULTS_DIR)/validation_rust_dropped.json \
+	    --out-heavy-dropped $(HEAVY_DROPPED)
+
+.PHONY: list-objects shard-reference assemble-reference assemble-final lint-workflows
 
 # Mint a validation inputs snapshot LOCALLY into a scratch tree, no upload:
 # the one online path (.github/workflows/mint-inputs.yml) by hand, minus the
@@ -747,126 +936,6 @@ lint-workflows:
 	@echo "──── actionlint: .github/workflows ─────────────────────"
 	@actionlint -shellcheck= .github/workflows/*.yml
 	@echo "  workflows OK."
-
-# A shard must contain both halves and be parseable. Zero OD rows is legal for
-# one object (not every catalog entry need carry fittable astrometry) but zero
-# prop+eph rows means the run produced nothing for an object CI believes it
-# covered — the silent-empty shape, caught here at the shard rather than after
-# 50 of them have been concatenated into an innocuous-looking whole.
-define ASSERT_SHARD_COMPLETE
-import json, sys, pathlib
-d, obj = pathlib.Path(sys.argv[1]), sys.argv[2]
-propeph, od = d / "validation_rust_propeph.json", d / "validation_rust_od.json"
-problems = []
-counts = {}
-for f in (propeph, od):
-    if not f.is_file():
-        problems.append(f"{f.name}: missing")
-        continue
-    try:
-        counts[f.name] = len(json.load(open(f)))
-    except Exception as exc:
-        problems.append(f"{f.name}: unparseable ({exc})")
-for side in ("validation_rust_od_orbits.jsonl", "validation_rust_od_compare.jsonl"):
-    if counts.get("validation_rust_od.json") and not (d / side).is_file():
-        problems.append(f"{side}: missing, but the OD pass emitted rows")
-if counts.get("validation_rust_propeph.json") == 0:
-    problems.append("validation_rust_propeph.json: zero rows")
-if problems:
-    print(f"ERROR: reference shard for {obj!r} is not usable:", file=sys.stderr)
-    for p in problems:
-        print(f"  - {p}", file=sys.stderr)
-    print("       A shard that is short here is an object silently absent from", file=sys.stderr)
-    print("       the assembled reference and from the report.", file=sys.stderr)
-    raise SystemExit(1)
-print(f"  shard OK: {obj} — {counts.get('validation_rust_propeph.json', 0)} prop+eph rows, "
-      f"{counts.get('validation_rust_od.json', 0)} OD rows")
-endef
-export ASSERT_SHARD_COMPLETE
-
-define ASSEMBLE_SHARDS
-import json, pathlib, sys
-shard_dir = pathlib.Path(sys.argv[1])
-expected_file = pathlib.Path(sys.argv[2])
-out_propeph, out_od, out_orbits, out_compare, out_unified = (
-    pathlib.Path(p) for p in sys.argv[3:8]
-)
-
-expected = []
-for line in expected_file.read_text().splitlines():
-    if line.strip():
-        slug, _, name = line.partition("\t")
-        expected.append((slug, name))
-if not expected:
-    raise SystemExit("ERROR: catalog enumeration produced zero objects; refusing to assemble.")
-
-def shard_path(slug):
-    """Locate one object's shard directory, whichever layout staged it.
-
-    A local run writes results/shards/<slug>/ directly. CI downloads the
-    per-object artifacts, and actions/download-artifact nests each one under a
-    directory named after the artifact — results/shards/reference-shard-<slug>/.
-    Accepting both means this does not depend on that action's nesting behavior,
-    which cannot be verified outside a real run; a shell step that flattened one
-    layout into the other would silently produce nothing if the assumption were
-    wrong, and every object would then read as missing.
-    """
-    for candidate in (shard_dir / slug, shard_dir / f"reference-shard-{slug}"):
-        if (candidate / "validation_rust_propeph.json").is_file():
-            return candidate
-    return shard_dir / slug  # canonical path, for the error message
-
-propeph, od, orbits, compare, missing = [], [], [], [], []
-for slug, name in expected:
-    d = shard_path(slug)
-    p, o = d / "validation_rust_propeph.json", d / "validation_rust_od.json"
-    if not (p.is_file() and o.is_file()):
-        missing.append(f"{name} (slug {slug}): "
-                       f"{'propeph' if not p.is_file() else ''}"
-                       f"{' and ' if not p.is_file() and not o.is_file() else ''}"
-                       f"{'od' if not o.is_file() else ''} shard absent")
-        continue
-    propeph += json.load(open(p))
-    od += json.load(open(o))
-    for src, dst in ((d / "validation_rust_od_orbits.jsonl", orbits),
-                     (d / "validation_rust_od_compare.jsonl", compare)):
-        if src.is_file():
-            dst += [ln for ln in src.read_text().splitlines() if ln.strip()]
-
-if missing:
-    print(f"ERROR: {len(missing)} of {len(expected)} reference shards did not arrive:",
-          file=sys.stderr)
-    for m in missing:
-        print(f"  - {m}", file=sys.stderr)
-    print("       Every object in the catalog gets a matrix leg; a leg that failed or", file=sys.stderr)
-    print("       was cancelled leaves its object ABSENT, and a report built from a", file=sys.stderr)
-    print("       partial reference is indistinguishable from a complete one.", file=sys.stderr)
-    print("       Re-run the failed leg(s); do not assemble around them.", file=sys.stderr)
-    raise SystemExit(1)
-
-# Unlike a single object's shard, the assembled whole having no OD rows means
-# the entire OD axis is dead — the empyrean-7wo5 shape the suite exists to catch.
-if not od:
-    raise SystemExit("ERROR: assembled reference carries zero OD rows across all "
-                     f"{len(expected)} objects. The OD axis produced nothing, which is a "
-                     "dead axis, not a passing one. Check the fixture fetch (make fixtures).")
-
-# The unified reference is written HERE, not by the $(RUST) rule, because the
-# assemble job carries no engine: that rule's prerequisites name $(RUST_BIN),
-# which only the phony `build-rust` produces, so make would abort before
-# running any recipe. Both halves are already in memory, so emit it directly
-# and let `make plan REFERENCE_ASSEMBLED=1` treat it as given.
-for path, rows in ((out_propeph, propeph), (out_od, od), (out_unified, propeph + od)):
-    path.parent.mkdir(parents=True, exist_ok=True)
-    json.dump(rows, open(path, "w"), indent=2, default=str)
-for path, lines in ((out_orbits, orbits), (out_compare, compare)):
-    path.write_text("".join(ln + "\n" for ln in lines))
-
-print(f"Assembled {len(expected)} shards -> {len(propeph)} prop+eph rows, {len(od)} OD rows, "
-      f"{len(orbits)} orbit sidecar rows, {len(compare)} compare sidecar rows; "
-      f"unified {len(propeph) + len(od)} rows -> {out_unified}")
-endef
-export ASSEMBLE_SHARDS
 
 # ── Test plan ──────────────────────────────────────────────
 # The plan is the canonical test fixture: same row schema as a channel
@@ -931,6 +1000,25 @@ print("  plan OD rows: " + ", ".join(f"{n} {t}" for t, n in sorted(c.items())))
 endef
 export ASSERT_PLAN_HAS_OD
 
+# A heavy leg (empyrean-heavy) replays the HEAVY plan: the emitted plan rows of
+# the decoupled rows and their warm-up leaders, every one a propagation row. It
+# holds no OD row by construction, so it is checked for what it is instead.
+define ASSERT_HEAVY_PLAN
+import json, sys
+
+path = sys.argv[1]
+rows = json.load(open(path))
+if not rows:
+    sys.exit(f"ERROR: {path} is empty: a heavy leg has nothing to replay.")
+bad = sorted({r.get("test_type") for r in rows} - {"propagation"})
+if bad:
+    sys.exit(f"ERROR: {path} holds {bad} rows; the heavy plan holds propagation rows only.")
+print(f"  heavy plan: {len(rows)} propagation rows")
+endef
+export ASSERT_HEAVY_PLAN
+# `full` (the plan assemble published) or `heavy` (the heavy plan prep emitted).
+PLAN_KIND ?= full
+
 plan: $(PLAN) check-plan
 ifeq ($(PLAN_PREBUILT),1)
 # Matrix-CI replay/external leg: the plan was produced by the prep job and
@@ -952,27 +1040,96 @@ endif
 # python3 rather than $(WHEEL_PY) because the external legs carry no
 # wheel venv.
 check-plan: $(PLAN)
+ifeq ($(PLAN_KIND),heavy)
+	@python3 -c "$$ASSERT_HEAVY_PLAN" $(PLAN)
+else ifeq ($(PLAN_KIND),full)
 	@python3 -c "$$ASSERT_PLAN_HAS_OD" $(PLAN) $(OD_TEST_TYPES)
+else
+	@echo "ERROR: PLAN_KIND=$(PLAN_KIND) is neither full nor heavy."; exit 1
+endif
 
-run-python: $(PLAN) check-plan fixtures
+# One channel leg's rows of the prebuilt plan (see channel_plan).
+#
+# check-plan runs on the FULL prebuilt plan, before the selection, and never on
+# a leg. Its assertion is about the plan the assemble job staged (some OD row,
+# and some `orbit_determination` row among them); a leg of a few propagation
+# rows holds none, so a per-leg assertion would fail a correct leg, and
+# asserting it on the full plan first means no leg replays a slice of a gutted
+# plan. What a leg can get wrong on its own the select step refuses by name: a
+# schedule built for another plan, an unknown channel or leg, an empty leg.
+#
+# Every leg file is remade on every invocation (check-plan is phony), so a leg
+# left by an earlier LEG is never reused.
+$(RESULTS_DIR)/validation_plan.leg-%.json: $(PLAN) check-plan
+	@echo "──── Plan: select this leg's rows of the prebuilt plan ──"
+	@test -n "$(LEG)" || { echo "ERROR: $@ needs LEG=<leg id> (see $(SCHEDULE))."; exit 1; }
+	@python3 $(ROOT)/scripts/channel-chunks.py select --plan $(PLAN) \
+	    --schedule $(SCHEDULE) --channel $* --leg "$(LEG)" --output $@ \
+	    --reps-output $(RESULTS_DIR)/validation_plan.leg-$*.reps.json
+
+# The cost-balanced schedule of the channel legs: a pure function of the plan,
+# the committed cost table and the leg budget. Writes $(SCHEDULE) and the leg
+# matrix, prints each channel's predicted leg walls, and names every row the
+# cost table does not know.
+.PHONY: schedule refresh-costs
+schedule: $(PLAN) check-plan
+	@echo "──── Schedule: pack the plan into cost-balanced legs ────"
+	@python3 $(ROOT)/scripts/schedule.py pack --plan $(PLAN) --costs $(COSTS) \
+	    --channels $(SCHEDULED_CHANNELS) --budget $(CHANNEL_LEG_BUDGET) $(HEAVY_FLAG) \
+	    $(if $(wildcard $(HEAVY)),--heavy $(HEAVY),) \
+	    --out $(SCHEDULE) --matrix $(LEG_MATRIX)
+
+# The external legs (S7): one leg per tool, or, for a tool the external cost
+# table prices per object (jorbit, OrbFit), object legs packed longest object
+# first so no leg replays the whole catalog, each with a timeout sized to its
+# predicted wall (scripts/schedule.py pack-external). EXTERNAL_TOOLS names the
+# tools that run; EXTERNAL_LEG_TARGET_MIN overrides the table's target leg wall
+# (a rehearsal lowers it to cut two objects into two legs).
+EXTERNAL_COSTS := $(ROOT)/fixtures/external-costs.json
+EXTERNAL_SCHEDULE ?= $(RESULTS_DIR)/external-schedule.json
+EXTERNAL_LEG_MATRIX := $(RESULTS_DIR)/external-leg-matrix.json
+EXTERNAL_TOOLS ?= assist,findorb,kete,jorbit,layup,orbfit,grss
+EXTERNAL_LEG_TARGET_MIN ?=
+# One external leg's id in $(EXTERNAL_SCHEDULE); empty runs the tool over the
+# whole plan, as before the chunking.
+EXT_LEG ?=
+.PHONY: schedule-external
+schedule-external: $(PLAN) check-plan
+	@echo "──── Schedule: the external legs ───────────────────────"
+	@python3 $(ROOT)/scripts/schedule.py pack-external --plan $(PLAN) --costs $(EXTERNAL_COSTS) \
+	    --tools $(EXTERNAL_TOOLS) $(if $(EXTERNAL_LEG_TARGET_MIN),--target-leg-min $(EXTERNAL_LEG_TARGET_MIN),) \
+	    --out $(EXTERNAL_SCHEDULE) --matrix $(EXTERNAL_LEG_MATRIX)
+
+# Rebuild the committed cost table from a named run's results: FROM is a
+# directory holding that run's validation_plan.json, validation_rust.json and
+# each channel's output (whole, or its leg files below it). The new table goes
+# in through a PR, with the run it came from named in the table itself.
+refresh-costs:
+	@test -n "$(FROM)" -a -n "$(RUN_ID)" -a -n "$(ENGINE_PIN)" || { \
+	    echo "usage: make refresh-costs FROM=<run dir> RUN_ID=<run id> ENGINE_PIN=<engine pin>"; exit 1; }
+	@python3 $(ROOT)/scripts/schedule.py refresh-costs --from "$(FROM)" \
+	    --run-id "$(RUN_ID)" --engine-pin "$(ENGINE_PIN)" --out $(COSTS)
+
+run-python: $(call channel_plan,python) check-plan fixtures
 	@echo "──── Python channel: replay plan ───────────────────────"
 	@$(WHEEL_PY) $(EMPYREAN_RUNNERS)/python/run.py \
-	    --input $(PLAN) --output $(PYTHON) \
+	    --input $(call channel_plan,python) --context $(PLAN) --output $(PYTHON) \
+	    $(call channel_reps,python) \
 	    --fixtures-dir $(FIXTURES_PSV) \
 	    --data-dir $(DATA_DIR)
 
-run-c: $(PLAN) $(C_BIN) check-plan fixtures
+run-c: $(call channel_plan,c) $(C_BIN) check-plan fixtures
 	@echo "──── C channel: replay plan (prop / eph / OD) ──────────"
 	@$(WHEEL_PY) $(EMPYREAN_RUNNERS)/c/drive.py \
-	    --input $(PLAN) \
+	    --input $(call channel_plan,c) --context $(PLAN) $(call channel_reps,c) \
 	    --output $(C_OUT) --runner $(C_BIN) \
 	    --fixtures-dir $(FIXTURES_PSV) \
 	    $(if $(filter-out $(HOME)/.empyrean/data,$(DATA_DIR)),--data-dir $(DATA_DIR),)
 
-run-cli: $(PLAN) $(CLI_BIN) check-plan fixtures
+run-cli: $(call channel_plan,cli) $(CLI_BIN) check-plan fixtures
 	@echo "──── CLI channel: fork-exec one binary per plan row ────"
 	@$(DYLD) $(WHEEL_PY) $(EMPYREAN_RUNNERS)/cli/drive.py \
-	    --input $(PLAN) \
+	    --input $(call channel_plan,cli) --context $(PLAN) $(call channel_reps,cli) \
 	    --output $(CLI_OUT) --runner $(CLI_BIN) \
 	    --fixtures-dir $(FIXTURES_PSV) \
 	    $(if $(filter-out $(HOME)/.empyrean/data,$(DATA_DIR)),--data-dir $(DATA_DIR),)
@@ -982,7 +1139,7 @@ run-assist: $(PLAN) check-plan $(ASSIST_PY)
 	@$(ASSIST_PY) $(EMP_VAL_RUNNERS)/assist/run_assist.py $(PLAN) \
 	    --output $(ASSIST_OUT) \
 	    --horizons-cache $(CACHE_DIR)/horizons \
-	    --data-dir $(DATA_DIR)
+	    --data-dir $(ASSIST_DATA_DIR)
 
 # find_orb's build fails loudly (see findorb/setup.sh), and a missing binary
 # at RUN time is a failure too, not a skip. This used to
@@ -993,6 +1150,8 @@ run-assist: $(PLAN) check-plan $(ASSIST_PY)
 # reduce then omits find_orb honestly.
 # fo asserts without ~/.find_orb (miscell.cpp); a cached build restores the
 # binary but not $HOME, so the config dir is installed here when missing.
+# find_orb's binary DE440 comes from its folder of the third-party tool set.
+FINDORB_DATA_DIR ?= $(DATA_DIR)/third-party/findorb
 run-findorb: $(ASSIST_PY) check-plan fixtures
 	@test -f "$(HOME)/.find_orb/cospar.txt" || { \
 	    echo "──── Installing find_orb config directory (cached build) ───"; \
@@ -1002,14 +1161,21 @@ run-findorb: $(ASSIST_PY) check-plan fixtures
 	    echo "       Build it with: make setup-findorb"; \
 	    echo "       (An empty result file would report 'find_orb compared nothing' as a pass.)"; \
 	    exit 1; }
+	@# find_orb links its binary DE440 only when the file is there and otherwise
+	@# runs without it, so its absence is refused here rather than discovered in
+	@# the residuals.
+	@test -s "$(FINDORB_DATA_DIR)/linux_p1550p2650.440" || { \
+	    echo "ERROR: $(FINDORB_DATA_DIR)/linux_p1550p2650.440 is missing: find_orb's DE440 comes from"; \
+	    echo "       the findorb/ folder of the third-party tool set (synced under $(DATA_DIR)/third-party)."; \
+	    exit 1; }
 	@echo "──── find_orb: external OD reference ───────────────────"
 	@$(ASSIST_PY) $(EMP_VAL_RUNNERS)/findorb/run_findorb.py $(FIXTURES_PSV) \
 	    --output $(FINDORB_OUT) --fo-binary $(FO_BIN) \
-	    --data-dir $(DATA_DIR) --plan $(PLAN)
+	    --data-dir $(FINDORB_DATA_DIR) --plan $(PLAN)
 	@echo "──── find_orb: radar-augmented OD reference (psv-radar) ─"
 	@$(ASSIST_PY) $(EMP_VAL_RUNNERS)/findorb/run_findorb.py $(FIXTURES_PSV_RADAR) \
 	    --output $(FINDORB_RADAR_OUT) --fo-binary $(FO_BIN) \
-	    --data-dir $(DATA_DIR) --test-type orbit_determination_radar
+	    --data-dir $(FINDORB_DATA_DIR) --test-type orbit_determination_radar
 
 # ── OpenOrb (oorb) external comparison — propagation + ephemeris ─
 # Independent Fortran implementation (Granvik et al., University of
@@ -1046,10 +1212,20 @@ setup-orbfit:
 	@cd $(EMP_VAL_RUNNERS)/orbfit && ./setup.sh
 
 run-orbfit: $(ORBFIT_OUT)
+# EXT_LEG runs one object leg of the external schedule; its "every object
+# failed" verdict is then taken over the merged legs (channel-chunks.py
+# concat-external), so a leg whose few objects all fail does not hide the rest.
 $(ORBFIT_OUT): $(PLAN) | check-plan fixtures
 	@echo "──── OrbFit: external OD reference (neofit2.x via docker) ──"
-	@$(EMP_VAL_RUNNERS)/orbfit/run_orbfit.py \
-	    --plan $(PLAN) --output $(ORBFIT_OUT) --psv-dir $(FIXTURES_PSV)
+	@set --; \
+	if [ -n "$(EXT_LEG)" ]; then \
+	    only="$$(python3 $(ROOT)/scripts/channel-chunks.py external-objects --plan $(PLAN) \
+	        --schedule $(EXTERNAL_SCHEDULE) --tool orbfit --leg "$(EXT_LEG)")" || exit 1; \
+	    set -- --defer-all-failed; \
+	    if [ -n "$$only" ]; then echo "  leg $(EXT_LEG): $$only"; set -- --defer-all-failed --only "$$only"; fi; \
+	fi; \
+	$(EMP_VAL_RUNNERS)/orbfit/run_orbfit.py \
+	    --plan $(PLAN) --output $(ORBFIT_OUT) --psv-dir $(FIXTURES_PSV) "$$@"
 
 # Optional: empyrean-core direct (no FFI). Replays the plan in-process so
 # the report's Section 09 can show binding-translation drift (rust wrapper
@@ -1059,10 +1235,29 @@ ifneq ($(WITH_CORE),1)
 	@echo "──── Core channel skipped (empyrean-core not found) ────"
 endif
 
-$(CORE_OUT): $(PLAN) $(CORE_BIN) | check-plan fixtures
+# A replica leg of the heavy row (a leg with repetition overrides) runs the rows
+# that carry one in their own validate-core process with --n-timing-runs 1, the
+# rest as usual, and joins the two outputs: validate-core has no per-row
+# repetition input, and none is needed.
+$(CORE_OUT): $(call channel_plan,core) $(CORE_BIN) | check-plan fixtures
 	@echo "──── Core channel: replay plan via empyrean-core ───────"
-	@$(DYLD) $(CORE_BIN) --input $(PLAN) --output $(CORE_OUT) \
-	    --fixtures-dir $(FIXTURES_PSV)
+	@if [ -n "$(LEG)" ] && [ "$$(python3 -c "import json;print(len(json.load(open('$(RESULTS_DIR)/validation_plan.leg-core.reps.json'))))")" != "0" ]; then \
+	    python3 $(ROOT)/scripts/channel-chunks.py partition --input $(call channel_plan,core) \
+	        --reps $(RESULTS_DIR)/validation_plan.leg-core.reps.json \
+	        --override-out $(RESULTS_DIR)/validation_plan.leg-core.once.json \
+	        --rest-out $(RESULTS_DIR)/validation_plan.leg-core.rest.json || exit 1; \
+	    echo "[]" > $(CORE_OUT).rest; \
+	    if [ "$$(python3 -c "import json;print(len(json.load(open('$(RESULTS_DIR)/validation_plan.leg-core.rest.json'))))")" != "0" ]; then \
+	        $(DYLD) $(CORE_BIN) --input $(RESULTS_DIR)/validation_plan.leg-core.rest.json --output $(CORE_OUT).rest \
+	            --fixtures-dir $(FIXTURES_PSV) || exit 1; \
+	    fi; \
+	    $(DYLD) $(CORE_BIN) --n-timing-runs 1 --input $(RESULTS_DIR)/validation_plan.leg-core.once.json \
+	        --output $(CORE_OUT).once --fixtures-dir $(FIXTURES_PSV) || exit 1; \
+	    python3 $(ROOT)/scripts/channel-chunks.py join --out $(CORE_OUT) $(CORE_OUT).rest $(CORE_OUT).once || exit 1; \
+	else \
+	    $(DYLD) $(CORE_BIN) --input $(call channel_plan,core) --output $(CORE_OUT) \
+	        --fixtures-dir $(FIXTURES_PSV); \
+	fi
 
 # ── Kete external comparison (standalone, not in report) ───
 # kete is Dar Dahlen's open-source NEO toolkit (originally developed
@@ -1102,10 +1297,13 @@ $(KETE_OUT): $(PLAN) $(KETE_PY) | check-plan fixtures
 GRSS_VENV := $(EMP_VAL_RUNNERS)/grss/.venv
 GRSS_PY := $(GRSS_VENV)/bin/python
 
+# GRSS's seven SPICE kernels come from its folder of the third-party tool set,
+# synced under $(DATA_DIR)/third-party; none is downloaded.
+GRSS_DATA_DIR ?= $(DATA_DIR)/third-party/grss
 setup-grss: $(GRSS_PY)
 $(GRSS_PY):
 	@echo "──── Setting up grss venv + SPICE kernels ──────────────"
-	@cd $(EMP_VAL_RUNNERS)/grss && DATA_DIR="$(DATA_DIR)" ./setup.sh
+	@cd $(EMP_VAL_RUNNERS)/grss && GRSS_DATA_DIR="$(GRSS_DATA_DIR)" ./setup.sh
 
 run-grss: $(GRSS_OUT)
 # find_orb's and layup's RUN-time rule (the venv BUILD stays optional): a
@@ -1143,10 +1341,19 @@ $(JORBIT_PY):
 	@cd $(EMP_VAL_RUNNERS)/jorbit && DATA_DIR="$(DATA_DIR)" ./setup.sh
 
 run-jorbit: $(JORBIT_OUT)
+# EXT_LEG runs one object leg of the external schedule (`--only` its objects);
+# jorbit still reads the whole plan, so its geocentre ephemeris spans every
+# geocentric row exactly as an unchunked run's does.
 $(JORBIT_OUT): $(PLAN) $(JORBIT_PY) | check-plan
 	@echo "──── jorbit: external (opt-in) reference ───────────────"
-	@$(JORBIT_PY) $(EMP_VAL_RUNNERS)/jorbit/run_jorbit.py \
-	    --input $(PLAN) --output $(JORBIT_OUT) --data-dir $(DATA_DIR)
+	@set --; \
+	if [ -n "$(EXT_LEG)" ]; then \
+	    only="$$(python3 $(ROOT)/scripts/channel-chunks.py external-objects --plan $(PLAN) \
+	        --schedule $(EXTERNAL_SCHEDULE) --tool jorbit --leg "$(EXT_LEG)")" || exit 1; \
+	    if [ -n "$$only" ]; then echo "  leg $(EXT_LEG): $$only"; set -- --only "$$only"; fi; \
+	fi; \
+	$(JORBIT_PY) $(EMP_VAL_RUNNERS)/jorbit/run_jorbit.py \
+	    --input $(PLAN) --output $(JORBIT_OUT) --data-dir $(DATA_DIR) "$$@"
 
 # ── layup (opt-in external OD reference) ─────────────────────
 # MIT-licensed, ASSIST-backed orbit fitter (Smithsonian / CfA; Matthew
@@ -1156,14 +1363,18 @@ $(JORBIT_OUT): $(PLAN) $(JORBIT_PY) | check-plan
 LAYUP_VENV := $(EMP_VAL_RUNNERS)/layup/.venv
 LAYUP_PY := $(LAYUP_VENV)/bin/python
 # layup's data directory (its --ar): every kernel, the observatory codes and
-# the debiasing table under layup's own names, staged from $(DATA_DIR) by
-# stage_data.py. layup never downloads at run time.
+# the debiasing table under layup's own names, staged by stage_data.py from
+# the layup folder of the third-party tool set (dataset
+# third-party-tools-2026-11-08, synced under $(DATA_DIR)/third-party): the
+# folder lists every file layup reads, shared kernels included, so layup needs
+# nothing from the engine kernel set. layup never downloads at run time.
+LAYUP_DATA_DIR ?= $(DATA_DIR)/third-party/layup
 LAYUP_DATA := $(EMP_VAL_RUNNERS)/layup/data
 
 setup-layup: $(LAYUP_PY)
 $(LAYUP_PY):
 	@echo "──── Setting up layup venv (pinned release + staged data) ─"
-	@cd $(EMP_VAL_RUNNERS)/layup && DATA_DIR="$(DATA_DIR)" ./setup.sh
+	@cd $(EMP_VAL_RUNNERS)/layup && DATA_DIR="$(LAYUP_DATA_DIR)" ./setup.sh
 
 run-layup: $(LAYUP_OUT)
 # layup's venv is an optional, heavy BUILD (see layup/setup.sh), but it is
@@ -1180,10 +1391,11 @@ $(LAYUP_OUT): | fixtures
 	@# Re-staged on every run: a venv restored from the tool cache skips
 	@# setup.sh, and the data must be the set this run synced.
 	@$(LAYUP_PY) $(EMP_VAL_RUNNERS)/layup/stage_data.py \
-	    --data-dir "$(DATA_DIR)" --dest "$(LAYUP_DATA)"
+	    --data-dir "$(LAYUP_DATA_DIR)" --dest "$(LAYUP_DATA)"
 	@mkdir -p $(RESULTS_DIR)
 	@$(LAYUP_PY) $(EMP_VAL_RUNNERS)/layup/run_layup.py $(FIXTURES_PSV) \
-	    --ar-data-path "$(LAYUP_DATA)" --output $(LAYUP_OUT)
+	    --ar-data-path "$(LAYUP_DATA)" --output $(LAYUP_OUT) \
+	    $(if $(OBJECTS),--only "$(OBJECTS)",)
 
 # ── Merge external + report ────────────────────────────────
 # Channel-agnostic meta operations live in this repo's CLI binary. It
@@ -1268,6 +1480,7 @@ reduce: build-empyrean-validation
 	elif [ -f "$(RUST)" ]; then ref="$(RUST)"; merged="$(RUST_MERGED)"; \
 	else echo "ERROR: reduce found neither $(CORE_OUT) nor $(RUST) — no reference channel was staged."; exit 1; fi; \
 	echo "Reference channel: $$ref  →  $$merged"; \
+	: > "$(RESULTS_DIR)/comparators-absent.txt"; \
 	flags=""; \
 	add() { \
 	    if [ -f "$$2" ]; then \
@@ -1275,10 +1488,14 @@ reduce: build-empyrean-validation
 	            echo "  NOTE $$1 — marked DISABLED ($$3) yet $$2 IS staged; folding it in anyway. Someone re-enabled the leg without clearing the note."; \
 	        fi; \
 	        flags="$$flags $$1 $$2"; \
+	    elif [ -f "$$2.absent" ]; then \
+	        echo "  skip $$1 — NOT MERGED from its legs: $$(head -1 "$$2.absent")"; \
+	        printf '%s=%s\n' "$${1#--}" "its legs could not be merged into one file: $$(head -1 "$$2.absent")" >> "$(RESULTS_DIR)/comparators-absent.txt"; \
 	    elif [ -n "$$3" ]; then \
 	        echo "  skip $$1 — DISABLED by decision: $$3"; \
 	    else \
 	        echo "  skip $$1 — MISSING: $$2 was not staged. Its matrix leg was expected to run and did not deliver (fail-fast:false keeps the rest alive); the report omits this comparator."; \
+	        printf '%s=%s\n' "$${1#--}" "its leg staged no output ($$(basename $$2) is missing), so it is absent from this report" >> "$(RESULTS_DIR)/comparators-absent.txt"; \
 	    fi; }; \
 	add --assist        "$(ASSIST_OUT)"          ""; \
 	add --findorb       "$(FINDORB_OUT)"         ""; \
@@ -1291,6 +1508,7 @@ reduce: build-empyrean-validation
 	add --orbfit        "$(ORBFIT_OUT)"          ""; \
 	add --layup         "$(LAYUP_OUT)"           ""; \
 	if [ -d "$(CACHE_DIR)/sbdb" ]; then flags="$$flags --jpl-sbdb-cache $(CACHE_DIR)/sbdb"; fi; \
+	if [ -s "$(RESULTS_DIR)/comparators-absent.txt" ]; then flags="$$flags --comparator-absent-file $(RESULTS_DIR)/comparators-absent.txt"; fi; \
 	$(EMP_VAL_BIN) merge-external -i "$$ref" -o "$$merged" $$flags
 	@$(EMP_VAL_BIN) report \
 	    --results $(REPORT_INPUTS) \
@@ -1312,7 +1530,7 @@ ARCHIVE_DIR := $(RESULTS_DIR)/archive
 # responses cached at the time). Removing them is now something you have to ask
 # for by name.
 clean:
-	@rm -f $(REPORT) $(REPORT_DATA) $(SUMMARY) $(RUST_MERGED) $(CORE_MERGED) $(PLAN)
+	@rm -f $(REPORT) $(REPORT_DATA) $(SUMMARY) $(RUST_MERGED) $(CORE_MERGED) $(PLAN) $(wildcard $(RESULTS_DIR)/validation_plan.leg-*.json) $(wildcard $(RESULTS_DIR)/*_merged_comparators.json) $(wildcard $(RESULTS_DIR)/comparators-absent.txt)
 	@echo "Removed the derived report / summary / merge / plan from $(RESULTS_DIR)."
 	@echo "Per-channel results are PRESERVED — 'make clean-results' removes those,"
 	@echo "'make archive' snapshots them to $(ARCHIVE_DIR)/<timestamp>/ first."

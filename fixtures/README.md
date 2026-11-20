@@ -26,9 +26,11 @@ horizons/<file>.json       Horizons state vectors (the IC at the SBDB epoch,
                            corrected) per observer per dt
 psv/<name>.psv             optical OD astrometry, ADES 2017 PSV
 psv-radar/<name>.psv       optical + <radar> table for the radar objects
-MANIFEST.json              per-file manifest (fetched beside the data; not
-                           tracked), verified against the pin before any file
-                           is trusted
+snapshot-manifest.json     the snapshot's per-file MANIFEST.json (fetched
+                           beside the data; not tracked), verified against the
+                           pin before any file is trusted; never named
+                           MANIFEST.json here, which on a case-insensitive
+                           filesystem is the pin manifest.json itself
 ```
 
 `sbdb/` and `horizons/` files are the engine's own disk-cache files, named by
@@ -95,6 +97,13 @@ The inputs snapshot follows the same cache discipline as the kernel set:
 - **every other job** restores that exact key and refuses to run on a miss,
   with no credential, then re-verifies the snapshot offline. The external
   comparator legs therefore keep carrying no secret and no identity.
+- **the layup external leg** is the one exception for kernel data (not for
+  inputs): it syncs the published third-party tool set
+  (`THIRD_PARTY_DATASET`, `gs://empyrean-data`) with the bucket's tool into
+  `$DATA_DIR/third-party`, sharing one content pool with the engine set, and
+  stages its data from the `layup/` folder (`LAYUP_DATA_DIR` in the Makefile).
+  The seal still precedes the run step. Under `gh act` the set comes from a
+  `/host-third-party` bind mount (`ACT_THIRD_PARTY_DIR` overrides).
 
 ## Only ever from there — the seal
 
