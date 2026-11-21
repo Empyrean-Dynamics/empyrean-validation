@@ -14,6 +14,7 @@ use crate::predict_schema::{
     COVERAGE_ARC_SPLIT_DAYS, CalibrationCell, ObjectWalkSummary, PredictAggregates, SurfaceCell,
 };
 use crate::schema::{ValidationResult, channel_produces, test_types};
+use crate::tool_registry::Field;
 
 /// Numerical-fidelity threshold: any metric whose absolute difference
 /// against the Rust reference exceeds this is flagged as a failure.
@@ -1820,6 +1821,25 @@ type PanelSpec = (
     HashMap<(String, i64), f64>,
 );
 
+/// `(object, dt) →` the first value of one registry field on the core channel's
+/// rows of `test_type` (the channel every external folds onto).
+fn core_pair_vals(
+    results: &[ValidationResult],
+    test_type: &str,
+    f: Field,
+) -> HashMap<(String, i64), f64> {
+    let mut out: HashMap<(String, i64), f64> = HashMap::new();
+    for r in results {
+        if r.channel == "core"
+            && r.test_type == test_type
+            && let Some(v) = (f.get)(r)
+        {
+            out.entry((r.object.clone(), r.dt_days as i64)).or_insert(v);
+        }
+    }
+    out
+}
+
 /// Append a hidden hatched panel for every ordered pair of distinct externals.
 /// Both externals carry positions on the axis, so the pair is legal and
 /// reachable from the selects, but no shared-reference difference is stored so
@@ -2812,45 +2832,9 @@ fn build_prop_agreement_grid(results: &[ValidationResult]) -> String {
     }
     // Every cross-tool difference is stored on the core rows. Each is a legal
     // pair whose one side is empyrean or JPL (the only pairs reconstructable
-    // from the stored differences — no raw ASSIST/find_orb position vectors
-    // exist, so e.g. ASSIST-vs-find_orb has no panel and renders hatched).
-    let mut emp_assist: HashMap<(String, i64), f64> = HashMap::new();
-    let mut emp_findorb: HashMap<(String, i64), f64> = HashMap::new();
-    let mut emp_oorb: HashMap<(String, i64), f64> = HashMap::new();
-    let mut emp_grss: HashMap<(String, i64), f64> = HashMap::new();
-    let mut assist: HashMap<(String, i64), f64> = HashMap::new();
-    let mut findorb: HashMap<(String, i64), f64> = HashMap::new();
-    let mut oorb: HashMap<(String, i64), f64> = HashMap::new();
-    let mut grss: HashMap<(String, i64), f64> = HashMap::new();
-    for r in results {
-        if r.channel == "core" && r.test_type == "propagation" {
-            let key = (r.object.clone(), r.dt_days as i64);
-            if let Some(v) = r.emp_vs_assist_km {
-                emp_assist.entry(key.clone()).or_insert(v);
-            }
-            if let Some(v) = r.emp_vs_findorb_km {
-                emp_findorb.entry(key.clone()).or_insert(v);
-            }
-            if let Some(v) = r.emp_vs_oorb_km {
-                emp_oorb.entry(key.clone()).or_insert(v);
-            }
-            if let Some(v) = r.emp_vs_grss_km {
-                emp_grss.entry(key.clone()).or_insert(v);
-            }
-            if let Some(v) = r.assist_vs_horizons_km {
-                assist.entry(key.clone()).or_insert(v);
-            }
-            if let Some(v) = r.findorb_vs_horizons_km {
-                findorb.entry(key.clone()).or_insert(v);
-            }
-            if let Some(v) = r.oorb_vs_horizons_km {
-                oorb.entry(key.clone()).or_insert(v);
-            }
-            if let Some(v) = r.grss_vs_horizons_km {
-                grss.entry(key).or_insert(v);
-            }
-        }
-    }
+    // from the stored differences: no raw ASSIST/find_orb position vectors
+    // exist, so e.g. ASSIST-vs-find_orb has no panel and renders hatched). The
+    // fields each tool contributes come from the one tool registry.
     // Default (empyrean vs JPL) first, then empyrean vs each external, then each
     // external vs JPL. Only pairs that carry data are emitted.
     let mut tools = vec![GridTool {
@@ -2866,16 +2850,18 @@ fn build_prop_agreement_grid(results: &[ValidationResult]) -> String {
     // with the Section-1 timing panels (`axis_present_externals`): heatmap pairs
     // and timing pairs cannot drift because both derive from this one call.
     let ext_present: Vec<(&str, &str)> = axis_present_externals(results, "propagation");
-    let extra: Vec<PanelSpec> = vec![
-        ("empyrean", "empyrean", "assist", "ASSIST", emp_assist),
-        ("empyrean", "empyrean", "findorb", "find_orb", emp_findorb),
-        ("empyrean", "empyrean", "oorb", "OpenOrb", emp_oorb),
-        ("empyrean", "empyrean", "grss", "GRSS", emp_grss),
-        ("ASSIST", "assist", "jpl", "JPL", assist),
-        ("find_orb", "findorb", "jpl", "JPL", findorb),
-        ("OpenOrb", "oorb", "jpl", "JPL", oorb),
-        ("GRSS", "grss", "jpl", "JPL", grss),
-    ];
+    let core_prop = |f: Field| core_pair_vals(results, "propagation", f);
+    let mut extra: Vec<PanelSpec> = Vec::new();
+    for spec in crate::tool_registry::externals() {
+        if let Some(f) = spec.prop_vs_emp {
+            extra.push(("empyrean", "empyrean", spec.slug, spec.label, core_prop(f)));
+        }
+    }
+    for spec in crate::tool_registry::externals() {
+        if let Some(f) = spec.prop_vs_jpl {
+            extra.push((spec.label, spec.slug, "jpl", "JPL", core_prop(f)));
+        }
+    }
     for (label, tool_slug, ref_slug, ref_label, vals) in extra {
         if !vals.is_empty() {
             tools.push(GridTool {
@@ -2904,28 +2890,16 @@ fn build_prop_agreement_grid(results: &[ValidationResult]) -> String {
 fn build_eph_agreement_grid(results: &[ValidationResult]) -> String {
     type Acc = HashMap<(String, i64), (f64, u32)>;
     let mut sig_acc: Acc = HashMap::new();
-    // external vs JPL (stored per-site separation, arcsec)
-    let mut fo_acc: Acc = HashMap::new();
-    let mut oorb_acc: Acc = HashMap::new();
-    let mut grss_acc: Acc = HashMap::new();
-    // empyrean vs external (norm of the signed-offset difference, arcsec)
-    let mut emp_fo_acc: Acc = HashMap::new();
-    let mut emp_oorb_acc: Acc = HashMap::new();
-    let mut emp_grss_acc: Acc = HashMap::new();
+    // Per external, by registry slug: the stored per-site separation from JPL
+    // (arcsec) and the norm of the signed-offset difference from empyrean
+    // (arcsec). The fields each tool contributes come from the one registry.
+    let mut vs_jpl_acc: HashMap<&'static str, Acc> = HashMap::new();
+    let mut vs_emp_acc: HashMap<&'static str, Acc> = HashMap::new();
     let add = |acc: &mut Acc, key: &(String, i64), v: f64| {
         let e = acc.entry(key.clone()).or_insert((0.0, 0));
         e.0 += v;
         e.1 += 1;
     };
-    let cross =
-        |dra: Option<f64>, ddec: Option<f64>, xra: Option<f64>, xdec: Option<f64>| -> Option<f64> {
-            match (dra, ddec, xra, xdec) {
-                (Some(a), Some(b), Some(c), Some(d)) => {
-                    Some(((a - c).powi(2) + (b - d).powi(2)).sqrt())
-                }
-                _ => None,
-            }
-        };
     for r in results {
         if r.test_type != "ephemeris" {
             continue;
@@ -2944,38 +2918,22 @@ fn build_eph_agreement_grid(results: &[ValidationResult]) -> String {
         // Cross-tool pairs and external-vs-JPL both read off the core rows,
         // which carry empyrean's own offsets alongside the merged externals'.
         if r.channel == "core" {
-            if let Some(v) = r.findorb_separation_arcsec {
-                add(&mut fo_acc, &key, v);
-            }
-            if let Some(v) = r.oorb_separation_arcsec {
-                add(&mut oorb_acc, &key, v);
-            }
-            if let Some(v) = r.grss_separation_arcsec {
-                add(&mut grss_acc, &key, v);
-            }
-            if let Some(v) = cross(
-                r.d_ra_arcsec,
-                r.d_dec_arcsec,
-                r.findorb_d_ra_arcsec,
-                r.findorb_d_dec_arcsec,
-            ) {
-                add(&mut emp_fo_acc, &key, v);
-            }
-            if let Some(v) = cross(
-                r.d_ra_arcsec,
-                r.d_dec_arcsec,
-                r.oorb_d_ra_arcsec,
-                r.oorb_d_dec_arcsec,
-            ) {
-                add(&mut emp_oorb_acc, &key, v);
-            }
-            if let Some(v) = cross(
-                r.d_ra_arcsec,
-                r.d_dec_arcsec,
-                r.grss_d_ra_arcsec,
-                r.grss_d_dec_arcsec,
-            ) {
-                add(&mut emp_grss_acc, &key, v);
+            for spec in crate::tool_registry::externals() {
+                if let Some(v) = spec.eph_sep.and_then(|f| (f.get)(r)) {
+                    add(vs_jpl_acc.entry(spec.slug).or_default(), &key, v);
+                }
+                if let (Some(a), Some(b), Some(xa), Some(xb)) = (
+                    r.d_ra_arcsec,
+                    r.d_dec_arcsec,
+                    spec.eph_d_ra.and_then(|f| (f.get)(r)),
+                    spec.eph_d_dec.and_then(|f| (f.get)(r)),
+                ) {
+                    add(
+                        vs_emp_acc.entry(spec.slug).or_default(),
+                        &key,
+                        ((a - xa).powi(2) + (b - xb).powi(2)).sqrt(),
+                    );
+                }
             }
         }
     }
@@ -3004,26 +2962,17 @@ fn build_eph_agreement_grid(results: &[ValidationResult]) -> String {
     // the Section-1 timing panels (`axis_present_externals`) so heatmap pairs and
     // timing pairs cannot drift.
     let ext_present: Vec<(&str, &str)> = axis_present_externals(results, "ephemeris");
-    let extra: Vec<PanelSpec> = vec![
-        (
-            "empyrean",
-            "empyrean",
-            "findorb",
-            "find_orb",
-            to_mas(emp_fo_acc),
-        ),
-        (
-            "empyrean",
-            "empyrean",
-            "oorb",
-            "OpenOrb",
-            to_mas(emp_oorb_acc),
-        ),
-        ("empyrean", "empyrean", "grss", "GRSS", to_mas(emp_grss_acc)),
-        ("find_orb", "findorb", "jpl", "JPL", to_mas(fo_acc)),
-        ("OpenOrb", "oorb", "jpl", "JPL", to_mas(oorb_acc)),
-        ("GRSS", "grss", "jpl", "JPL", to_mas(grss_acc)),
-    ];
+    let mut extra: Vec<PanelSpec> = Vec::new();
+    for spec in crate::tool_registry::externals() {
+        if let Some(acc) = vs_emp_acc.remove(spec.slug) {
+            extra.push(("empyrean", "empyrean", spec.slug, spec.label, to_mas(acc)));
+        }
+    }
+    for spec in crate::tool_registry::externals() {
+        if let Some(acc) = vs_jpl_acc.remove(spec.slug) {
+            extra.push((spec.label, spec.slug, "jpl", "JPL", to_mas(acc)));
+        }
+    }
     for (label, tool_slug, ref_slug, ref_label, vals) in extra {
         if !vals.is_empty() {
             tools.push(GridTool {
@@ -3183,7 +3132,7 @@ struct OdPanel<'a> {
     ref_slug: &'static str,
     is_default: bool,
     /// Hover for a converged cell that carries no closeness fill.
-    nocov_title: &'static str,
+    nocov_title: String,
     /// Per-object optical arc.
     optical: HashMap<&'a str, OdArcCell>,
     /// Per-object radar arc (only the radar objects).
@@ -3193,6 +3142,8 @@ struct OdPanel<'a> {
     /// detail behind an object-level count so the visible line stays terse.
     summary_title: String,
     fails: Vec<String>,
+    /// Objects whose rows for this tool disagree: named, left blank, never picked.
+    conflicts: Vec<String>,
 }
 
 /// Render one OD panel's table: the selected tool's convergence + closeness,
@@ -3322,7 +3273,7 @@ fn od_panel_table(
                         c.converged,
                         c.sigma,
                         c.has_record,
-                        panel.nocov_title,
+                        &panel.nocov_title,
                     ));
                     let nobs = c.n_obs.map(|n| n.to_string()).unwrap_or_else(|| "—".into());
                     let chi2 = fmt_num(c.chi2);
@@ -3343,7 +3294,7 @@ fn od_panel_table(
                 }
                 None => {
                     // This tool ran no optical fit for this object.
-                    h.push_str(&od_state_cell(None, None, false, panel.nocov_title));
+                    h.push_str(&od_state_cell(None, None, false, &panel.nocov_title));
                     h.push_str("<td class=\"od-d\">—</td><td class=\"od-d\">—</td><td class=\"od-d\">—</td></tr>");
                 }
             }
@@ -3353,7 +3304,7 @@ fn od_panel_table(
                 h.push_str("<tr class=\"gsub odrow odradar\"><td class=\"gtool\">+ radar</td>");
                 match panel.radar.get(*obj) {
                     Some(c) => {
-                        h.push_str(&od_state_cell(c.converged, None, false, panel.nocov_title));
+                        h.push_str(&od_state_cell(c.converged, None, false, &panel.nocov_title));
                         let rnobs = c.n_obs.map(|n| n.to_string()).unwrap_or_else(|| "—".into());
                         let rchi2 = fmt_num(c.chi2);
                         h.push_str(&format!(
@@ -3361,7 +3312,7 @@ fn od_panel_table(
                         ));
                     }
                     None => {
-                        h.push_str(&od_state_cell(None, None, false, panel.nocov_title));
+                        h.push_str(&od_state_cell(None, None, false, &panel.nocov_title));
                         h.push_str("<td class=\"od-d\">—</td><td class=\"od-d\">—</td><td class=\"od-d hatch\" title=\"this tool ran no radar arc in this run\"></td></tr>");
                     }
                 }
@@ -3369,6 +3320,82 @@ fn od_panel_table(
         }
     }
     h.push_str("</tbody></table></div>");
+}
+
+/// empyrean's OD arcs: one canonical row per object (optical) and per radar arc,
+/// shared by the §1.3A grid and the §1.3B per-population medians so both count
+/// the same arcs. See `build_od_closeness_grid` for why the untagged row is
+/// canonical. Objects whose untagged rows disagree are listed in `conflicts`
+/// and absent from the maps.
+struct EmpOdArcs<'a> {
+    opt: HashMap<&'a str, &'a ValidationResult>,
+    radar: HashMap<&'a str, &'a ValidationResult>,
+    conflicts: Vec<String>,
+}
+
+fn emp_od_arcs(results: &[ValidationResult]) -> EmpOdArcs<'_> {
+    let mut emp_opt: HashMap<&str, &ValidationResult> = HashMap::new();
+    let mut emp_radar: HashMap<&str, &ValidationResult> = HashMap::new();
+    let mut emp_conflicts: Vec<String> = Vec::new();
+    {
+        let mut opt_rows: BTreeMap<&str, Vec<&ValidationResult>> = BTreeMap::new();
+        let mut radar_rows: BTreeMap<&str, Vec<&ValidationResult>> = BTreeMap::new();
+        for r in results {
+            if r.channel != "rust" {
+                continue;
+            }
+            if r.test_type == "orbit_determination" && r.propagation_uncertainty.is_none() {
+                opt_rows.entry(r.object.as_str()).or_default().push(r);
+            } else if r.test_type == "orbit_determination_radar" {
+                radar_rows.entry(r.object.as_str()).or_default().push(r);
+            }
+        }
+        let fp = |r: &ValidationResult| {
+            format!(
+                "{:?}|{:?}|{:?}",
+                r.od_converged, r.n_obs_used, r.od_reduced_chi2
+            )
+        };
+        for (rows_by_obj, out) in [(&opt_rows, &mut emp_opt), (&radar_rows, &mut emp_radar)] {
+            for (obj, rs) in rows_by_obj {
+                if rs.iter().all(|r| fp(r) == fp(rs[0])) {
+                    out.insert(*obj, rs[0]);
+                } else {
+                    emp_conflicts.push((*obj).to_string());
+                }
+            }
+        }
+    }
+    emp_conflicts.sort();
+    EmpOdArcs {
+        opt: emp_opt,
+        radar: emp_radar,
+        conflicts: emp_conflicts,
+    }
+}
+
+/// The one row to read a tool's per-object fit from, when an object has several
+/// rows that each carry it (the merge copies the per-object fit onto every
+/// method row). `Some` when the rows agree on everything this tool measured and
+/// on its convergence outcome; `None` when they disagree, so the caller names
+/// the object instead of picking one.
+fn od_unique_row<'a>(
+    spec: &crate::tool_registry::ToolSpec,
+    rows: &[&'a ValidationResult],
+) -> Option<&'a ValidationResult> {
+    let first = *rows.first()?;
+    let print = |r: &ValidationResult| -> String {
+        let vals: Vec<Option<f64>> = spec.fields().iter().map(|f| (f.get)(r)).collect();
+        let cell = match fitter_convergence_cell(spec.slug, spec.label, Some(r)) {
+            ConvergenceCell::Converged { .. } => 1,
+            ConvergenceCell::NotConverged { .. } => 2,
+            ConvergenceCell::NotAttempted { .. } => 3,
+            ConvergenceCell::Unsupported { .. } => 4,
+        };
+        format!("{vals:?}|{cell}")
+    };
+    let want = print(first);
+    rows.iter().all(|r| print(r) == want).then_some(first)
 }
 
 /// Build the H3 orbit-determination panels: one tool's fits against one
@@ -3396,26 +3423,47 @@ fn build_od_closeness_grid(
         }
     }
 
-    // empyrean OD rows (rust): optical + radar.
-    let mut emp_opt: HashMap<&str, &ValidationResult> = HashMap::new();
-    let mut emp_radar: HashMap<&str, &ValidationResult> = HashMap::new();
+    // empyrean OD rows (rust): optical + radar, ONE row per object arc. Each
+    // object carries one `orbit_determination` row per uncertainty method (the
+    // plan's method axis, where refused methods are rows with no fit) beside the
+    // plan's plain OD row: the untagged row (`propagation_uncertainty` null),
+    // the OD test before the method axis existed. That untagged row is the
+    // canonical arc, so the grid, its σ_eq record and its summary all read the
+    // same row, and a method row never adds a grid row. Two untagged rows for
+    // one object that disagree are named in the panel, not picked between.
+    let EmpOdArcs {
+        opt: emp_opt,
+        radar: emp_radar,
+        conflicts: emp_conflicts,
+    } = emp_od_arcs(results);
+    // An external fitter's per-object fit lives on the reference channel's rows,
+    // copied onto every method row of the object. Read it ONCE per object; rows
+    // that disagree on what this tool measured are refused by name (see
+    // `od_unique_row`), never silently picked between.
+    let mut core_od_all: BTreeMap<&str, Vec<&ValidationResult>> = BTreeMap::new();
     for r in results {
-        if r.channel == "rust" {
-            if r.test_type == "orbit_determination" {
-                emp_opt.insert(r.object.as_str(), r);
-            } else if r.test_type == "orbit_determination_radar" {
-                emp_radar.insert(r.object.as_str(), r);
-            }
+        if r.channel == "core" && r.test_type == "orbit_determination" {
+            core_od_all.entry(r.object.as_str()).or_default().push(r);
         }
     }
+    let mut fo_conflicts: Vec<String> = Vec::new();
+    let findorb_spec = crate::tool_registry::tool("findorb").expect("findorb is registered");
     // find_orb OD data (folded onto core rows).
     let mut fo: HashMap<&str, &ValidationResult> = HashMap::new();
-    for r in results {
-        if r.channel == "core"
-            && r.test_type == "orbit_determination"
-            && (r.findorb_rms_residual.is_some() || r.findorb_n_obs_used.is_some())
-        {
-            fo.insert(r.object.as_str(), r);
+    for (obj, rs) in &core_od_all {
+        let attempted: Vec<&ValidationResult> = rs
+            .iter()
+            .copied()
+            .filter(|r| r.findorb_rms_residual.is_some() || r.findorb_n_obs_used.is_some())
+            .collect();
+        if attempted.is_empty() {
+            continue;
+        }
+        match od_unique_row(findorb_spec, &attempted) {
+            Some(r) => {
+                fo.insert(*obj, r);
+            }
+            None => fo_conflicts.push((*obj).to_string()),
         }
     }
 
@@ -3424,13 +3472,12 @@ fn build_od_closeness_grid(
     // is shared by every panel, so the panels the selector swaps line up
     // row-for-row.
     let mut blocks: BTreeMap<&str, Vec<&str>> = BTreeMap::new();
-    for r in results {
-        if r.channel == "rust" && r.test_type == "orbit_determination" {
-            blocks
-                .entry(r.population.as_str())
-                .or_default()
-                .push(r.object.as_str());
-        }
+    for (&obj, r) in &emp_opt {
+        blocks.entry(r.population.as_str()).or_default().push(obj);
+    }
+    // A stable order before the offender-first sort below.
+    for objs in blocks.values_mut() {
+        objs.sort_unstable();
     }
     let sigma_key = |o: &str| -> f64 { sigma.get(o).and_then(|v| *v).unwrap_or(-1.0) };
     let mut block_order: Vec<(&str, Vec<&str>)> = blocks.into_iter().collect();
@@ -3494,14 +3541,10 @@ fn build_od_closeness_grid(
         // Summary (preserves the counts the method caveat cites: every
         // comparison record, both common-epoch directions).
         let n_arcs = emp_opt.len() + emp_radar.len();
-        let n_conv = results
-            .iter()
-            .filter(|r| {
-                r.channel == "rust"
-                    && (r.test_type == "orbit_determination"
-                        || r.test_type == "orbit_determination_radar")
-                    && r.od_converged == Some(true)
-            })
+        let n_conv = emp_opt
+            .values()
+            .chain(emp_radar.values())
+            .filter(|r| r.od_converged == Some(true))
             .count();
         // Radar-informed JPL objects are excluded from the comparison statistics
         // (an optical-only fit is not like for like); the excluded count is stated.
@@ -3541,36 +3584,37 @@ fn build_od_closeness_grid(
         // like-for-like — hatched, counted, out of statistics"), not this hover.
         let summary_title = String::new();
 
-        // Failures list (empyrean rows that did not converge).
+        // Failures list (empyrean arcs that did not converge), one per arc.
         let mut fails: Vec<String> = Vec::new();
-        for r in results {
-            if r.channel == "rust"
-                && (r.test_type == "orbit_determination"
-                    || r.test_type == "orbit_determination_radar")
-                && r.od_converged == Some(false)
-            {
-                let short: String = r.notes.trim().chars().take(60).collect();
-                fails.push(format!(
-                    "<tr><td class=\"od-fail-name\">{}</td><td>empyrean</td><td title=\"{}\">{}</td></tr>",
-                    attr_escape(&r.object),
-                    attr_escape(&r.notes),
-                    attr_escape(&short)
-                ));
-            }
+        let mut failed_arcs: Vec<&ValidationResult> = emp_opt
+            .values()
+            .chain(emp_radar.values())
+            .copied()
+            .filter(|r| r.od_converged == Some(false))
+            .collect();
+        failed_arcs.sort_by(|a, b| (&a.object, &a.test_type).cmp(&(&b.object, &b.test_type)));
+        for r in failed_arcs {
+            let short: String = r.notes.trim().chars().take(60).collect();
+            fails.push(format!(
+                "<tr><td class=\"od-fail-name\">{}</td><td>empyrean</td><td title=\"{}\">{}</td></tr>",
+                attr_escape(&r.object),
+                attr_escape(&r.notes),
+                attr_escape(&short)
+            ));
         }
-
         panels.push(OdPanel {
             tool_slug: "empyrean",
             tool_label: "empyrean",
             tool_color: "#5b9bd5",
             ref_slug: "jpl",
             is_default: true,
-            nocov_title: "converged · no comparison record in this run",
+            nocov_title: "converged · no comparison record in this run".to_string(),
             optical,
             radar,
             summary,
             summary_title,
             fails,
+            conflicts: emp_conflicts.clone(),
         });
     }
 
@@ -3609,12 +3653,86 @@ fn build_od_closeness_grid(
             tool_color: "#d05040",
             ref_slug: "jpl",
             is_default: false,
-            nocov_title: "find_orb converged · publishes no covariance in this run",
+            nocov_title: "find_orb converged · publishes no covariance in this run".to_string(),
             optical,
             radar: HashMap::new(),
             summary,
             summary_title: String::new(),
             fails: Vec::new(),
+            conflicts: fo_conflicts.clone(),
+        });
+    }
+
+    // Every other fitter with rows in this run vs JPL, from the one tool registry:
+    // each panel reads only that tool's own fields, under that tool's own
+    // convergence rule (`fitter_convergence_cell`, the rule the Part 2 matrix
+    // uses), so a tool is neither charged for an arc it was never handed nor
+    // credited with a fit it did not make.
+    for spec in od_fit_tools(results) {
+        if spec.slug == "findorb" {
+            continue; // its panel is built above
+        }
+        let mut optical: HashMap<&str, OdArcCell> = HashMap::new();
+        let mut conflicts: Vec<String> = Vec::new();
+        for (&obj, rs) in &core_od_all {
+            // The arcs this tool was handed: a row it fit, or failed to.
+            let attempted: Vec<&ValidationResult> = rs
+                .iter()
+                .copied()
+                .filter(|r| {
+                    matches!(
+                        fitter_convergence_cell(spec.slug, spec.label, Some(r)),
+                        ConvergenceCell::Converged { .. } | ConvergenceCell::NotConverged { .. }
+                    )
+                })
+                .collect();
+            if attempted.is_empty() {
+                continue;
+            }
+            let Some(r) = od_unique_row(spec, &attempted) else {
+                conflicts.push(obj.to_string());
+                continue;
+            };
+            let converged = match fitter_convergence_cell(spec.slug, spec.label, Some(r)) {
+                ConvergenceCell::Converged { .. } => Some(true),
+                _ => Some(false),
+            };
+            optical.insert(
+                obj,
+                OdArcCell {
+                    converged,
+                    sigma: None,
+                    has_record: false,
+                    n_obs: spec.od_nobs.and_then(|f| (f.get)(r)).map(|v| v as u32),
+                    chi2: spec.chi2(r),
+                },
+            );
+        }
+        let att = optical.len();
+        let conv = optical
+            .values()
+            .filter(|c| c.converged == Some(true))
+            .count();
+        let summary = format!(
+            "{conv}/{att} arcs fit · {} publishes no closeness metric against JPL in this run",
+            spec.label
+        );
+        panels.push(OdPanel {
+            tool_slug: spec.slug,
+            tool_label: spec.label,
+            tool_color: spec.color,
+            ref_slug: "jpl",
+            is_default: false,
+            nocov_title: format!(
+                "{} converged · no closeness metric against JPL in this run",
+                spec.label
+            ),
+            optical,
+            radar: HashMap::new(),
+            summary,
+            summary_title: String::new(),
+            fails: Vec::new(),
+            conflicts,
         });
     }
 
@@ -3666,6 +3784,17 @@ fn build_od_closeness_grid(
                 panel.fails.join("")
             ));
         }
+        if !panel.conflicts.is_empty() {
+            h.push_str(&format!(
+                "<div class=\"od-fails\"><div class=\"od-fails-h\" title=\"the rows this tool has for these objects disagree, so no one fit can be read; the arc is left blank\">Rows disagree ({})</div><table class=\"agrid odfails\"><tbody>{}</tbody></table></div>",
+                panel.conflicts.len(),
+                panel
+                    .conflicts
+                    .iter()
+                    .map(|o| format!("<tr><td class=\"od-fail-name\">{}</td></tr>", attr_escape(o)))
+                    .collect::<String>()
+            ));
+        }
         h.push_str("</div>");
     }
     // A legal pair with no OD comparison record (a non-JPL reference, or a tool
@@ -3693,24 +3822,31 @@ fn build_od_fit_quality_panel(
     let mut chi2: HashMap<&str, Vec<f64>> = HashMap::new();
     let mut rms: HashMap<&str, Vec<f64>> = HashMap::new();
     let mut sig: HashMap<&str, Vec<f64>> = HashMap::new();
-    for r in results {
-        if r.channel == "rust"
-            && (r.test_type == "orbit_determination" || r.test_type == "orbit_determination_radar")
-        {
-            obj_pop
-                .entry(r.object.as_str())
-                .or_insert(r.population.as_str());
-            let pop = r.population.as_str();
-            if let Some(n) = r.n_obs_used {
-                nobs.entry(pop).or_default().push(n as f64);
-            }
-            if let Some(c) = r.od_reduced_chi2.filter(|c| c.is_finite()) {
-                chi2.entry(pop).or_default().push(c);
-            }
-            if let Some(v) = r.od_rms_combined_arcsec.filter(|v| v.is_finite()) {
-                rms.entry(pop).or_default().push(v);
-            }
+    // One optical fit per object: the same canonical (untagged) row as the §1.3A
+    // grid, so a population median weights every object once (an object carries 7
+    // or 8 OD rows, one per uncertainty method, beside the plain row). Radar fits
+    // stay out: an optical+radar fit is a second fit of an object already here,
+    // and its chi-square mixes radar residuals into a different quantity. They
+    // are counted per population for the hover.
+    let arcs = emp_od_arcs(results);
+    let mut radar_left_out: HashMap<&str, usize> = HashMap::new();
+    for r in arcs.opt.values() {
+        obj_pop
+            .entry(r.object.as_str())
+            .or_insert(r.population.as_str());
+        let pop = r.population.as_str();
+        if let Some(n) = r.n_obs_used {
+            nobs.entry(pop).or_default().push(n as f64);
         }
+        if let Some(c) = r.od_reduced_chi2.filter(|c| c.is_finite()) {
+            chi2.entry(pop).or_default().push(c);
+        }
+        if let Some(v) = r.od_rms_combined_arcsec.filter(|v| v.is_finite()) {
+            rms.entry(pop).or_default().push(v);
+        }
+    }
+    for r in arcs.radar.values() {
+        *radar_left_out.entry(r.population.as_str()).or_default() += 1;
     }
     for c in orbit_comparisons {
         if c.common_epoch_source != "sbdb"
@@ -3751,8 +3887,12 @@ fn build_od_fit_quality_panel(
     }
     for pop in &pops {
         let n = nobs.get(pop).map(|v| v.len()).unwrap_or(0);
+        let radar_note = match radar_left_out.get(pop).copied().unwrap_or(0) {
+            0 => String::new(),
+            k => format!("; {k} radar fit(s) shown in 1.3 A, not in these medians"),
+        };
         h.push_str(&format!(
-            "<tr class=\"gobjrow\"><td class=\"gobjname\" title=\"median over {n} fit(s)\">{}</td>",
+            "<tr class=\"gobjrow\"><td class=\"gobjname\" title=\"median over {n} fit(s){radar_note}\">{}</td>",
             attr_escape(pop)
         ));
         h.push_str(&format!(
@@ -6414,7 +6554,32 @@ fn tool_timing_cols(
             "JPL",
             format!("JPL: reference solution, {HATCH_NOT_TIMED}"),
         )],
-        (other, _) => vec![TimingCol::untimed(other.to_string(), HATCH_NOT_TIMED)],
+        // Any other registered tool with a wall clock: read it off the core
+        // channel's rows, where every external folds its fields. A tool without
+        // one stays hatched.
+        (other, _) => {
+            match crate::tool_registry::tool(other).and_then(|t| t.time.map(|f| (t, f))) {
+                Some((t, f)) => {
+                    let boundary = if test_type == "orbit_determination" {
+                        BOUND_C
+                    } else {
+                        BOUND_B
+                    };
+                    vec![TimingCol::timed(
+                        t.label,
+                        Box::new(move |r: &ValidationResult| {
+                            if r.channel == "core" {
+                                (f.get)(r)
+                            } else {
+                                None
+                            }
+                        }),
+                        boundary,
+                    )]
+                }
+                None => vec![TimingCol::untimed(other.to_string(), HATCH_NOT_TIMED)],
+            }
+        }
     }
 }
 
@@ -6562,72 +6727,77 @@ fn axis_present_externals(
     results: &[ValidationResult],
     test_type: &str,
 ) -> Vec<(&'static str, &'static str)> {
-    let core = |f: &dyn Fn(&ValidationResult) -> bool| {
-        results
-            .iter()
-            .any(|r| r.channel == "core" && r.test_type == test_type && f(r))
-    };
-    let mut v = Vec::new();
-    match test_type {
-        "propagation" => {
-            if core(&|r| r.assist_vs_horizons_km.is_some()) {
-                v.push(("assist", "ASSIST"));
-            }
-            if core(&|r| r.findorb_vs_horizons_km.is_some()) {
-                v.push(("findorb", "find_orb"));
-            }
-            if core(&|r| r.oorb_vs_horizons_km.is_some()) {
-                v.push(("oorb", "OpenOrb"));
-            }
-            if core(&|r| r.grss_vs_horizons_km.is_some()) {
-                v.push(("grss", "GRSS"));
-            }
-        }
-        "ephemeris" => {
-            if core(&|r| r.findorb_separation_arcsec.is_some()) {
-                v.push(("findorb", "find_orb"));
-            }
-            if core(&|r| r.oorb_separation_arcsec.is_some()) {
-                v.push(("oorb", "OpenOrb"));
-            }
-            if core(&|r| r.grss_separation_arcsec.is_some()) {
-                v.push(("grss", "GRSS"));
-            }
-        }
-        _ => {}
-    }
-    v
+    crate::tool_registry::externals()
+        .filter(|t| {
+            let f = match test_type {
+                "propagation" => t.prop_vs_jpl,
+                "ephemeris" => t.eph_sep,
+                _ => None,
+            };
+            f.is_some_and(|f| {
+                results.iter().any(|r| {
+                    r.channel == "core" && r.test_type == test_type && (f.get)(r).is_some()
+                })
+            })
+        })
+        .map(|t| (t.slug, t.label))
+        .collect()
+}
+
+/// The registry tools that have an orbit-determination fit with rows in this run,
+/// in select order: the tools the OD panels and the OD timing slot pair against
+/// JPL. A tool is one when it declares an OD field and any core OD row carries
+/// something it measured or an error/unsupported mark it was handed (the same
+/// "was part of this invocation" test as `od_tool_present`).
+fn od_fit_tools(results: &[ValidationResult]) -> Vec<&'static crate::tool_registry::ToolSpec> {
+    crate::tool_registry::externals()
+        .filter(|t| t.od_rms.is_some() || t.od_chi2.is_some() || t.od_nobs.is_some())
+        .filter(|t| od_tool_present(t.slug, results))
+        .collect()
 }
 
 /// The (tool, ref) pairs a timing axis renders, mirroring exactly the pairs its
 /// heatmap / OD panels carry so the selects never reach a missing timing panel.
+/// Propagation and ephemeris add the timing-only tools (kete, jorbit: no stored
+/// position difference, so no accuracy pair) as tool-vs-JPL and empyrean-vs-tool
+/// pairs where the run timed them on the axis. No external-vs-external pair.
 fn timing_pairs(
     results: &[ValidationResult],
     test_type: &str,
 ) -> Vec<(&'static str, &'static str, &'static str, &'static str)> {
     if test_type == "orbit_determination" {
         let mut v = vec![("empyrean", "empyrean", "jpl", "JPL")];
-        if od_tool_present("findorb", results) {
-            v.push(("findorb", "find_orb", "jpl", "JPL"));
+        for t in od_fit_tools(results) {
+            v.push((t.slug, t.label, "jpl", "JPL"));
         }
         return v;
     }
     let externals = axis_present_externals(results, test_type);
+    let timing_only: Vec<(&'static str, &'static str)> = crate::tool_registry::externals()
+        .filter(|t| !externals.iter().any(|(s, _)| *s == t.slug))
+        .filter(|t| {
+            t.time.is_some_and(|f| {
+                results.iter().any(|r| {
+                    r.channel == "core" && r.test_type == test_type && (f.get)(r).is_some()
+                })
+            })
+        })
+        .filter(|t| t.prop_vs_jpl.is_none() && t.eph_d_ra.is_none())
+        .map(|t| (t.slug, t.label))
+        .collect();
     let mut v: Vec<(&'static str, &'static str, &'static str, &'static str)> =
         vec![("empyrean", "empyrean", "jpl", "JPL")];
-    for &(s, l) in &externals {
+    for &(s, l) in externals.iter().chain(&timing_only) {
         v.push(("empyrean", "empyrean", s, l));
     }
-    for &(s, l) in &externals {
+    for &(s, l) in externals.iter().chain(&timing_only) {
         v.push((s, l, "jpl", "JPL"));
     }
-    for &(sa, la) in &externals {
-        for &(sb, lb) in &externals {
-            if sa != sb {
-                v.push((sa, la, sb, lb));
-            }
-        }
-    }
+    // External-vs-external pairs are not timed pairs: each panel draws both
+    // members' heatmaps, so every external's heatmap would be repeated in a panel
+    // per other external (quadratic page growth), and the accuracy slots carry
+    // those pairs only as the hatched "not compared" line. Each external's wall
+    // clock is already in its own tool-vs-JPL and empyrean-vs-tool panels.
     v
 }
 
@@ -7234,15 +7404,10 @@ fn tool_color_tokens_css() -> String {
     // (slug, dark, light): dark clears AA on the dark card/input surface #151b23,
     // light on the light card surface #edf1f6 (the tighter of the two light
     // surfaces). find_orb is nudged brighter in dark so it, too, clears AA as text.
-    const TOOL_COLORS: [(&str, &str, &str); 4] = [
-        ("empyrean", "#5b9bd5", "#2f6a9e"),
-        ("jpl", "#3d9a6d", "#2c7550"),
-        ("assist", "#c77dff", "#7c3aed"),
-        ("findorb", "#dd6154", "#b83a2c"),
-    ];
+    let tokens = crate::tool_registry::color_tokens();
     let mut dark = String::from("  :root {");
     let mut light = String::from("  :root.theme-light {");
-    for (slug, d, l) in TOOL_COLORS {
+    for (slug, d, l) in tokens {
         dark.push_str(&format!(" --tool-{slug}: {d};"));
         light.push_str(&format!(" --tool-{slug}: {l};"));
     }
@@ -9956,30 +10121,12 @@ pub fn generate_report(
     let mut tools_present: BTreeSet<&str> = BTreeSet::new();
     tools_present.insert("empyrean");
     tools_present.insert("jpl");
-    for r in results {
-        if r.assist_vs_horizons_km.is_some() || r.emp_vs_assist_km.is_some() {
-            tools_present.insert("assist");
-        }
-        if r.oorb_vs_horizons_km.is_some() || r.oorb_separation_arcsec.is_some() {
-            tools_present.insert("oorb");
-        }
-        if r.findorb_rms_residual.is_some()
-            || r.findorb_vs_horizons_km.is_some()
-            || r.findorb_d_ra_arcsec.is_some()
-        {
-            tools_present.insert("findorb");
-        }
-        if r.orbfit_rms_arcsec.is_some() {
-            tools_present.insert("orbfit");
-        }
-        if r.layup_reduced_chi2.is_some() || r.layup_converged.is_some() {
-            tools_present.insert("layup");
-        }
-        if r.grss_vs_horizons_km.is_some()
-            || r.grss_separation_arcsec.is_some()
-            || r.grss_rms_arcsec.is_some()
-        {
-            tools_present.insert("grss");
+    // A registry tool is in the run when any row carries a field it measured, or
+    // when `od_tool_present` finds it was handed arcs (an error or an unsupported
+    // mark): one probe over the one registry, no hand-written list.
+    for spec in crate::tool_registry::externals() {
+        if results.iter().any(|r| spec.has_any(r)) || od_tool_present(spec.slug, results) {
+            tools_present.insert(spec.slug);
         }
     }
     let tools_present_json = serde_json::to_string(&tools_present).unwrap_or_default();
@@ -10201,7 +10348,7 @@ pub fn generate_report(
         &od_closeness_grid_html,
         &od_fit_quality_html,
         &t3_od_timing_html,
-        "<div class=\"disclosures\"><details><summary>Method</summary><div class=\"disc-body\">By object: fill = <code>σ_eq = √(Δᵀ(Σ_fit+Σ_ref)⁻¹Δ/6)</code>, the 6-DOF Mahalanobis distance in Sun-centred ecliptic J2000 elements at a common epoch; shape carries convergence. Objects whose JPL solution used radar are hatched, counted, out of statistics; nine of 82 lack a finite metric (Σ_ref not positive-definite). By population: median n_obs, χ²ᵣ, post-fit RMS″ and σ_eq; the rejected fraction and JPL's solution date are not in the rows.</div></details></div>",
+        "<div class=\"disclosures\"><details><summary>Method</summary><div class=\"disc-body\">One row per object arc: empyrean is read from each object's plain OD fit (the untagged row, the OD test before the method axis; the per-method rows repeat or refuse that fit and add no row), and an external's per-object fit is read once, an object whose rows disagree being named under the grid and left blank. By object: fill = <code>σ_eq = √(Δᵀ(Σ_fit+Σ_ref)⁻¹Δ/6)</code>, the 6-DOF Mahalanobis distance in Sun-centred ecliptic J2000 elements at a common epoch; shape carries convergence. Objects whose JPL solution used radar are hatched, counted, out of statistics; nine of 82 lack a finite metric (Σ_ref not positive-definite). By population: median n_obs, χ²ᵣ, post-fit RMS″ and σ_eq; the rejected fraction and JPL's solution date are not in the rows.</div></details></div>",
     );
     let part1_sections = format!("{s1_1}{s1_2}{s1_3}");
     let part1_head = part1_head_html();
@@ -11070,23 +11217,20 @@ const isDtObject = (o) => DT_OBJECTS.has(o);
 const HERO_CH = {{ pass: {hero_ch_pass}, n: {hero_ch_n} }};
 
 // ─────────── tool-pair registry (report generalization) ───────────
-// Single source of truth for the tool1-vs-tool2 comparator. Every row carries
-// per-tool fields (emp_* = Empyrean, ref_* = JPL Horizons truth, assist_*,
-// oorb_*, findorb_*, orbfit_*, layup_*). This registry knows how to read a
-// pairwise value for a chosen (tool1, tool2) on a given axis, and which
-// pairings are legal — propagation/ephemeris comparisons are stored as
-// Horizons-anchored diffs (raw ASSIST/OpenOrb vectors are NOT persisted), so
-// only pairs reconstructable from those diffs are offered.
-const TOOLS = {{
-    empyrean: {{ label: 'empyrean', color: '#5b9bd5', truth: false }},
-    jpl:      {{ label: 'JPL', color: '#3d9a6d', truth: true }},
-    assist:   {{ label: 'ASSIST', color: '#c77dff', truth: false }},
-    oorb:     {{ label: 'OpenOrb', color: '#e8a040', truth: false }},
-    findorb:  {{ label: 'find_orb', color: '#d05040', truth: false }},
-    orbfit:   {{ label: 'OrbFit', color: '#7dd3c0', truth: false }},
-    layup:    {{ label: 'layup', color: '#e07bc0', truth: false }},
-    grss:     {{ label: 'GRSS', color: '#8fbf5f', truth: false }},
-}};
+// Single source of truth for the tool1-vs-tool2 comparator: the Rust registry
+// (src/tool_registry.rs), inlined as JSON. Each entry names a tool, its label and
+// chart colour, its axes, and the row fields it contributes (emp_* = empyrean,
+// ref_* = JPL Horizons truth, assist_*, oorb_*, findorb_*, orbfit_*, layup_*,
+// grss_*, adam_core_*, adam_core_rust_*, kete_*, jorbit_*). The readers below
+// are generic over it: no tool is listed by hand in this script. Propagation and
+// ephemeris comparisons are stored as Horizons-anchored diffs (raw ASSIST/OpenOrb
+// vectors are NOT persisted), so only pairs reconstructable from those diffs are
+// offered.
+const TOOL_REGISTRY = TOOL_REGISTRY_JSON;
+const TOOL_BY = {{}};
+for (const t of TOOL_REGISTRY) TOOL_BY[t.slug] = t;
+const TOOLS = {{}};
+for (const t of TOOL_REGISTRY) TOOLS[t.slug] = {{ label: t.label, color: t.color, truth: t.truth }};
 function toolLabel(t) {{ return (TOOLS[t] && TOOLS[t].label) || t; }}
 function toolColor(t) {{ return (TOOLS[t] && TOOLS[t].color) || '#888'; }}
 // CSS colour for a tool NAME shown as DOM text (the compare-bar selects and the
@@ -11101,20 +11245,12 @@ function toolTextColor(t) {{ return 'var(--tool-' + t + ', ' + toolColor(t) + ')
 // populate and drive the server-rendered pair-panels before the dataset arrives.
 const TOOLS_PRESENT = new Set(TOOLS_PRESENT_JSON);
 
-// Per-tool axis coverage. prop_pos: propagation position (km). eph: ephemeris
-// separation (arcsec). od_rms / od_chi2 / od_nobs: OD scalars. time: ms.
-const TOOL_AXES = {{
-    empyrean: new Set(['prop_pos', 'eph', 'od_rms', 'od_chi2', 'od_nobs', 'time']),
-    jpl:      new Set(['prop_pos', 'eph', 'od_chi2', 'od_nobs']),
-    assist:   new Set(['prop_pos', 'time']),
-    oorb:     new Set(['prop_pos', 'eph', 'time']),
-    findorb:  new Set(['prop_pos', 'eph', 'od_rms', 'od_nobs']),
-    orbfit:   new Set(['od_rms', 'od_nobs']),
-    layup:    new Set(['od_chi2', 'od_nobs']),
-    // GRSS is the only external reference that covers every axis at once.
-    grss:     new Set(['prop_pos', 'eph', 'od_rms', 'od_chi2', 'od_nobs', 'time']),
-}};
-// Which (tool, axis) actually have data in THIS run — a tool may be
+// Per-tool axis coverage, derived by the registry from the fields each tool
+// declares. prop_pos: propagation position (km). eph: ephemeris separation
+// (arcsec). od_rms / od_chi2 / od_nobs: OD scalars. time: ms.
+const TOOL_AXES = {{}};
+for (const t of TOOL_REGISTRY) TOOL_AXES[t.slug] = new Set(t.axes);
+// Which (tool, axis) actually have data in THIS run: a tool may be
 // structurally capable of an axis (TOOL_AXES) yet carry no rows for it (e.g.
 // OpenOrb ran propagation but not ephemeris here). Intersecting the two keeps
 // the selector from offering pairs that would draw an empty chart.
@@ -11126,37 +11262,32 @@ let TOOL_AXIS_DATA = {{}};
 // candidate's. A row from before the flag was recorded counts unless layup said it
 // did not converge. Mirrors ValidationResult::layup_chi2_is_a_fit.
 function layupFitOfArc(r) {{ return r.layup_flag != null ? [0, 2, 6, 9].includes(r.layup_flag) : r.layup_converged !== false; }}
+// Per-tool absolute scalars, read through the registry's field names.
+function toolField(row, tool, key) {{ const t = TOOL_BY[tool]; return (t && t[key] && row[t[key]] != null) ? row[t[key]] : null; }}
+function toolTimeMs(row, tool) {{ return toolField(row, tool, 'time'); }}
+function odRms(row, tool) {{ return toolField(row, tool, 'od_rms'); }}
+function odNobs(row, tool) {{ return toolField(row, tool, 'od_nobs'); }}
+// A tool's chi-square counts only under its own rule for when it is a fit of the
+// whole arc (layup's flag); every other tool's always counts.
+function odReducedChi2(row, tool) {{
+    const t = TOOL_BY[tool];
+    if (t && t.chi2_rule === 'layup' && !layupFitOfArc(row)) return null;
+    return toolField(row, tool, 'od_chi2');
+}}
 function computeToolAxisData() {{
     const has = {{}};
     const mark = (t, ax) => {{ (has[t] = has[t] || new Set()).add(ax); }};
     for (const r of results) {{
-        if (r.emp_vs_horizons_km != null) {{ mark('empyrean', 'prop_pos'); mark('jpl', 'prop_pos'); }}
-        if (r.emp_vs_assist_km != null || r.assist_vs_horizons_km != null) {{ mark('assist', 'prop_pos'); mark('empyrean', 'prop_pos'); mark('jpl', 'prop_pos'); }}
-        if (r.emp_vs_oorb_km != null || r.oorb_vs_horizons_km != null) {{ mark('oorb', 'prop_pos'); mark('empyrean', 'prop_pos'); mark('jpl', 'prop_pos'); }}
-        if (r.d_ra_arcsec != null) {{ mark('empyrean', 'eph'); mark('jpl', 'eph'); }}
-        if (r.oorb_d_ra_arcsec != null) {{ mark('oorb', 'eph'); mark('jpl', 'eph'); }}
-        if (r.emp_time_ms != null) mark('empyrean', 'time');
-        if (r.assist_time_ms != null) mark('assist', 'time');
-        if (r.oorb_time_ms != null) mark('oorb', 'time');
-        if (r.od_rms_combined_arcsec != null) mark('empyrean', 'od_rms');
-        if (r.od_reduced_chi2 != null) mark('empyrean', 'od_chi2');
-        if (r.n_obs_used != null) mark('empyrean', 'od_nobs');
-        if (r.findorb_rms_residual != null) {{ mark('findorb', 'od_rms'); mark('findorb', 'od_nobs'); }}
-        if (r.orbfit_rms_arcsec != null) {{ mark('orbfit', 'od_rms'); mark('orbfit', 'od_nobs'); }}
-        if (layupFitOfArc(r) && r.layup_reduced_chi2 != null) mark('layup', 'od_chi2');
-        if (r.layup_n_obs_used != null) mark('layup', 'od_nobs');
-        if (r.findorb_vs_horizons_km != null) {{ mark('findorb', 'prop_pos'); mark('jpl', 'prop_pos'); }}
-        if (r.emp_vs_findorb_km != null) {{ mark('findorb', 'prop_pos'); mark('empyrean', 'prop_pos'); }}
-        if (r.findorb_d_ra_arcsec != null) {{ mark('findorb', 'eph'); mark('jpl', 'eph'); }}
-        if (r.ref_od_reduced_chi2 != null) mark('jpl', 'od_chi2');
-        if (r.ref_od_n_obs_used != null) mark('jpl', 'od_nobs');
-        if (r.grss_vs_horizons_km != null) {{ mark('grss', 'prop_pos'); mark('jpl', 'prop_pos'); }}
-        if (r.emp_vs_grss_km != null) {{ mark('grss', 'prop_pos'); mark('empyrean', 'prop_pos'); }}
-        if (r.grss_d_ra_arcsec != null) {{ mark('grss', 'eph'); mark('jpl', 'eph'); }}
-        if (r.grss_rms_arcsec != null) mark('grss', 'od_rms');
-        if (r.grss_reduced_chi2 != null) mark('grss', 'od_chi2');
-        if (r.grss_n_obs_used != null) mark('grss', 'od_nobs');
-        if (r.grss_time_ms != null) mark('grss', 'time');
+        for (const t of TOOL_REGISTRY) {{
+            const got = f => !!f && r[f] != null;
+            if (got(t.prop_vs_jpl)) {{ mark(t.slug, 'prop_pos'); mark('jpl', 'prop_pos'); }}
+            if (got(t.prop_vs_emp)) {{ mark(t.slug, 'prop_pos'); mark('empyrean', 'prop_pos'); }}
+            if (got(t.eph_d_ra) && got(t.eph_d_dec)) {{ mark(t.slug, 'eph'); mark('jpl', 'eph'); }}
+            if (got(t.time)) mark(t.slug, 'time');
+            if (got(t.od_rms)) mark(t.slug, 'od_rms');
+            if (odReducedChi2(r, t.slug) != null) mark(t.slug, 'od_chi2');
+            if (got(t.od_nobs)) mark(t.slug, 'od_nobs');
+        }}
     }}
     return has;
 }}
@@ -11164,35 +11295,36 @@ function hasAxis(tool, axis) {{
     return !!(TOOL_AXES[tool] && TOOL_AXES[tool].has(axis) && TOOL_AXIS_DATA[tool] && TOOL_AXIS_DATA[tool].has(axis));
 }}
 
-// Pairwise propagation position difference (km) on a core prop row. Only the
-// Horizons-anchored / Empyrean-anchored diffs exist on disk; any other pair
-// (e.g. ASSIST vs OpenOrb) returns null and is gated out by legalPair.
+// The stored field holding the propagation position difference of a pair, or
+// null when the pair is not reconstructable. Only the Horizons-anchored (tool vs
+// JPL) and empyrean-anchored (empyrean vs tool) diffs exist on disk; any other
+// pair (e.g. ASSIST vs OpenOrb) has none and is gated out by legalPair.
+function propPairField(t1, t2) {{
+    if (t1 === t2) return null;
+    if (t1 === 'jpl' || t2 === 'jpl') {{
+        const other = TOOL_BY[t1 === 'jpl' ? t2 : t1];
+        return (other && other.prop_vs_jpl) || null;
+    }}
+    if (t1 === 'empyrean' || t2 === 'empyrean') {{
+        const other = TOOL_BY[t1 === 'empyrean' ? t2 : t1];
+        return (other && other.prop_vs_emp) || null;
+    }}
+    return null;
+}}
 function propPosDiffKm(row, t1, t2) {{
-    const F = {{
-        'empyrean|jpl': 'emp_vs_horizons_km',
-        'assist|empyrean': 'emp_vs_assist_km',
-        'empyrean|oorb': 'emp_vs_oorb_km',
-        'assist|jpl': 'assist_vs_horizons_km',
-        'jpl|oorb': 'oorb_vs_horizons_km',
-        'empyrean|findorb': 'emp_vs_findorb_km',
-        'findorb|jpl': 'findorb_vs_horizons_km',
-        'empyrean|grss': 'emp_vs_grss_km',
-        'grss|jpl': 'grss_vs_horizons_km',
-    }};
-    const f = F[[t1, t2].sort().join('|')];
+    const f = propPairField(t1, t2);
     return (f && row[f] != null) ? row[f] : null;
 }}
 
 // Ephemeris signed offsets (dRA·cosδ, dDec) of a tool vs Horizons (arcsec).
-// Horizons is the origin (0,0); Empyrean and OpenOrb store signed offsets, so
-// a tool1-vs-tool2 separation is the norm of their difference.
+// Horizons is the origin (0,0); every tool that stores signed offsets is read
+// through the registry, so a tool-vs-tool separation is the norm of their
+// difference.
 function ephOffsets(row, tool) {{
     if (tool === 'jpl') return [0, 0];
-    if (tool === 'empyrean') return (row.d_ra_arcsec != null && row.d_dec_arcsec != null) ? [row.d_ra_arcsec, row.d_dec_arcsec] : null;
-    if (tool === 'oorb') return (row.oorb_d_ra_arcsec != null && row.oorb_d_dec_arcsec != null) ? [row.oorb_d_ra_arcsec, row.oorb_d_dec_arcsec] : null;
-    if (tool === 'findorb') return (row.findorb_d_ra_arcsec != null && row.findorb_d_dec_arcsec != null) ? [row.findorb_d_ra_arcsec, row.findorb_d_dec_arcsec] : null;
-    if (tool === 'grss') return (row.grss_d_ra_arcsec != null && row.grss_d_dec_arcsec != null) ? [row.grss_d_ra_arcsec, row.grss_d_dec_arcsec] : null;
-    return null;
+    const t = TOOL_BY[tool];
+    if (!t || !t.eph_d_ra || !t.eph_d_dec) return null;
+    return (row[t.eph_d_ra] != null && row[t.eph_d_dec] != null) ? [row[t.eph_d_ra], row[t.eph_d_dec]] : null;
 }}
 function ephSepArcsec(row, t1, t2) {{
     const a = ephOffsets(row, t1), b = ephOffsets(row, t2);
@@ -11200,12 +11332,6 @@ function ephSepArcsec(row, t1, t2) {{
     const dra = a[0] - b[0], ddec = a[1] - b[1];
     return Math.sqrt(dra * dra + ddec * ddec);
 }}
-
-// Per-tool absolute scalars.
-function toolTimeMs(row, tool) {{ return ({{ empyrean: row.emp_time_ms, assist: row.assist_time_ms, oorb: row.oorb_time_ms, grss: row.grss_time_ms }})[tool] ?? null; }}
-function odRms(row, tool) {{ return ({{ empyrean: row.od_rms_combined_arcsec, findorb: row.findorb_rms_residual, orbfit: row.orbfit_rms_arcsec, grss: row.grss_rms_arcsec }})[tool] ?? null; }}
-function odReducedChi2(row, tool) {{ return ({{ empyrean: row.od_reduced_chi2, layup: layupFitOfArc(row) ? row.layup_reduced_chi2 : null, jpl: row.ref_od_reduced_chi2, grss: row.grss_reduced_chi2 }})[tool] ?? null; }}
-function odNobs(row, tool) {{ return ({{ empyrean: row.n_obs_used, findorb: row.findorb_n_obs_used, orbfit: row.orbfit_n_obs_used, layup: row.layup_n_obs_used, jpl: row.ref_od_n_obs_used, grss: row.grss_n_obs_used }})[tool] ?? null; }}
 
 // ── Mahalanobis (uncertainty-unit) offsets ──────────────────────────────
 // Only Empyrean propagates a covariance, so these are defined only for the
@@ -11277,17 +11403,16 @@ let propHeatMode = 'physical', ephHeatMode = 'physical';
 function legalPair(t1, t2, axis) {{
     if (t1 === t2) return false;
     if (!hasAxis(t1, axis) || !hasAxis(t2, axis)) return false;
-    if (axis === 'prop_pos') {{
-        const anchored = t => t === 'empyrean' || t === 'jpl';
-        if (!anchored(t1) && !anchored(t2)) return false; // e.g. ASSIST vs OpenOrb
-    }}
+    // Propagation: only a pair with a stored difference (one side anchored to
+    // empyrean or JPL, and the other tool declaring that difference).
+    if (axis === 'prop_pos' && !propPairField(t1, t2)) return false;
     if (axis === 'eph') {{
         // Whitelist, not a blacklist: an ephemeris pair is only reconstructable
         // for tools that persist SIGNED (dRA·cosδ, dDec) offsets vs Horizons.
         // A tool storing only a scalar separation has no direction, so its
-        // difference against another tool is not defined. `ephOffsets` must
-        // know each name listed here.
-        const ok = t => t === 'empyrean' || t === 'jpl' || t === 'oorb' || t === 'findorb' || t === 'grss';
+        // difference against another tool is not defined. `ephOffsets` reads
+        // the same registry fields this test requires.
+        const ok = t => t === 'jpl' || !!(TOOL_BY[t] && TOOL_BY[t].eph_d_ra && TOOL_BY[t].eph_d_dec);
         if (!ok(t1) || !ok(t2)) return false;
     }}
     return true;
@@ -11337,32 +11462,44 @@ onToolChange(showPairPanels);
 // browser may restore from its back/forward cache.
 document.querySelectorAll('details').forEach(d => {{ d.open = false; }});
 
-// The option sets differ (Tool offers empyrean; Reference offers jpl/layup),
-// so a value legal in one select is not always legal in the other — the source
-// of the blanked-select bug. Kept at module scope so the change handlers and the
-// invariant can consult them.
+// The option sets are derived, never listed: PAIR_PANELS maps each tool to the
+// references it forms a pair with that some Part 1 section actually renders (a
+// panel holding a table, not the hatched "not compared" line), computed by the
+// renderer from the very panels in this page. The Tool select offers each tool
+// with at least one such pair; the Reference select offers only the references
+// that pair with the chosen tool, so every selectable pair renders something.
+const PAIR_PANELS = PAIR_PANELS_JSON;
+// Comparators that can carry rows yet form no pair, with the reason (Rust
+// NOT_PAIRABLE); empty when every comparator pairs.
+const NOT_PAIRABLE = NOT_PAIRABLE_JSON;
 let TOOL_OPTS = [], REF_OPTS = [];
-function populateToolSelects() {{
-    // Tool (the tool under test) leads with empyrean; Reference leads with JPL,
-    // the run's reference. Each select offers only the tools present in the run.
-    const toolOrder = ['empyrean', 'assist', 'findorb', 'grss', 'oorb', 'orbfit'];
-    const refOrder = ['jpl', 'assist', 'findorb', 'grss', 'oorb', 'layup', 'orbfit'];
-    TOOL_OPTS = toolOrder.filter(t => TOOLS_PRESENT.has(t));
-    REF_OPTS = refOrder.filter(t => TOOLS_PRESENT.has(t));
-    const s1 = document.getElementById('tool1-select'), s2 = document.getElementById('tool2-select');
-    if (s1) s1.innerHTML = TOOL_OPTS.map(t => `<option value="${{t}}">${{toolLabel(t)}}</option>`).join('');
-    if (s2) s2.innerHTML = REF_OPTS.map(t => `<option value="${{t}}">${{toolLabel(t)}}</option>`).join('');
-    if (s1) s1.value = TOOL1;
-    if (s2) s2.value = TOOL2;
-    syncPairOptions();
+function refsFor(tool) {{ return PAIR_PANELS[tool] || []; }}
+function fillRefSelect() {{
+    REF_OPTS = refsFor(TOOL1);
+    const s2 = document.getElementById('tool2-select');
+    if (s2) {{
+        s2.innerHTML = REF_OPTS.map(t => `<option value="${{t}}">${{toolLabel(t)}}</option>`).join('');
+        s2.value = TOOL2;
+    }}
 }}
-
-// An illegal pair is unselectable: in each select the option equal to the other
-// select's current value is disabled, so tool === reference can never be chosen.
-function syncPairOptions() {{
-    const s1 = document.getElementById('tool1-select'), s2 = document.getElementById('tool2-select');
-    if (s1) for (const o of s1.options) o.disabled = (o.value === TOOL2);
-    if (s2) for (const o of s2.options) o.disabled = (o.value === TOOL1);
+function populateToolSelects() {{
+    TOOL_OPTS = TOOL_REGISTRY.map(t => t.slug).filter(t => refsFor(t).length > 0);
+    // The starting pair must itself be a rendered pair.
+    if (!TOOL_OPTS.includes(TOOL1) && TOOL_OPTS.length) TOOL1 = TOOL_OPTS[0];
+    if (!refsFor(TOOL1).includes(TOOL2) && refsFor(TOOL1).length) TOOL2 = refsFor(TOOL1)[0];
+    const s1 = document.getElementById('tool1-select');
+    if (s1) {{
+        s1.innerHTML = TOOL_OPTS.map(t => `<option value="${{t}}">${{toolLabel(t)}}</option>`).join('');
+        s1.value = TOOL1;
+    }}
+    fillRefSelect();
+    // Every comparator in the run is offered or named not-pairable; anything else
+    // is a bug, surfaced here rather than as a tool the reader cannot select.
+    const named = new Set(NOT_PAIRABLE.map(x => x[0]));
+    for (const t of TOOLS_PRESENT) {{
+        const offered = TOOL_OPTS.includes(t) || Object.values(PAIR_PANELS).some(rs => rs.includes(t));
+        if (!offered && !named.has(t)) console.error('[pair options] ' + t + ' is in the run but no select offers it and it is not listed as not-pairable');
+    }}
 }}
 
 // Loud invariant: the two selects, the model pair, and the option sets must
@@ -11405,19 +11542,19 @@ function applyToolSelection() {{
 function wireToolSelector() {{
     populateToolSelects();
     const t1 = document.getElementById('tool1-select'), t2 = document.getElementById('tool2-select');
-    // The matching option is disabled (syncPairOptions), so a same-tool pair
-    // cannot be picked; the guard below only assigns values legal in the target
-    // select, so no auto-swap can ever blank a dropdown.
+    // The Reference select holds only the references that pair with the chosen
+    // tool, so any value it can take is a rendered pair and a same-tool pair can
+    // never be chosen. Changing the tool keeps the reference where it still
+    // pairs, else falls back to JPL (the run's reference), else the first.
     if (t1) t1.onchange = () => {{
         TOOL1 = t1.value;
-        if (TOOL1 === TOOL2) {{ TOOL2 = REF_OPTS.find(t => t !== TOOL1) || TOOL2; if (t2) t2.value = TOOL2; }}
-        syncPairOptions();
+        const refs = refsFor(TOOL1);
+        if (!refs.includes(TOOL2)) TOOL2 = refs.includes('jpl') ? 'jpl' : (refs[0] || TOOL2);
+        fillRefSelect();
         applyToolSelection();
     }};
     if (t2) t2.onchange = () => {{
         TOOL2 = t2.value;
-        if (TOOL2 === TOOL1) {{ TOOL1 = TOOL_OPTS.find(t => t !== TOOL2) || TOOL1; if (t1) t1.value = TOOL1; }}
-        syncPairOptions();
         applyToolSelection();
     }};
     applyToolSelection();
@@ -12042,9 +12179,8 @@ if (assistResults.length > 0) {{
 const ephBase = (() => {{
     const src = results.filter(r => r.channel === 'core' && r.test_type === 'ephemeris');
     const rows = src.length ? src : ephResults;
-    const AVG = ['separation_arcsec', 'd_ra_arcsec', 'd_dec_arcsec',
-                 'oorb_separation_arcsec', 'oorb_d_ra_arcsec', 'oorb_d_dec_arcsec',
-                 'findorb_separation_arcsec', 'findorb_d_ra_arcsec', 'findorb_d_dec_arcsec'];
+    // Every tool's separation and signed offsets, from the registry.
+    const AVG = TOOL_REGISTRY.flatMap(t => [t.eph_sep, t.eph_d_ra, t.eph_d_dec]).filter(Boolean);
     // Key on the uncertainty mode too, so we average over observing SITES
     // only — not across the first_order_detection_on / none_detection_on rows
     // that eph is doubled over (same RA/Dec but must stay distinct rows).
@@ -12519,6 +12655,61 @@ function datasetFail(msg) {{
     datasetBanner('<b>Dataset not loaded.</b> ' + msg, 'error');
     markDatasetPending('dataset not loaded');
 }}
+// PARSE_ROWS_BEGIN
+// Parse the verified dataset bytes row by row. The dataset is one JSON array of
+// row objects and can exceed V8's maximum string length (about 536.9 million
+// characters, so a decode of the whole file to one string returns an empty
+// string in Chromium and `JSON.parse` of it fails). So the bytes are scanned
+// for the array's depth-1 objects, tracking string and escape state so a brace,
+// bracket or quote inside a string value never ends a row, and each row is
+// decoded and `JSON.parse`d on its own. The result is exactly what `JSON.parse`
+// of the whole file would return; anything that is not a JSON array of objects
+// throws, with the row index where one is at fault.
+function parseDatasetRows(bytes) {{
+    const dec = new TextDecoder('utf-8');
+    const rows = [];
+    const n = bytes.length;
+    let depth = 0, inStr = false, esc = false, start = -1, opened = false, closed = false;
+    for (let i = 0; i < n; i++) {{
+        const c = bytes[i];
+        if (inStr) {{
+            if (esc) esc = false;
+            else if (c === 0x5c) esc = true;
+            else if (c === 0x22) inStr = false;
+            continue;
+        }}
+        if (c === 0x20 || c === 0x0a || c === 0x0d || c === 0x09) continue;
+        if (c === 0xef && depth === 0 && !opened && i === 0) {{ i += 2; continue; }}
+        if (closed) throw new SyntaxError('unexpected content after the closing bracket at byte ' + i);
+        if (depth === 0) {{
+            if (c !== 0x5b) throw new SyntaxError('the dataset is not a JSON array (byte ' + i + ')');
+            opened = true; depth = 1;
+            continue;
+        }}
+        if (depth === 1) {{
+            if (c === 0x7b) {{ start = i; depth = 2; }}
+            else if (c === 0x2c) {{ /* separator */ }}
+            else if (c === 0x5d) {{ depth = 0; closed = true; }}
+            else throw new SyntaxError('row ' + rows.length + ' is not an object (byte ' + i + ')');
+            continue;
+        }}
+        if (c === 0x22) {{ inStr = true; continue; }}
+        if (c === 0x7b || c === 0x5b) depth++;
+        else if (c === 0x7d || c === 0x5d) {{
+            depth--;
+            if (depth === 1) {{
+                let row;
+                try {{ row = JSON.parse(dec.decode(bytes.subarray(start, i + 1))); }}
+                catch (e) {{ throw new SyntaxError('row ' + rows.length + ': ' + e.message); }}
+                rows.push(row);
+                start = -1;
+            }}
+        }}
+    }}
+    if (!opened || !closed) throw new SyntaxError('the dataset ends before its closing bracket (' + rows.length + ' rows read)');
+    return rows;
+}}
+// PARSE_ROWS_END
 async function loadDataset() {{
     markDatasetPending('dataset not loaded');
     datasetBanner(`Loading dataset <code>${{DATASET.file}}</code> (${{fmtDataBytes(DATASET.bytes)}})…`, 'status');
@@ -12542,7 +12733,7 @@ async function loadDataset() {{
         return;
     }}
     let parsed;
-    try {{ parsed = JSON.parse(new TextDecoder('utf-8').decode(bytes)); }}
+    try {{ parsed = parseDatasetRows(bytes); }}
     catch (e) {{ datasetFail(`The dataset is not valid JSON (${{e}}).`); return; }}
     // Belt-and-suspenders: the byte length and hash checked above already pin the
     // file, so a wrong row count reaches here only on a hash collision at the exact
@@ -12864,6 +13055,14 @@ loadPredict();
     let html = html.replace("PREDICT_DESCRIPTOR_JSON", &predict_descriptor_json);
     let html = html.replace("PW_PRIMARY_JSON", &pw_primary_json);
     let html = html.replace("TOOLS_PRESENT_JSON", &tools_present_json);
+    // The Tool / Reference options are the pairs some Part 1 section really
+    // renders, read back from the panels in the page itself (not from a list).
+    let pair_panels_json = pair_panels_json(&rendered_pair_panels(&html));
+    let html = html.replace("PAIR_PANELS_JSON", &pair_panels_json);
+    let not_pairable_json =
+        serde_json::to_string(&crate::tool_registry::NOT_PAIRABLE).unwrap_or_default();
+    let html = html.replace("NOT_PAIRABLE_JSON", &not_pairable_json);
+    let html = html.replace("TOOL_REGISTRY_JSON", &crate::tool_registry::registry_json());
     let html = html.replace("POP_COLORS_JSON", &pop_colors_json);
     let html = html.replace("CHANNEL_COLORS_JSON", &channel_colors_json);
     let html = html.replace("ORBIT_COMPARISONS_JSON", &orbit_comparisons_json);
@@ -12872,6 +13071,106 @@ loadPredict();
     let html = html.replace("RADAR_EXCLUDED_JSON", &radar_excluded_json);
 
     std::fs::write(output, html).map_err(|e| format!("Failed to write report: {e}"))
+}
+
+/// One `.pair-panel` as the finished page carries it.
+pub(crate) struct RenderedPanel {
+    /// The `data-section` of the `.pair-panels` group it sits in (read by the
+    /// tests, which sweep the sections one by one).
+    #[allow(dead_code)]
+    pub section: String,
+    pub tool: String,
+    pub reference: String,
+    /// Does its body hold a table? A panel that is only the hatched "not compared"
+    /// line holds none and renders no comparison.
+    pub has_table: bool,
+}
+
+/// Every Part 1 pair panel in the page, with whether it renders a comparison.
+pub(crate) fn pair_panels_in(html: &str) -> Vec<RenderedPanel> {
+    const OPEN: &str = "<div class=\"pair-panel\" data-tool=\"";
+    const GROUP: &str = "<div class=\"pair-panels\" data-section=\"";
+    const GENERIC: &str = "<div class=\"pair-notcompared generic\"";
+    let attr_end = |from: usize| html[from..].find('"').map(|e| from + e);
+    let mut out = Vec::new();
+    let mut from = 0;
+    while let Some(i) = html[from..].find(OPEN) {
+        let start = from + i;
+        let attrs = start + OPEN.len();
+        let Some(tool_end) = attr_end(attrs) else {
+            break;
+        };
+        let body_from = tool_end;
+        from = body_from;
+        let ref_key = "\" data-ref=\"";
+        let Some(ref_start) = html[tool_end..]
+            .starts_with(ref_key)
+            .then_some(tool_end + ref_key.len())
+        else {
+            continue;
+        };
+        let Some(ref_end) = attr_end(ref_start) else {
+            break;
+        };
+        // The panel runs to the next panel or the group's generic fallback line.
+        let next_panel = html[body_from..].find(OPEN).map(|n| body_from + n);
+        let next_generic = html[body_from..].find(GENERIC).map(|n| body_from + n);
+        let end = [next_panel, next_generic]
+            .into_iter()
+            .flatten()
+            .min()
+            .unwrap_or(html.len());
+        let section = html[..start]
+            .rfind(GROUP)
+            .and_then(|g| {
+                let s0 = g + GROUP.len();
+                attr_end(s0).map(|e| html[s0..e].to_string())
+            })
+            .unwrap_or_default();
+        out.push(RenderedPanel {
+            section,
+            tool: html[attrs..tool_end].to_string(),
+            reference: html[ref_start..ref_end].to_string(),
+            has_table: html[body_from..end].contains("<table"),
+        });
+    }
+    out
+}
+
+/// The `(tool, reference)` pairs for which some Part 1 section renders a real
+/// panel. A panel that is only the hatched "not compared" line (a pair listed for
+/// completeness with no stored comparison) is not a rendered pair, so no select
+/// offers it. This is the single derivation of the Compare bar's options.
+pub(crate) fn rendered_pair_panels(html: &str) -> BTreeSet<(String, String)> {
+    pair_panels_in(html)
+        .into_iter()
+        .filter(|p| p.has_table)
+        .map(|p| (p.tool, p.reference))
+        .collect()
+}
+
+/// The Compare bar's pair map as JSON: each tool to the references it pairs with,
+/// both in registry order, so the page offers exactly the rendered pairs.
+fn pair_panels_json(pairs: &BTreeSet<(String, String)>) -> String {
+    let order = |slug: &str| {
+        crate::tool_registry::TOOLS
+            .iter()
+            .position(|t| t.slug == slug)
+            .unwrap_or(usize::MAX)
+    };
+    let mut map: BTreeMap<usize, (String, Vec<String>)> = BTreeMap::new();
+    for (t, r) in pairs {
+        map.entry(order(t))
+            .or_insert_with(|| (t.clone(), Vec::new()))
+            .1
+            .push(r.clone());
+    }
+    let mut obj = serde_json::Map::new();
+    for (_, (t, mut refs)) in map {
+        refs.sort_by_key(|r| order(r));
+        obj.insert(t, serde_json::json!(refs));
+    }
+    serde_json::Value::Object(obj).to_string()
 }
 
 /// The Part 4.2 timeline sidecar path for a report output: the output with its
@@ -14236,8 +14535,8 @@ mod tests {
         );
         // The page scripts read layup's chi-square only through the flag gate.
         assert!(
-            html.contains("layupFitOfArc(r) && r.layup_reduced_chi2 != null")
-                && html.contains("layup: layupFitOfArc(row) ? row.layup_reduced_chi2 : null"),
+            html.contains("t.chi2_rule === 'layup' && !layupFitOfArc(row)")
+                && html.contains("\"chi2_rule\":\"layup\""),
             "the page must gate layup's chi-square on its flag",
         );
 
@@ -15236,8 +15535,8 @@ mod tests {
         // Every Section-1 cost pair-panel names only its own two tools. On
         // propagation / ephemeris a timed member draws a heatmap and an untimed
         // member (JPL always; find_orb here) is one hatched line whose reason
-        // rides the hover; orbit determination keeps its per-object table. kete
-        // and jorbit (timing only, never a pair member) never leak in.
+        // rides the hover; orbit determination keeps its per-object table. A tool
+        // outside the panel's own pair (kete and jorbit included) never leaks in.
         let rows = timing_fixture();
         let dir = tempfile::tempdir().unwrap();
         let out = dir.path().join("report.html");
@@ -16163,8 +16462,8 @@ mod tests {
         );
         // The lowercase product name is the one the tool selector renders.
         assert!(
-            html.contains("label: 'empyrean'"),
-            "the JS tool label must be lowercase 'empyrean'"
+            html.contains("\"label\":\"empyrean\""),
+            "the registry's tool label must be lowercase 'empyrean'"
         );
     }
 
@@ -16586,7 +16885,8 @@ mod tests {
         let light_block = html
             .find(":root.theme-light { --tool-empyrean")
             .expect("light tool tokens");
-        for slug in ["empyrean", "jpl", "assist", "findorb"] {
+        // Every token the registry declares, new tools included.
+        for (slug, _, _) in crate::tool_registry::color_tokens() {
             let needle = format!("--tool-{slug}: ");
             let d = hex_after(dark_block, &needle);
             let l = hex_after(light_block, &needle);
@@ -20896,5 +21196,604 @@ mod tests {
         );
         assert_eq!(desc["rows"].as_u64().unwrap() as usize, rows.len());
         assert_eq!(desc["hash"].as_str().unwrap(), fnv1a32_hex(&data_bytes));
+    }
+    // ── The Compare bar offers only what renders (beads 5vru7, e4rre) ──────
+    //
+    // The first rc.1 publish let a reader select pairs (layup, OrbFit, GRSS and
+    // both adam-core channels against JPL) whose every Part 1 section answered
+    // "Not compared". These tests render a run that carries every comparator and
+    // assert the Tool / Reference options are exactly the pairs that draw.
+
+    /// A run with rows for every comparator: the empyrean channels, the JPL
+    /// reference, and each external on every axis it covers.
+    fn all_comparators_run() -> Vec<ValidationResult> {
+        let mut rows = Vec::new();
+        for (o, pop) in [("Apophis", "NEO"), ("Bennu", "NEO")] {
+            for dt in [0.0_f64, 30.0] {
+                // empyrean's own Section-1 propagation row (rust channel).
+                let mut rr = synthetic_rust_prop_row(o, dt);
+                rr.population = pop.to_string();
+                rr.propagation_uncertainty = Some(EMP_SECTION1_ARM.to_string());
+                rows.push(rr);
+                // the core row every external folds onto.
+                let mut c = synthetic_core_prop_row(o, pop, dt);
+                c.assist_time_ms = Some(3.0);
+                c.oorb_vs_horizons_km = Some(0.2);
+                c.emp_vs_oorb_km = Some(0.2);
+                c.oorb_time_ms = Some(4.0);
+                c.emp_vs_findorb_km = Some(0.3);
+                c.grss_vs_horizons_km = Some(0.4);
+                c.emp_vs_grss_km = Some(0.4);
+                c.grss_time_ms = Some(5.0);
+                c.adam_core_vs_horizons_km = Some(0.5);
+                c.adam_core_time_ms = Some(6.0);
+                c.adam_core_rust_vs_horizons_km = Some(0.6);
+                c.adam_core_rust_time_ms = Some(7.0);
+                c.kete_time_ms = Some(8.0);
+                c.jorbit_time_ms = Some(9.0);
+                rows.push(c);
+                // ephemeris: rust (empyrean) and core (externals).
+                let mut er = synthetic_rust_prop_row(o, dt);
+                er.population = pop.to_string();
+                er.test_type = "ephemeris".to_string();
+                er.propagation_uncertainty = Some(EMP_SECTION1_ARM.to_string());
+                er.separation_arcsec = Some(0.01);
+                er.d_ra_arcsec = Some(0.005);
+                er.d_dec_arcsec = Some(0.004);
+                er.emp_time_ms = Some(2.0);
+                rows.push(er);
+                let mut ec = synthetic_core_prop_row(o, pop, dt);
+                ec.test_type = "ephemeris".to_string();
+                ec.separation_arcsec = Some(0.01);
+                ec.d_ra_arcsec = Some(0.005);
+                ec.d_dec_arcsec = Some(0.004);
+                ec.emp_time_ms = Some(2.0);
+                ec.findorb_separation_arcsec = Some(0.02);
+                ec.findorb_d_ra_arcsec = Some(0.01);
+                ec.findorb_d_dec_arcsec = Some(0.01);
+                ec.oorb_separation_arcsec = Some(0.03);
+                ec.oorb_d_ra_arcsec = Some(0.02);
+                ec.oorb_d_dec_arcsec = Some(0.02);
+                ec.grss_separation_arcsec = Some(0.04);
+                ec.grss_d_ra_arcsec = Some(0.03);
+                ec.grss_d_dec_arcsec = Some(0.02);
+                ec.adam_core_separation_arcsec = Some(0.05);
+                ec.adam_core_d_ra_arcsec = Some(0.03);
+                ec.adam_core_d_dec_arcsec = Some(0.03);
+                ec.adam_core_time_ms = Some(6.0);
+                ec.adam_core_rust_separation_arcsec = Some(0.06);
+                ec.adam_core_rust_d_ra_arcsec = Some(0.04);
+                ec.adam_core_rust_d_dec_arcsec = Some(0.03);
+                ec.adam_core_rust_time_ms = Some(7.0);
+                ec.kete_time_ms = Some(8.0);
+                ec.jorbit_time_ms = Some(9.0);
+                rows.push(ec);
+            }
+            // orbit determination: rust (empyrean) and core (every fitter).
+            let mut or = synthetic_core_od_row(o);
+            or.channel = "rust".to_string();
+            or.population = pop.to_string();
+            let mut oc = synthetic_core_od_row(o);
+            oc.population = pop.to_string();
+            oc.emp_time_ms = Some(100.0);
+            oc.findorb_n_obs_used = Some(95);
+            oc.findorb_time_ms = Some(50.0);
+            oc.orbfit_rms_arcsec = Some(0.4);
+            oc.orbfit_n_obs_used = Some(96);
+            oc.orbfit_time_ms = Some(60.0);
+            oc.layup_flag = Some(0);
+            oc.layup_time_ms = Some(70.0);
+            oc.grss_rms_arcsec = Some(0.5);
+            oc.grss_reduced_chi2 = Some(1.1);
+            oc.grss_n_obs_used = Some(97);
+            oc.grss_converged = Some(true);
+            oc.grss_time_ms = Some(80.0);
+            oc.adam_core_reduced_chi2 = Some(1.2);
+            oc.adam_core_n_obs_used = Some(98);
+            oc.adam_core_converged = Some(true);
+            oc.adam_core_time_ms = Some(90.0);
+            oc.adam_core_rust_reduced_chi2 = Some(1.3);
+            oc.adam_core_rust_n_obs_used = Some(99);
+            oc.adam_core_rust_converged = Some(true);
+            oc.adam_core_rust_time_ms = Some(91.0);
+            // Each object carries one OD row per uncertainty method beside the plain
+            // untagged row, as the real data does: the fit under first_order, none
+            // and auto, a refusal (no fit) under the other four. The merge copies the
+            // external fitters' per-object fit onto every one of them.
+            let plain = [or.clone(), oc.clone()];
+            rows.push(or);
+            rows.push(oc);
+            for base in plain {
+                for (method, refused) in [
+                    ("first_order", false),
+                    ("none", false),
+                    ("auto", false),
+                    ("second_order", true),
+                    ("sigma_point", true),
+                    ("monte_carlo", true),
+                    ("gaussian_mixture", true),
+                ] {
+                    let mut m = base.clone();
+                    m.propagation_uncertainty = Some(format!("{method}_detection_on"));
+                    if refused {
+                        m.od_converged = Some(false);
+                        m.n_obs_used = None;
+                        m.od_reduced_chi2 = None;
+                        m.od_chi2 = None;
+                        m.od_rms_combined_arcsec = None;
+                    }
+                    rows.push(m);
+                }
+            }
+        }
+        // ASSIST's standalone arm row (its timing column reads this channel).
+        let mut a = synthetic_rust_prop_row("Apophis", 0.0);
+        a.channel = "assist".to_string();
+        a.propagation_uncertainty = Some("assist_default_variational_off".to_string());
+        a.assist_time_ms = Some(3.0);
+        rows.push(a);
+        rows
+    }
+
+    fn panels_of(html: &str, section: &str) -> BTreeSet<(String, String)> {
+        pair_panels_in(html)
+            .into_iter()
+            .filter(|p| p.section == section && p.has_table)
+            .map(|p| (p.tool, p.reference))
+            .collect()
+    }
+
+    #[test]
+    fn every_option_a_select_offers_renders_a_pair_panel_and_every_comparator_is_offered() {
+        let html = render_rows(&all_comparators_run());
+        let pairs = rendered_pair_panels(&html);
+        let tools: BTreeSet<&str> = pairs.iter().map(|(t, _)| t.as_str()).collect();
+        let refs: BTreeSet<&str> = pairs.iter().map(|(_, r)| r.as_str()).collect();
+
+        // The page's own option map is the rendered pairs, nothing else.
+        let json = pair_panels_json(&pairs);
+        let map: serde_json::Value = serde_json::from_str(&json).unwrap();
+        let mut from_map = BTreeSet::new();
+        for (t, rs) in map.as_object().unwrap() {
+            for r in rs.as_array().unwrap() {
+                from_map.insert((t.clone(), r.as_str().unwrap().to_string()));
+            }
+        }
+        assert_eq!(from_map, pairs, "the options are not the rendered pairs");
+        assert!(
+            html.contains(&format!("const PAIR_PANELS = {json};")),
+            "the page must embed the rendered-pair map"
+        );
+
+        // Every option, and every pair the selects can form, renders a panel that
+        // holds a table in some Part 1 section: judged on the page's own panels,
+        // not on the derivation under test.
+        let drawn: Vec<RenderedPanel> = pair_panels_in(&html)
+            .into_iter()
+            .filter(|p| p.has_table)
+            .collect();
+        for t in &tools {
+            assert!(
+                drawn.iter().any(|p| p.tool == *t),
+                "tool option {t} draws nothing"
+            );
+        }
+        for r in &refs {
+            assert!(
+                drawn.iter().any(|p| p.reference == *r),
+                "reference option {r} draws nothing"
+            );
+        }
+        for (t, r) in &pairs {
+            assert!(
+                drawn.iter().any(|p| p.tool == *t && p.reference == *r),
+                "the selectable pair {t} vs {r} draws nothing in any Part 1 section"
+            );
+        }
+        // And the page really holds panels the options leave out (the hatched
+        // external-vs-external pairs), so the derivation is not vacuous.
+        assert!(
+            pair_panels_in(&html).iter().any(|p| !p.has_table),
+            "expected hatched, table-less panels in the run"
+        );
+        // The default pair is offered.
+        assert!(pairs.contains(&("empyrean".to_string(), "jpl".to_string())));
+
+        // Every comparator that carries rows is offered by a select, or is named
+        // in the one not-pairable list with its reason.
+        let named: BTreeSet<&str> = crate::tool_registry::NOT_PAIRABLE
+            .iter()
+            .map(|(s, _)| *s)
+            .collect();
+        for spec in crate::tool_registry::TOOLS {
+            let offered = tools.contains(spec.slug) || refs.contains(spec.slug);
+            assert!(
+                offered || named.contains(spec.slug),
+                "{} carries rows in the run but no select offers it and it is not listed as not-pairable",
+                spec.slug
+            );
+        }
+    }
+
+    #[test]
+    fn every_od_tool_with_rows_has_a_panel_against_jpl_in_part_one() {
+        let html = render_rows(&all_comparators_run());
+        let od = panels_of(&html, "h3-od");
+        for t in [
+            "empyrean",
+            "findorb",
+            "orbfit",
+            "layup",
+            "grss",
+            "adam-core",
+            "adam-core-rust",
+        ] {
+            assert!(
+                od.contains(&(t.to_string(), "jpl".to_string())),
+                "no OD panel for {t} vs JPL; got {od:?}"
+            );
+        }
+        // The OD timing slot carries the same tools.
+        let timing = panels_of(&html, "t3-od");
+        for t in [
+            "findorb",
+            "orbfit",
+            "layup",
+            "grss",
+            "adam-core",
+            "adam-core-rust",
+        ] {
+            assert!(
+                timing.contains(&(t.to_string(), "jpl".to_string())),
+                "no OD timing panel for {t} vs JPL; got {timing:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn propagation_and_ephemeris_render_both_adam_core_channels() {
+        let html = render_rows(&all_comparators_run());
+        let prop = panels_of(&html, "h1-prop");
+        let eph = panels_of(&html, "h2-eph");
+        for t in ["adam-core", "adam-core-rust"] {
+            assert!(
+                prop.contains(&(t.to_string(), "jpl".to_string())),
+                "{t} prop"
+            );
+            assert!(
+                eph.contains(&(t.to_string(), "jpl".to_string())),
+                "{t} eph vs jpl"
+            );
+            // Signed d_ra/d_dec exist, so ephemeris pairs with empyrean as GRSS does.
+            assert!(
+                eph.contains(&("empyrean".to_string(), t.to_string())),
+                "{t} eph vs empyrean"
+            );
+        }
+        assert!(eph.contains(&("empyrean".to_string(), "grss".to_string())));
+        // No emp-vs-adam-core position difference is stored, so there is no
+        // propagation panel for it (not reconstructable).
+        assert!(!prop.contains(&("empyrean".to_string(), "adam-core".to_string())));
+    }
+
+    #[test]
+    fn timing_slots_render_kete_and_jorbit() {
+        let html = render_rows(&all_comparators_run());
+        for section in ["t1-prop", "t2-eph"] {
+            let timing = panels_of(&html, section);
+            for t in ["kete", "jorbit", "adam-core", "adam-core-rust", "grss"] {
+                assert!(
+                    timing.contains(&(t.to_string(), "jpl".to_string())),
+                    "{section}: no timing panel for {t} vs JPL; got {timing:?}"
+                );
+            }
+            // Every timed pair is empyrean-vs-tool or tool-vs-JPL: an
+            // external-vs-external pair would repeat each external's heatmap in a
+            // panel per other external.
+            for (t, r) in &timing {
+                assert!(
+                    t == "empyrean" || r == "jpl",
+                    "{section}: external-vs-external timing panel {t} vs {r}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_pair_that_draws_nothing_in_any_section_is_not_offered() {
+        // Strip every wall clock: the external-vs-external pairs then have no
+        // heatmap in the accuracy slots (hatched, no stored cross difference) and
+        // none in the timing slots, so no section draws them. They stay in the
+        // page as hatched lines, and no select may offer them.
+        let mut rows = all_comparators_run();
+        for r in &mut rows {
+            r.assist_time_ms = None;
+            r.oorb_time_ms = None;
+            r.grss_time_ms = None;
+            r.findorb_time_ms = None;
+            r.adam_core_time_ms = None;
+            r.adam_core_rust_time_ms = None;
+            r.kete_time_ms = None;
+            r.jorbit_time_ms = None;
+        }
+        let html = render_rows(&rows);
+        let panels = pair_panels_in(&html);
+        assert!(
+            panels
+                .iter()
+                .any(|p| p.tool == "assist" && p.reference == "findorb" && !p.has_table),
+            "the hatched assist-vs-find_orb panel should still be in the page"
+        );
+        let pairs = rendered_pair_panels(&html);
+        assert!(
+            !pairs.contains(&("assist".to_string(), "findorb".to_string())),
+            "a pair no section draws was offered"
+        );
+        assert!(pairs.contains(&("assist".to_string(), "jpl".to_string())));
+        // kete and jorbit, untimed, are no longer in the run at all.
+        assert!(!pairs.iter().any(|(t, _)| t == "kete" || t == "jorbit"));
+    }
+
+    #[test]
+    fn tools_present_probe_reads_the_registry() {
+        let html = render_rows(&all_comparators_run());
+        for spec in crate::tool_registry::externals() {
+            assert!(
+                html.contains(&format!("\"{}\"", spec.slug)),
+                "{} absent from the page",
+                spec.slug
+            );
+        }
+        let start = html.find("const TOOLS_PRESENT = new Set(").unwrap()
+            + "const TOOLS_PRESENT = new Set(".len();
+        let end = start + html[start..].find(");").unwrap();
+        let present: Vec<String> = serde_json::from_str(&html[start..end]).unwrap();
+        for spec in crate::tool_registry::TOOLS {
+            assert!(
+                present.iter().any(|p| p == spec.slug),
+                "{} missing from TOOLS_PRESENT {present:?}",
+                spec.slug
+            );
+        }
+    }
+    // ── The dataset loader parses per row (bead e4rre) ─────────────────────
+    //
+    // V8 cannot build a string longer than ~536.9 million characters, and the
+    // run's dataset is 688 MB, so decoding the whole file to one string returned
+    // '' in Chromium and the page showed "Dataset not loaded". The loader scans
+    // the verified bytes for the array's rows and parses each on its own.
+
+    fn emitted_parse_rows(html: &str) -> String {
+        let a = html
+            .find("// PARSE_ROWS_BEGIN")
+            .expect("the page carries the row parser");
+        let b = html
+            .find("// PARSE_ROWS_END")
+            .expect("row parser end marker");
+        html[a..b].to_string()
+    }
+
+    #[test]
+    fn load_dataset_never_decodes_the_whole_file_to_one_string() {
+        let html = render_rows(&pair_test_rows());
+        let a = html.find("async function loadDataset()").unwrap();
+        let end = a + html[a..].find("\n}}\n").unwrap_or(4000).min(6000);
+        let body = &html[a..end];
+        assert!(
+            body.contains("parseDatasetRows(bytes)"),
+            "loadDataset must parse per row"
+        );
+        assert!(
+            !body.contains("TextDecoder('utf-8').decode(bytes)"),
+            "loadDataset decodes the whole file to one string again"
+        );
+        // The checks stay exactly as loud: byte length, FNV-1a-32 hash, row count.
+        for needle in [
+            "bytes.length !== DATASET.bytes",
+            "Byte-length mismatch",
+            "h !== DATASET.hash",
+            "Hash mismatch",
+            "parsed.length !== DATASET.rows",
+            "Row-count mismatch",
+        ] {
+            assert!(body.contains(needle), "loader lost its check: {needle}");
+        }
+    }
+
+    #[test]
+    fn emitted_row_parser_matches_json_parse_under_node() {
+        let node = std::process::Command::new("node").arg("--version").output();
+        if node.is_err() {
+            assert!(
+                std::env::var_os("CI").is_none(),
+                "node is not on this CI runner image: the loader test cannot run"
+            );
+            eprintln!("node not found: skipping the emitted-loader test locally");
+            return;
+        }
+        let html = render_rows(&pair_test_rows());
+        let parser = emitted_parse_rows(&html);
+        let dir = tempfile::tempdir().unwrap();
+        let script = dir.path().join("loader.js");
+        let js = format!(
+            r#"{parser}
+const assert = require('assert');
+const enc = new TextEncoder();
+const bytesOf = s => enc.encode(s);
+const agree = (name, text) => {{
+    assert.deepStrictEqual(parseDatasetRows(bytesOf(text)), JSON.parse(text), name);
+}};
+// Strings holding braces, brackets, quotes, backslashes, escapes and non-ASCII.
+agree('braces in strings', '[{{"a":"}}{{","b":"]["}},{{"a":"x"}}]');
+agree('escaped quote', '[{{"a":"he said \\"}}\\" ok","b":1}}]');
+agree('escaped backslash before quote', '[{{"a":"path\\\\","b":"}}"}},{{"c":2}}]');
+agree('unicode escapes and utf-8', '[{{"a":"\\u007d\\u005d","b":"\u00e9\u4e2d\ud83d\ude80}}"}}]');
+agree('nested', '[{{"a":{{"b":[1,{{"c":"]"}}]}},"d":[[],{{}}]}}, {{"e":null,"f":true,"g":-1.5e3}}]');
+agree('whitespace', ' \n[ \r\n {{ "a" : 1 }} ,\t{{"b":2}}\n ]\n ');
+agree('empty', '[]');
+agree('one big row', '[{{"v":"' + 'x'.repeat(100000) + '"}}]');
+// A row split across what would be a chunk boundary: many rows.
+const many = Array.from({{ length: 5000 }}, (_, i) => ({{ i, s: 'q"}}{{' + i, a: [i, '[']}}));
+agree('many rows', JSON.stringify(many));
+// Refused, loudly.
+const refuses = (name, text) => assert.throws(() => parseDatasetRows(bytesOf(text)), SyntaxError, name);
+refuses('object top level', '{{"a":1}}');
+refuses('truncated', '[{{"a":1}},{{"b":');
+refuses('unclosed array', '[{{"a":1}}');
+refuses('row not an object', '[1,2]');
+refuses('string element', '["a"]');
+refuses('trailing garbage', '[{{"a":1}}] x');
+refuses('bad row', '[{{"a":1}},{{"b":}}]');
+console.log('ok');
+"#
+        );
+        std::fs::write(&script, js).unwrap();
+        let out = std::process::Command::new("node")
+            .arg(&script)
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "the emitted loader disagrees with JSON.parse:\n{}\n{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+    // ── One grid row per object arc (OD grid, every panel) ─────────────────
+
+    /// The inner HTML of every h3-od panel, keyed `tool/ref`.
+    fn od_panel_bodies(html: &str) -> Vec<(String, String)> {
+        let g = html
+            .find("<div class=\"pair-panels\" data-section=\"h3-od\">")
+            .expect("OD pair-panels group");
+        let end = g + html[g..]
+            .find("<div class=\"pair-notcompared generic\"")
+            .unwrap();
+        let group = &html[g..end];
+        let open = "<div class=\"pair-panel\" data-tool=\"";
+        group
+            .split(open)
+            .skip(1)
+            .map(|chunk| {
+                let tool = chunk.split('"').next().unwrap();
+                let refr = chunk
+                    .split("data-ref=\"")
+                    .nth(1)
+                    .unwrap()
+                    .split('"')
+                    .next()
+                    .unwrap();
+                (format!("{tool}/{refr}"), chunk.to_string())
+            })
+            .collect()
+    }
+
+    fn summary_of(body: &str) -> String {
+        let a = body.find("class=\"grid-summary\"").unwrap();
+        let t0 = a + body[a..].find('>').unwrap() + 1;
+        body[t0..t0 + body[t0..].find("</div>").unwrap()].to_string()
+    }
+
+    #[test]
+    fn every_od_panel_has_one_row_per_object_arc_and_counts_arcs() {
+        let html = render_rows(&all_comparators_run());
+        let panels = od_panel_bodies(&html);
+        assert!(
+            panels.len() >= 7,
+            "expected the empyrean, find_orb and five fitter panels"
+        );
+        for (name, body) in &panels {
+            let rows = body.matches("class=\"gobjr odrow\"").count();
+            assert_eq!(
+                rows, 2,
+                "{name}: one row per object arc (2 objects, 8 rows each in the data)"
+            );
+            // Distinct objects: each name opens exactly one row.
+            for o in ["Apophis", "Bennu"] {
+                let n = body.matches(&format!("class=\"gobjname2\">{o}<")).count()
+                    + body
+                        .matches(&format!("class=\"gobjname2 od-fail-name\">{o}<"))
+                        .count();
+                assert_eq!(n, 1, "{name}: {o} appears {n} times");
+            }
+            assert!(
+                body.contains("NEO (2)"),
+                "{name}: group header must count arcs, not rows"
+            );
+            let sum = summary_of(body);
+            assert!(
+                sum.starts_with("2/2 "),
+                "{name}: summary counts arcs (2 of 2), got {sum:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_external_whose_rows_disagree_is_named_not_picked() {
+        let mut rows = all_comparators_run();
+        // One of Apophis's method rows carries a different layup fit.
+        let i = rows
+            .iter()
+            .position(|r| {
+                r.channel == "core"
+                    && r.test_type == "orbit_determination"
+                    && r.object == "Apophis"
+                    && r.propagation_uncertainty.as_deref() == Some("auto_detection_on")
+            })
+            .unwrap();
+        rows[i].layup_n_obs_used = Some(7);
+        let html = render_rows(&rows);
+        let panels = od_panel_bodies(&html);
+        let (_, layup) = panels.iter().find(|(n, _)| n == "layup/jpl").unwrap();
+        assert!(
+            layup.contains("Rows disagree (1)"),
+            "the disagreement must be named"
+        );
+        assert_eq!(layup.matches("class=\"gobjr odrow\"").count(), 2);
+        assert!(
+            summary_of(layup).starts_with("1/1 "),
+            "the disputed arc is not counted as a fit"
+        );
+        // The other tools, whose rows agree, are untouched.
+        let (_, grss) = panels.iter().find(|(n, _)| n == "grss/jpl").unwrap();
+        assert!(!grss.contains("Rows disagree"));
+    }
+    #[test]
+    fn fit_quality_medians_weight_every_object_arc_once() {
+        // Object A has the plain row and three converged method rows (n_obs 100);
+        // object B has the plain row and one (n_obs 10). A median over every row
+        // reads [10, 10, 100 x4] = 100 (the report's lower median); one row per arc
+        // reads [10, 100] = 10.
+        let mk = |obj: &str, method: Option<&str>, n: u32| {
+            let mut r = synthetic_core_od_row(obj);
+            r.channel = "rust".to_string();
+            r.n_obs_used = Some(n);
+            r.propagation_uncertainty = method.map(|m| format!("{m}_detection_on"));
+            r
+        };
+        let mut rows = vec![mk("A", None, 100), mk("B", None, 10)];
+        for m in ["first_order", "none", "auto"] {
+            rows.push(mk("A", Some(m), 100));
+        }
+        rows.push(mk("B", Some("first_order"), 10));
+        // A radar arc of A with a huge n_obs: included, it would move the median.
+        let mut radar = mk("A", None, 100_000);
+        radar.test_type = "orbit_determination_radar".to_string();
+        rows.push(radar);
+        // A refused method row carries no fit and must not disturb the arc.
+        let mut refused = mk("A", Some("second_order"), 0);
+        refused.n_obs_used = None;
+        refused.od_converged = Some(false);
+        refused.od_reduced_chi2 = None;
+        rows.push(refused);
+        let html = build_od_fit_quality_panel(&rows, &[]);
+        assert!(
+            html.contains("median over 2 fit(s)"),
+            "one fit per object arc: {html}"
+        );
+        assert!(
+            html.contains("median over 2 fit(s); 1 radar fit(s) shown in 1.3 A, not in these medians\">NEO</td><td class=\"od-d\">10</td>"),
+            "the per-arc median n_obs is 10, not the per-row 100: {html}"
+        );
     }
 }
