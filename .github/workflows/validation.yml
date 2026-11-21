@@ -1762,6 +1762,26 @@ jobs:
         run: |
           TIMESTAMP=$(date -u +%Y%m%d_%H%M%S)
           alias_canonical() { cp "$1" "$2"; }
+
+          # The per-channel files a run published: the empyrean channels, then every
+          # comparator the run was asked for (EXTERNAL_TOOLS) and its radar pass when
+          # it has one (find_orb and GRSS fit radar arcs into validation_<tool>_radar).
+          # Derived from the run's own comparator list, never a copy of it, so a new
+          # comparator cannot be left out of the bucket (GRSS was, until this was
+          # written). A channel whose file is absent is skipped: its leg is reported
+          # missing by reduce, and a subset run carries fewer channels.
+          EMPYREAN_CHANNELS="rust python c cli core"
+          copy_channels() {
+            dest="$1"
+            for ch in ${EMPYREAN_CHANNELS} $(echo "${EXTERNAL_TOOLS}" | tr ',' ' '); do
+              for suffix in "" "_radar"; do
+                f="results/validation_${ch}${suffix}.json"
+                if [ -f "$f" ]; then
+                  gcloud storage cp "$f" "${dest}/${ch}${suffix}.json"
+                fi
+              done
+            done
+          }
           if [ -f results/validation_core_merged.json ]; then
             alias_canonical results/validation_core_merged.json results/validation.json
           else
@@ -1787,10 +1807,7 @@ jobs:
             gcloud storage cp results/validation_report.predict.json "${{ env.GCS_BUCKET }}/latest/validation_report.predict.json"
           fi
           gcloud storage cp results/validation_summary.json    ${{ env.GCS_BUCKET }}/latest/validation_summary.json
-          for ch in rust python c cli core assist findorb oorb kete jorbit layup adam-core adam-core-rust orbfit; do
-            f="results/validation_${ch}.json"
-            [ -f "$f" ] && gcloud storage cp "$f" "${{ env.GCS_BUCKET }}/latest/channels/${ch}.json"
-          done
+          copy_channels "${{ env.GCS_BUCKET }}/latest/channels"
 
           gcloud storage cp results/validation.json            ${{ env.GCS_BUCKET }}/archive/${TIMESTAMP}/validation.json
           gcloud storage cp results/od_validation.json         ${{ env.GCS_BUCKET }}/archive/${TIMESTAMP}/od_validation.json
@@ -1802,10 +1819,7 @@ jobs:
             gcloud storage cp results/validation_report.predict.json "${{ env.GCS_BUCKET }}/archive/${TIMESTAMP}/validation_report.predict.json"
           fi
           gcloud storage cp results/validation_summary.json    ${{ env.GCS_BUCKET }}/archive/${TIMESTAMP}/validation_summary.json
-          for ch in rust python c cli core assist findorb oorb kete jorbit layup adam-core adam-core-rust orbfit; do
-            f="results/validation_${ch}.json"
-            [ -f "$f" ] && gcloud storage cp "$f" "${{ env.GCS_BUCKET }}/archive/${TIMESTAMP}/channels/${ch}.json"
-          done
+          copy_channels "${{ env.GCS_BUCKET }}/archive/${TIMESTAMP}/channels"
 
       - name: Upload report artifact
         uses: actions/upload-artifact@v4
@@ -1851,3 +1865,32 @@ jobs:
           else
             echo "Report NOT published to GCS (event \`${{ github.event_name }}\`, ref \`${{ github.ref }}\`, OBJECTS \`${OBJECTS:-<full catalog>}\`) — see the \`validation-report\` CI artifact on this run." >> $GITHUB_STEP_SUMMARY
           fi
+
+      # ── Post-publish check: the public page is served as a web page ─────
+      # Fetches the report from the public hostname and fails the job, by name,
+      # unless its content-type starts with text/html. A browser given an object
+      # served as application/json shows its source instead of the report, and
+      # nothing else in this workflow can see that: the bucket copy succeeds
+      # either way (the first rc.1 publish went out that way). Fetching our own
+      # hostname is not an upstream fetch; the no-JPL/NAIF/MPC rule does not cover it.
+      #
+      # This step is EXPECTED TO FAIL until the Cloudflare rule that sets the
+      # content-type for validation.empyrean-dynamics.com is fixed (bead 0b94c, an
+      # owner-held setting): the public hostname currently serves the report as
+      # application/json. The failure is the intended signal, not a defect here.
+      # It runs last so the report artifact and the step summary are already
+      # recorded when it fails.
+      - name: Check the published report is served as HTML
+        if: steps.publish-gate.outputs.publish == 'true'
+        run: |
+          url="https://validation.empyrean-dynamics.com/latest/validation_report.html"
+          headers="$(curl --silent --show-error --location --head --retry 3 --retry-delay 10 "$url")"
+          ctype="$(printf '%s\n' "$headers" | tr -d '\r' | grep -i '^content-type:' | tail -1 | cut -d: -f2- | sed 's/^ *//' | tr 'A-Z' 'a-z')"
+          echo "content-type of ${url}: ${ctype:-<none>}"
+          case "$ctype" in
+            text/html*) echo "Served as HTML." ;;
+            *)
+              echo "::error title=Published report is not served as HTML::${url} is served with content-type '${ctype:-none}', not text/html, so a browser shows its source instead of the report. Fix the content-type for the public hostname (bead 0b94c)."
+              exit 1
+              ;;
+          esac
