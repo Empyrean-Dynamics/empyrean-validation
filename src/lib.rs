@@ -42,5 +42,6 @@ pub mod predict_schema;
 pub mod report;
 pub mod schema;
 pub mod synthetic;
+pub mod tool_registry;
 pub mod weights;
 pub mod windows;
