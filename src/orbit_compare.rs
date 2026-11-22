@@ -185,7 +185,7 @@ fn compare_pair(
             match (det_a, det_b) {
                 (Some(da), Some(db)) if db > 0.0 => da / db,
                 _ => {
-                    notes.push("covariance not SPD — volume ratio undefined".to_string());
+                    notes.push("covariance not SPD, volume ratio undefined".to_string());
                     f64::NAN
                 }
             }
