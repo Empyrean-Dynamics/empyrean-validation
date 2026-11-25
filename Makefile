@@ -1627,7 +1627,8 @@ reduce: build-empyrean-validation
 	    --results $(REPORT_INPUTS) \
 	    --output $(REPORT) \
 	    --summary $(SUMMARY) \
-	    $(if $(wildcard $(WALK_AGG)),--predict-agg $(WALK_AGG),)
+	    $(if $(wildcard $(WALK_AGG)),--predict-agg $(WALK_AGG),) \
+	    $(if $(ARCHIVE_TIMESTAMP),--archive-timestamp $(ARCHIVE_TIMESTAMP),)
 	@echo "Report: $(REPORT)"
 	@echo "Summary: $(SUMMARY)"
 

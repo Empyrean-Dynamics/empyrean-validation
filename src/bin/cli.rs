@@ -43,7 +43,10 @@ use empyrean_validation::{
     comparators::{self, ComparatorOutcome, Folded, read_tool_records},
     inputs::{InputProduct, cache_file_name, missing_input},
     plan::{PlanConfig, build_plan},
-    report::{FLOOR_EXCEPTIONS, SUMMARY_TEST_TYPES, generate_report, normalize_engine},
+    report::{
+        FLOOR_EXCEPTIONS, FloorExceptionVerdict, SUMMARY_TEST_TYPES, floor_exception_verdict,
+        generate_report,
+    },
     schema::{OrbitComparison, ValidationResult, channels, test_types},
 };
 
@@ -342,6 +345,14 @@ struct ReportArgs {
     /// never silently pooled under one tool with near-duplicate arm names.
     #[arg(long, value_delimiter = ',')]
     predict_run: Vec<PathBuf>,
+    /// The `YYYYMMDD_HHMMSS` timestamp the publish step files this run's archive
+    /// under (`archive/<timestamp>/`). The workflow mints it once, before the
+    /// report is rendered, and both the render and the upload use it. The cite
+    /// block links the permanent archive page with it. Omit it for a render that
+    /// is not published (a PR run, act, local): the report then says so and
+    /// carries no link.
+    #[arg(long)]
+    archive_timestamp: Option<String>,
 }
 
 #[derive(Parser, Debug)]
@@ -2317,6 +2328,7 @@ fn report(args: ReportArgs) -> Result<(), Box<dyn std::error::Error>> {
         predict_agg.as_ref(),
         &predict_runs,
         &comparator_outcomes,
+        args.archive_timestamp.as_deref(),
     )
     .map_err(|e| format!("report: {e}"))?;
     eprintln!("Wrote report to {}", args.output.display());
@@ -3097,11 +3109,14 @@ fn apply_floor_exceptions(
             .iter()
             .filter(|r| r["object"].as_str() == Some(e.object))
         {
-            let ran_on = row["source_version"]
-                .as_str()
-                .map(normalize_engine)
-                .unwrap_or_default();
-            if ran_on != e.engine {
+            // The verdict is the library's, the one the report's known-exceptions
+            // strip names; this gate only turns it into failures and notes.
+            let verdict = floor_exception_verdict(
+                e,
+                row["converged"].as_bool() != Some(false),
+                row["source_version"].as_str(),
+            );
+            if let FloorExceptionVerdict::WrongEngine { ran_on } = &verdict {
                 failures.push(format!(
                     "{channel}: floor exception FAILED: {} / {tt} is excused only on the rc1 \
                      engine [{}], but this row ran on [{}]; the exception is keyed to the rc1 \
@@ -3111,10 +3126,10 @@ fn apply_floor_exceptions(
                     if ran_on.is_empty() {
                         "no source_version"
                     } else {
-                        &ran_on
+                        ran_on
                     }
                 ));
-            } else if row["converged"].as_bool() == Some(false) {
+            } else if verdict == FloorExceptionVerdict::Excused {
                 out.count += 1;
                 out.notes.push(format!(
                     "ci-check: {channel}: NOTE the {} / {tt} fit did not converge and is excused \
@@ -3552,6 +3567,7 @@ mod tests {
                 summary: Some(summary_path.clone()),
                 predict_agg: vec![],
                 predict_run: vec![],
+                archive_timestamp: None,
             })
             .expect("report");
             let summary: serde_json::Value =
@@ -4196,6 +4212,7 @@ mod tests {
             summary: Some(summary_path.clone()),
             predict_agg: vec![],
             predict_run: vec![],
+            archive_timestamp: None,
         })
         .expect("report");
         let summary: serde_json::Value =
@@ -4246,6 +4263,7 @@ mod tests {
             summary: None,
             predict_agg: vec![],
             predict_run: vec![],
+            archive_timestamp: None,
         })
         .expect_err("absent sidecar must fail");
         let msg = err.to_string();
@@ -4269,6 +4287,7 @@ mod tests {
             summary: None,
             predict_agg: vec![],
             predict_run: vec![],
+            archive_timestamp: None,
         })
         .expect("staged sidecar");
     }
@@ -4289,6 +4308,7 @@ mod tests {
             summary: None,
             predict_agg: vec![],
             predict_run: vec![],
+            archive_timestamp: None,
         })
         .expect("prop-only run needs no sidecar");
     }
@@ -4645,6 +4665,7 @@ mod tests {
             summary: None,
             predict_agg: vec![],
             predict_run: vec![],
+            archive_timestamp: None,
         })
         .unwrap();
         let html = std::fs::read_to_string(&out).unwrap();
@@ -5476,6 +5497,7 @@ mod tests {
             summary: Some(summary.clone()),
             predict_agg: vec![],
             predict_run: vec![],
+            archive_timestamp: None,
         })
         .unwrap();
         let html = std::fs::read_to_string(&out).unwrap();
@@ -5511,6 +5533,7 @@ mod tests {
             summary: Some(summary.clone()),
             predict_agg: vec![],
             predict_run: vec![],
+            archive_timestamp: None,
         })
         .unwrap();
         let sum: serde_json::Value =
@@ -5873,6 +5896,7 @@ mod tests {
             summary: Some(summary.clone()),
             predict_agg: vec![],
             predict_run: vec![],
+            archive_timestamp: None,
         })
         .unwrap();
         let sum: serde_json::Value =

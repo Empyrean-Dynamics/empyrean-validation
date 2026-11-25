@@ -19,7 +19,17 @@ use crate::tool_registry::Field;
 /// Numerical-fidelity threshold: any metric whose absolute difference
 /// against the Rust reference exceeds this is flagged as a failure.
 /// Applied directly in whatever unit each metric is in.
+pub mod summary;
+
 pub const FIDELITY_THRESHOLD: f64 = 1e-10;
+
+/// The empyrean distribution version under test, defined once: the appendix's
+/// run summary, the branded-export attribution and the cite block all read it.
+const EMPYREAN_VERSION: &str = "0.11.0-rc.1";
+/// The engine component versions the run summary and the cite block state.
+const VERSION_HYPERJET: &str = "1.15.0";
+const VERSION_EMPYREAN_CORE: &str = "0.11.1";
+const VERSION_C_ABI: &str = "1100";
 
 /// One AU in km, used to convert vector position differences (which are
 /// stored in AU) to km for display.
@@ -424,7 +434,7 @@ fn fmt_error(km: Option<f64>) -> String {
                 format!("{:.0} km", km)
             } else {
                 // Past lunar orbit, show in AU.
-                format!("{:.3} AU", km / AU_KM)
+                format!("{:.3} au", km / AU_KM)
             }
         }
     }
@@ -617,6 +627,15 @@ struct FitRow {
     object: String,
     converged: bool,
     source_version: Option<String>,
+}
+
+/// The fit a row records, as a floor exception reads it.
+fn fit_row_of(r: &ValidationResult) -> FitRow {
+    FitRow {
+        object: r.object.clone(),
+        converged: r.od_converged.unwrap_or(true),
+        source_version: r.source_version.clone(),
+    }
 }
 
 #[derive(Debug, Clone, Default)]
@@ -840,6 +859,62 @@ pub const FLOOR_EXCEPTIONS: &[FloorException] = &[FloorException {
              (beads a7f5f, slpum, wka0f)",
 }];
 
+/// What a [`FloorException`] does to one fit. `ci-check` (which gates on it) and
+/// the report's known-exceptions strip (which names it) both read this verdict,
+/// so the strip says what the gate decided and no log text is parsed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FloorExceptionVerdict {
+    /// The fit ran on another engine than the exception is keyed to; the
+    /// exception fails and must be re-examined. Carries the normalized engine
+    /// the row ran on (empty when the row carries none).
+    WrongEngine { ran_on: String },
+    /// The engine matches and the fit did not converge: excused by name.
+    Excused,
+    /// The engine matches and the fit converged: the exception went unused.
+    Unused,
+}
+
+/// The verdict of exception `e` on one fit of its object and axis.
+pub fn floor_exception_verdict(
+    e: &FloorException,
+    converged: bool,
+    source_version: Option<&str>,
+) -> FloorExceptionVerdict {
+    let ran_on = source_version.map(normalize_engine).unwrap_or_default();
+    if ran_on != e.engine {
+        FloorExceptionVerdict::WrongEngine { ran_on }
+    } else if !converged {
+        FloorExceptionVerdict::Excused
+    } else {
+        FloorExceptionVerdict::Unused
+    }
+}
+
+/// Every [`FLOOR_EXCEPTIONS`] entry that has a fit in these rows, with the verdict
+/// on each such fit, read from the rows exactly as the summary's `fit_rows` are
+/// (the same rows, the same [`fit_row_of`]). An exception with no row for its
+/// object (a subset run) is absent: nothing ran that it could excuse.
+pub fn floor_exception_verdicts(
+    results: &[ValidationResult],
+) -> Vec<(&'static FloorException, FloorExceptionVerdict)> {
+    let mut out = Vec::new();
+    for e in FLOOR_EXCEPTIONS {
+        for r in results.iter().filter(|r| {
+            r.channel == e.channel
+                && r.test_type == e.test_type
+                && r.object == e.object
+                && !is_timing_only_uncertainty(r.propagation_uncertainty.as_deref())
+        }) {
+            let f = fit_row_of(r);
+            out.push((
+                e,
+                floor_exception_verdict(e, f.converged, f.source_version.as_deref()),
+            ));
+        }
+    }
+    out
+}
+
 /// An engine `source_version` string with its whitespace runs collapsed to one
 /// space, so the multi-line stamp the rust runner writes compares equal to the
 /// single-line spelling in [`FLOOR_EXCEPTIONS`].
@@ -987,11 +1062,7 @@ fn rollup_channels(results: &[ValidationResult]) -> Vec<ChannelRollup> {
                 by_tt_fit_rows
                     .entry(r.test_type.clone())
                     .or_default()
-                    .push(FitRow {
-                        object: r.object.clone(),
-                        converged: r.od_converged.unwrap_or(true),
-                        source_version: r.source_version.clone(),
-                    });
+                    .push(fit_row_of(r));
             }
             let key = row_key(r);
             channel_keys.insert(key.clone());
@@ -1406,7 +1477,7 @@ fn reference_rows_by_object(results: &[ValidationResult]) -> BTreeMap<String, us
 /// the summary as `reference_declined_rows` with their count so `ci-check`
 /// can print what was dropped; a summary without the count predates the rule
 /// and the gate refuses it.
-fn reference_declined_rows(results: &[ValidationResult]) -> Vec<serde_json::Value> {
+pub fn reference_declined_rows(results: &[ValidationResult]) -> Vec<serde_json::Value> {
     results
         .iter()
         .filter(|r| {
@@ -1558,12 +1629,52 @@ fn write_summary(
 // Convergence matrix (§09), who converged on what, and who was never asked
 // ─────────────────────────────────────────────────────────────────────────
 
+/// The roots a CI runner's absolute work directory starts with, each followed by
+/// `<repo>/<repo>/` (the workspace of the checked-out repository).
+const RUNNER_WORK_ROOTS: [&str; 3] = ["/home/runner/work/", "/Users/runner/work/", "/__w/"];
+
+/// Shorten a runner's absolute work-directory prefix to `…/` wherever the page
+/// shows tool or engine text (owner ruling 2026-11-22): `/home/runner/work/<repo>/<repo>/`
+/// and the same under the macOS and container roots. Every other character is
+/// left as the tool wrote it. This is the one function; the HTML escape and the
+/// dataset projection both call it, so no sink can show a runner path.
+pub(crate) fn shorten_runner_path(s: &str) -> std::borrow::Cow<'_, str> {
+    if !RUNNER_WORK_ROOTS.iter().any(|root| s.contains(root)) {
+        return std::borrow::Cow::Borrowed(s);
+    }
+    let mut out = String::with_capacity(s.len());
+    let mut rest = s;
+    'scan: while !rest.is_empty() {
+        for root in RUNNER_WORK_ROOTS {
+            if let Some(after) = rest.strip_prefix(root) {
+                // `<repo>/<repo>/`: two equal, non-empty path segments.
+                let mut segs = after.splitn(3, '/');
+                if let (Some(a), Some(b), Some(tail)) = (segs.next(), segs.next(), segs.next())
+                    && !a.is_empty()
+                    && a == b
+                    && !a.contains(char::is_whitespace)
+                {
+                    out.push('…');
+                    out.push('/');
+                    rest = tail;
+                    continue 'scan;
+                }
+            }
+        }
+        let c = rest.chars().next().unwrap_or_default();
+        out.push(c);
+        rest = &rest[c.len_utf8()..];
+    }
+    std::borrow::Cow::Owned(out)
+}
+
 /// Escape a string for use inside a double-quoted HTML attribute.
 ///
 /// The matrix puts free-form text, a channel's `notes`, a tool's error
 /// string, an object name like `1I/'Oumuamua`, into `title=`, so a stray
 /// quote would end the attribute and a stray `<` would open a tag.
 fn attr_escape(s: &str) -> String {
+    let s = shorten_runner_path(s);
     let mut out = String::with_capacity(s.len());
     for c in s.chars() {
         match c {
@@ -1781,6 +1892,29 @@ fn grid_fmt(axis: GridAxis, v: f64) -> String {
         GridAxis::TimingMs => fmt_ms(v),
         GridAxis::SepArcsec => fmt_arcsec(v),
     }
+}
+
+/// The median, 90th percentile and cell count of a pair's finite cells: the
+/// statistic the panel's summary line prints and the summary card repeats.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct GridStat {
+    p50: f64,
+    p90: f64,
+    n: usize,
+}
+
+/// The [`GridStat`] of a pair's cells, `None` when none is finite.
+fn grid_stat(vals: &HashMap<(String, i64), f64>) -> Option<GridStat> {
+    let mut v: Vec<f64> = vals.values().copied().filter(|v| v.is_finite()).collect();
+    if v.is_empty() {
+        return None;
+    }
+    let n = v.len();
+    Some(GridStat {
+        p50: percentile(&mut v, 0.5),
+        p90: percentile(&mut v, 0.9),
+        n,
+    })
 }
 
 /// One tool's contribution to an agreement grid: its measured value keyed by
@@ -2418,20 +2552,12 @@ fn render_agreement_grid(
     // carries the "worst …" clause the WORST column and the darkest cell already
     // state in view, so the line itself stays lean.
     let summary_for = |tool: &GridTool| -> (String, String) {
-        let mut vals: Vec<f64> = tool
-            .vals
-            .values()
-            .copied()
-            .filter(|v| v.is_finite())
-            .collect();
-        if vals.is_empty() {
+        let Some(GridStat { p50, p90, n }) = grid_stat(&tool.vals) else {
             return (
                 "No comparable rows on this axis in this run.".to_string(),
                 String::new(),
             );
-        }
-        let p50 = percentile(&mut vals, 0.5);
-        let p90 = percentile(&mut vals, 0.9);
+        };
         // Tie-break on (object, dt) so the "worst" pick never depends on the
         // map's iteration order, the summary line must be reproducible.
         let (worst_v, worst_obj, worst_dt) = tool.vals.iter().filter(|(_, v)| v.is_finite()).fold(
@@ -2448,7 +2574,7 @@ fn render_agreement_grid(
             "p90 {} · median {} · {} cells",
             grid_fmt(axis, p90),
             grid_fmt(axis, p50),
-            vals.len(),
+            n,
         );
         let title = format!(
             "worst {} {} at {}",
@@ -2815,6 +2941,18 @@ fn emp_eph_agreement_vals(results: &[ValidationResult]) -> HashMap<(String, i64)
 
 /// Build the propagation vs-JPL agreement grid (H1).
 fn build_prop_agreement_grid(results: &[ValidationResult]) -> String {
+    render_prop_like_grid(
+        "h1-prop",
+        GridAxis::PropKm,
+        results,
+        prop_grid_tools(results),
+    )
+}
+
+/// Every pair the propagation agreement grid renders: empyrean vs JPL first,
+/// then the externals, then the hatched cross pairs. The summary card reads the
+/// same tools, so the card and the panel statistic cannot disagree.
+fn prop_grid_tools(results: &[ValidationResult]) -> Vec<GridTool> {
     let emp = emp_prop_agreement_vals(results);
     let mut emp_sigma: HashMap<(String, i64), f64> = HashMap::new();
     for r in results {
@@ -2879,7 +3017,7 @@ fn build_prop_agreement_grid(results: &[ValidationResult]) -> String {
     // positions but no shared-reference difference is stored, so they render a
     // hatched "not compared" panel.
     push_cross_hatched_panels(&mut tools, &ext_present);
-    render_prop_like_grid("h1-prop", GridAxis::PropKm, results, tools)
+    tools
 }
 
 /// Build the ephemeris sky-plane agreement grid (H2). Every panel is a legal
@@ -2888,6 +3026,11 @@ fn build_prop_agreement_grid(results: &[ValidationResult]) -> String {
 /// dRA·cosδ / dDec offsets vs Horizons, differenced per site). ASSIST persists
 /// no sky-plane offset, so it forms no ephemeris pair.
 fn build_eph_agreement_grid(results: &[ValidationResult]) -> String {
+    render_prop_like_grid("h2-eph", GridAxis::EphMas, results, eph_grid_tools(results))
+}
+
+/// Every pair the ephemeris agreement grid renders (see [`prop_grid_tools`]).
+fn eph_grid_tools(results: &[ValidationResult]) -> Vec<GridTool> {
     type Acc = HashMap<(String, i64), (f64, u32)>;
     let mut sig_acc: Acc = HashMap::new();
     // Per external, by registry slug: the stored per-site separation from JPL
@@ -2989,7 +3132,7 @@ fn build_eph_agreement_grid(results: &[ValidationResult]) -> String {
     // Legal external-vs-external sky-plane pairs (both carry offsets, no stored
     // cross difference) render a hatched "not compared" panel.
     push_cross_hatched_panels(&mut tools, &ext_present);
-    render_prop_like_grid("h2-eph", GridAxis::EphMas, results, tools)
+    tools
 }
 
 /// Shared setup for the propagation-shaped grids.
@@ -3131,6 +3274,12 @@ struct OdArcCell {
     chi2: Option<f64>,
     /// The tool's own one-sentence reason, for a fit that did not converge.
     reason: Option<String>,
+    /// The tool's own named failure flag, where it records one (layup's
+    /// `layup_flag_name`), for a fit that did not converge.
+    flag: Option<String>,
+    /// The fit fell under find_orb's observation-coverage floor
+    /// ([`findorb_under_coverage_floor`]): a placeholder orbit, not a fit.
+    under_coverage_floor: bool,
 }
 
 /// One OD panel: a single tool's fits against a single reference. Every panel
@@ -3154,6 +3303,8 @@ struct OdPanel<'a> {
     /// one-sentence reason, per object (optical, radar).
     optical_absent: HashMap<&'a str, String>,
     radar_absent: HashMap<&'a str, String>,
+    /// The arc counts the headline states ([`od_counts_text`]).
+    counts: OdCounts,
     summary: String,
     /// Hover for the summary line (empty = none); carries the record-level
     /// detail behind an object-level count so the visible line stays terse.
@@ -3314,6 +3465,10 @@ fn external_od_arcs<'a>(
                 n_obs: spec.od_nobs.and_then(|f| (f.get)(r)).map(|v| v as u32),
                 chi2: spec.chi2(r),
                 reason,
+                flag: (spec.slug == "layup" && converged == Some(false))
+                    .then(|| r.layup_flag_name.clone())
+                    .flatten(),
+                under_coverage_floor: spec.slug == "findorb" && findorb_under_coverage_floor(r),
             },
         );
     }
@@ -3607,16 +3762,22 @@ fn od_unique_row<'a>(
     rows.iter().all(|r| print(r) == want).then_some(first)
 }
 
-/// Build the H3 orbit-determination panels: one tool's fits against one
-/// reference per panel, following the Tool and Reference selects exactly as the
-/// propagation (1.1A) and ephemeris (1.2A) pair-panels do. The default panel is
-/// empyrean vs JPL; each other legal pair with comparison records is a hidden
-/// panel the selector reveals, and a pair with no records shows the generic
-/// hatched "not compared" line. The cross-fitter comparison lives in Part 2.
-fn build_od_closeness_grid(
-    results: &[ValidationResult],
-    orbit_comparisons: &[crate::schema::OrbitComparison],
-) -> String {
+/// Everything the OD panels read, computed once from the rows: the panels, the
+/// row order they share, and the radar sets. The summary card counts arcs from the
+/// same panels the tables list, so the card and the headline cannot disagree.
+struct OdPanelSet<'a> {
+    panels: Vec<OdPanel<'a>>,
+    block_order: Vec<(&'a str, Vec<&'a str>)>,
+    radar_objs: BTreeSet<&'a str>,
+    radar_counts: BTreeMap<&'a str, (u32, u32)>,
+}
+
+/// Build every OD panel (empyrean vs JPL, then each fitting tool vs JPL) and the
+/// shared row structure. See [`build_od_closeness_grid`] for the page they feed.
+fn od_panel_set<'a>(
+    results: &'a [ValidationResult],
+    orbit_comparisons: &'a [crate::schema::OrbitComparison],
+) -> OdPanelSet<'a> {
     // sigma_equiv per object, canonical sbdb direction (empyrean's fit at
     // JPL's own published epoch). `Some(None)` records a present-but-non-SPD
     // reference; absent keys have no comparison record at all.
@@ -3720,6 +3881,8 @@ fn build_od_closeness_grid(
                     n_obs: r.n_obs_used,
                     chi2: r.od_reduced_chi2,
                     reason: None,
+                    flag: None,
+                    under_coverage_floor: false,
                 },
             );
         }
@@ -3734,6 +3897,8 @@ fn build_od_closeness_grid(
                     n_obs: r.n_obs_used,
                     chi2: r.od_reduced_chi2,
                     reason: None,
+                    flag: None,
+                    under_coverage_floor: false,
                 },
             );
         }
@@ -3790,7 +3955,12 @@ fn build_od_closeness_grid(
             .collect();
         failed_arcs.sort_by(|a, b| (&a.object, &a.test_type).cmp(&(&b.object, &b.test_type)));
         for r in failed_arcs {
-            let short: String = r.notes.trim().chars().take(60).collect();
+            // Shortened before it is cut to 60 characters, so a runner path the cut
+            // would split is still recognised.
+            let short: String = shorten_runner_path(r.notes.trim())
+                .chars()
+                .take(60)
+                .collect();
             fails.push(format!(
                 "<tr><td class=\"od-fail-name\">{}</td><td>empyrean</td><td title=\"{}\">{}</td></tr>",
                 attr_escape(&r.object),
@@ -3809,6 +3979,7 @@ fn build_od_closeness_grid(
             radar,
             optical_absent: HashMap::new(),
             radar_absent: HashMap::new(),
+            counts,
             summary,
             summary_title,
             fails,
@@ -3868,12 +4039,38 @@ fn build_od_closeness_grid(
             radar,
             optical_absent,
             radar_absent,
+            counts,
             summary,
             summary_title: String::new(),
             fails: Vec::new(),
             conflicts,
         });
     }
+
+    OdPanelSet {
+        panels,
+        block_order,
+        radar_objs,
+        radar_counts,
+    }
+}
+
+/// Build the H3 orbit-determination panels: one tool's fits against one
+/// reference per panel, following the Tool and Reference selects exactly as the
+/// propagation (1.1A) and ephemeris (1.2A) pair-panels do. The default panel is
+/// empyrean vs JPL; each other legal pair with comparison records is a hidden
+/// panel the selector reveals, and a pair with no records shows the generic
+/// hatched "not compared" line. The cross-fitter comparison lives in Part 2.
+fn build_od_closeness_grid(
+    results: &[ValidationResult],
+    orbit_comparisons: &[crate::schema::OrbitComparison],
+) -> String {
+    let OdPanelSet {
+        panels,
+        block_order,
+        radar_objs,
+        radar_counts,
+    } = od_panel_set(results, orbit_comparisons);
 
     // ── Render ──
     let mut h = String::new();
@@ -4170,18 +4367,33 @@ fn wrap_arcsec(mut d: f64) -> f64 {
 /// objects that reached DIFF, compared count, bit-identical count, max diff.
 type FidAgg = (FidState, BTreeSet<String>, usize, usize, f64);
 
-/// Build the H4 channel-fidelity grid: the four-state channel × test-type
-/// summary and the complete per-object grid beneath it.
-fn build_channel_fidelity_grid(results: &[ValidationResult]) -> String {
-    // Distribution channels the report validates against core.
-    let channels = ["rust", "python", "cli", "c"];
-    // (row test_type, header, is_angular, ulp floor, physical floor).
-    let test_types = [
-        ("propagation", "propagation", false, 1e-10, 1.0),
-        ("ephemeris", "ephemeris", true, 1e-6, 1e-3),
-        ("orbit_determination", "orbit det.", false, 1e-10, 1.0),
-    ];
+/// The distribution channels the report validates against core, in the order the
+/// fidelity matrix lists them.
+const FID_CHANNELS: [&str; 4] = ["rust", "python", "cli", "c"];
 
+/// The fidelity matrix's axes: (row test_type, header, is_angular, ulp floor,
+/// physical floor).
+const FID_TEST_TYPES: [(&str, &str, bool, f64, f64); 3] = [
+    ("propagation", "propagation", false, 1e-10, 1.0),
+    ("ephemeris", "ephemeris", true, 1e-6, 1e-3),
+    ("orbit_determination", "orbit det.", false, 1e-10, 1.0),
+];
+
+/// Every channel-vs-core agreement the fidelity matrix and the per-object grid
+/// read, computed once from the rows. The summary card reads the same cells, so
+/// the card and the matrix cannot disagree.
+struct FidelityAgg {
+    /// Per (channel, test_type): worst state, the objects that hit DIFF, the
+    /// compared and bit-identical counts, and the max difference.
+    cell: HashMap<(&'static str, &'static str), FidAgg>,
+    /// Per (channel, test_type, object): worst state (for the per-object grid).
+    obj_cell: HashMap<(&'static str, &'static str, String), FidState>,
+    /// The channels that carry any row.
+    present: BTreeSet<&'static str>,
+}
+
+/// Aggregate the channel-vs-core differences (see [`FidelityAgg`]).
+fn fidelity_agg(results: &[ValidationResult]) -> FidelityAgg {
     // Index core rows by the same key rollup_channels uses.
     type Key = (String, i64, String, String, Option<String>, Option<String>);
     let key_of = |r: &ValidationResult| -> Key {
@@ -4202,26 +4414,25 @@ fn build_channel_fidelity_grid(results: &[ValidationResult]) -> String {
         }
     }
 
-    // Per (channel, test_type): worst state, the objects that hit DIFF, the
-    // compared and bit-identical counts, and the max difference.
-    // Per (channel, test_type, object): worst state (for the per-object grid).
-    let mut cell: HashMap<(&str, &str), FidAgg> = HashMap::new();
-    let mut obj_cell: HashMap<(&str, &str, String), FidState> = HashMap::new();
-    let mut present: BTreeSet<&str> = BTreeSet::new();
+    let mut cell: HashMap<(&'static str, &'static str), FidAgg> = HashMap::new();
+    let mut obj_cell: HashMap<(&'static str, &'static str, String), FidState> = HashMap::new();
+    let mut present: BTreeSet<&'static str> = BTreeSet::new();
     for r in results {
         if r.channel == "core" || is_timing_only_uncertainty(r.propagation_uncertainty.as_deref()) {
             continue;
         }
-        let ch = match channels.iter().find(|&&c| c == r.channel) {
+        let ch = match FID_CHANNELS.iter().find(|&&c| c == r.channel) {
             Some(&c) => c,
             None => continue,
         };
         present.insert(ch);
-        let (tt_key, _, is_ang, ulp, phys) =
-            match test_types.iter().find(|(k, _, _, _, _)| *k == r.test_type) {
-                Some(t) => *t,
-                None => continue,
-            };
+        let (tt_key, _, is_ang, ulp, phys) = match FID_TEST_TYPES
+            .iter()
+            .find(|(k, _, _, _, _)| *k == r.test_type)
+        {
+            Some(t) => *t,
+            None => continue,
+        };
         let Some(core) = core_by_key.get(&key_of(r)) else {
             continue;
         };
@@ -4264,15 +4475,35 @@ fn build_channel_fidelity_grid(results: &[ValidationResult]) -> String {
             .or_insert(FidState::Exact);
         *oc = (*oc).max(st);
     }
+    FidelityAgg {
+        cell,
+        obj_cell,
+        present,
+    }
+}
 
-    let is_angular_tt = |tt: &str| tt == "ephemeris";
-    let fmt_amt = |tt: &str, v: f64| -> String {
-        if is_angular_tt(tt) {
-            fmt_arcsec(v)
-        } else {
-            fmt_error(Some(v))
-        }
-    };
+/// The text a fidelity cell shows for a maximum difference on `tt`: arcsec on the
+/// ephemeris axis, a position offset elsewhere.
+fn fid_amount_text(tt: &str, v: f64) -> String {
+    if tt == "ephemeris" {
+        fmt_arcsec(v)
+    } else {
+        fmt_error(Some(v))
+    }
+}
+
+/// Build the H4 channel-fidelity grid: the four-state channel × test-type
+/// summary and the complete per-object grid beneath it.
+fn build_channel_fidelity_grid(results: &[ValidationResult]) -> String {
+    let channels = FID_CHANNELS;
+    let test_types = FID_TEST_TYPES;
+    let FidelityAgg {
+        cell,
+        obj_cell,
+        present,
+    } = fidelity_agg(results);
+
+    let fmt_amt = fid_amount_text;
 
     // ── Summary: channels bit-identical on at least one axis ──────────
     let n_present = channels.iter().filter(|c| present.contains(*c)).count();
@@ -4862,6 +5093,19 @@ fn empyrean_convergence_cell(
 // Each external fitter reads its own folded fields off the reference-channel
 // row, the same fields the Part 2 panels read. None fold an iteration count.
 
+/// find_orb used under half of the observations it was given (the 50% coverage
+/// floor): its placeholder-orbit fallback, not a fit. The one rule the
+/// convergence cell and the known-exceptions strip both read.
+fn findorb_under_coverage_floor(r: &ValidationResult) -> bool {
+    match (r.findorb_n_obs_used, r.findorb_n_obs_rejected) {
+        (Some(used), Some(rejected)) => {
+            let total = used + rejected;
+            total > 0 && f64::from(used) / f64::from(total) < 0.5
+        }
+        _ => false,
+    }
+}
+
 fn findorb_convergence_cell(r: &ValidationResult) -> ConvergenceCell {
     if r.findorb_rms_residual.is_none() && r.findorb_n_obs_used.is_none() {
         return ConvergenceCell::NotAttempted {
@@ -4872,17 +5116,17 @@ fn findorb_convergence_cell(r: &ValidationResult) -> ConvergenceCell {
                 .to_string(),
         };
     }
-    if let (Some(used), Some(rejected)) = (r.findorb_n_obs_used, r.findorb_n_obs_rejected) {
+    if let (Some(used), Some(rejected)) = (r.findorb_n_obs_used, r.findorb_n_obs_rejected)
+        && findorb_under_coverage_floor(r)
+    {
         let total = used + rejected;
-        if total > 0 && f64::from(used) / f64::from(total) < 0.5 {
-            return ConvergenceCell::NotConverged {
-                reason: Some(format!(
-                    "find_orb used {used}/{total} observations ({:.1}%), below the 50% coverage \
-                     floor, its placeholder-orbit fallback rather than a fit",
-                    100.0 * f64::from(used) / f64::from(total)
-                )),
-            };
-        }
+        return ConvergenceCell::NotConverged {
+            reason: Some(format!(
+                "find_orb used {used}/{total} observations ({:.1}%), below the 50% coverage \
+                 floor, its placeholder-orbit fallback rather than a fit",
+                100.0 * f64::from(used) / f64::from(total)
+            )),
+        };
     }
     ConvergenceCell::Converged { iterations: None }
 }
@@ -6315,15 +6559,94 @@ fn cov_pathology(c: &crate::schema::OrbitComparison) -> &'static str {
     "scale-only"
 }
 
+/// What the covariance-realism table (4.1) and the uncertainty card state: the
+/// observed σ_eq statistics over the objects with a comparison record, radar-
+/// informed JPL objects excluded (optical-only is not like for like with them).
+/// Counted in objects from the one exclusion set (matches §1.3A); the SBDB
+/// record tally rides in the table header's hover.
+struct CovStats {
+    /// SBDB records excluded across the radar objects.
+    n_radar_excl_recs: usize,
+    /// Radar objects excluded.
+    n_radar_excl_objs: usize,
+    /// Records with a finite σ_eq, the denominator of every fraction.
+    n_finite: usize,
+    /// Records kept after the radar exclusion.
+    n_total: usize,
+    /// Median σ_eq (NaN when none is finite).
+    med: f64,
+    /// Finite records with σ_eq ≤ 1, ≤ 3 and > 10.
+    le1: usize,
+    le3: usize,
+    gt10: usize,
+}
+
+/// Expected median σ_eq of a 6-DOF chi distribution, χ(6)/√6.
+const COV_EXPECTED_MEDIAN: &str = "0.944";
+/// Expected fraction of a 6-DOF chi distribution within 1σ_eq, as the table prints it.
+const COV_EXPECTED_LE1: &str = "57.7%";
+/// Expected fraction within 3σ_eq, as the table prints it.
+const COV_EXPECTED_LE3: &str = "~100%";
+
+/// The [`CovStats`] of the canonical sbdb-direction records.
+fn cov_stats(
+    recs: &[&crate::schema::OrbitComparison],
+    radar_counts: &BTreeMap<&str, (u32, u32)>,
+) -> CovStats {
+    let n_radar_excl_recs = recs
+        .iter()
+        .filter(|c| radar_counts.contains_key(c.object.as_str()))
+        .count();
+    let n_radar_excl_objs = radar_counts.len();
+    let finite: Vec<f64> = recs
+        .iter()
+        .filter(|c| !radar_counts.contains_key(c.object.as_str()))
+        .filter(|c| c.sigma_equiv_combined.is_finite())
+        .map(|c| c.sigma_equiv_combined)
+        .collect();
+    let n_finite = finite.len();
+    let n_total = recs
+        .iter()
+        .filter(|c| !radar_counts.contains_key(c.object.as_str()))
+        .count();
+    let mut fs = finite.clone();
+    let med = if fs.is_empty() {
+        f64::NAN
+    } else {
+        percentile(&mut fs, 0.5)
+    };
+    let le1 = finite.iter().filter(|&&v| v <= 1.0).count();
+    let le3 = finite.iter().filter(|&&v| v <= 3.0).count();
+    let gt10 = finite.iter().filter(|&&v| v > 10.0).count();
+    CovStats {
+        n_radar_excl_recs,
+        n_radar_excl_objs,
+        n_finite,
+        n_total,
+        med,
+        le1,
+        le3,
+        gt10,
+    }
+}
+
+/// The canonical sbdb-direction orbit-comparison records (empyrean's fit at JPL's
+/// own published epoch).
+fn sbdb_records(
+    orbit_comparisons: &[crate::schema::OrbitComparison],
+) -> Vec<&crate::schema::OrbitComparison> {
+    orbit_comparisons
+        .iter()
+        .filter(|c| c.common_epoch_source == "sbdb")
+        .collect()
+}
+
 fn build_covariance_realism_html(
     results: &[ValidationResult],
     orbit_comparisons: &[crate::schema::OrbitComparison],
 ) -> String {
     // Canonical sbdb-direction records.
-    let recs: Vec<&crate::schema::OrbitComparison> = orbit_comparisons
-        .iter()
-        .filter(|c| c.common_epoch_source == "sbdb")
-        .collect();
+    let recs = sbdb_records(orbit_comparisons);
     // Objects whose JPL solution used radar: their rows stay visible in the
     // per-object table (hatched, reason on hover) but are out of the coverage
     // statistics. One set, shared with §1.3A and Part 2.
@@ -6350,36 +6673,16 @@ fn build_covariance_realism_html(
         }
     }
 
-    // Coverage against chi(6)/sqrt(6): expected median 0.944, fraction ≤1 57.7%.
-    // Radar-informed JPL objects are out of the statistics (optical-only is not
-    // like for like); the excluded count is stated in the coverage-table header.
-    // Stated in OBJECTS from the one exclusion set (matches §1.3A); the SBDB
-    // record tally rides in the header hover.
-    let n_radar_excl_recs = recs
-        .iter()
-        .filter(|c| radar_counts.contains_key(c.object.as_str()))
-        .count();
-    let n_radar_excl_objs = radar_counts.len();
-    let finite: Vec<f64> = recs
-        .iter()
-        .filter(|c| !radar_counts.contains_key(c.object.as_str()))
-        .filter(|c| c.sigma_equiv_combined.is_finite())
-        .map(|c| c.sigma_equiv_combined)
-        .collect();
-    let n_finite = finite.len();
-    let n_total = recs
-        .iter()
-        .filter(|c| !radar_counts.contains_key(c.object.as_str()))
-        .count();
-    let mut fs = finite.clone();
-    let med = if fs.is_empty() {
-        f64::NAN
-    } else {
-        percentile(&mut fs, 0.5)
-    };
-    let le1 = finite.iter().filter(|&&v| v <= 1.0).count();
-    let le3 = finite.iter().filter(|&&v| v <= 3.0).count();
-    let gt10 = finite.iter().filter(|&&v| v > 10.0).count();
+    let CovStats {
+        n_radar_excl_recs,
+        n_radar_excl_objs,
+        n_finite,
+        n_total,
+        med,
+        le1,
+        le3,
+        gt10,
+    } = cov_stats(&recs, &radar_counts);
     let pct = |n: usize, d: usize| {
         if d > 0 {
             100.0 * n as f64 / d as f64
@@ -6399,9 +6702,9 @@ fn build_covariance_realism_html(
         "<div class=\"grid-scroll\"><table class=\"agrid covtab\"><thead><tr><th class=\"gobj\">statistic</th><th>{}</th><th title=\"{n_radar_excl_recs} SBDB records excluded across the radar objects\">observed · {n_finite} finite of {n_total} · {n_radar_excl_objs} radar objects excluded</th></tr></thead><tbody>",
         uhdr("expected · χ(6)/√6"),
     ));
-    h.push_str(&format!("<tr class=\"gsub\"><td class=\"gtool\">median σ_eq</td><td class=\"r1c\">0.944</td><td class=\"r1c\">{med:.2}</td></tr>"));
-    h.push_str(&format!("<tr class=\"gsub\"><td class=\"gtool\">fraction ≤ 1σ</td><td class=\"r1c\">57.7%</td><td class=\"r1c\">{:.0}% ({}/{})</td></tr>", pct(le1, n_finite), le1, n_finite));
-    h.push_str(&format!("<tr class=\"gsub\"><td class=\"gtool\">fraction ≤ 3σ</td><td class=\"r1c\">~100%</td><td class=\"r1c\">{:.0}% ({}/{})</td></tr>", pct(le3, n_finite), le3, n_finite));
+    h.push_str(&format!("<tr class=\"gsub\"><td class=\"gtool\">median σ_eq</td><td class=\"r1c\">{COV_EXPECTED_MEDIAN}</td><td class=\"r1c\">{med:.2}</td></tr>"));
+    h.push_str(&format!("<tr class=\"gsub\"><td class=\"gtool\">fraction ≤ 1σ</td><td class=\"r1c\">{COV_EXPECTED_LE1}</td><td class=\"r1c\">{:.0}% ({}/{})</td></tr>", pct(le1, n_finite), le1, n_finite));
+    h.push_str(&format!("<tr class=\"gsub\"><td class=\"gtool\">fraction ≤ 3σ</td><td class=\"r1c\">{COV_EXPECTED_LE3}</td><td class=\"r1c\">{:.0}% ({}/{})</td></tr>", pct(le3, n_finite), le3, n_finite));
     h.push_str(&format!("<tr class=\"gsub\"><td class=\"gtool\">entries beyond 10σ</td><td class=\"r1c\">~0</td><td class=\"r1c\">{gt10}</td></tr>"));
     h.push_str("</tbody></table></div>");
 
@@ -7292,50 +7595,62 @@ fn tstat(mut v: Vec<f64>) -> Option<TStat> {
     })
 }
 
+/// empyrean's wall clock on `tt` (one arm, or every arm): the rust channel's rows,
+/// the core channel's when rust has none (`true` says it fell back). The one
+/// reading the Part 2 timing matrix and the summary card share.
+fn emp_timing(results: &[ValidationResult], tt: &str, arm: Option<&str>) -> (Option<TStat>, bool) {
+    for ch in ["rust", "core"] {
+        let vals: Vec<f64> = results
+            .iter()
+            .filter(|r| {
+                r.channel == ch
+                    && r.test_type == tt
+                    && arm
+                        .map(|a| r.propagation_uncertainty.as_deref() == Some(a))
+                        .unwrap_or(true)
+            })
+            .filter_map(|r| r.emp_time_ms)
+            .collect();
+        if let Some(s) = tstat(vals) {
+            return (Some(s), ch == "core");
+        }
+    }
+    (None, false)
+}
+
+/// An external tool's wall clock on `tt`, by its own timing field.
+fn ext_timing(
+    results: &[ValidationResult],
+    tt: &str,
+    f: &dyn Fn(&ValidationResult) -> Option<f64>,
+) -> Option<TStat> {
+    tstat(
+        results
+            .iter()
+            .filter(|r| r.test_type == tt)
+            .filter_map(f)
+            .collect(),
+    )
+}
+
+/// ASSIST's wall clock on one of its arms (rows on the `assist` channel).
+fn assist_timing(results: &[ValidationResult], arm: &str) -> Option<TStat> {
+    tstat(
+        results
+            .iter()
+            .filter(|r| r.channel == "assist" && r.propagation_uncertainty.as_deref() == Some(arm))
+            .filter_map(|r| r.assist_time_ms)
+            .collect(),
+    )
+}
+
 /// Part-2 T1: every timing arm as a numbers-only matrix (p5 / p50 / p95 / n),
 /// grouped by boundary, the dot strip's rows, ported. No ratio column; the
 /// reader deduces. JPL is a hatched "not timed" row, an absent tool is hatched.
 fn build_part2_timing_t1(results: &[ValidationResult]) -> String {
-    // empyrean: rust preferred, core fall-back (labelled).
-    let emp = |tt: &str, arm: Option<&'static str>| -> (Option<TStat>, bool) {
-        for ch in ["rust", "core"] {
-            let vals: Vec<f64> = results
-                .iter()
-                .filter(|r| {
-                    r.channel == ch
-                        && r.test_type == tt
-                        && arm
-                            .map(|a| r.propagation_uncertainty.as_deref() == Some(a))
-                            .unwrap_or(true)
-                })
-                .filter_map(|r| r.emp_time_ms)
-                .collect();
-            if let Some(s) = tstat(vals) {
-                return (Some(s), ch == "core");
-            }
-        }
-        (None, false)
-    };
-    let ext = |tt: &str, f: &dyn Fn(&ValidationResult) -> Option<f64>| -> Option<TStat> {
-        tstat(
-            results
-                .iter()
-                .filter(|r| r.test_type == tt)
-                .filter_map(f)
-                .collect(),
-        )
-    };
-    let assist = |arm: &'static str| -> Option<TStat> {
-        tstat(
-            results
-                .iter()
-                .filter(|r| {
-                    r.channel == "assist" && r.propagation_uncertainty.as_deref() == Some(arm)
-                })
-                .filter_map(|r| r.assist_time_ms)
-                .collect(),
-        )
-    };
+    let emp = |tt: &str, arm: Option<&'static str>| emp_timing(results, tt, arm);
+    let ext = |tt: &str, f: &dyn Fn(&ValidationResult) -> Option<f64>| ext_timing(results, tt, f);
+    let assist = |arm: &'static str| assist_timing(results, arm);
     // S3 item 5: the capped (loud-FAIL) count per ASSIST arm, a row whose
     // adaptive step collapsed before the target epoch carries a null
     // `assist_time_ms`, so it is excluded from the percentiles above. Counted
@@ -9900,7 +10215,7 @@ fn config_assist_subsection(results: &[ValidationResult]) -> String {
         ),
     ];
     let mut rows_html = String::new();
-    let mut version: Option<String> = None;
+    let version = assist_version(results);
     for (arm, cfg_label, variational) in ARMS {
         let Some(rep) = results
             .iter()
@@ -9908,10 +10223,7 @@ fn config_assist_subsection(results: &[ValidationResult]) -> String {
         else {
             continue;
         };
-        let (kv, ver) = parse_assist_note(&rep.notes);
-        if version.is_none() {
-            version = ver;
-        }
+        let (kv, _) = parse_assist_note(&rep.notes);
         let cell = |k: &str| {
             kv.get(k)
                 .map(|v| format!("<code>{v}</code>"))
@@ -9962,6 +10274,24 @@ fn config_generic_subsection(
     )
 }
 
+/// The version a run recorded for tool `key` (`merge-external` folds it onto the
+/// rows as `tool_versions`). The one reading the Configurations appendix and the
+/// cite block share.
+fn recorded_tool_version(results: &[ValidationResult], key: &str) -> Option<String> {
+    results
+        .iter()
+        .find_map(|r| r.tool_versions.as_ref().and_then(|m| m.get(key)).cloned())
+}
+
+/// ASSIST's version, read from its arm rows' `config=` note (it records none in
+/// `tool_versions`): the first arm row that carries one.
+fn assist_version(results: &[ValidationResult]) -> Option<String> {
+    results
+        .iter()
+        .filter(|r| r.channel == "assist")
+        .find_map(|r| parse_assist_note(&r.notes).1)
+}
+
 /// A Configurations subsection built from the version and settings that
 /// `merge-external` folded onto the rows (`tool_versions` / `tool_settings`). The
 /// table lists exactly the recorded settings (alphabetical); nothing is typed here,
@@ -9972,9 +10302,7 @@ fn config_recorded_subsection(
     display: &str,
     method: &str,
 ) -> String {
-    let version = results
-        .iter()
-        .find_map(|r| r.tool_versions.as_ref().and_then(|m| m.get(key)).cloned());
+    let version = recorded_tool_version(results, key);
     let settings = results
         .iter()
         .filter_map(|r| r.tool_settings.as_ref().and_then(|m| m.get(key)))
@@ -10133,6 +10461,7 @@ fn render_failed_comparators(comparators: &[crate::comparators::ComparatorOutcom
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn generate_report(
     results: &[ValidationResult],
     orbit_comparisons: &[crate::schema::OrbitComparison],
@@ -10141,6 +10470,7 @@ pub fn generate_report(
     predict_agg: Option<&crate::predict_schema::PredictAggregates>,
     predict_runs: &[crate::predict_schema::PredictAggregates],
     comparators: &[crate::comparators::ComparatorOutcome],
+    archive_timestamp: Option<&str>,
 ) -> Result<(), String> {
     let core_results: Vec<&ValidationResult> =
         results.iter().filter(|r| r.channel == "core").collect();
@@ -10258,17 +10588,8 @@ pub fn generate_report(
     // selects can populate and switch the server-rendered pair-panels before the
     // fetched dataset arrives (they never need it). A BTreeSet keeps the emitted
     // literal stable across renders.
-    let mut tools_present: BTreeSet<&str> = BTreeSet::new();
-    tools_present.insert("empyrean");
+    let mut tools_present: BTreeSet<&str> = summary::tools_in_run(results);
     tools_present.insert("jpl");
-    // A registry tool is in the run when any row carries a field it measured, or
-    // when `od_tool_present` finds it was handed arcs (an error or an unsupported
-    // mark): one probe over the one registry, no hand-written list.
-    for spec in crate::tool_registry::externals() {
-        if results.iter().any(|r| spec.has_any(r)) || od_tool_present(spec.slug, results) {
-            tools_present.insert(spec.slug);
-        }
-    }
     let tools_present_json = serde_json::to_string(&tools_present).unwrap_or_default();
 
     // S5a: the "Configurations" appendix (A.3). One subsection per external
@@ -10303,7 +10624,7 @@ pub fn generate_report(
     };
     // The empyrean distribution version the component table reports, defined once
     // here and reused by the branded-export attribution so the two cannot drift.
-    let empyrean_version = "0.11.0-rc.1";
+    let empyrean_version = EMPYREAN_VERSION;
     // The branded-export attribution, built once server-side. It is emitted only
     // into the client script (never as visible page text); the download handler
     // appends each chart's own section, title and selected pair at click time.
@@ -10492,7 +10813,26 @@ pub fn generate_report(
     );
     let part1_sections = format!("{s1_1}{s1_2}{s1_3}");
     let part1_head = part1_head_html();
-    let part1_facts = part1_facts_html(&part1_facts(results));
+    let p1_facts = part1_facts(results);
+    let part1_facts = part1_facts_html(&p1_facts);
+    // The summary layer: its data computed once from the rows, then the masthead
+    // and the layer rendered from it. The layer is spliced in after every
+    // placeholder of the page has been replaced (see the end of this function).
+    let summary_data = summary::build_summary(
+        results,
+        orbit_comparisons,
+        archive_timestamp,
+        &summary::RunFacts {
+            n_objects,
+            n_populations,
+            dt_values: &dt_values,
+            epoch_mjd_tdb: p1_facts.epoch_mjd,
+            run_date: report_run_date,
+        },
+    );
+    let masthead_html = summary::masthead_html(&summary_data, "validation.json");
+    let summary_layer = summary::layer_html(&summary_data);
+    let cite_block = summary::cite_html(&summary_data);
     // S7 item 3: the whole sidebar generated from the part/section tree.
     let rail_html = build_rail_html();
 
@@ -10772,17 +11112,6 @@ pub fn generate_report(
      section's 60px gutter), so masthead and every section share one left edge
      at 1440 and 1920; the ≤1100px block below drops it back to the 20px gutter
      when the rail hides. */
-  .masthead {{ padding: 48px 60px 22px 270px; max-width: 1600px; margin: 0 auto; border-bottom: 1px solid var(--ed-border); }}
-  .masthead .mh-eyebrow {{ font-family: var(--ed-font-mono); font-size: 10px; color: var(--ed-accent); letter-spacing: 1.5px; text-transform: uppercase; }}
-  .masthead h1 {{ font-family: var(--ed-font-display); font-weight: 700; font-size: 34px; letter-spacing: -0.5px; margin: 6px 0 10px; }}
-  .masthead h1 .mh-dim {{ color: var(--ed-text-muted); }}
-  .mh-prov {{ font-family: var(--ed-font-mono); font-size: 11px; color: var(--ed-text-muted); line-height: 1.7; margin-top: 6px; }}
-  .mh-link {{ color: var(--ed-accent); text-decoration: none; }}
-  .mh-controls {{ display: flex; align-items: center; gap: 12px; flex-wrap: wrap; margin-top: 16px; font-family: var(--ed-font-mono); font-size: 13px; }}
-  .shownum {{ display: inline-flex; align-items: center; gap: 6px; color: var(--ed-text-secondary); cursor: pointer; }}
-  .mh-toggle {{ background: var(--ed-input-bg); color: var(--ed-text-secondary); border: 1px solid var(--ed-input-border); border-radius: var(--ed-radius-sm); padding: 5px 10px; cursor: pointer; font-family: var(--ed-font-mono); font-size: 12px; }}
-  .mh-toggle:hover, .mh-toggle.active {{ color: var(--ed-accent); border-color: var(--ed-accent); }}
-  .mh-toggle.active {{ background: var(--ed-surface-raised); }}
 
   /* Layout, sticky left rail + single-scroll content column. */
   .layout-wrap {{ display: flex; gap: 0; max-width: 1600px; margin: 0 auto; align-items: flex-start; }}
@@ -10798,7 +11127,7 @@ pub fn generate_report(
      (2.1/2.2/2.3), Part 3, Part 4, then the appendix (run summary, external
      tools, configurations, provenance). No flex `order` reorders any section, so
      the DOM order is the visual order the reader and the scroll-spy both see. */
-  @media (max-width: 1100px) {{ .rail {{ display: none; }} .masthead {{ padding: 32px 20px 18px; }} }}
+  @media (max-width: 1100px) {{ .rail {{ display: none; }} }}
 
   /* S5 item 1: the Part head is a left-aligned stack, a mono eyebrow over a
      Syne title, flush on the content edge (no centring, no max-width box), so
@@ -11116,7 +11445,6 @@ pub fn generate_report(
     --ed-scrollbar-thumb: #c3ccd8; --ed-scrollbar-hover: #a8b4c2;
     --ed-chart-grid: rgba(40,80,130,0.14);
   }}
-  :root.theme-light .masthead h1 .mh-dim {{ color: var(--ed-text-muted); }}
   /* Light-theme ladder backgrounds and ink are generated with the dark ones (see
      the {{ladder_css}} block above); no per-bin light overrides live here. */
   :root.theme-light .gc.mg::before {{ color: rgba(0,0,0,0.72); }}
@@ -11129,19 +11457,13 @@ pub fn generate_report(
   :root.theme-light .grid-key .gk-sw.st-tol {{ background: #e6d3a0; }}
   :root.theme-light .grid-key .gk-sw.st-diff {{ background: #e8b3a8; }}
   :root.theme-light .grid-key .gk-sw.rw {{ background: #d3e3f0; }}
+{summary_css}
 </style>
 </head>
 <body class="shownums">
 
-<div class="masthead">
-  <div class="mh-eyebrow">Validation Report</div>
-  <h1>EMPYREAN <span class="mh-dim">DYNAMICS</span></h1>
-  <div class="mh-prov"><a href="#s13" class="mh-link" title="provenance &amp; references">provenance</a> &nbsp;·&nbsp; <a href="validation.json" download class="mh-link" title="download the run's full results JSON">results</a></div>
-  <div class="mh-controls">
-    <label class="shownum"><input type="checkbox" id="show-numbers" checked> show numbers</label>
-    <button id="theme-toggle" class="mh-toggle" title="Toggle light / dark theme" aria-label="Toggle light or dark theme">◐ theme</button>
-  </div>
-</div>
+{masthead_html}
+{summary_layer}
 
 <div class="layout-wrap">
 <nav class="rail" id="rail" aria-label="Contents">
@@ -11244,12 +11566,12 @@ pub fn generate_report(
   <table class="agrid list" data-grid="list" style="max-width:720px; margin-bottom:6px;">
     <thead><tr><th style="text-align:left">Component</th><th style="text-align:left">Purpose</th><th>Version</th></tr></thead>
     <tbody>
-      <tr><td style="text-align:left">hyperjet</td><td style="text-align:left">Automatic differentiation, STMs / STTs</td><td>1.15.0</td></tr>
-      <tr><td style="text-align:left">empyrean-core</td><td style="text-align:left">Reference channel (<code>validate-core</code>)</td><td>0.11.1</td></tr>
+      <tr><td style="text-align:left">hyperjet</td><td style="text-align:left">Automatic differentiation, STMs / STTs</td><td>{version_hyperjet}</td></tr>
+      <tr><td style="text-align:left">empyrean-core</td><td style="text-align:left">Reference channel (<code>validate-core</code>)</td><td>{version_empyrean_core}</td></tr>
       <tr><td style="text-align:left">empyrean</td><td style="text-align:left">Distribution under test, Rust wrapper, C ABI, Python wheel, CLI</td><td>{empyrean_version}</td></tr>
       <tr><td style="text-align:left">empyrean-py</td><td style="text-align:left">Python wheel</td><td>{empyrean_version}</td></tr>
       <tr><td style="text-align:left">empyrean-cli</td><td style="text-align:left">Command-line interface</td><td>{empyrean_version}</td></tr>
-      <tr><td style="text-align:left">C ABI</td><td style="text-align:left"><code>EMPYREAN_ABI_VERSION</code>, equality-checked at load</td><td>1100</td></tr>
+      <tr><td style="text-align:left">C ABI</td><td style="text-align:left"><code>EMPYREAN_ABI_VERSION</code>, equality-checked at load</td><td>{version_c_abi}</td></tr>
     </tbody>
   </table>
   </div>
@@ -11315,6 +11637,7 @@ pub fn generate_report(
 {configurations_section}
 
 {provenance_footer_html}
+<!--CITE_BLOCK-->
 </main>
 </div>
 
@@ -13090,6 +13413,9 @@ loadPredict();
         chart_h = FULL_CHART_HEIGHT_PX,
         rail_html = rail_html,
         part1_head = part1_head,
+        masthead_html = masthead_html,
+        summary_layer = "<!--SUMMARY_LAYER-->",
+        summary_css = summary::SUMMARY_CSS,
         part1_facts = part1_facts,
         part1_sections = part1_sections,
         part2_sections = part2_sections,
@@ -13115,6 +13441,9 @@ loadPredict();
         provenance_footer_html = provenance_footer_html,
         configurations_section = configurations_section,
         empyrean_version = empyrean_version,
+        version_hyperjet = VERSION_HYPERJET,
+        version_empyrean_core = VERSION_EMPYREAN_CORE,
+        version_c_abi = VERSION_C_ABI,
     );
 
     // Write the dataset (and fail loudly) BEFORE the HTML, and hand the page a
@@ -13215,6 +13544,10 @@ loadPredict();
     let html = html.replace("DISAGREEMENT_JSON", &disagreement_json);
     let html = html.replace("METHOD_RENDER_JS", METHOD_RENDER_JS);
     let html = html.replace("RADAR_EXCLUDED_JSON", &radar_excluded_json);
+    // Last: the summary layer carries tool names and error text, which no
+    // placeholder above may rewrite.
+    let html = html.replace("<!--SUMMARY_LAYER-->", &summary_layer);
+    let html = html.replace("<!--CITE_BLOCK-->", &cite_block);
 
     std::fs::write(output, html).map_err(|e| format!("Failed to write report: {e}"))
 }
@@ -13457,6 +13790,15 @@ fn project_dataset_json(results: &[ValidationResult]) -> Result<String, String> 
         let kept: serde_json::Map<String, serde_json::Value> = map
             .into_iter()
             .filter(|(k, _)| keep.contains(k.as_str()))
+            .map(|(k, v)| match v {
+                // Tool and engine text the page shows (the row's notes) loses the
+                // runner's work-directory prefix here, as in the HTML escape.
+                serde_json::Value::String(t) => (
+                    k,
+                    serde_json::Value::String(shorten_runner_path(&t).into_owned()),
+                ),
+                other => (k, other),
+            })
             .collect();
         out.push_str(&serde_json::to_string(&kept).map_err(|e| format!("serialize row {i}: {e}"))?);
     }
@@ -13572,7 +13914,7 @@ mod tests {
         let rows = vec![synthetic_rust_prop_row("Apophis", 0.0)];
         let dir = tempfile::tempdir().unwrap();
         let out = dir.path().join("report.html");
-        generate_report(&rows, &[], &out, None, None, &[], &[]).unwrap();
+        generate_report(&rows, &[], &out, None, None, &[], &[], None).unwrap();
         let html = std::fs::read_to_string(&out).unwrap();
 
         // The light page ground the finding measured against.
@@ -13668,7 +14010,7 @@ mod tests {
         let (rows, cmps) = radar_scenario();
         let dir = tempfile::tempdir().unwrap();
         let out = dir.path().join("report.html");
-        generate_report(&rows, &cmps, &out, None, None, &[], &[]).unwrap();
+        generate_report(&rows, &cmps, &out, None, None, &[], &[], None).unwrap();
         let raw = std::fs::read_to_string(&out).unwrap();
         // Excise <script>/<style> so `<th>` literals in the client JS source
         // (headers the browser builds at runtime) are not scanned as markup.
@@ -13727,7 +14069,7 @@ mod tests {
         ];
         let dir = tempfile::tempdir().unwrap();
         let out = dir.path().join("report.html");
-        let result = generate_report(&rows, &[], &out, None, None, &[], &[]);
+        let result = generate_report(&rows, &[], &out, None, None, &[], &[], None);
         assert!(result.is_ok(), "generate_report failed: {result:?}");
         let html = std::fs::read_to_string(&out).unwrap();
         assert!(html.contains("EMPYREAN"), "missing brand title");
@@ -13743,7 +14085,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let html = dir.path().join("report.html");
         let summary = dir.path().join("summary.json");
-        let result = generate_report(&rows, &[], &html, Some(&summary), None, &[], &[]);
+        let result = generate_report(&rows, &[], &html, Some(&summary), None, &[], &[], None);
         assert!(result.is_ok());
         let summary_json = std::fs::read_to_string(&summary).unwrap();
         let v: serde_json::Value = serde_json::from_str(&summary_json).unwrap();
@@ -13781,7 +14123,7 @@ mod tests {
         }];
         let dir = tempfile::tempdir().unwrap();
         let out = dir.path().join("report.html");
-        generate_report(&rows, &comps, &out, None, None, &[], &[]).unwrap();
+        generate_report(&rows, &comps, &out, None, None, &[], &[], None).unwrap();
         let html = std::fs::read_to_string(&out).unwrap();
         assert!(
             html.contains("Covariance realism"),
@@ -13885,7 +14227,7 @@ mod tests {
         ];
         let dir = tempfile::tempdir().unwrap();
         let out = dir.path().join("report.html");
-        generate_report(&rows, &[], &out, None, None, &[], &[]).unwrap();
+        generate_report(&rows, &[], &out, None, None, &[], &[], None).unwrap();
         std::fs::read_to_string(&out).unwrap()
     }
 
@@ -14017,7 +14359,7 @@ mod tests {
         let agg = synthetic_predict_aggregates("snap");
         let dir = tempfile::tempdir().unwrap();
         let out = dir.path().join("report.html");
-        generate_report(&rows, &[], &out, None, Some(&agg), &[], &[]).unwrap();
+        generate_report(&rows, &[], &out, None, Some(&agg), &[], &[], None).unwrap();
         let raw = std::fs::read_to_string(&out).unwrap();
         let html = strip_tag(&strip_tag(&raw, "script"), "style");
         if let Some((tok, sid, ctx)) = scan(&html) {
@@ -14754,7 +15096,7 @@ mod tests {
         ];
         let dir = tempfile::tempdir().unwrap();
         let out = dir.path().join("report.html");
-        generate_report(&rows, &[], &out, None, None, &[], &[]).unwrap();
+        generate_report(&rows, &[], &out, None, None, &[], &[], None).unwrap();
         let html = std::fs::read_to_string(&out).unwrap();
 
         // (1) the sibling dataset holds the verbatim serialization.
@@ -14892,8 +15234,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let a = dir.path().join("report_a.html");
         let b = dir.path().join("report_b.html");
-        generate_report(&rows, &[], &a, None, None, &[], &[]).unwrap();
-        generate_report(&rows, &[], &b, None, None, &[], &[]).unwrap();
+        generate_report(&rows, &[], &a, None, None, &[], &[], None).unwrap();
+        generate_report(&rows, &[], &b, None, None, &[], &[], None).unwrap();
         assert!(dir.path().join("report_a.data.json").exists());
         assert!(dir.path().join("report_b.data.json").exists());
         assert!(
@@ -14925,8 +15267,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let out1 = dir.path().join("r1.html");
         let out2 = dir.path().join("r2.html");
-        generate_report(&rows, &[], &out1, None, None, &[], &[]).unwrap();
-        generate_report(&rows, &[], &out2, None, None, &[], &[]).unwrap();
+        generate_report(&rows, &[], &out1, None, None, &[], &[], None).unwrap();
+        generate_report(&rows, &[], &out2, None, None, &[], &[], None).unwrap();
         // The ONLY intended difference is the dataset file name each page cites.
         let s1 = std::fs::read_to_string(&out1)
             .unwrap()
@@ -14981,7 +15323,7 @@ mod tests {
         }
         let dir = tempfile::tempdir().unwrap();
         let out = dir.path().join("report.html");
-        generate_report(&rows, &[], &out, None, None, &[], &[]).unwrap();
+        generate_report(&rows, &[], &out, None, None, &[], &[], None).unwrap();
         let html = std::fs::read_to_string(&out).unwrap();
 
         // Exactly one hatch definition, everywhere on the page.
@@ -15778,7 +16120,7 @@ mod tests {
         let rows = timing_fixture();
         let dir = tempfile::tempdir().unwrap();
         let out = dir.path().join("report.html");
-        generate_report(&rows, &[], &out, None, None, &[], &[]).unwrap();
+        generate_report(&rows, &[], &out, None, None, &[], &[], None).unwrap();
         let html = std::fs::read_to_string(&out).unwrap();
 
         let all = ["empyrean", "assist", "findorb", "jpl", "kete", "jorbit"];
@@ -16031,7 +16373,7 @@ mod tests {
     fn run_summary_is_ordered_into_the_appendix_and_the_page_opens_on_part_one() {
         let dir = tempfile::tempdir().unwrap();
         let out = dir.path().join("report.html");
-        generate_report(&timing_fixture(), &[], &out, None, None, &[], &[]).unwrap();
+        generate_report(&timing_fixture(), &[], &out, None, None, &[], &[], None).unwrap();
         let html = std::fs::read_to_string(&out).unwrap();
         // S7 item 3: DOM order == visual order — no flex `order` reorders the
         // column, so byte position IS the on-page order. The page opens on Part 1
@@ -16062,7 +16404,7 @@ mod tests {
     fn part_two_hatched_cells_carry_their_reason_on_hover_only() {
         let dir = tempfile::tempdir().unwrap();
         let out = dir.path().join("report.html");
-        generate_report(&timing_fixture(), &[], &out, None, None, &[], &[]).unwrap();
+        generate_report(&timing_fixture(), &[], &out, None, None, &[], &[], None).unwrap();
         let html = std::fs::read_to_string(&out).unwrap();
         // S7: Part 2 is the three sections between the part2 and part3 heads.
         let start = html.find("id=\"part2\"").expect("Part 2 head");
@@ -16139,7 +16481,7 @@ mod tests {
 
         let dir = tempfile::tempdir().unwrap();
         let out = dir.path().join("report.html");
-        generate_report(&timing_fixture(), &[], &out, None, None, &[], &[]).unwrap();
+        generate_report(&timing_fixture(), &[], &out, None, None, &[], &[], None).unwrap();
         let html = std::fs::read_to_string(&out).unwrap();
         // S7: the rail names 2.1 by its axis (Propagation), never a "side by
         // side" ranking label.
@@ -16253,7 +16595,7 @@ mod tests {
         // console stays clean on the owner's local server.
         let dir = tempfile::tempdir().unwrap();
         let out = dir.path().join("report.html");
-        generate_report(&timing_fixture(), &[], &out, None, None, &[], &[]).unwrap();
+        generate_report(&timing_fixture(), &[], &out, None, None, &[], &[], None).unwrap();
         let html = std::fs::read_to_string(&out).unwrap();
         let head = &html[..html.find("</head>").expect("head present")];
         assert!(
@@ -16267,7 +16609,7 @@ mod tests {
         let rows = timing_fixture();
         let dir = tempfile::tempdir().unwrap();
         let out = dir.path().join("report.html");
-        generate_report(&rows, &[], &out, None, None, &[], &[]).unwrap();
+        generate_report(&rows, &[], &out, None, None, &[], &[], None).unwrap();
         let html = std::fs::read_to_string(&out).unwrap();
 
         let p2 = html.find("id=\"part2\"").expect("part2 anchor");
@@ -16321,7 +16663,7 @@ mod tests {
         assert_eq!(emp_eph_channel(&rows), ("core", true));
         let dir = tempfile::tempdir().unwrap();
         let out = dir.path().join("report.html");
-        generate_report(&rows, &[], &out, None, None, &[], &[]).unwrap();
+        generate_report(&rows, &[], &out, None, None, &[], &[], None).unwrap();
         let html = std::fs::read_to_string(&out).unwrap();
         assert!(
             html.contains("core channel</span>"),
@@ -16350,7 +16692,7 @@ mod tests {
         assert_eq!(picked, vec![5.0], "the rust ephemeris value must be used");
         let dir2 = tempfile::tempdir().unwrap();
         let out2 = dir2.path().join("report.html");
-        generate_report(&rows2, &[], &out2, None, None, &[], &[]).unwrap();
+        generate_report(&rows2, &[], &out2, None, None, &[], &[], None).unwrap();
         let html2 = std::fs::read_to_string(&out2).unwrap();
         assert!(
             !html2.contains("core channel</span>"),
@@ -16444,6 +16786,7 @@ mod tests {
             None,
             &[],
             &[],
+            None,
         )
         .unwrap();
         let html = std::fs::read_to_string(&out).unwrap();
@@ -16654,7 +16997,7 @@ mod tests {
     fn render_rows(rows: &[ValidationResult]) -> String {
         let dir = tempfile::tempdir().unwrap();
         let out = dir.path().join("report.html");
-        generate_report(rows, &[], &out, None, None, &[], &[]).unwrap();
+        generate_report(rows, &[], &out, None, None, &[], &[], None).unwrap();
         std::fs::read_to_string(&out).unwrap()
     }
 
@@ -16996,7 +17339,7 @@ mod tests {
         let agg = synthetic_predict_aggregates("snap");
         let dir = tempfile::tempdir().unwrap();
         let out = dir.path().join("report.html");
-        generate_report(&rows, &[], &out, None, Some(&agg), &[], &[]).unwrap();
+        generate_report(&rows, &[], &out, None, Some(&agg), &[], &[], None).unwrap();
         let html = std::fs::read_to_string(&out).unwrap();
         let f = html
             .find("function drawWalkTimeline(")
@@ -17032,8 +17375,17 @@ mod tests {
         let agg = synthetic_predict_aggregates("snap");
         let dir = tempfile::tempdir().unwrap();
         let out = dir.path().join("report.html");
-        generate_report(&rows, &[], &out, None, Some(&agg), &[], &[]).unwrap();
+        generate_report(&rows, &[], &out, None, Some(&agg), &[], &[], None).unwrap();
         let html = std::fs::read_to_string(&out).unwrap();
+        // The summary layer's one card matrix is its own component (`vr-fid`), not a
+        // grid of the page body this test audits.
+        let html = match html.find("<section class=\"vr-layer\"") {
+            Some(a) => {
+                let b = a + html[a..].find("</section>").expect("the layer closes") + 10;
+                format!("{}{}", &html[..a], &html[b..])
+            }
+            None => html,
+        };
         let mut n_tables = 0usize;
         let mut idx = 0usize;
         while let Some(rel) = html[idx..].find("<table") {
@@ -17304,7 +17656,7 @@ mod tests {
         // inside the merged 1.2 section (s06), between the B and C slot anchors.
         let dir = tempfile::tempdir().unwrap();
         let out = dir.path().join("report.html");
-        generate_report(&timing_fixture(), &[], &out, None, None, &[], &[]).unwrap();
+        generate_report(&timing_fixture(), &[], &out, None, None, &[], &[], None).unwrap();
         let html = std::fs::read_to_string(&out).unwrap();
 
         // The old split sections no longer exist as section anchors.
@@ -17357,7 +17709,7 @@ mod tests {
         // section.
         let dir = tempfile::tempdir().unwrap();
         let out = dir.path().join("report.html");
-        generate_report(&timing_fixture(), &[], &out, None, None, &[], &[]).unwrap();
+        generate_report(&timing_fixture(), &[], &out, None, None, &[], &[], None).unwrap();
         let html = std::fs::read_to_string(&out).unwrap();
         let num = |sid: &str| -> String {
             let at = html
@@ -17410,7 +17762,7 @@ mod tests {
         // read from the rows, in the eyebrow role under the title.
         let dir = tempfile::tempdir().unwrap();
         let out = dir.path().join("report.html");
-        generate_report(&timing_fixture(), &[], &out, None, None, &[], &[]).unwrap();
+        generate_report(&timing_fixture(), &[], &out, None, None, &[], &[], None).unwrap();
         let html = std::fs::read_to_string(&out).unwrap();
         let bar = html.find("id=\"part1-bar\"").expect("part1-bar");
         let p2 = html[bar..].find("id=\"part2\"").map(|e| bar + e).unwrap();
@@ -17445,7 +17797,7 @@ mod tests {
         // · error growth / · cost / · outliers entries are gone.
         let dir = tempfile::tempdir().unwrap();
         let out = dir.path().join("report.html");
-        generate_report(&timing_fixture(), &[], &out, None, None, &[], &[]).unwrap();
+        generate_report(&timing_fixture(), &[], &out, None, None, &[], &[], None).unwrap();
         let html = std::fs::read_to_string(&out).unwrap();
         let rail_at = html.find("<nav class=\"rail\"").expect("rail");
         let rail_end = html[rail_at..].find("</nav>").map(|e| rail_at + e).unwrap();
@@ -17487,7 +17839,7 @@ mod tests {
         // also keeps the ▸outliers itemised runaway list.
         let dir = tempfile::tempdir().unwrap();
         let out = dir.path().join("report.html");
-        generate_report(&timing_fixture(), &[], &out, None, None, &[], &[]).unwrap();
+        generate_report(&timing_fixture(), &[], &out, None, None, &[], &[], None).unwrap();
         let html = std::fs::read_to_string(&out).unwrap();
         let count_methods = |a: &str, b: &str| -> usize {
             let lo = html.find(a).unwrap();
@@ -17528,7 +17880,7 @@ mod tests {
         let (rows, cmp) = radar_scenario();
         let dir = tempfile::tempdir().unwrap();
         let out = dir.path().join("report.html");
-        generate_report(&rows, &cmp, &out, None, None, &[], &[]).unwrap();
+        generate_report(&rows, &cmp, &out, None, None, &[], &[], None).unwrap();
         let html = std::fs::read_to_string(&out).unwrap();
         assert!(
             !html.contains("Δr @epoch") && !html.contains("not in the sidecar schema yet"),
@@ -17561,7 +17913,7 @@ mod tests {
         // per-chart drawers and the divergent gMed estimator are gone.
         let dir = tempfile::tempdir().unwrap();
         let out = dir.path().join("report.html");
-        generate_report(&timing_fixture(), &[], &out, None, None, &[], &[]).unwrap();
+        generate_report(&timing_fixture(), &[], &out, None, None, &[], &[], None).unwrap();
         let html = std::fs::read_to_string(&out).unwrap();
         assert_eq!(
             html.matches("function drawGrowthChart(").count(),
@@ -17608,7 +17960,7 @@ mod tests {
         // ephemeris canonical, 520px). The card class is defined exactly once.
         let dir = tempfile::tempdir().unwrap();
         let out = dir.path().join("report.html");
-        generate_report(&timing_fixture(), &[], &out, None, None, &[], &[]).unwrap();
+        generate_report(&timing_fixture(), &[], &out, None, None, &[], &[], None).unwrap();
         let html = std::fs::read_to_string(&out).unwrap();
         assert_eq!(
             html.matches(".chart-container {").count(),
@@ -17639,7 +17991,7 @@ mod tests {
         // token, re-theme on a flip, and keep the legend clear of the title band.
         let dir = tempfile::tempdir().unwrap();
         let out = dir.path().join("report.html");
-        generate_report(&timing_fixture(), &[], &out, None, None, &[], &[]).unwrap();
+        generate_report(&timing_fixture(), &[], &out, None, None, &[], &[], None).unwrap();
         let html = std::fs::read_to_string(&out).unwrap();
 
         // The invisible ghost-grey literal is gone everywhere.
@@ -17960,7 +18312,7 @@ mod tests {
         let agg = synthetic_predict_aggregates("snap");
         let dir = tempfile::tempdir().unwrap();
         let out = dir.path().join("report.html");
-        generate_report(&rows, &[], &out, None, Some(&agg), &[], &[]).unwrap();
+        generate_report(&rows, &[], &out, None, Some(&agg), &[], &[], None).unwrap();
         let html = std::fs::read_to_string(&out).unwrap();
         // The 4.2 panel titles carry no hover caption (fails on the old structure).
         assert!(
@@ -19462,6 +19814,7 @@ mod tests {
             Some(&agg),
             std::slice::from_ref(&run),
             &[],
+            None,
         )
         .unwrap();
         let html = std::fs::read_to_string(&out).unwrap();
@@ -19557,6 +19910,7 @@ mod tests {
             Some(&agg),
             std::slice::from_ref(&run),
             &[],
+            None,
         )
         .unwrap();
         let html = std::fs::read_to_string(&out).unwrap();
@@ -19604,7 +19958,7 @@ mod tests {
         let agg = synthetic_predict_aggregates("2026-07-29-snap");
         let dir = tempfile::tempdir().unwrap();
         let out = dir.path().join("report.html");
-        generate_report(&rows, &[], &out, None, Some(&agg), &[], &[]).unwrap();
+        generate_report(&rows, &[], &out, None, Some(&agg), &[], &[], None).unwrap();
         let html = std::fs::read_to_string(&out).unwrap();
         assert!(html.contains("id=\"s15\""), "missing 4.2 anchor");
         assert!(html.contains("class=\"agrid pw-grid\""), "no 4.2 grids");
@@ -19641,7 +19995,7 @@ mod tests {
         let agg = synthetic_predict_aggregates("snap");
         let dir = tempfile::tempdir().unwrap();
         let out = dir.path().join("report.html");
-        generate_report(&rows, &[], &out, None, Some(&agg), &[], &[]).unwrap();
+        generate_report(&rows, &[], &out, None, Some(&agg), &[], &[], None).unwrap();
         let html = std::fs::read_to_string(&out).unwrap();
 
         // Count the numeric value spans (`<span class="cn">…`) inside one panel's
@@ -19706,7 +20060,7 @@ mod tests {
         let agg = synthetic_predict_aggregates("snap");
         let dir = tempfile::tempdir().unwrap();
         let out = dir.path().join("report.html");
-        generate_report(&rows, &[], &out, None, Some(&agg), &[], &[]).unwrap();
+        generate_report(&rows, &[], &out, None, Some(&agg), &[], &[], None).unwrap();
         let html = std::fs::read_to_string(&out).unwrap();
 
         let cs = html.find(">Coverage</div>").expect("4.2A Coverage panel");
@@ -19786,7 +20140,7 @@ mod tests {
         let agg = synthetic_predict_aggregates("snap");
         let dir = tempfile::tempdir().unwrap();
         let out = dir.path().join("report.html");
-        generate_report(&rows, &[], &out, None, Some(&agg), &[], &[]).unwrap();
+        generate_report(&rows, &[], &out, None, Some(&agg), &[], &[], None).unwrap();
         let html = std::fs::read_to_string(&out).unwrap();
         let cs = html.find(">Coverage</div>").expect("4.2A Coverage panel");
         let ce = html[cs..].find("Surfaces</div>").map(|i| cs + i).unwrap();
@@ -19852,7 +20206,7 @@ mod tests {
         ));
         let dir = tempfile::tempdir().unwrap();
         let out = dir.path().join("report.html");
-        generate_report(&rows, &[], &out, None, Some(&agg), &[], &[]).unwrap();
+        generate_report(&rows, &[], &out, None, Some(&agg), &[], &[], None).unwrap();
         let html = std::fs::read_to_string(&out).unwrap();
         let cs = html.find(">Coverage</div>").expect("4.2A Coverage panel");
         let ce = html[cs..].find("Surfaces</div>").map(|i| cs + i).unwrap();
@@ -19917,7 +20271,7 @@ mod tests {
         let agg = synthetic_predict_aggregates("snap");
         let dir = tempfile::tempdir().unwrap();
         let out = dir.path().join("report.html");
-        generate_report(&rows, &[], &out, None, Some(&agg), &[], &[]).unwrap();
+        generate_report(&rows, &[], &out, None, Some(&agg), &[], &[], None).unwrap();
         let html = std::fs::read_to_string(&out).unwrap();
         assert!(
             html.contains("σ_pred-dominated 75% of rows"),
@@ -20058,7 +20412,7 @@ mod tests {
         let rows = vec![synthetic_rust_prop_row("Apophis", 0.0)];
         let dir = tempfile::tempdir().unwrap();
         let out = dir.path().join("report.html");
-        generate_report(&rows, &[], &out, None, None, &[], &[]).unwrap();
+        generate_report(&rows, &[], &out, None, None, &[], &[], None).unwrap();
         let html = std::fs::read_to_string(&out).unwrap();
         assert!(html.contains("id=\"s15\""), "the 4.2 shell always renders");
         assert!(
@@ -20085,7 +20439,7 @@ mod tests {
         let agg = synthetic_predict_aggregates("snap");
         let dir = tempfile::tempdir().unwrap();
         let out = dir.path().join("report.html");
-        generate_report(&rows, &[], &out, None, Some(&agg), &[], &[]).unwrap();
+        generate_report(&rows, &[], &out, None, Some(&agg), &[], &[], None).unwrap();
         let html = std::fs::read_to_string(&out).unwrap();
         // The n=2 thin cell renders hatched with its count + reason, never as a
         // coloured value (its 0.3 realism / 0.5 sep must not appear as a cell).
@@ -20101,7 +20455,7 @@ mod tests {
         let agg = synthetic_predict_aggregates("snap"); // calibration is empty
         let dir = tempfile::tempdir().unwrap();
         let out = dir.path().join("report.html");
-        generate_report(&rows, &[], &out, None, Some(&agg), &[], &[]).unwrap();
+        generate_report(&rows, &[], &out, None, Some(&agg), &[], &[], None).unwrap();
         let html = std::fs::read_to_string(&out).unwrap();
         assert!(
             html.contains("awaiting Student-t chain"),
@@ -20115,7 +20469,7 @@ mod tests {
         let agg = synthetic_predict_aggregates("snap");
         let dir = tempfile::tempdir().unwrap();
         let out = dir.path().join("report.html");
-        generate_report(&rows, &[], &out, None, Some(&agg), &[], &[]).unwrap();
+        generate_report(&rows, &[], &out, None, Some(&agg), &[], &[], None).unwrap();
         let html = std::fs::read_to_string(&out).unwrap();
         // The large per-object family must not ride inline on the page.
         assert!(
@@ -20148,8 +20502,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let a = dir.path().join("a.html");
         let b = dir.path().join("b.html");
-        generate_report(&rows, &[], &a, None, Some(&agg), &[], &[]).unwrap();
-        generate_report(&rows, &[], &b, None, Some(&agg), &[], &[]).unwrap();
+        generate_report(&rows, &[], &a, None, Some(&agg), &[], &[], None).unwrap();
+        generate_report(&rows, &[], &b, None, Some(&agg), &[], &[], None).unwrap();
         let sa = std::fs::read(predict_path_for(&a)).unwrap();
         let sb = std::fs::read(predict_path_for(&b)).unwrap();
         assert_eq!(sa, sb, "the predict sidecar must be byte-reproducible");
@@ -20474,7 +20828,7 @@ mod tests {
         let agg = synthetic_predict_aggregates("snap");
         let dir = tempfile::tempdir().unwrap();
         let out = dir.path().join("report.html");
-        generate_report(&rows, &[], &out, None, Some(&agg), &[], &[]).unwrap();
+        generate_report(&rows, &[], &out, None, Some(&agg), &[], &[], None).unwrap();
         let html = std::fs::read_to_string(&out).unwrap();
         // One merged section: no separate Calibration panel-title.
         assert!(
@@ -20585,7 +20939,7 @@ mod tests {
         let (rows, cmp) = radar_scenario();
         let dir = tempfile::tempdir().unwrap();
         let out = dir.path().join("report.html");
-        generate_report(&rows, &cmp, &out, None, None, &[], &[]).unwrap();
+        generate_report(&rows, &cmp, &out, None, None, &[], &[], None).unwrap();
         let html = std::fs::read_to_string(&out).unwrap();
 
         // 2.1 "By object and fitter": the empyrean σ_eq column is dropped (1.3A
@@ -20628,7 +20982,7 @@ mod tests {
         let agg = synthetic_predict_aggregates("snap");
         let dir = tempfile::tempdir().unwrap();
         let out = dir.path().join("report.html");
-        generate_report(&rows, &[], &out, None, Some(&agg), &[], &[]).unwrap();
+        generate_report(&rows, &[], &out, None, Some(&agg), &[], &[], None).unwrap();
         let html = std::fs::read_to_string(&out).unwrap();
         assert!(
             html.contains(">empyrean <span class=\"pwarm\" title=\"arm efcc.adap.nonight\">EFCC · adaptive · per-obs · linear</span>"),
@@ -20781,7 +21135,7 @@ mod tests {
         );
         // The masthead dim ink reads a token, not a bespoke rgba.
         assert!(
-            html.contains(".masthead h1 .mh-dim { color: var(--ed-text-muted); }")
+            html.contains(".vr-mast h1 span { color: var(--ed-text-muted);")
                 && !html.contains("rgba(232,232,236,0.38)"),
             "the dim masthead ink reads a token"
         );
@@ -20796,7 +21150,7 @@ mod tests {
     fn s5_item6_timing_key_line_and_a2_absent_line_is_data_driven() {
         let dir = tempfile::tempdir().unwrap();
         let out = dir.path().join("report.html");
-        generate_report(&timing_fixture(), &[], &out, None, None, &[], &[]).unwrap();
+        generate_report(&timing_fixture(), &[], &out, None, None, &[], &[], None).unwrap();
         let html = std::fs::read_to_string(&out).unwrap();
         // The 2.2 timing tables carry ONE visible key line; the header-row hover
         // sentence is gone from the speed matrix. Delta 9: the key line is a terse
@@ -20878,7 +21232,7 @@ mod tests {
 
         let dir = tempfile::tempdir().unwrap();
         let out = dir.path().join("report.html");
-        generate_report(&timing_fixture(), &[], &out, None, None, &[], &[]).unwrap();
+        generate_report(&timing_fixture(), &[], &out, None, None, &[], &[], None).unwrap();
         let html = std::fs::read_to_string(&out).unwrap();
         // The key lines this delta governs are the Part 1 and Part 2 unit keys
         // (the C·cost timing keys and the Part-2 readout keys km/mas/σ_eq); scan
@@ -20906,7 +21260,7 @@ mod tests {
     fn delta9_masthead_has_no_rust_channel_under_test() {
         let dir = tempfile::tempdir().unwrap();
         let out = dir.path().join("report.html");
-        generate_report(&timing_fixture(), &[], &out, None, None, &[], &[]).unwrap();
+        generate_report(&timing_fixture(), &[], &out, None, None, &[], &[], None).unwrap();
         let html = std::fs::read_to_string(&out).unwrap();
         let mstart = html.find("<div class=\"masthead\">").expect("masthead");
         let mend = mstart
@@ -21412,7 +21766,7 @@ mod tests {
         ];
         let dir = tempfile::tempdir().unwrap();
         let out = dir.path().join("report.html");
-        generate_report(&rows, &[], &out, None, None, &[], &[]).unwrap();
+        generate_report(&rows, &[], &out, None, None, &[], &[], None).unwrap();
         let html = std::fs::read_to_string(&out).unwrap();
         let data_bytes = std::fs::read(dir.path().join("report.data.json")).unwrap();
         // The new fields reached the sidecar.
@@ -22362,7 +22716,10 @@ console.log('ok');
         while let Some(i) = rest.find("<script") {
             let tag_end = i + rest[i..].find('>').unwrap() + 1;
             let end = tag_end + rest[tag_end..].find("</script>").unwrap();
-            if !rest[i..tag_end].contains("src=") {
+            // Executable scripts only: a `src=` script is external, and a JSON data
+            // block (the summary layer's data) is not JavaScript.
+            let tag = &rest[i..tag_end];
+            if !tag.contains("src=") && !tag.contains("application/json") {
                 out.push_str(&rest[tag_end..end]);
                 out.push('\n');
             }
@@ -22496,7 +22853,7 @@ console.log('ok');
         let rows = em_dash_free_run();
         let dir = tempfile::tempdir().unwrap();
         let out = dir.path().join("rep.html");
-        generate_report(&rows, &[], &out, None, None, &[], &[]).unwrap();
+        generate_report(&rows, &[], &out, None, None, &[], &[], None).unwrap();
         let html = std::fs::read_to_string(&out).unwrap();
         let bytes = std::fs::read(dir.path().join("rep.data.json")).unwrap();
         let listed: BTreeSet<&str> = dataset_row_fields().into_iter().collect();
@@ -22550,7 +22907,7 @@ console.log('ok');
         let rows = em_dash_free_run();
         let dir = tempfile::tempdir().unwrap();
         let out = dir.path().join("rep.html");
-        generate_report(&rows, &[], &out, None, None, &[], &[]).unwrap();
+        generate_report(&rows, &[], &out, None, None, &[], &[], None).unwrap();
         let html = std::fs::read_to_string(&out).unwrap();
         let a = html.find("function fnv1a32(bytes)").unwrap();
         let b = html[a..].find("function datasetFail").unwrap() + a;
