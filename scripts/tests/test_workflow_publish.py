@@ -89,7 +89,13 @@ def test_every_comparator_is_copied_in_both_publish_loops(tmp_path):
 
     _, text = step("Upload to GCS")
     script = run_block(text).replace("${{ env.GCS_BUCKET }}", BUCKET)
-    env = {**os.environ, "PATH": f"{bindir}:{os.environ['PATH']}", "EXTERNAL_TOOLS": ",".join(tools)}
+    env = {
+        **os.environ,
+        "PATH": f"{bindir}:{os.environ['PATH']}",
+        "EXTERNAL_TOOLS": ",".join(tools),
+        # Minted before the report was rendered (test_workflow_archive_timestamp.py).
+        "ARCHIVE_TIMESTAMP": "20990101_000000",
+    }
     r = subprocess.run(["bash", "-e", "-c", script], cwd=tmp_path, env=env, capture_output=True, text=True)
     assert r.returncode == 0, r.stderr
 

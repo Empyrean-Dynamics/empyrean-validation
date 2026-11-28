@@ -1614,6 +1614,68 @@ jobs:
               --results-dir results
           done
 
+      # ── Publish decision and archive timestamp ─────────────────
+      # Decided BEFORE the report is rendered, because the report's cite block
+      # carries the permanent archive link, which names the timestamp. Both are
+      # decided here, once, ahead of the render, the gate and the upload.
+      #
+      # Publish on every real trigger (a pin-bump push or a manual dispatch;
+      # the retired sibling dispatch used to be one too, and omitting a real
+      # trigger here once left the bucket stale while the summary claimed a
+      # publish).
+      #
+      # But NOT from every ref, and NOT for every object set. `latest/` is the
+      # published dashboard: whatever lands there is read as "this is Empyrean's
+      # validation of record." Two ways that was reachable by a run that has no
+      # business claiming it:
+      #
+      #   - a workflow_dispatch from ANY branch published over main's results,
+      #     so testing a pipeline change republished the dashboard from the
+      #     branch under test;
+      #   - a subset run (OBJECTS=…) published a partial report as canonical.
+      #     ci-check already refuses to enforce its per-axis row floors on a
+      #     subset — it warns and skips them — so the suite already knows a
+      #     subset is not gate-worthy, yet it published one as the gate anyway.
+      #
+      # Both are decided here, once, so the auth step and the upload step cannot
+      # disagree about whether this run is allowed to publish.
+      - name: Decide whether this run may publish
+        id: publish-gate
+        run: |
+          trigger=0
+          # `schedule` is inert while the weekly cron is off (see "Triggers"
+          # at the top) and is kept here ON PURPOSE. This gate is the narrower of the two
+          # lists, so a cron restored in `on:` without a matching edit here
+          # would run the full suite and then silently decline to publish it.
+          case "${{ github.event_name }}" in
+            schedule|push|workflow_dispatch) trigger=1 ;;
+          esac
+          if [ "$trigger" -ne 1 ]; then
+            echo "publish=false" >> "$GITHUB_OUTPUT"
+            echo "Not publishing: ${{ github.event_name }} is not a publishing trigger."
+          elif [ "${ACT:-}" = "true" ]; then
+            echo "publish=false" >> "$GITHUB_OUTPUT"
+            echo "Not publishing: this is a local rehearsal under act."
+          elif [ "${{ github.ref }}" != "refs/heads/main" ]; then
+            echo "publish=false" >> "$GITHUB_OUTPUT"
+            echo "::notice title=Not publishing::ref is ${{ github.ref }}, not refs/heads/main — results stay as run artifacts so a branch under test cannot overwrite the published dashboard."
+          elif [ -n "${OBJECTS}" ]; then
+            echo "publish=false" >> "$GITHUB_OUTPUT"
+            echo "::notice title=Not publishing::OBJECTS='${OBJECTS}' is a subset, so this run is not the validation of record. ci-check already skips its row floors for subsets; publishing one as latest/ would contradict that."
+          else
+            echo "publish=true" >> "$GITHUB_OUTPUT"
+            echo "Publishing: full catalog on refs/heads/main via ${{ github.event_name }}."
+          fi
+      # The archive timestamp, minted ONCE, here, and only for a run that will
+      # publish. The report renders its cite block from it (`make reduce` passes
+      # it to `report --archive-timestamp`) and the upload files both archive
+      # copies under it, so the link the report prints is the page that exists.
+      # A run that does not publish (a PR run, act, a subset, a branch under
+      # test) mints none, and its report says it is an unpublished render.
+      - name: Mint the archive timestamp
+        if: steps.publish-gate.outputs.publish == 'true'
+        run: echo "ARCHIVE_TIMESTAMP=$(date -u +%Y%m%d_%H%M%S)" >> "$GITHUB_ENV"
+
       # reduce runs the prebuilt harness against the engine library and kernel
       # set restored above, then folds in whichever external
       # channels are present (skipping any that a failed leg left absent, and any
@@ -1703,53 +1765,8 @@ jobs:
             ${FLOORS} ${REQUIRE}
 
       # ── GCS upload ─────────────────────────────────────────────
-      # Publish on every real trigger (a pin-bump push or a manual dispatch;
-      # the retired sibling dispatch used to be one too, and omitting a real
-      # trigger here once left the bucket stale while the summary claimed a
-      # publish).
-      #
-      # But NOT from every ref, and NOT for every object set. `latest/` is the
-      # published dashboard: whatever lands there is read as "this is Empyrean's
-      # validation of record." Two ways that was reachable by a run that has no
-      # business claiming it:
-      #
-      #   - a workflow_dispatch from ANY branch published over main's results,
-      #     so testing a pipeline change republished the dashboard from the
-      #     branch under test;
-      #   - a subset run (OBJECTS=…) published a partial report as canonical.
-      #     ci-check already refuses to enforce its per-axis row floors on a
-      #     subset — it warns and skips them — so the suite already knows a
-      #     subset is not gate-worthy, yet it published one as the gate anyway.
-      #
-      # Both are decided here, once, so the auth step and the upload step cannot
-      # disagree about whether this run is allowed to publish.
-      - name: Decide whether this run may publish
-        id: publish-gate
-        run: |
-          trigger=0
-          # `schedule` is inert while the weekly cron is off (see "Triggers"
-          # at the top) and is kept here ON PURPOSE. This gate is the narrower of the two
-          # lists, so a cron restored in `on:` without a matching edit here
-          # would run the full suite and then silently decline to publish it.
-          case "${{ github.event_name }}" in
-            schedule|push|workflow_dispatch) trigger=1 ;;
-          esac
-          if [ "$trigger" -ne 1 ]; then
-            echo "publish=false" >> "$GITHUB_OUTPUT"
-            echo "Not publishing: ${{ github.event_name }} is not a publishing trigger."
-          elif [ "${ACT:-}" = "true" ]; then
-            echo "publish=false" >> "$GITHUB_OUTPUT"
-            echo "Not publishing: this is a local rehearsal under act."
-          elif [ "${{ github.ref }}" != "refs/heads/main" ]; then
-            echo "publish=false" >> "$GITHUB_OUTPUT"
-            echo "::notice title=Not publishing::ref is ${{ github.ref }}, not refs/heads/main — results stay as run artifacts so a branch under test cannot overwrite the published dashboard."
-          elif [ -n "${OBJECTS}" ]; then
-            echo "publish=false" >> "$GITHUB_OUTPUT"
-            echo "::notice title=Not publishing::OBJECTS='${OBJECTS}' is a subset, so this run is not the validation of record. ci-check already skips its row floors for subsets; publishing one as latest/ would contradict that."
-          else
-            echo "publish=true" >> "$GITHUB_OUTPUT"
-            echo "Publishing: full catalog on refs/heads/main via ${{ github.event_name }}."
-          fi
+      # Whether this run publishes is decided by the "Decide whether this run may
+      # publish" step, which now runs before the report is rendered (see there).
       - name: Authenticate to Google Cloud
         if: steps.publish-gate.outputs.publish == 'true'
         uses: google-github-actions/auth@v2
@@ -1760,7 +1777,10 @@ jobs:
         if: steps.publish-gate.outputs.publish == 'true'
         working-directory: empyrean-validation
         run: |
-          TIMESTAMP=$(date -u +%Y%m%d_%H%M%S)
+          # The timestamp the "Mint the archive timestamp" step fixed before the
+          # report was rendered: the same value the report's cite block links.
+          # Never minted here, so the render and the archive cannot disagree.
+          TIMESTAMP="${ARCHIVE_TIMESTAMP:?the archive timestamp was not minted before the report was rendered}"
           alias_canonical() { cp "$1" "$2"; }
 
           # The per-channel files a run published: the empyrean channels, then every
